@@ -17,8 +17,11 @@ except ImportError:
     HAS_LIBS = False
 
 class SettingsDialog(wx.Dialog):
-    def __init__(self, parent, selected_count, suggested_res, layer_names):
+    def __init__(self, parent, selected_count, suggested_res, layer_names, preview_callback=None):
         super().__init__(parent, title="Thermal Sim (Bulletproof)")
+        
+        self.layer_names = layer_names
+        self.preview_callback = preview_callback
         
         sizer = wx.BoxSizer(wx.VERTICAL)
         
@@ -75,15 +78,30 @@ class SettingsDialog(wx.Dialog):
         sizer.Add(box_grid, 0, wx.EXPAND|wx.ALL, 5)
 
         # --- Buttons ---
-        btn_sizer = wx.StdDialogButtonSizer()
-        btn_sizer.AddButton(wx.Button(self, wx.ID_OK, "Run"))
-        btn_sizer.AddButton(wx.Button(self, wx.ID_CANCEL, "Cancel"))
-        btn_sizer.Realize()
-        sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT|wx.ALL, 10)
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        
+        self.btn_preview = wx.Button(self, label="Preview")
+        self.btn_preview.Bind(wx.EVT_BUTTON, self.on_preview)
+        btn_sizer.Add(self.btn_preview, 0, wx.ALL, 5)
+        
+        btn_sizer.AddStretchSpacer()
+        
+        btn_run = wx.Button(self, wx.ID_OK, "Run")
+        btn_cancel = wx.Button(self, wx.ID_CANCEL, "Cancel")
+        btn_sizer.Add(btn_run, 0, wx.ALL, 5)
+        btn_sizer.Add(btn_cancel, 0, wx.ALL, 5)
+        
+        sizer.Add(btn_sizer, 0, wx.EXPAND|wx.ALL, 10)
         
         self.SetSizer(sizer)
         self.Fit()
         self.Center()
+    
+    def on_preview(self, event):
+        if self.preview_callback:
+            settings = self.get_values()
+            if settings:
+                self.preview_callback(settings, self.layer_names)
 
     def add_field(self, sizer, label_text, default_val):
         row = wx.BoxSizer(wx.HORIZONTAL)
@@ -118,12 +136,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.description = "Crash-safe Multilayer Sim"
         self.show_toolbar_button = True
         self.icon_file_name = "" 
+        
+        # Store references for preview
+        self.board = None
+        self.copper_ids = []
+        self.bbox = None
 
     def Run(self):
         try:
             self.RunSafe()
         except Exception:
-            # Zeige JEDEN Fehler an, damit wir wissen was los ist
+            # Show every error so we know what's happening
             wx.MessageBox(traceback.format_exc(), "Thermal Sim CRASH")
 
     def RunSafe(self):
@@ -133,45 +156,26 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         board = pcbnew.GetBoard()
         
         # --- 1. Robust Layer Detection ---
-        # Get actual copper layer count from board stackup
-        try:
-            copper_layer_count = board.GetCopperLayerCount()
-        except:
-            copper_layer_count = 2  # Fallback for older API
-        
-        # Use pcbnew constants for layer IDs (works across KiCad versions)
-        # F_Cu = Front Copper (Top), B_Cu = Back Copper (Bottom)
-        F_Cu = pcbnew.F_Cu
-        B_Cu = pcbnew.B_Cu
-        
+        # Get all enabled copper layers in stackup order
         copper_ids = []
         layer_names = []
+        enabled_layers = board.GetEnabledLayers()
         
-        # Always add F.Cu (Top)
-        copper_ids.append(F_Cu)
-        layer_names.append(board.GetLayerName(F_Cu))
+        for lid in range(64): # Scan all possible layers
+            try:
+                is_copper = pcbnew.IsCopperLayer(lid)
+            except:
+                is_copper = (lid < 32) # Standard KiCad copper layer range
+                
+            if enabled_layers.Contains(lid) and is_copper:
+                copper_ids.append(lid)
+                layer_names.append(board.GetLayerName(lid))
         
-        # Add inner copper layers if present (In1_Cu, In2_Cu, etc.)
-        inner_count = copper_layer_count - 2
-        inner_layer_ids = [
-            pcbnew.In1_Cu, pcbnew.In2_Cu, pcbnew.In3_Cu, pcbnew.In4_Cu,
-            pcbnew.In5_Cu, pcbnew.In6_Cu, pcbnew.In7_Cu, pcbnew.In8_Cu,
-            pcbnew.In9_Cu, pcbnew.In10_Cu, pcbnew.In11_Cu, pcbnew.In12_Cu,
-            pcbnew.In13_Cu, pcbnew.In14_Cu, pcbnew.In15_Cu, pcbnew.In16_Cu,
-            pcbnew.In17_Cu, pcbnew.In18_Cu, pcbnew.In19_Cu, pcbnew.In20_Cu,
-            pcbnew.In21_Cu, pcbnew.In22_Cu, pcbnew.In23_Cu, pcbnew.In24_Cu,
-            pcbnew.In25_Cu, pcbnew.In26_Cu, pcbnew.In27_Cu, pcbnew.In28_Cu,
-            pcbnew.In29_Cu, pcbnew.In30_Cu
-        ]
-        for i in range(inner_count):
-            if i < len(inner_layer_ids):
-                copper_ids.append(inner_layer_ids[i])
-                layer_names.append(board.GetLayerName(inner_layer_ids[i]))
-        
-        # Always add B.Cu (Bottom) if more than 1 layer
-        if copper_layer_count >= 2:
-            copper_ids.append(B_Cu)
-            layer_names.append(board.GetLayerName(B_Cu))
+        # Standard ordering: Top to Bottom (0 -> 31)
+        copper_ids.sort()
+        # Re-map layer names in sorted order
+        layer_names = [board.GetLayerName(lid) for lid in copper_ids]
+        copper_layer_count = len(copper_ids)
 
         # --- 2. Auto-Resolution ---
         try: bbox = board.GetBoundingBox()
@@ -207,7 +211,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         pads_list = [p[1] for p in selected_pads] 
 
         # --- 4. UI ---
-        dlg = SettingsDialog(None, len(pads_list), suggested_res, layer_names)
+        # Store references for preview
+        self.board = board
+        self.copper_ids = copper_ids
+        self.bbox = bbox
+        
+        dlg = SettingsDialog(None, len(pads_list), suggested_res, layer_names, 
+                             preview_callback=self.generate_preview)
         if dlg.ShowModal() != wx.ID_OK:
             dlg.Destroy(); return
         settings = dlg.get_values()
@@ -216,7 +226,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # --- 5. Grid Setup ---
         res = settings['res']
-        if (w_mm/res)*(h_mm/res) > 200000: # Speicher Schutz
+        if (w_mm/res)*(h_mm/res) > 200000: # Memory protection
             res = math.sqrt(area / 100000)
         
         x_min = bbox.GetX() * 1e-6 
@@ -296,12 +306,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             pad_lid = pad.GetLayer()
             target_idx = 0 # Default: Top
             
-            # --- CRASH FIX: Sicherstellen dass Layer existiert ---
+            # --- CRASH FIX: Ensure layer exists ---
             if pad_lid in copper_ids:
                 target_idx = copper_ids.index(pad_lid)
             else:
-                # Pad ist auf Layer, der nicht in copper_ids ist (z.B. "All Layers")
-                # Wir legen es einfach auf Top (0) oder Bottom (-1) je nach Name
+                # Pad is on layer not in copper_ids (e.g. "All Layers")
+                # Default to Top (0) or Bottom (-1) based on name
                 lname = board.GetLayerName(pad_lid).upper()
                 if "B." in lname or "BOT" in lname: target_idx = layer_count - 1
                 else: target_idx = 0
@@ -377,9 +387,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             percent = int((b / num_batches) * 100)
             elapsed = time.time() - start_time
             msg = f"Step {b*batch_size}/{steps}"
-            if b > 0:
-                rem = int((elapsed / b) * (num_batches - b))
-                msg += f" (Est. {rem}s)"
             
             if not pd.Update(percent, msg): aborted = True; break
             
@@ -477,13 +484,21 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                  if rs < rows and cs < cols:
                     H[rs:re, cs:ce] = 1.0
 
-        # Safe Object Iteration
+        # --- 2. Tracks & Vias ---
+        # Map layer IDs to indices for fast lookup
+        lid_to_idx = {lid: i for i, lid in enumerate(copper_ids)}
+        
+        def safe_fill(lid, bbox, val):
+            if lid in lid_to_idx:
+                fill_box(lid_to_idx[lid], bbox, val)
+
         try:
             tracks = board.Tracks() if hasattr(board, 'Tracks') else board.GetTracks()
             for t in tracks:
                 lid = t.GetLayer()
-                if lid in copper_ids:
-                    fill_box(copper_ids.index(lid), t.GetBoundingBox(), k_cu)
+                safe_fill(lid, t.GetBoundingBox(), k_cu)
+                
+                # Check if it is a via
                 if "VIA" in str(type(t)).upper(): 
                     fill_via(t.GetBoundingBox(), v_via)
 
@@ -492,27 +507,36 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 for pad in fp.Pads():
                     bb = pad.GetBoundingBox()
                     if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
+                        # PTH pads exist on all copper layers
                         for i in range(num_layers): fill_box(i, bb, k_cu)
                         fill_via(bb, v_via)
                     else:
-                        lid = pad.GetLayer()
-                        if lid in copper_ids:
-                            fill_box(copper_ids.index(lid), bb, k_cu)
+                        # SMD pads
+                        safe_fill(pad.GetLayer(), bb, k_cu)
 
             zones = board.Zones() if hasattr(board, 'Zones') else board.GetZones()
             for z in zones:
                 if not z.IsFilled(): continue
-                lid = z.GetLayer()
-                if lid in copper_ids:
-                    fill_box(copper_ids.index(lid), z.GetBoundingBox(), k_cu)
-                if settings['use_heatsink'] and lid == pcbnew.Eco1_User:
-                    fill_hs(z.GetBoundingBox())
+                # Check all layers the zone might be on (multiselection)
+                try:
+                    z_lids = z.GetLayerSet().IntSeq()
+                except:
+                    z_lids = [z.GetLayer()]
+                
+                for lid in z_lids:
+                    safe_fill(lid, z.GetBoundingBox(), k_cu)
+                
+                if settings['use_heatsink']:
+                    z_ls = z.GetLayerSet()
+                    if z_ls.Contains(pcbnew.Eco1_User):
+                        fill_hs(z.GetBoundingBox())
             
             if settings['use_heatsink']:
                 for d in board.GetDrawings():
-                    if d.GetLayer() == pcbnew.Eco1_User: fill_hs(d.GetBoundingBox())
-        except Exception:
-            pass # Ignore single element errors
+                    if d.GetLayer() == pcbnew.Eco1_User: 
+                        fill_hs(d.GetBoundingBox())
+        except Exception as e:
+            pass # Silent fail for single element errors
 
         return K, V, H
 
@@ -573,6 +597,75 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         else: 
             import subprocess
             subprocess.call(['xdg-open', output_file])
+
+    def generate_preview(self, settings, layer_names):
+        """Generates a preview image of detected copper and vias"""
+        board = self.board
+        copper_ids = self.copper_ids
+        bbox = self.bbox
+        
+        if not board or not bbox:
+            wx.MessageBox("Board data missing for preview", "Error")
+            return
+
+        res = settings['res']
+        w_mm = bbox.GetWidth() * 1e-6
+        h_mm = bbox.GetHeight() * 1e-6
+        x_min = bbox.GetX() * 1e-6
+        y_min = bbox.GetY() * 1e-6
+        cols = int(w_mm / res) + 4
+        rows = int(h_mm / res) + 4
+        
+        # Physics constants for mapping
+        k_fr4_rel = 1.0
+        k_cu_rel  = 400.0
+        layer_count = len(copper_ids)
+        total_thick = max(0.2, settings['thick'])
+        dielectric_thick = total_thick / max(1, (layer_count - 1))
+        v_base = 0.3 / dielectric_thick
+        v_via  = 390.0 / dielectric_thick
+
+        try:
+            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_rel, v_base, v_via)
+            
+            output_file = os.path.join(os.path.dirname(__file__), "thermal_preview.png")
+            count = len(K)
+            cols_grid = 2
+            rows_grid = math.ceil(count / 2)
+            
+            fig, axes = plt.subplots(rows_grid, cols_grid, figsize=(12, 4*rows_grid), squeeze=False)
+            axes = axes.flatten()
+            
+            for i in range(count):
+                ax = axes[i]
+                name = layer_names[i] if i < len(layer_names) else f"Layer {i}"
+                ax.set_title(f"Preview: {name}")
+                
+                # Show copper in green
+                k_disp = (K[i] - 1.0) / (400.0 - 1.0)
+                ax.imshow(k_disp, cmap='Greens', origin='upper', interpolation='none')
+                
+                # Overlay vias in red
+                v_mask = V_map > v_base
+                if np.any(v_mask):
+                    ax.imshow(np.ma.masked_where(~v_mask, v_mask), cmap='Reds', origin='upper', alpha=0.8, interpolation='none')
+                
+                ax.axis('off')
+
+            for j in range(count, len(axes)):
+                axes[j].axis('off')
+
+            plt.tight_layout()
+            plt.savefig(output_file, dpi=120)
+            plt.close()
+            
+            if sys.platform == 'win32': os.startfile(output_file)
+            else: 
+                import subprocess
+                subprocess.call(['xdg-open', output_file])
+                
+        except Exception as e:
+            wx.MessageBox(f"Preview error: {traceback.format_exc()}", "Error")
 
     def show_results_all_layers(self, T, H, amb, layer_names):
         output_file = os.path.join(os.path.dirname(__file__), "thermal_stackup.png")
