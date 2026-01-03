@@ -494,7 +494,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             re = min(rows, int((y0+h - y_min)/res)+1)
             if cs >= ce or rs >= re:
                 return
-            if not hasattr(zone, "HitTest"):
+            filled_polys = None
+            if hasattr(zone, "GetFilledPolysList"):
+                try:
+                    filled_polys = zone.GetFilledPolysList()
+                except Exception:
+                    filled_polys = None
+            if filled_polys is None and not hasattr(zone, "HitTest"):
                 fill_box(l_idx, bbox, val)
                 return
             for r in range(rs, re):
@@ -504,7 +510,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     x = x_min + (c + 0.5) * res
                     pos = pcbnew.VECTOR2I(int(x * 1e6), y_iu)
                     try:
-                        if zone.HitTest(pos):
+                        hit = False
+                        if filled_polys is not None:
+                            if hasattr(filled_polys, "Contains"):
+                                hit = filled_polys.Contains(pos)
+                            elif hasattr(filled_polys, "PointInside"):
+                                hit = filled_polys.PointInside(pos)
+                        if not hit and hasattr(zone, "HitTest"):
+                            hit = zone.HitTest(pos)
+                        if hit:
                             K[l_idx, r, c] = max(K[l_idx, r, c], val)
                     except Exception:
                         continue
