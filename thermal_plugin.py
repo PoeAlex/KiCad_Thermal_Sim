@@ -154,7 +154,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             wx.MessageBox("Please install numpy & matplotlib!", "Error"); return
 
         board = pcbnew.GetBoard()
-        
+
+        # Keep zone fills up-to-date (required for HitTestFilledArea-based zone mapping in KiCad 9)
+        try:
+            pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+        except Exception:
+            pass
+
         # --- 1. Robust Layer Detection ---
         # Get all enabled copper layers in stackup order
         copper_ids = []
@@ -484,7 +490,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                  if rs < rows and cs < cols:
                     H[rs:re, cs:ce] = 1.0
 
-        def fill_zone(l_idx, zone, val):
+        def fill_zone(l_idx, lid, zone, val):
+            # Use *filled* area hit-test so clearance/holes (pads other nets, tracks, keepouts) are respected.
             bbox = zone.GetBoundingBox()
             x0, y0 = bbox.GetX()*1e-6, bbox.GetY()*1e-6
             w, h   = bbox.GetWidth()*1e-6, bbox.GetHeight()*1e-6
@@ -494,77 +501,19 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             re = min(rows, int((y0+h - y_min)/res)+1)
             if cs >= ce or rs >= re:
                 return
-            filled_polys = None
-            if hasattr(zone, "GetFilledPolysList"):
-                try:
-                    filled_polys = zone.GetFilledPolysList()
-                except Exception:
-                    filled_polys = None
-            polyset = filled_polys
-            try:
-                if polyset is not None and hasattr(polyset, "OutlineCount"):
-                    if polyset.OutlineCount() == 0:
-                        polyset = None
-            except Exception:
-                polyset = None
-            if polyset is None:
-                if hasattr(zone, "Outline"):
-                    try:
-                        polyset = zone.Outline()
-                    except Exception:
-                        polyset = None
-                elif hasattr(zone, "GetOutline"):
-                    try:
-                        polyset = zone.GetOutline()
-                    except Exception:
-                        polyset = None
-            if polyset is None and not hasattr(zone, "HitTest"):
-                fill_box(l_idx, bbox, val)
-                return
+
+            # Fallback if KiCad build lacks HitTestFilledArea (older versions)
+            has_filled_hit = hasattr(zone, "HitTestFilledArea")
+
             def to_iu(value_mm):
-                if hasattr(pcbnew, "FromMM"):
+                try:
                     return pcbnew.FromMM(value_mm)
-                return int(value_mm * 1e6)
-            def point_in_polyset(polyset_obj, position):
-                if hasattr(polyset_obj, "OutlineCount") and hasattr(polyset_obj, "Outline"):
-                    try:
-                        outline_count = polyset_obj.OutlineCount()
-                    except Exception:
-                        outline_count = 0
-                    if outline_count > 0:
-                        for outline_idx in range(outline_count):
-                            try:
-                                outline = polyset_obj.Outline(outline_idx)
-                            except Exception:
-                                continue
-                            try:
-                                if not outline.PointInside(position):
-                                    continue
-                            except Exception:
-                                continue
-                            hole_count = 0
-                            if hasattr(polyset_obj, "HoleCount") and hasattr(polyset_obj, "Hole"):
-                                try:
-                                    hole_count = polyset_obj.HoleCount(outline_idx)
-                                except Exception:
-                                    hole_count = 0
-                            for hole_idx in range(hole_count):
-                                try:
-                                    hole = polyset_obj.Hole(outline_idx, hole_idx)
-                                except Exception:
-                                    continue
-                                try:
-                                    if hole.PointInside(position):
-                                        return False
-                                except Exception:
-                                    continue
-                            return True
-                        return False
-                if hasattr(polyset_obj, "Contains"):
-                    return polyset_obj.Contains(position)
-                if hasattr(polyset_obj, "PointInside"):
-                    return polyset_obj.PointInside(position)
-                return False
+                except Exception:
+                    return int(value_mm * 1e6)
+
+            # Use a tiny margin (in internal units) to avoid edge quantization misses at polygon borders.
+            margin_iu = 1
+
             for r in range(rs, re):
                 y = y_min + (r + 0.5) * res
                 y_iu = to_iu(y)
@@ -573,9 +522,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     pos = pcbnew.VECTOR2I(to_iu(x), y_iu)
                     try:
                         hit = False
-                        if polyset is not None:
-                            hit = point_in_polyset(polyset, pos)
-                        if not hit and hasattr(zone, "HitTest"):
+                        if has_filled_hit:
+                            hit = zone.HitTestFilledArea(lid, pos, margin_iu)
+                        elif hasattr(zone, "HitTest"):
                             hit = zone.HitTest(pos)
                         if hit:
                             K[l_idx, r, c] = max(K[l_idx, r, c], val)
@@ -641,7 +590,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
                 for lid in z_lids:
                     if lid in lid_to_idx:
-                        fill_zone(lid_to_idx[lid], z, k_cu)
+                        fill_zone(lid_to_idx[lid], lid, z, k_cu)
                 
                 if settings['use_heatsink']:
                     z_ls = z.GetLayerSet()
@@ -724,6 +673,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         if not board or not bbox:
             wx.MessageBox("Board data missing for preview", "Error")
             return
+
+
+        # Keep zone fills up-to-date (required for HitTestFilledArea-based zone mapping in KiCad 9)
+        try:
+            pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+        except Exception:
+            pass
 
         res = settings['res']
         w_mm = bbox.GetWidth() * 1e-6
