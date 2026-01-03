@@ -484,6 +484,31 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                  if rs < rows and cs < cols:
                     H[rs:re, cs:ce] = 1.0
 
+        def fill_zone(l_idx, zone, val):
+            bbox = zone.GetBoundingBox()
+            x0, y0 = bbox.GetX()*1e-6, bbox.GetY()*1e-6
+            w, h   = bbox.GetWidth()*1e-6, bbox.GetHeight()*1e-6
+            cs = max(0, int((x0 - x_min)/res))
+            rs = max(0, int((y0 - y_min)/res))
+            ce = min(cols, int((x0+w - x_min)/res)+1)
+            re = min(rows, int((y0+h - y_min)/res)+1)
+            if cs >= ce or rs >= re:
+                return
+            if not hasattr(zone, "HitTest"):
+                fill_box(l_idx, bbox, val)
+                return
+            for r in range(rs, re):
+                y = y_min + (r + 0.5) * res
+                y_iu = int(y * 1e6)
+                for c in range(cs, ce):
+                    x = x_min + (c + 0.5) * res
+                    pos = pcbnew.VECTOR2I(int(x * 1e6), y_iu)
+                    try:
+                        if zone.HitTest(pos):
+                            K[l_idx, r, c] = max(K[l_idx, r, c], val)
+                    except Exception:
+                        continue
+
         # --- 2. Tracks & Vias ---
         # Map layer IDs to indices for fast lookup
         lid_to_idx = {lid: i for i, lid in enumerate(copper_ids)}
@@ -542,7 +567,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         z_lids = []
 
                 for lid in z_lids:
-                    safe_fill(lid, z.GetBoundingBox(), k_cu)
+                    if lid in lid_to_idx:
+                        fill_zone(lid_to_idx[lid], z, k_cu)
                 
                 if settings['use_heatsink']:
                     z_ls = z.GetLayerSet()
