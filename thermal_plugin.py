@@ -525,6 +525,46 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 if hasattr(pcbnew, "FromMM"):
                     return pcbnew.FromMM(value_mm)
                 return int(value_mm * 1e6)
+            def point_in_polyset(polyset_obj, position):
+                if hasattr(polyset_obj, "OutlineCount") and hasattr(polyset_obj, "Outline"):
+                    try:
+                        outline_count = polyset_obj.OutlineCount()
+                    except Exception:
+                        outline_count = 0
+                    if outline_count > 0:
+                        for outline_idx in range(outline_count):
+                            try:
+                                outline = polyset_obj.Outline(outline_idx)
+                            except Exception:
+                                continue
+                            try:
+                                if not outline.PointInside(position):
+                                    continue
+                            except Exception:
+                                continue
+                            hole_count = 0
+                            if hasattr(polyset_obj, "HoleCount") and hasattr(polyset_obj, "Hole"):
+                                try:
+                                    hole_count = polyset_obj.HoleCount(outline_idx)
+                                except Exception:
+                                    hole_count = 0
+                            for hole_idx in range(hole_count):
+                                try:
+                                    hole = polyset_obj.Hole(outline_idx, hole_idx)
+                                except Exception:
+                                    continue
+                                try:
+                                    if hole.PointInside(position):
+                                        return False
+                                except Exception:
+                                    continue
+                            return True
+                        return False
+                if hasattr(polyset_obj, "Contains"):
+                    return polyset_obj.Contains(position)
+                if hasattr(polyset_obj, "PointInside"):
+                    return polyset_obj.PointInside(position)
+                return False
             for r in range(rs, re):
                 y = y_min + (r + 0.5) * res
                 y_iu = to_iu(y)
@@ -534,10 +574,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     try:
                         hit = False
                         if polyset is not None:
-                            if hasattr(polyset, "Contains"):
-                                hit = polyset.Contains(pos)
-                            elif hasattr(polyset, "PointInside"):
-                                hit = polyset.PointInside(pos)
+                            hit = point_in_polyset(polyset, pos)
                         if not hit and hasattr(zone, "HitTest"):
                             hit = zone.HitTest(pos)
                         if hit:
