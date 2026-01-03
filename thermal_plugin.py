@@ -516,13 +516,22 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
             zones = board.Zones() if hasattr(board, 'Zones') else board.GetZones()
             for z in zones:
-                if not z.IsFilled(): continue
+                if hasattr(z, "IsFilled") and not z.IsFilled():
+                    is_rule_area = getattr(z, "GetIsRuleArea", lambda: False)()
+                    is_keepout = getattr(z, "GetIsKeepout", lambda: False)()
+                    if is_rule_area or is_keepout:
+                        continue
                 # Check all layers the zone might be on (multiselection)
                 try:
-                    z_lids = z.GetLayerSet().IntSeq()
-                except:
-                    z_lids = [z.GetLayer()]
-                
+                    z_lids = list(z.GetLayerSet().IntSeq())
+                except Exception:
+                    z_lids = []
+                if not z_lids:
+                    try:
+                        z_lids = [z.GetLayer()]
+                    except Exception:
+                        z_lids = []
+
                 for lid in z_lids:
                     safe_fill(lid, z.GetBoundingBox(), k_cu)
                 
