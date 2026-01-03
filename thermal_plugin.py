@@ -500,22 +500,44 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     filled_polys = zone.GetFilledPolysList()
                 except Exception:
                     filled_polys = None
-            if filled_polys is None and not hasattr(zone, "HitTest"):
+            polyset = filled_polys
+            try:
+                if polyset is not None and hasattr(polyset, "OutlineCount"):
+                    if polyset.OutlineCount() == 0:
+                        polyset = None
+            except Exception:
+                polyset = None
+            if polyset is None:
+                if hasattr(zone, "Outline"):
+                    try:
+                        polyset = zone.Outline()
+                    except Exception:
+                        polyset = None
+                elif hasattr(zone, "GetOutline"):
+                    try:
+                        polyset = zone.GetOutline()
+                    except Exception:
+                        polyset = None
+            if polyset is None and not hasattr(zone, "HitTest"):
                 fill_box(l_idx, bbox, val)
                 return
+            def to_iu(value_mm):
+                if hasattr(pcbnew, "FromMM"):
+                    return pcbnew.FromMM(value_mm)
+                return int(value_mm * 1e6)
             for r in range(rs, re):
                 y = y_min + (r + 0.5) * res
-                y_iu = int(y * 1e6)
+                y_iu = to_iu(y)
                 for c in range(cs, ce):
                     x = x_min + (c + 0.5) * res
-                    pos = pcbnew.VECTOR2I(int(x * 1e6), y_iu)
+                    pos = pcbnew.VECTOR2I(to_iu(x), y_iu)
                     try:
                         hit = False
-                        if filled_polys is not None:
-                            if hasattr(filled_polys, "Contains"):
-                                hit = filled_polys.Contains(pos)
-                            elif hasattr(filled_polys, "PointInside"):
-                                hit = filled_polys.PointInside(pos)
+                        if polyset is not None:
+                            if hasattr(polyset, "Contains"):
+                                hit = polyset.Contains(pos)
+                            elif hasattr(polyset, "PointInside"):
+                                hit = polyset.PointInside(pos)
                         if not hit and hasattr(zone, "HitTest"):
                             hit = zone.HitTest(pos)
                         if hit:
