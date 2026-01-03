@@ -522,10 +522,19 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     if is_rule_area or is_keepout:
                         continue
                 # Check all layers the zone might be on (multiselection)
-                try:
-                    z_lids = list(z.GetLayerSet().IntSeq())
-                except Exception:
-                    z_lids = []
+                z_lids = []
+                if hasattr(z, "IsOnLayer"):
+                    for lid in copper_ids:
+                        try:
+                            if z.IsOnLayer(lid):
+                                z_lids.append(lid)
+                        except Exception:
+                            continue
+                if not z_lids:
+                    try:
+                        z_lids = list(z.GetLayerSet().IntSeq())
+                    except Exception:
+                        z_lids = []
                 if not z_lids:
                     try:
                         z_lids = [z.GetLayer()]
