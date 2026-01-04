@@ -200,10 +200,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # Get all enabled copper layers in stackup order
         enabled_layers = board.GetEnabledLayers()
 
-        def add_unique(target, seen, lid):
+        def add_unique(target, seen, lid, force=False):
             if lid in seen:
                 return
-            if enabled_layers.Contains(lid) and pcbnew.IsCopperLayer(lid):
+            if (force or enabled_layers.Contains(lid)) and pcbnew.IsCopperLayer(lid):
                 target.append(lid)
                 seen.add(lid)
 
@@ -248,12 +248,20 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         try:
             copper_count = board.GetCopperLayerCount()
         except Exception:
-            copper_count = None
 
-        def expected_copper_order():
-            order = []
-            if hasattr(pcbnew, "F_Cu"):
-                order.append(pcbnew.F_Cu)
+        expected_ids = []
+        if copper_count:
+                expected_ids.append(pcbnew.F_Cu)
+            if hasattr(pcbnew, "In1_Cu"):
+                    expected_ids.append(pcbnew.In1_Cu + i)
+                expected_ids.append(pcbnew.B_Cu)
+
+        if expected_ids:
+            if set(copper_ids) != set(expected_ids):
+                copper_ids = []
+                seen_layers = set()
+                for lid in expected_ids:
+                    add_unique(copper_ids, seen_layers, lid, force=True)
             if copper_count and hasattr(pcbnew, "In1_Cu"):
                 for i in range(max(0, copper_count - 2)):
                     order.append(pcbnew.In1_Cu + i)
