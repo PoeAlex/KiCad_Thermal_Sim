@@ -198,23 +198,77 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # --- 1. Robust Layer Detection ---
         # Get all enabled copper layers in stackup order
-        copper_ids = []
-        layer_names = []
         enabled_layers = board.GetEnabledLayers()
-        
-        for lid in range(64): # Scan all possible layers
+
+        def add_unique(target, seen, lid):
+            if lid in seen:
+                return
+            if enabled_layers.Contains(lid) and pcbnew.IsCopperLayer(lid):
+                target.append(lid)
+                seen.add(lid)
+
+        copper_ids = []
+        seen_layers = set()
+
+        stackup = None
+        for attr in ("GetLayerStackup", "GetStackup"):
+            if hasattr(board, attr):
+                try:
+                    stackup = getattr(board, attr)()
+                except Exception:
+                    stackup = None
+                if stackup:
+                    break
+
+        if stackup:
+            for getter in ("GetCopperLayers", "GetLayerSequence", "GetLayers"):
+                if not hasattr(stackup, getter):
+                    continue
+                try:
+                    layer_seq = getattr(stackup, getter)()
+                except Exception:
+                    continue
+                for item in layer_seq:
+                    lid = None
+                    if isinstance(item, int):
+                        lid = item
+                    elif hasattr(item, "GetLayerId"):
+                        lid = item.GetLayerId()
+                    elif hasattr(item, "GetLayer"):
+                        try:
+                            lid = item.GetLayer()
+                        except Exception:
+                            lid = None
+                    if lid is not None:
+                        add_unique(copper_ids, seen_layers, lid)
+                if copper_ids:
+                    break
+
+        if not copper_ids:
+            copper_count = None
             try:
-                is_copper = pcbnew.IsCopperLayer(lid)
-            except:
-                is_copper = (lid < 32) # Standard KiCad copper layer range
-                
-            if enabled_layers.Contains(lid) and is_copper:
-                copper_ids.append(lid)
-                layer_names.append(board.GetLayerName(lid))
-        
-        # Standard ordering: Top to Bottom (0 -> 31)
-        copper_ids.sort()
-        # Re-map layer names in sorted order
+                copper_count = board.GetCopperLayerCount()
+            except Exception:
+                copper_count = None
+
+            if hasattr(pcbnew, "F_Cu"):
+                add_unique(copper_ids, seen_layers, pcbnew.F_Cu)
+            if copper_count and hasattr(pcbnew, "In1_Cu"):
+                for i in range(max(0, copper_count - 2)):
+                    add_unique(copper_ids, seen_layers, pcbnew.In1_Cu + i)
+            if hasattr(pcbnew, "B_Cu"):
+                add_unique(copper_ids, seen_layers, pcbnew.B_Cu)
+
+        if not copper_ids:
+            for lid in range(64):  # Scan all possible layers
+                try:
+                    is_copper = pcbnew.IsCopperLayer(lid)
+                except Exception:
+                    is_copper = (lid < 32)  # Standard KiCad copper layer range
+                if enabled_layers.Contains(lid) and is_copper:
+                    add_unique(copper_ids, seen_layers, lid)
+            copper_ids.sort()
+
         layer_names = [board.GetLayerName(lid) for lid in copper_ids]
         copper_layer_count = len(copper_ids)
 
