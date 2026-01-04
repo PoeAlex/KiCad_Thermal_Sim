@@ -16,6 +16,12 @@ try:
 except ImportError:
     HAS_LIBS = False
 
+try:
+    import numba
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, selected_count, suggested_res, layer_names, preview_callback=None):
         super().__init__(parent, title="Thermal Sim (Bulletproof)")
@@ -65,11 +71,12 @@ class SettingsDialog(wx.Dialog):
         box_filter = wx.StaticBoxSizer(wx.VERTICAL, self, "Geometry Filters")
         self.chk_ignore_traces = wx.CheckBox(self, label="Ignore Traces")
         self.chk_ignore_traces.SetValue(False)
+        self.chk_ignore_traces.SetValue(False)
         box_filter.Add(self.chk_ignore_traces, 0, wx.ALL, 5)
 
-        self.chk_ignore_polygons = wx.CheckBox(self, label="Ignore Polygons Not Attached to Selected Pads")
-        self.chk_ignore_polygons.SetValue(False)
-        box_filter.Add(self.chk_ignore_polygons, 0, wx.ALL, 5)
+        # self.chk_ignore_polygons = wx.CheckBox(self, label="Ignore Polygons Not Attached to Selected Pads")
+        # self.chk_ignore_polygons.SetValue(False)
+        # box_filter.Add(self.chk_ignore_polygons, 0, wx.ALL, 5)
 
         self.chk_limit_area = wx.CheckBox(self, label="Limit Area to Pads")
         self.chk_limit_area.SetValue(False)
@@ -142,7 +149,8 @@ class SettingsDialog(wx.Dialog):
                 'show_all': self.chk_all_layers.GetValue(),
                 'snapshots': self.chk_snapshots.GetValue(),
                 'ignore_traces': self.chk_ignore_traces.GetValue(),
-                'ignore_polygons': self.chk_ignore_polygons.GetValue(),
+                # 'ignore_polygons': self.chk_ignore_polygons.GetValue(), # Disabled by request
+                'ignore_polygons': False,
                 'limit_area': self.chk_limit_area.GetValue(),
                 'pad_dist_mm': float(self.pad_dist_input.GetValue()),
                 'use_heatsink': self.chk_heatsink.GetValue(),
@@ -323,8 +331,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         alpha_eff = 1.1e-4  # Copper thermal diffusivity (m^2/s)
         
         # CFL stability: dt < dx^2 / (4 * alpha) for 2D explicit
+        # 0.15 for speed while maintaining stability
         dt_limit = 0.15 * (dx**2) / alpha_eff
-        dt = min(dt_limit, 0.005)  # Cap at 5ms for accuracy
+        dt = min(dt_limit, 0.010)  # Cap at 10ms
         sim_time = settings['time']
         steps = max(200, int(sim_time / dt))
         dt = sim_time / steps  # Recalculate dt to match exactly
@@ -407,10 +416,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         aborted = False
         roll = np.roll
         
-        # Diffusion coefficient - scaled for stability
-        # CFL condition: coeff < 0.25 for 2D explicit
+        # Diffusion coefficient - scaled for stability (Max 0.25)
+        # We aligned dt_limit with 0.15, so we match it here
         max_k = np.max(K)
-        diff_factor = 0.12 / max(max_k, 1.0)
+        diff_factor = 0.15 / max(max_k, 1.0)
         K_safe = K * diff_factor
         
         # Vertical heat transfer coefficient
@@ -442,60 +451,121 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         smooth_weight = 0.1
         
         v_chg = np.zeros_like(T)
-        for b in range(num_batches):
-            percent = int((b / num_batches) * 100)
-            elapsed = time.time() - start_time
-            msg = f"Step {b*batch_size}/{steps}"
-            
-            if not pd.Update(percent, msg): aborted = True; break
-            
-            for _ in range(batch_size):
-                step_counter += 1
+        
+        # --- OPTIMIZATION: Slicing Views & Buffers ---
+        # Pre-allocate slice views to avoid constructing them inside the loop
+        # Inner domain (excluding 1 pixel border)
+        T_inner = T[:, 1:-1, 1:-1]
+        K_inner = K_safe[:, 1:-1, 1:-1]
+        P_inner = P_map[:, 1:-1, 1:-1]
+        
+        # Neighbor slices
+        T_up    = T[:, :-2, 1:-1]
+        T_down  = T[:, 2:, 1:-1]
+        T_left  = T[:, 1:-1, :-2]
+        T_right = T[:, 1:-1, 2:]
+
+        # Buffer for vertical transfer
+        if layer_count > 1:
+            z_eff_inner = z_eff[1:-1, 1:-1]
+            H_map_inner = H_map[1:-1, 1:-1]
+            dT_layer_buf = np.zeros((layer_count-1, rows-2, cols-2))
+            v_chg_inner_buf = np.zeros_like(T_inner)
+        else:
+            # For single layer, these are not strictly used but defined to be safe
+            H_map_inner = H_map[1:-1, 1:-1]
+            z_eff_inner = None
+            dT_layer_buf = None
+            v_chg_inner_buf = None
+
+
+
+        try:
+            for b in range(num_batches):
+                percent = int((b / num_batches) * 100)
+                elapsed = time.time() - start_time
+                msg = f"Step {b*batch_size}/{steps}"
                 
-                # Lateral Heat Diffusion (2D Laplacian) - standard 5-point stencil
-                L = (roll(T, -1, 2) + roll(T, 1, 2) + 
-                     roll(T, -1, 1) + roll(T, 1, 1) - 4*T)
+                # Check for cancel
+                keep_going = True
+                try:
+                    keep_going = pd.Update(percent, msg)
+                except:
+                    # Handle cases where dialog might be dead
+                    keep_going = False
+                    
+                if not keep_going: 
+                    aborted = True
+                    break
                 
-                # Vertical Heat Transfer between layers (vectorized)
-                v_chg.fill(0.0)
-                if layer_count > 1:
-                    # Temperature difference between adjacent layers
-                    dT_down = T[1:] - T[:-1]
-                    # Heat flux with via enhancement
-                    flux = dT_down * z_eff
-                    # Clamp flux to prevent instability
-                    flux = np.clip(flux, -50, 50)
-                    v_chg[:-1] += flux   # Heat flows into upper layer
-                    v_chg[1:] -= flux    # Heat flows out of lower layer
+                for _ in range(batch_size):
+                    step_counter += 1
+                    
+                    # Lateral Heat Diffusion (2D Laplacian) on inner pixels
+                    # L = Neighbors - 4*Center
+                    L = (T_up + T_down + T_left + T_right)
+                    L -= 4 * T_inner
+                    
+                    # Vertical Heat Transfer
+                    if layer_count > 1:
+                        v_chg_inner_buf.fill(0.0)
+                        
+                        # Gradient T[i+1] - T[i] using buffer
+                        np.subtract(T_inner[1:], T_inner[:-1], out=dT_layer_buf)
+                        
+                        # Flux
+                        dT_layer_buf *= z_eff_inner
+                        np.clip(dT_layer_buf, -50, 50, out=dT_layer_buf)
+                        
+                        # Apply flux
+                        v_chg_inner_buf[:-1] += dT_layer_buf
+                        v_chg_inner_buf[1:]  -= dT_layer_buf
+                        
+                        # T += L*K + v + P
+                        L *= K_inner
+                        L += v_chg_inner_buf
+                        L += P_inner
+                        T_inner += L
+                    else:
+                        # Single layer
+                        L *= K_inner
+                        L += P_inner
+                        T_inner += L
+                    
+                    # Clamp temperature
+                    np.clip(T_inner, amb, amb + 500, out=T_inner)
+                    
+                    # Convective cooling (Boundary Conditions)
+                    # Top Layer Inner
+                    T_inner[0] -= (T_inner[0] - amb) * cool_air
+                    
+                    # Bottom layer
+                    if layer_count > 1:
+                        T_inner[-1] -= (T_inner[-1] - amb) * ((1-H_map_inner)*cool_air + H_map_inner*cool_sink_factor)
+                    else:
+                        T_inner[0] -= (T_inner[0] - amb) * cool_air
+                    
+                    # Smoothing
+                    if step_counter % 50 == 0:
+                        # Smoothing using slicing
+                        sL = (T_up + T_down + T_left + T_right)
+                        sL *= smooth_weight
+                        sL += T_inner
+                        sL /= (1 + 4*smooth_weight)
+                        T_inner[:] = sL
                 
-                # Update temperature
-                T += (L * K_safe) + v_chg + P_map
-                
-                # Clamp temperature to prevent runaway (physical limit)
-                np.clip(T, amb, amb + 500, out=T)
-                
-                # Apply convective cooling at boundaries
-                T[0] -= (T[0] - amb) * cool_air
-                
-                # Bottom layer cooling
-                if layer_count > 1:
-                    T[-1] -= (T[-1] - amb) * ((1-H_map)*cool_air + H_map*cool_sink_factor)
-                else:
-                    T[0] -= (T[0] - amb) * cool_air
-                
-                # Apply smoothing periodically to dampen checkerboard oscillations
-                if step_counter % 50 == 0:
-                    # Simple 3x3 averaging filter (weighted)
-                    T_smooth = (T + 
-                               smooth_weight * (roll(T, -1, 2) + roll(T, 1, 2) + 
-                                                roll(T, -1, 1) + roll(T, 1, 1))) / (1 + 4*smooth_weight)
-                    T = T_smooth
-            
-            if settings['snapshots'] and (b % snap_int == 0):
-                self.save_snapshot(T, H_map, settings['amb'], layer_names, snap_cnt)
-                snap_cnt += 1
-            
-        pd.Destroy()
+                if settings['snapshots'] and (b % snap_int == 0):
+                    self.save_snapshot(T, H_map, settings['amb'], layer_names, snap_cnt)
+                    snap_cnt += 1
+        finally:
+            if pd:
+                pd.Hide()
+                pd.Destroy()
+            # Force event processing to ensure modal state is cleared
+            try:
+                wx.GetApp().Yield()
+            except:
+                pass
         if not aborted:
             if settings['show_all']:
                 self.show_results_all_layers(T, H_map, settings['amb'], layer_names)
