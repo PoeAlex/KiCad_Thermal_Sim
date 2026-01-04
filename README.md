@@ -1,6 +1,8 @@
 # KiCad Thermal Sim — Fast Multi-Layer Copper Thermal Estimator for KiCad
 
-**KiCad Thermal Sim ** is a lightweight KiCad PCB Editor plugin that performs a fast, layout-oriented **heat spreading simulation across all copper layers** (F.Cu…B.Cu including inner layers).
+![Stackup view](docs/images/results.png "simulation results")
+
+**KiCad Thermal Sim** is a lightweight KiCad PCB Editor plugin that performs a fast, layout-oriented **heat spreading simulation across all copper layers** (F.Cu…B.Cu including inner layers).
 
 This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineering tool to quickly answer:
 
@@ -46,6 +48,8 @@ Typical paths:
 4. Set **Total Power**, **Duration**, **Ambient**, and **Resolution**.
 5. (Optional) enable geometry filters and/or the thermal pad zone.
 6. Click **Preview** (sanity check), then **Run**.
+
+![Stackup view](docs/images/gui.png "GUI")
 
 ---
 
