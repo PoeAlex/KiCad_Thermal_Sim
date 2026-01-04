@@ -243,7 +243,7 @@ Absolute temperatures are **estimates** and depend on modeling assumptions.
 
 ## License / Disclaimer
 
-Add a license file (MIT is common for KiCad plugins).
+MIT License
 
 This plugin provides engineering estimates intended for fast iteration and comparative analysis.
 For safety-critical or thermally constrained designs, validate with measurement and/or a full 3D thermal tool.
