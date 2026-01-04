@@ -189,24 +189,34 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             pass
 
         # --- 1. Robust Layer Detection ---
-        # Get all enabled copper layers in stackup order
-        copper_ids = []
-        layer_names = []
+        # Robust Ordering: Identify F.Cu and B.Cu explicitly
+        try:
+            f_id = board.GetLayerID("F.Cu")
+            b_id = board.GetLayerID("B.Cu")
+        except:
+            # Fallback to standard IDs if GetLayerID fails
+            f_id, b_id = 0, 31
+
+        # Filter all enabled copper layers
         enabled_layers = board.GetEnabledLayers()
+        all_copper = []
+        for lid in range(128): # Sufficient range for modern KiCad
+            if enabled_layers.Contains(lid) and pcbnew.IsCopperLayer(lid):
+                all_copper.append(lid)
+
+        # Construct stack: [Front] + [Sorted Inners] + [Back]
+        copper_ids = []
+        if f_id in all_copper: 
+            copper_ids.append(f_id)
         
-        for lid in range(64): # Scan all possible layers
-            try:
-                is_copper = pcbnew.IsCopperLayer(lid)
-            except:
-                is_copper = (lid < 32) # Standard KiCad copper layer range
-                
-            if enabled_layers.Contains(lid) and is_copper:
-                copper_ids.append(lid)
-                layer_names.append(board.GetLayerName(lid))
-        
-        # Standard ordering: Top to Bottom (0 -> 31)
-        copper_ids.sort()
-        # Re-map layer names in sorted order
+        inners = [lid for lid in all_copper if lid != f_id and lid != b_id]
+        inners.sort()
+        copper_ids.extend(inners)
+
+        if b_id in all_copper and b_id != f_id: 
+            copper_ids.append(b_id)
+
+        # Final name mapping
         layer_names = [board.GetLayerName(lid) for lid in copper_ids]
         copper_layer_count = len(copper_ids)
 
