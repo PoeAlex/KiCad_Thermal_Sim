@@ -210,6 +210,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         copper_ids = []
         seen_layers = set()
 
+        if hasattr(enabled_layers, "CuStack"):
+            try:
+                layer_seq = enabled_layers.CuStack()
+            except Exception:
+                layer_seq = None
+            if layer_seq:
+                for lid in layer_seq:
+                    add_unique(copper_ids, seen_layers, lid, force=True)
+
         stackup = None
         for attr in ("GetLayerStackup", "GetStackup"):
             if hasattr(board, attr):
@@ -246,9 +255,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         copper_count = None
         try:
-            copper_count = board.GetCopperLayerCount()
+            if hasattr(board, "GetDesignSettings"):
+                copper_count = board.GetDesignSettings().GetCopperLayerCount()
+            else:
+                copper_count = board.GetCopperLayerCount()
         except Exception:
-
+            try:
+                copper_count = board.GetCopperLayerCount()
+            except Exception:
+                copper_count = None
         expected_ids = []
         if copper_count:
                 expected_ids.append(pcbnew.F_Cu)
@@ -258,9 +273,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         if expected_ids:
             if set(copper_ids) != set(expected_ids):
+                detected_ids = list(copper_ids)
                 copper_ids = []
                 seen_layers = set()
                 for lid in expected_ids:
+                    add_unique(copper_ids, seen_layers, lid, force=True)
+                for lid in detected_ids:
                     add_unique(copper_ids, seen_layers, lid, force=True)
             if copper_count and hasattr(pcbnew, "In1_Cu"):
                 for i in range(max(0, copper_count - 2)):
