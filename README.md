@@ -1,6 +1,6 @@
-# Thermal Sim (Bulletproof) — Fast Multi-Layer Copper Thermal Estimator for KiCad
+# KiCad Thermal Sim — Fast Multi-Layer Copper Thermal Estimator for KiCad
 
-**Thermal Sim (Bulletproof)** is a lightweight KiCad PCB Editor plugin that performs a fast, layout-oriented **heat spreading simulation across all copper layers** (F.Cu…B.Cu including inner layers).
+**KiCad Thermal Sim ** is a lightweight KiCad PCB Editor plugin that performs a fast, layout-oriented **heat spreading simulation across all copper layers** (F.Cu…B.Cu including inner layers).
 
 This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineering tool to quickly answer:
 
@@ -32,15 +32,16 @@ Typical paths:
 - **Linux**: `~/.local/share/kicad/9.0/scripting/plugins/`
 - **macOS**: `~/Library/Application Support/kicad/9.0/scripting/plugins/`
 
-3. Restart KiCad.
-4. In PCB Editor, run it via **Tools → External Plugins** (or the plugin menu, depending on KiCad version).
+3. ***Install Matplotlib!*** Open Kicad 9.0 Command Prompt and type in "pip install matplotlib" and Enter
+4. Restart KiCad.
+5. In PCB Editor, run it via **Tools → External Plugins** (or the plugin menu, depending on KiCad version).
 
 ---
 
 ## Quick start
 
 1. Open your PCB in **KiCad PCB Editor**.
-2. Select the **pads** that represent your heat sources.
+2. Select one or multiple **pads** that represent your heat sources.
 3. Run the plugin.
 4. Set **Total Power**, **Duration**, **Ambient**, and **Resolution**.
 5. (Optional) enable geometry filters and/or the thermal pad zone.
