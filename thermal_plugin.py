@@ -244,20 +244,32 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 if copper_ids:
                     break
 
-        if not copper_ids:
+        copper_count = None
+        try:
+            copper_count = board.GetCopperLayerCount()
+        except Exception:
             copper_count = None
-            try:
-                copper_count = board.GetCopperLayerCount()
-            except Exception:
-                copper_count = None
 
+        def expected_copper_order():
+            order = []
             if hasattr(pcbnew, "F_Cu"):
-                add_unique(copper_ids, seen_layers, pcbnew.F_Cu)
+                order.append(pcbnew.F_Cu)
             if copper_count and hasattr(pcbnew, "In1_Cu"):
                 for i in range(max(0, copper_count - 2)):
-                    add_unique(copper_ids, seen_layers, pcbnew.In1_Cu + i)
+                    order.append(pcbnew.In1_Cu + i)
             if hasattr(pcbnew, "B_Cu"):
-                add_unique(copper_ids, seen_layers, pcbnew.B_Cu)
+                order.append(pcbnew.B_Cu)
+            return order
+
+        if copper_ids:
+            expected_order = expected_copper_order()
+            if expected_order and len(copper_ids) < len(expected_order):
+                for lid in expected_order:
+                    add_unique(copper_ids, seen_layers, lid)
+
+        if not copper_ids:
+            for lid in expected_copper_order():
+                add_unique(copper_ids, seen_layers, lid)
 
         if not copper_ids:
             for lid in range(64):  # Scan all possible layers
