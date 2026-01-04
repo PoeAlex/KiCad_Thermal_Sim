@@ -262,9 +262,32 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         res = settings['res']
         if (w_mm/res)*(h_mm/res) > 200000: # Memory protection
             res = math.sqrt(area / 100000)
-        
-        x_min = bbox.GetX() * 1e-6 
+
+        x_min = bbox.GetX() * 1e-6
         y_min = bbox.GetY() * 1e-6
+        x_max = x_min + w_mm
+        y_max = y_min + h_mm
+
+        if settings.get('limit_area') and settings.get('pad_dist_mm', 0.0) > 0:
+            radius_mm = settings['pad_dist_mm']
+            pad_xs = []
+            pad_ys = []
+            for pad in pads_list:
+                try:
+                    pos = pad.GetPosition()
+                    pad_xs.append(pos.x * 1e-6)
+                    pad_ys.append(pos.y * 1e-6)
+                except Exception:
+                    continue
+            if pad_xs and pad_ys:
+                x_min = max(x_min, min(pad_xs) - radius_mm)
+                y_min = max(y_min, min(pad_ys) - radius_mm)
+                x_max = min(x_max, max(pad_xs) + radius_mm)
+                y_max = min(y_max, max(pad_ys) + radius_mm)
+                w_mm = max(res, x_max - x_min)
+                h_mm = max(res, y_max - y_min)
+                area = w_mm * h_mm
+
         cols = int(w_mm / res) + 4
         rows = int(h_mm / res) + 4
         
