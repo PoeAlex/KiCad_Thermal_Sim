@@ -71,7 +71,13 @@ class SettingsDialog(wx.Dialog):
         self.chk_ignore_polygons.SetValue(False)
         box_filter.Add(self.chk_ignore_polygons, 0, wx.ALL, 5)
 
-        self.pad_dist_input = self.add_field(box_filter, "Limit Area to Pads (mm, 0=off):", "0")
+        self.chk_limit_area = wx.CheckBox(self, label="Limit Area to Pads")
+        self.chk_limit_area.SetValue(False)
+        box_filter.Add(self.chk_limit_area, 0, wx.ALL, 5)
+
+        self.pad_dist_input = self.add_field(box_filter, "Limit Distance (mm):", "30")
+        self.pad_dist_input.Enable(False)
+        self.chk_limit_area.Bind(wx.EVT_CHECKBOX, self.on_limit_area_toggle)
         sizer.Add(box_filter, 0, wx.EXPAND|wx.ALL, 5)
 
         # --- Pad ---
@@ -137,6 +143,7 @@ class SettingsDialog(wx.Dialog):
                 'snapshots': self.chk_snapshots.GetValue(),
                 'ignore_traces': self.chk_ignore_traces.GetValue(),
                 'ignore_polygons': self.chk_ignore_polygons.GetValue(),
+                'limit_area': self.chk_limit_area.GetValue(),
                 'pad_dist_mm': float(self.pad_dist_input.GetValue()),
                 'use_heatsink': self.chk_heatsink.GetValue(),
                 'pad_th': float(self.pad_thick.GetValue()),
@@ -144,6 +151,9 @@ class SettingsDialog(wx.Dialog):
             }
         except ValueError:
             return None
+
+    def on_limit_area_toggle(self, event):
+        self.pad_dist_input.Enable(self.chk_limit_area.GetValue())
 
 class ThermalPlugin(pcbnew.ActionPlugin):
     def defaults(self):
@@ -475,16 +485,28 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         V = np.ones((rows, cols)) * v_base
         H = np.zeros((rows, cols))
 
-        area_mask = self.build_pad_distance_mask(pads_list, rows, cols, x_min, y_min, res, settings.get('pad_dist_mm', 0.0))
+        limit_area = settings.get('limit_area', False)
+        radius_mm = settings.get('pad_dist_mm', 0.0) if limit_area else 0.0
+        area_mask = self.build_pad_distance_mask(pads_list, rows, cols, x_min, y_min, res, radius_mm)
 
         pad_net_codes = set()
+        pad_net_names = set()
         if settings.get('ignore_polygons'):
             for pad in pads_list:
                 try:
                     pad_net_codes.add(pad.GetNetCode())
                 except Exception:
                     continue
+                try:
+                    pad_net_names.add(pad.GetNetname())
+                except Exception:
+                    try:
+                        net = pad.GetNet()
+                        pad_net_names.add(net.GetNetname())
+                    except Exception:
+                        pass
             pad_net_codes = {code for code in pad_net_codes if code is not None}
+            pad_net_names = {name for name in pad_net_names if name}
         
         def fill_box(l_idx, bbox, val):
             x0, y0 = bbox.GetX()*1e-6, bbox.GetY()*1e-6
@@ -621,13 +643,26 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     is_keepout = getattr(z, "GetIsKeepout", lambda: False)()
                     if is_rule_area or is_keepout:
                         continue
-                if settings.get('ignore_polygons') and pad_net_codes:
+                if settings.get('ignore_polygons'):
+                    zone_net_name = None
+                    zone_net_code = None
                     try:
-                        zone_net = z.GetNetCode()
+                        zone_net_name = z.GetNetname()
                     except Exception:
-                        zone_net = None
-                    if zone_net not in pad_net_codes:
-                        continue
+                        try:
+                            zone_net_name = z.GetNet().GetNetname()
+                        except Exception:
+                            zone_net_name = None
+                    try:
+                        zone_net_code = z.GetNetCode()
+                    except Exception:
+                        zone_net_code = None
+                    if pad_net_names:
+                        if zone_net_name not in pad_net_names:
+                            continue
+                    elif pad_net_codes:
+                        if zone_net_code not in pad_net_codes:
+                            continue
                 # Check all layers the zone might be on (multiselection)
                 z_lids = []
                 if hasattr(z, "IsOnLayer"):
