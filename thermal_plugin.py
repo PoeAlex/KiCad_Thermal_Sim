@@ -16,6 +16,12 @@ try:
 except ImportError:
     HAS_LIBS = False
 
+try:
+    import numba
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, selected_count, suggested_res, layer_names, preview_callback=None):
         super().__init__(parent, title="Thermal Sim (Bulletproof)")
@@ -60,6 +66,26 @@ class SettingsDialog(wx.Dialog):
         box_out.Add(self.chk_snapshots, 0, wx.ALL, 5)
         
         sizer.Add(box_out, 0, wx.EXPAND|wx.ALL, 5)
+
+        # --- Filters ---
+        box_filter = wx.StaticBoxSizer(wx.VERTICAL, self, "Geometry Filters")
+        self.chk_ignore_traces = wx.CheckBox(self, label="Ignore Traces")
+        self.chk_ignore_traces.SetValue(False)
+        self.chk_ignore_traces.SetValue(False)
+        box_filter.Add(self.chk_ignore_traces, 0, wx.ALL, 5)
+
+        # self.chk_ignore_polygons = wx.CheckBox(self, label="Ignore Polygons Not Attached to Selected Pads")
+        # self.chk_ignore_polygons.SetValue(False)
+        # box_filter.Add(self.chk_ignore_polygons, 0, wx.ALL, 5)
+
+        self.chk_limit_area = wx.CheckBox(self, label="Limit Area to Pads")
+        self.chk_limit_area.SetValue(False)
+        box_filter.Add(self.chk_limit_area, 0, wx.ALL, 5)
+
+        self.pad_dist_input = self.add_field(box_filter, "Limit Distance (mm):", "30")
+        self.pad_dist_input.Enable(False)
+        self.chk_limit_area.Bind(wx.EVT_CHECKBOX, self.on_limit_area_toggle)
+        sizer.Add(box_filter, 0, wx.EXPAND|wx.ALL, 5)
 
         # --- Pad ---
         box_cool = wx.StaticBoxSizer(wx.VERTICAL, self, "Thermal Pad (User.Eco1)")
@@ -122,12 +148,20 @@ class SettingsDialog(wx.Dialog):
                 'res': float(self.res_input.GetValue()),
                 'show_all': self.chk_all_layers.GetValue(),
                 'snapshots': self.chk_snapshots.GetValue(),
+                'ignore_traces': self.chk_ignore_traces.GetValue(),
+                # 'ignore_polygons': self.chk_ignore_polygons.GetValue(), # Disabled by request
+                'ignore_polygons': False,
+                'limit_area': self.chk_limit_area.GetValue(),
+                'pad_dist_mm': float(self.pad_dist_input.GetValue()),
                 'use_heatsink': self.chk_heatsink.GetValue(),
                 'pad_th': float(self.pad_thick.GetValue()),
                 'pad_k': float(self.pad_k.GetValue())
             }
         except ValueError:
             return None
+
+    def on_limit_area_toggle(self, event):
+        self.pad_dist_input.Enable(self.chk_limit_area.GetValue())
 
 class ThermalPlugin(pcbnew.ActionPlugin):
     def defaults(self):
@@ -141,6 +175,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.board = None
         self.copper_ids = []
         self.bbox = None
+        self.pads_list = []
 
     def Run(self):
         try:
@@ -221,6 +256,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.board = board
         self.copper_ids = copper_ids
         self.bbox = bbox
+        self.pads_list = pads_list
         
         dlg = SettingsDialog(None, len(pads_list), suggested_res, layer_names, 
                              preview_callback=self.generate_preview)
@@ -234,9 +270,32 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         res = settings['res']
         if (w_mm/res)*(h_mm/res) > 200000: # Memory protection
             res = math.sqrt(area / 100000)
-        
-        x_min = bbox.GetX() * 1e-6 
+
+        x_min = bbox.GetX() * 1e-6
         y_min = bbox.GetY() * 1e-6
+        x_max = x_min + w_mm
+        y_max = y_min + h_mm
+
+        if settings.get('limit_area') and settings.get('pad_dist_mm', 0.0) > 0:
+            radius_mm = settings['pad_dist_mm']
+            pad_xs = []
+            pad_ys = []
+            for pad in pads_list:
+                try:
+                    pos = pad.GetPosition()
+                    pad_xs.append(pos.x * 1e-6)
+                    pad_ys.append(pos.y * 1e-6)
+                except Exception:
+                    continue
+            if pad_xs and pad_ys:
+                x_min = max(x_min, min(pad_xs) - radius_mm)
+                y_min = max(y_min, min(pad_ys) - radius_mm)
+                x_max = min(x_max, max(pad_xs) + radius_mm)
+                y_max = min(y_max, max(pad_ys) + radius_mm)
+                w_mm = max(res, x_max - x_min)
+                h_mm = max(res, y_max - y_min)
+                area = w_mm * h_mm
+
         cols = int(w_mm / res) + 4
         rows = int(h_mm / res) + 4
         
@@ -257,7 +316,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         
         # Create geometry maps
         try:
-            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_rel, v_base, v_via)
+            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_rel, v_base, v_via, pads_list)
         except Exception as e:
             wx.MessageBox(f"Error mapping geometry: {e}", "Error"); return
 
@@ -272,8 +331,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         alpha_eff = 1.1e-4  # Copper thermal diffusivity (m^2/s)
         
         # CFL stability: dt < dx^2 / (4 * alpha) for 2D explicit
+        # 0.15 for speed while maintaining stability
         dt_limit = 0.15 * (dx**2) / alpha_eff
-        dt = min(dt_limit, 0.005)  # Cap at 5ms for accuracy
+        dt = min(dt_limit, 0.010)  # Cap at 10ms
         sim_time = settings['time']
         steps = max(200, int(sim_time / dt))
         dt = sim_time / steps  # Recalculate dt to match exactly
@@ -356,10 +416,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         aborted = False
         roll = np.roll
         
-        # Diffusion coefficient - scaled for stability
-        # CFL condition: coeff < 0.25 for 2D explicit
+        # Diffusion coefficient - scaled for stability (Max 0.25)
+        # We aligned dt_limit with 0.15, so we match it here
         max_k = np.max(K)
-        diff_factor = 0.12 / max(max_k, 1.0)
+        diff_factor = 0.15 / max(max_k, 1.0)
         K_safe = K * diff_factor
         
         # Vertical heat transfer coefficient
@@ -380,7 +440,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         V_norm = V_map / v_base  # Will be 1 for FR4, ~1300 for vias
         # Clamp via enhancement to prevent instability
         V_enhance = np.clip(V_norm, 1.0, 50.0)  # Max 50x enhancement at vias
-        
+        z_eff = z_base * V_enhance
+
         snap_int = max(1, int(num_batches / 10))
         snap_cnt = 1
         step_counter = 0
@@ -389,72 +450,156 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # Pre-compute smoothing kernel weights
         smooth_weight = 0.1
         
-        for b in range(num_batches):
-            percent = int((b / num_batches) * 100)
-            elapsed = time.time() - start_time
-            msg = f"Step {b*batch_size}/{steps}"
-            
-            if not pd.Update(percent, msg): aborted = True; break
-            
-            for _ in range(batch_size):
-                step_counter += 1
+        v_chg = np.zeros_like(T)
+        
+        # --- OPTIMIZATION: Slicing Views & Buffers ---
+        # Pre-allocate slice views to avoid constructing them inside the loop
+        # Inner domain (excluding 1 pixel border)
+        T_inner = T[:, 1:-1, 1:-1]
+        K_inner = K_safe[:, 1:-1, 1:-1]
+        P_inner = P_map[:, 1:-1, 1:-1]
+        
+        # Neighbor slices
+        T_up    = T[:, :-2, 1:-1]
+        T_down  = T[:, 2:, 1:-1]
+        T_left  = T[:, 1:-1, :-2]
+        T_right = T[:, 1:-1, 2:]
+
+        # Buffer for vertical transfer
+        if layer_count > 1:
+            z_eff_inner = z_eff[1:-1, 1:-1]
+            H_map_inner = H_map[1:-1, 1:-1]
+            dT_layer_buf = np.zeros((layer_count-1, rows-2, cols-2))
+            v_chg_inner_buf = np.zeros_like(T_inner)
+        else:
+            # For single layer, these are not strictly used but defined to be safe
+            H_map_inner = H_map[1:-1, 1:-1]
+            z_eff_inner = None
+            dT_layer_buf = None
+            v_chg_inner_buf = None
+
+
+
+        try:
+            for b in range(num_batches):
+                percent = int((b / num_batches) * 100)
+                elapsed = time.time() - start_time
+                msg = f"Step {b*batch_size}/{steps}"
                 
-                # Lateral Heat Diffusion (2D Laplacian) - standard 5-point stencil
-                L = (roll(T, -1, 2) + roll(T, 1, 2) + 
-                     roll(T, -1, 1) + roll(T, 1, 1) - 4*T)
+                # Check for cancel
+                keep_going = True
+                try:
+                    keep_going = pd.Update(percent, msg)
+                except:
+                    # Handle cases where dialog might be dead
+                    keep_going = False
+                    
+                if not keep_going: 
+                    aborted = True
+                    break
                 
-                # Vertical Heat Transfer between layers (vectorized)
-                v_chg = np.zeros_like(T)
-                if layer_count > 1:
-                    # Temperature difference between adjacent layers
-                    dT_down = T[1:] - T[:-1]
-                    # Heat flux with via enhancement
-                    z_eff = z_base * V_enhance
-                    flux = dT_down * z_eff
-                    # Clamp flux to prevent instability
-                    flux = np.clip(flux, -50, 50)
-                    v_chg[:-1] += flux   # Heat flows into upper layer
-                    v_chg[1:] -= flux    # Heat flows out of lower layer
+                for _ in range(batch_size):
+                    step_counter += 1
+                    
+                    # Lateral Heat Diffusion (2D Laplacian) on inner pixels
+                    # L = Neighbors - 4*Center
+                    L = (T_up + T_down + T_left + T_right)
+                    L -= 4 * T_inner
+                    
+                    # Vertical Heat Transfer
+                    if layer_count > 1:
+                        v_chg_inner_buf.fill(0.0)
+                        
+                        # Gradient T[i+1] - T[i] using buffer
+                        np.subtract(T_inner[1:], T_inner[:-1], out=dT_layer_buf)
+                        
+                        # Flux
+                        dT_layer_buf *= z_eff_inner
+                        np.clip(dT_layer_buf, -50, 50, out=dT_layer_buf)
+                        
+                        # Apply flux
+                        v_chg_inner_buf[:-1] += dT_layer_buf
+                        v_chg_inner_buf[1:]  -= dT_layer_buf
+                        
+                        # T += L*K + v + P
+                        L *= K_inner
+                        L += v_chg_inner_buf
+                        L += P_inner
+                        T_inner += L
+                    else:
+                        # Single layer
+                        L *= K_inner
+                        L += P_inner
+                        T_inner += L
+                    
+                    # Clamp temperature
+                    np.clip(T_inner, amb, amb + 500, out=T_inner)
+                    
+                    # Convective cooling (Boundary Conditions)
+                    # Top Layer Inner
+                    T_inner[0] -= (T_inner[0] - amb) * cool_air
+                    
+                    # Bottom layer
+                    if layer_count > 1:
+                        T_inner[-1] -= (T_inner[-1] - amb) * ((1-H_map_inner)*cool_air + H_map_inner*cool_sink_factor)
+                    else:
+                        T_inner[0] -= (T_inner[0] - amb) * cool_air
+                    
+                    # Smoothing
+                    if step_counter % 50 == 0:
+                        # Smoothing using slicing
+                        sL = (T_up + T_down + T_left + T_right)
+                        sL *= smooth_weight
+                        sL += T_inner
+                        sL /= (1 + 4*smooth_weight)
+                        T_inner[:] = sL
                 
-                # Update temperature
-                T += (L * K_safe) + v_chg + P_map
-                
-                # Clamp temperature to prevent runaway (physical limit)
-                np.clip(T, amb, amb + 500, out=T)
-                
-                # Apply convective cooling at boundaries
-                T[0] -= (T[0] - amb) * cool_air
-                
-                # Bottom layer cooling
-                if layer_count > 1:
-                    T[-1] -= (T[-1] - amb) * ((1-H_map)*cool_air + H_map*cool_sink_factor)
-                else:
-                    T[0] -= (T[0] - amb) * cool_air
-                
-                # Apply smoothing periodically to dampen checkerboard oscillations
-                if step_counter % 50 == 0:
-                    # Simple 3x3 averaging filter (weighted)
-                    T_smooth = (T + 
-                               smooth_weight * (roll(T, -1, 2) + roll(T, 1, 2) + 
-                                                roll(T, -1, 1) + roll(T, 1, 1))) / (1 + 4*smooth_weight)
-                    T = T_smooth
-            
-            if settings['snapshots'] and (b % snap_int == 0):
-                self.save_snapshot(T, settings['amb'], snap_cnt)
-                snap_cnt += 1
-            
-        pd.Destroy()
+                if settings['snapshots'] and (b % snap_int == 0):
+                    self.save_snapshot(T, H_map, settings['amb'], layer_names, snap_cnt)
+                    snap_cnt += 1
+        finally:
+            if pd:
+                pd.Hide()
+                pd.Destroy()
+            # Force event processing to ensure modal state is cleared
+            try:
+                wx.GetApp().Yield()
+            except:
+                pass
         if not aborted:
             if settings['show_all']:
                 self.show_results_all_layers(T, H_map, settings['amb'], layer_names)
             else:
                 self.show_results_top_bot(T, H_map, settings['amb'])
 
-    def create_multilayer_maps(self, board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu, v_base, v_via):
+    def create_multilayer_maps(self, board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu, v_base, v_via, pads_list):
         num_layers = len(copper_ids)
         K = np.ones((num_layers, rows, cols)) * k_fr4
         V = np.ones((rows, cols)) * v_base
         H = np.zeros((rows, cols))
+
+        limit_area = settings.get('limit_area', False)
+        radius_mm = settings.get('pad_dist_mm', 0.0) if limit_area else 0.0
+        area_mask = self.build_pad_distance_mask(pads_list, rows, cols, x_min, y_min, res, radius_mm)
+
+        pad_net_codes = set()
+        pad_net_names = set()
+        if settings.get('ignore_polygons'):
+            for pad in pads_list:
+                try:
+                    pad_net_codes.add(pad.GetNetCode())
+                except Exception:
+                    continue
+                try:
+                    pad_net_names.add(pad.GetNetname())
+                except Exception:
+                    try:
+                        net = pad.GetNet()
+                        pad_net_names.add(net.GetNetname())
+                    except Exception:
+                        pass
+            pad_net_codes = {code for code in pad_net_codes if code is not None}
+            pad_net_names = {name for name in pad_net_names if name}
         
         def fill_box(l_idx, bbox, val):
             x0, y0 = bbox.GetX()*1e-6, bbox.GetY()*1e-6
@@ -466,7 +611,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             # Safe Slice Assignment
             if cs < ce and rs < re:
                 if rs < rows and cs < cols:
-                    K[l_idx, rs:re, cs:ce] = np.maximum(K[l_idx, rs:re, cs:ce], val)
+                    if area_mask is None:
+                        K[l_idx, rs:re, cs:ce] = np.maximum(K[l_idx, rs:re, cs:ce], val)
+                    else:
+                        region_mask = area_mask[rs:re, cs:ce]
+                        if np.any(region_mask):
+                            K_slice = K[l_idx, rs:re, cs:ce]
+                            np.maximum(K_slice, val, out=K_slice, where=region_mask)
 
         def fill_via(bbox, val):
             x0, y0 = bbox.GetX()*1e-6, bbox.GetY()*1e-6
@@ -477,7 +628,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             re = min(rows, int((y0+h - y_min)/res)+1)
             if cs < ce and rs < re:
                  if rs < rows and cs < cols:
-                    V[rs:re, cs:ce] = np.maximum(V[rs:re, cs:ce], val)
+                    if area_mask is None:
+                        V[rs:re, cs:ce] = np.maximum(V[rs:re, cs:ce], val)
+                    else:
+                        region_mask = area_mask[rs:re, cs:ce]
+                        if np.any(region_mask):
+                            V_slice = V[rs:re, cs:ce]
+                            np.maximum(V_slice, val, out=V_slice, where=region_mask)
 
         def fill_hs(bbox):
             x0, y0 = bbox.GetX()*1e-6, bbox.GetY()*1e-6
@@ -488,7 +645,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             re = min(rows, int((y0+h - y_min)/res)+1)
             if cs < ce and rs < re: 
                  if rs < rows and cs < cols:
-                    H[rs:re, cs:ce] = 1.0
+                    if area_mask is None:
+                        H[rs:re, cs:ce] = 1.0
+                    else:
+                        region_mask = area_mask[rs:re, cs:ce]
+                        if np.any(region_mask):
+                            H_slice = H[rs:re, cs:ce]
+                            H_slice[region_mask] = 1.0
 
         def fill_zone(l_idx, lid, zone, val):
             # Use *filled* area hit-test so clearance/holes (pads other nets, tracks, keepouts) are respected.
@@ -521,6 +684,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     x = x_min + (c + 0.5) * res
                     pos = pcbnew.VECTOR2I(to_iu(x), y_iu)
                     try:
+                        if area_mask is not None and not area_mask[r, c]:
+                            continue
                         hit = False
                         if has_filled_hit:
                             hit = zone.HitTestFilledArea(lid, pos, margin_iu)
@@ -542,11 +707,14 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         try:
             tracks = board.Tracks() if hasattr(board, 'Tracks') else board.GetTracks()
             for t in tracks:
+                is_via = "VIA" in str(type(t)).upper()
+                if settings.get('ignore_traces') and not is_via:
+                    continue
                 lid = t.GetLayer()
                 safe_fill(lid, t.GetBoundingBox(), k_cu)
                 
                 # Check if it is a via
-                if "VIA" in str(type(t)).upper(): 
+                if is_via:
                     fill_via(t.GetBoundingBox(), v_via)
 
             footprints = board.Footprints() if hasattr(board, 'Footprints') else board.GetFootprints()
@@ -568,6 +736,26 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     is_keepout = getattr(z, "GetIsKeepout", lambda: False)()
                     if is_rule_area or is_keepout:
                         continue
+                if settings.get('ignore_polygons'):
+                    zone_net_name = None
+                    zone_net_code = None
+                    try:
+                        zone_net_name = z.GetNetname()
+                    except Exception:
+                        try:
+                            zone_net_name = z.GetNet().GetNetname()
+                        except Exception:
+                            zone_net_name = None
+                    try:
+                        zone_net_code = z.GetNetCode()
+                    except Exception:
+                        zone_net_code = None
+                    if pad_net_names:
+                        if zone_net_name not in pad_net_names:
+                            continue
+                    elif pad_net_codes:
+                        if zone_net_code not in pad_net_codes:
+                            continue
                 # Check all layers the zone might be on (multiselection)
                 z_lids = []
                 if hasattr(z, "IsOnLayer"):
@@ -606,6 +794,35 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         return K, V, H
 
+    def build_pad_distance_mask(self, pads_list, rows, cols, x_min, y_min, res, radius_mm):
+        if not pads_list:
+            return None
+        if radius_mm is None or radius_mm <= 0:
+            return None
+        mask = np.zeros((rows, cols), dtype=bool)
+        r_cells = int(math.ceil(radius_mm / res))
+        radius_sq = radius_mm * radius_mm
+        for pad in pads_list:
+            try:
+                pos = pad.GetPosition()
+            except Exception:
+                continue
+            x_mm = pos.x * 1e-6
+            y_mm = pos.y * 1e-6
+            c0 = int((x_mm - x_min) / res)
+            r0 = int((y_mm - y_min) / res)
+            rs = max(0, r0 - r_cells)
+            re = min(rows, r0 + r_cells + 1)
+            cs = max(0, c0 - r_cells)
+            ce = min(cols, c0 + r_cells + 1)
+            if rs >= re or cs >= ce:
+                continue
+            ys = (np.arange(rs, re) - r0) * res
+            xs = (np.arange(cs, ce) - c0) * res
+            dist_sq = ys[:, None] * ys[:, None] + xs[None, :] * xs[None, :]
+            mask[rs:re, cs:ce] |= dist_sq <= radius_sq
+        return mask
+
     def get_pad_pixels(self, pad, rows, cols, x_min, y_min, res):
         bb = pad.GetBoundingBox()
         x0, y0 = bb.GetX()*1e-6, bb.GetY()*1e-6
@@ -619,15 +836,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             for c in range(cs, ce): pixels.append((r, c))
         return pixels
 
-    def save_snapshot(self, T, amb, idx):
+    def save_snapshot(self, T, H, amb, layer_names, idx):
         try:
             out_dir = os.path.dirname(__file__)
             fname = os.path.join(out_dir, f"snap_{idx:02d}.png")
-            self._save_plot(T, amb, fname)
+            self._save_stackup_plot(T, H, amb, layer_names, fname)
         except:
             tmp = tempfile.gettempdir()
             fname = os.path.join(tmp, f"thermal_snap_{idx:02d}.png")
-            self._save_plot(T, amb, fname)
+            self._save_stackup_plot(T, H, amb, layer_names, fname)
 
     def _save_plot(self, T, amb, fname):
         vmax = np.max(T)
@@ -640,6 +857,53 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         ax2.set_title("Bottom Layer")
         ax2.axis('off')
         plt.savefig(fname, bbox_inches='tight')
+        plt.close()
+
+    def _save_stackup_plot(self, T, H, amb, layer_names, fname):
+        vmax = np.max(T)
+        if vmax > amb + 250: vmax = amb + 250
+
+        count = len(T)
+        if count == 1:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+            axes = [ax]
+        elif count == 2:
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+            axes = axes.flatten()
+        else:
+            cols_grid = 2
+            rows_grid = math.ceil(count / 2)
+            fig, axes = plt.subplots(rows_grid, cols_grid, figsize=(12, 4*rows_grid))
+            axes = axes.flatten()
+
+        labels = []
+        for i in range(count):
+            if i < len(layer_names):
+                labels.append(layer_names[i])
+            elif i == 0:
+                labels.append("Top (F.Cu)")
+            elif i == count - 1:
+                labels.append("Bottom (B.Cu)")
+            else:
+                labels.append(f"Inner {i}")
+
+        for i in range(count):
+            if i >= len(axes): break
+            ax = axes[i]
+            name = labels[i]
+            max_temp = np.max(T[i])
+            ax.set_title(f"{name} - Max: {max_temp:.1f}°C")
+            im = ax.imshow(T[i], cmap='inferno', origin='upper', vmin=amb, vmax=vmax, interpolation='bilinear')
+            plt.colorbar(im, ax=ax)
+            ax.axis('off')
+            if i == count - 1 and np.max(H) > 0:
+                ax.contour(H, levels=[0.5], colors='white', linewidths=2, linestyles='--')
+
+        for j in range(count, len(axes)):
+            axes[j].axis('off')
+
+        plt.tight_layout()
+        plt.savefig(fname, dpi=150)
         plt.close()
 
     def show_results_top_bot(self, T, H, amb):
@@ -699,7 +963,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         v_via  = 390.0 / dielectric_thick
 
         try:
-            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_rel, v_base, v_via)
+            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_rel, v_base, v_via, self.pads_list)
             
             output_file = os.path.join(os.path.dirname(__file__), "thermal_preview.png")
             count = len(K)
