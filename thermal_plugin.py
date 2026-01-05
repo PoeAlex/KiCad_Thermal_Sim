@@ -3,7 +3,6 @@ import os
 import sys
 import traceback
 import math
-import re
 import time
 import tempfile
 
@@ -198,44 +197,54 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             pass
 
         # --- 1. Robust Layer Detection ---
-        # Collect enabled copper layers and order them physically: F.Cu, In1..InN, B.Cu.
+        # Get all enabled copper layers in stackup order
         copper_ids = []
+        layer_names = []
         enabled_layers = board.GetEnabledLayers()
-
-        # Scan a reasonable layer-id range (KiCad typically uses <= 64 for standard layers)
-        for lid in range(64):
+        
+        for lid in range(64): # Scan all possible layers
             try:
                 is_copper = pcbnew.IsCopperLayer(lid)
-            except Exception:
-                is_copper = (lid < 32)  # fallback for older APIs
-
+            except:
+                is_copper = (lid < 32) # Standard KiCad copper layer range
+                
             if enabled_layers.Contains(lid) and is_copper:
                 copper_ids.append(lid)
+                layer_names.append(board.GetLayerName(lid))
 
-        def _copper_sort_key(lid: int):
-            """Sort copper layers in physical stack order, independent of numeric layer IDs."""
+        # IMPORTANT (KiCad v9+):
+        # PCB layer IDs are *not* in physical stack order (e.g. B.Cu has ID=2, inner copper starts at 4).
+        # Therefore, never sort by numeric layer ID. Use CopperLayerToOrdinal() (or a name-based fallback)
+        # to obtain Top -> Inner(s) -> Bottom order.
+        def _copper_ordinal(lid: int) -> int:
             try:
-                if lid == pcbnew.F_Cu:
-                    return (-1000, 0)
-                if lid == pcbnew.B_Cu:
-                    return (1000, 0)
+                # CopperLayerToOrdinal expects a PCB_LAYER_ID; ToLAYER_ID() is safe across versions
+                if hasattr(pcbnew, "ToLAYER_ID") and hasattr(pcbnew, "CopperLayerToOrdinal"):
+                    return int(pcbnew.CopperLayerToOrdinal(pcbnew.ToLAYER_ID(int(lid))))
+                if hasattr(pcbnew, "CopperLayerToOrdinal"):
+                    return int(pcbnew.CopperLayerToOrdinal(int(lid)))
             except Exception:
                 pass
 
-            name = board.GetLayerName(lid).lower()
-            if name.startswith("f.cu") or name == "f.cu":
-                return (-1000, 0)
-            if name.startswith("b.cu") or name == "b.cu":
-                return (1000, 0)
+            # Fallback: parse common KiCad copper layer names
+            try:
+                nm = board.GetLayerName(lid).lower()
+            except Exception:
+                nm = str(lid)
 
-            m = re.search(r"in\s*(\d+)", name) or re.search(r"in(\d+)", name)
-            if m:
-                return (int(m.group(1)), 0)
+            if nm in ("f.cu",) or nm.startswith("f.cu"):
+                return -1
+            if nm in ("b.cu",) or nm.startswith("b.cu"):
+                return 10**9
 
-            # Unknown copper layer name: keep it between inners and bottom as best-effort
-            return (500, lid)
+            mm = re.search(r"in\s*(\d+)", nm) or re.search(r"in(\d+)", nm)
+            if mm:
+                return int(mm.group(1))
+            return 10**8 + int(lid)
 
-        copper_ids.sort(key=_copper_sort_key)
+        copper_ids.sort(key=_copper_ordinal)
+
+        # Re-map layer names in physical (stack) order
         layer_names = [board.GetLayerName(lid) for lid in copper_ids]
         copper_layer_count = len(copper_ids)
 
@@ -323,21 +332,21 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # --- 6. Maps ---
         layer_count = len(copper_ids)
         
-        # Physical thermal conductivity (W/mK)
-        # FR4 ~0.3 W/mK, Copper ~390 W/mK => ratio ~1300
-        k_fr4 = 0.3
-        k_cu  = 390.0
-
+        # Physical parameters - relative thermal conductivity
+        # FR4: ~0.3 W/mK, Copper: ~390 W/mK => ratio ~1300
+        # We use relative values for stability
+        k_fr4_rel = 1.0
+        k_cu_rel  = 400.0
         
         total_thick = max(0.2, settings['thick'])
         dielectric_thick = total_thick / max(1, (layer_count - 1))
         # Vertical conductance through dielectric vs via
-        v_base = k_fr4 / dielectric_thick   # FR4 vertical conductance
-        v_via  = k_cu  / dielectric_thick  # Via copper conductance
+        v_base = 0.3 / dielectric_thick   # FR4 vertical conductance
+        v_via  = 390.0 / dielectric_thick  # Via copper conductance
         
         # Create geometry maps
         try:
-            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu, v_base, v_via, pads_list)
+            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_rel, v_base, v_via, pads_list)
         except Exception as e:
             wx.MessageBox(f"Error mapping geometry: {e}", "Error"); return
 
@@ -359,223 +368,225 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         steps = max(200, int(sim_time / dt))
         dt = sim_time / steps  # Recalculate dt to match exactly
 
-        # --- 8. Power Injection & Thermal Mass ---
-        # We model temperature per copper layer slice. Each grid cell has a local heat capacity (J/K)
-        # that is the sum of its FR4 slice mass plus (where present) copper mass.
-        P_map = np.zeros((layer_count, rows, cols), dtype=np.float64)
-
-        # Material properties
-        rho_cu,  cp_cu  = 8900.0, 385.0   # Copper
-        rho_fr4, cp_fr4 = 1850.0, 1100.0  # FR4 (typ.)
-
-        total_thick_m = total_thick * 1e-3
-        copper_total_m = copper_thick * layer_count
-        fr4_total_m = max(total_thick_m - copper_total_m, 0.0)
-        fr4_thick_per_layer_m = max(fr4_total_m / max(1, layer_count), 1e-6)
-
+        # --- 8. Power Injection ---
+        P_map = np.zeros((layer_count, rows, cols))
+        
+        # Calculate thermal mass per pixel
+        # Copper dominates transient thermal behavior
+        # Copper: rho=8900 kg/m³, cp=385 J/kg·K
+        rho_cu, cp_cu = 8900, 385
+        
         pixel_area = dx * dx
-
-        # Copper mask from conductivity map
-        cu_mask = (K > (k_fr4 * 5.0))
-
-        cu_heat_cap  = pixel_area * copper_thick * rho_cu  * cp_cu
-        fr4_heat_cap = pixel_area * fr4_thick_per_layer_m * rho_fr4 * cp_fr4
-
-        # Per-layer per-cell heat capacity (J/K)
-        C_map = fr4_heat_cap + cu_mask.astype(np.float64) * cu_heat_cap
-        C_map = np.maximum(C_map, 1e-12)  # numerical safety
-
-        # In-plane conduction thickness map (m): copper where copper exists, FR4 otherwise
-        thick_inplane_map = np.where(cu_mask, copper_thick, fr4_thick_per_layer_m).astype(np.float64)
-
-        # Parse pad powers (W). Either a single value (applied to all pads) or a comma-separated list.
+        # Copper contribution per layer
+        cu_vol = pixel_area * copper_thick
+        cu_heat_cap = cu_vol * rho_cu * cp_cu  # J/K per pixel of copper
+        
+        # For multi-layer, add some FR4 contribution (FR4: rho=1850, cp=1100)
+        # Use a thin effective FR4 layer to model partial thermal mass coupling
+        fr4_effective_thick = min(layer_spacing_m * 0.1, 0.0001)  # 10% of spacing, max 0.1mm
+        fr4_vol = pixel_area * fr4_effective_thick
+        fr4_heat_cap = fr4_vol * 1850 * 1100  # J/K
+        
+        # Total heat capacity per pixel
+        pixel_heat_cap = cu_heat_cap + fr4_heat_cap
+        
+        # Power scale: dT per timestep = P * dt / heat_capacity
+        power_scale = dt / pixel_heat_cap
+        
         try:
-            p_parts = [float(x.strip()) for x in settings['power_str'].split(',') if x.strip()]
-            if not p_parts:
-                raise ValueError('Empty power value')
-            p_vals = [p_parts[0]] * len(pads_list) if len(p_parts) == 1 else p_parts
-        except Exception:
-            return
+            p_parts = [float(x.strip()) for x in settings['power_str'].split(',')]
+            p_vals = [p_parts[0]]*len(pads_list) if len(p_parts)==1 else p_parts
+        except: return
 
         for idx, pad in enumerate(pads_list):
             pad_lid = pad.GetLayer()
-            target_idx = 0  # Default: Top
-
-            # Ensure the pad layer exists in copper_ids
+            target_idx = 0 # Default: Top
+            
+            # --- CRASH FIX: Ensure layer exists ---
             if pad_lid in copper_ids:
                 target_idx = copper_ids.index(pad_lid)
             else:
-                # Pad is on layer not in copper_ids (e.g. 'All Layers')
-                # Default to Top or Bottom based on name
-                try:
-                    lname = board.GetLayerName(pad_lid).upper()
-                    if 'B.' in lname or 'BOT' in lname:
-                        target_idx = layer_count - 1
-                    else:
-                        target_idx = 0
-                except Exception:
-                    target_idx = 0
-
+                # Pad is on layer not in copper_ids (e.g. "All Layers")
+                # Default to Top (0) or Bottom (-1) based on name
+                lname = board.GetLayerName(pad_lid).upper()
+                if "B." in lname or "BOT" in lname: target_idx = layer_count - 1
+                else: target_idx = 0
+            
             pixels = self.get_pad_pixels(pad, rows, cols, x_min, y_min, res)
-            if not pixels:
-                continue
-
-            p_per_pixel = p_vals[idx] / float(len(pixels))
-            for r, c in pixels:
-                if 0 <= r < rows and 0 <= c < cols:
-                    P_map[target_idx, r, c] += (p_per_pixel * dt) / C_map[target_idx, r, c]
-
+            if pixels:
+                val = (p_vals[idx] * power_scale) / len(pixels)
+                for r, c in pixels: 
+                    # Bounds Check
+                    if r < rows and c < cols:
+                        P_map[target_idx, r, c] += val
 
         # --- 9. SOLVER ---
-        amb = settings['amb']
-        T = np.ones((layer_count, rows, cols), dtype=np.float64) * amb
-
-        # Surface convection (heuristic): natural convection in still air ~ 5..15 W/m²K
-        h_conv = 10.0  # W/m²K
-
-        # Thermal pad / heatsink coupling (heuristic).
+        T = np.ones((layer_count, rows, cols)) * settings['amb']
+        
+        # Convective cooling coefficient
+        # h * A * (T - Tamb) = heat loss, h ~ 10 W/m^2.K for natural convection
+        h_conv = 10.0  # W/m^2.K
+        pixel_area = dx * dx
+        cool_air = (h_conv * pixel_area / pixel_heat_cap) * dt
+        
+        # Thermal pad/heatsink cooling
         pad_thick_m = max(0.0001, settings['pad_th'] * 1e-3)
         pad_k = settings['pad_k']
-        # Effective heat transfer coefficient through pad (contact factor ~0.1)
-        h_sink = (pad_k / pad_thick_m) * 0.1  # W/m²K
+        # Effective heat transfer through thermal pad
+        h_sink = (pad_k / pad_thick_m) * 0.1  # Simplified sink model
+        cool_sink_factor = (h_sink * pixel_area / pixel_heat_cap) * dt
 
-        # Robust top/bottom indexing
-        idx_top = 0
-        idx_bot = layer_count - 1
-        try:
-            if pcbnew.F_Cu in copper_ids:
-                idx_top = copper_ids.index(pcbnew.F_Cu)
-            if pcbnew.B_Cu in copper_ids:
-                idx_bot = copper_ids.index(pcbnew.B_Cu)
-        except Exception:
-            pass
+        # Use larger batches for speed - reduce Python loop overhead
+        batch_size = 200
+        num_batches = max(1, int(steps / batch_size))
+        actual_steps = num_batches * batch_size
+        
+        pd = wx.ProgressDialog("Simulating...", "Initializing...", 100, style=wx.PD_CAN_ABORT|wx.PD_APP_MODAL|wx.PD_REMAINING_TIME)
+        start_time = time.time()
+        aborted = False
+        roll = np.roll
+        
+        # Diffusion coefficient - scaled for stability (Max 0.25)
+        # We aligned dt_limit with 0.15, so we match it here
+        max_k = np.max(K)
+        diff_factor = 0.15 / max(max_k, 1.0)
+        K_safe = K * diff_factor
+        
+        # Vertical heat transfer coefficient
+        # Q = k_fr4 * A * dT / d, where d = layer spacing
+        # dT/dt = Q / (m * cp) = k_fr4 * A * dT / (d * m * cp)
+        # For pixel: coefficient = k_fr4 * pixel_area / (layer_spacing * pixel_heat_cap) * dt
+        k_fr4_thermal = 0.3  # FR4 thermal conductivity W/(m·K)
+        
+        # Vertical coupling: heat transfer rate through FR4 between layers
+        if layer_count > 1 and layer_spacing_m > 0:
+            z_base = (k_fr4_thermal * pixel_area / layer_spacing_m) * dt / pixel_heat_cap
+        else:
+            z_base = 0.0
+        
+        # Via enhancement factor (vias increase vertical conductance)
+        # V_map has values: v_base for FR4, v_via for vias
+        # Normalize to get via locations: V_norm = 1 for FR4, higher for vias
+        V_norm = V_map / v_base  # Will be 1 for FR4, ~1300 for vias
+        # Clamp via enhancement to prevent instability
+        V_enhance = np.clip(V_norm, 1.0, 50.0)  # Max 50x enhancement at vias
+        z_eff = z_base * V_enhance
 
-        # Inner domain (excluding 1-pixel border)
+        snap_int = max(1, int(num_batches / 10))
+        snap_cnt = 1
+        step_counter = 0
+        amb = settings['amb']
+        
+        # Pre-compute smoothing kernel weights
+        smooth_weight = 0.1
+        
+        v_chg = np.zeros_like(T)
+        
+        # --- OPTIMIZATION: Slicing Views & Buffers ---
+        # Pre-allocate slice views to avoid constructing them inside the loop
+        # Inner domain (excluding 1 pixel border)
         T_inner = T[:, 1:-1, 1:-1]
+        K_inner = K_safe[:, 1:-1, 1:-1]
         P_inner = P_map[:, 1:-1, 1:-1]
-        C_inner = C_map[:, 1:-1, 1:-1]
-        H_map_inner = H_map[1:-1, 1:-1]
-
-        # Neighbor slices (views)
+        
+        # Neighbor slices
         T_up    = T[:, :-2, 1:-1]
         T_down  = T[:, 2:, 1:-1]
         T_left  = T[:, 1:-1, :-2]
         T_right = T[:, 1:-1, 2:]
 
-        # In-plane conduction coefficient map
-        # Explicit network update: ΔT = (dt/C) * Σ (k*t)*(Tn - T)
-        K_coeff = (K * thick_inplane_map * dt) / C_map
-        # Safety clamp: should already be <= ~0.15 for copper due to dt calculation
-        np.clip(K_coeff, 0.0, 0.24, out=K_coeff)
-        K_coeff_inner = K_coeff[:, 1:-1, 1:-1]
-
-        # Vertical coupling (between layers) - energy transfer per K difference (J/K per step)
-        if layer_count > 1 and layer_spacing_m > 0:
-            Gz_dt = (k_fr4 * pixel_area * dt) / layer_spacing_m  # J/K
-            V_norm = V_map / max(v_base, 1e-12)                  # 1 for FR4, ~1300 for vias
-            V_factor_inner = np.clip(V_norm, 1.0, 50.0)[1:-1, 1:-1]
-            Gz_dt_inner = Gz_dt * V_factor_inner
-        else:
-            Gz_dt_inner = None
-
-        # Precompute surface cooling coefficients
-        cool_top = (h_conv * pixel_area * dt) / C_inner[idx_top]
+        # Buffer for vertical transfer
         if layer_count > 1:
-            h_eff_bottom = h_conv * (1.0 - H_map_inner) + h_sink * H_map_inner
-            cool_bottom = (h_eff_bottom * pixel_area * dt) / C_inner[idx_bot]
+            z_eff_inner = z_eff[1:-1, 1:-1]
+            H_map_inner = H_map[1:-1, 1:-1]
+            dT_layer_buf = np.zeros((layer_count-1, rows-2, cols-2))
+            v_chg_inner_buf = np.zeros_like(T_inner)
         else:
-            h_eff_bottom = h_conv * (1.0 - H_map_inner) + h_sink * H_map_inner
-            cool_single = ((h_conv + h_eff_bottom) * pixel_area * dt) / C_inner[0]
+            # For single layer, these are not strictly used but defined to be safe
+            H_map_inner = H_map[1:-1, 1:-1]
+            z_eff_inner = None
+            dT_layer_buf = None
+            v_chg_inner_buf = None
 
-        # Use larger batches for speed - reduce Python loop overhead
-        batch_size = 200
-        num_batches = max(1, int(steps / batch_size))
 
-        pd = wx.ProgressDialog("Simulating...", "Initializing...", 100, style=wx.PD_CAN_ABORT|wx.PD_APP_MODAL|wx.PD_REMAINING_TIME)
-        aborted = False
-
-        # Buffers
-        L_buf = np.zeros_like(T_inner)
-        v_chg_buf = np.zeros_like(T_inner) if (layer_count > 1) else None
-
-        snap_int = max(1, int(num_batches / 10))
-        snap_cnt = 1
-        step_counter = 0
-
-        # Pre-compute smoothing kernel weights
-        smooth_weight = 0.1
 
         try:
             for b in range(num_batches):
                 percent = int((b / num_batches) * 100)
+                elapsed = time.time() - start_time
                 msg = f"Step {b*batch_size}/{steps}"
-
+                
                 # Check for cancel
                 keep_going = True
                 try:
-                    keep_going, _ = pd.Update(percent, msg)
-                except Exception:
-                    keep_going = True
-                if not keep_going:
+                    keep_going = pd.Update(percent, msg)
+                except:
+                    # Handle cases where dialog might be dead
+                    keep_going = False
+                    
+                if not keep_going: 
                     aborted = True
                     break
-
+                
                 for _ in range(batch_size):
                     step_counter += 1
-
-                    # Edge boundary condition (lateral): adiabatic/Neumann (mirror edges)
-                    # Prevents the 1-pixel border acting as an unphysical ambient heat sink.
-                    T[:, 0, :]  = T[:, 1, :]
-                    T[:, -1, :] = T[:, -2, :]
-                    T[:, :, 0]  = T[:, :, 1]
-                    T[:, :, -1] = T[:, :, -2]
-
-                    # In-plane diffusion (explicit)
-                    L_buf[:] = T_up
-                    L_buf += T_down
-                    L_buf += T_left
-                    L_buf += T_right
-                    L_buf -= 4.0 * T_inner
-                    L_buf *= K_coeff_inner
-
-                    # Vertical coupling between layers
-                    if Gz_dt_inner is not None:
-                        v_chg_buf.fill(0.0)
-                        for li in range(layer_count - 1):
-                            dT = T_inner[li] - T_inner[li + 1]
-                            E = dT * Gz_dt_inner  # J (per pixel) transferred this step
-                            v_chg_buf[li]     -= E / C_inner[li]
-                            v_chg_buf[li + 1] += E / C_inner[li + 1]
-                        L_buf += v_chg_buf
-
-                    # Power injection (already in ΔT/step)
-                    L_buf += P_inner
-
-                    # Update temperatures
-                    T_inner += L_buf
-
-                    # Clamp to reasonable range to prevent numerical blow-ups on bad inputs
-                    np.clip(T_inner, amb, amb + 500.0, out=T_inner)
-
-                    # Surface convection (top/bottom)
+                    
+                    # Lateral Heat Diffusion (2D Laplacian) on inner pixels
+                    # L = Neighbors - 4*Center
+                    L = (T_up + T_down + T_left + T_right)
+                    L -= 4 * T_inner
+                    
+                    # Vertical Heat Transfer
                     if layer_count > 1:
-                        T_inner[idx_top] -= (T_inner[idx_top] - amb) * cool_top
-                        T_inner[idx_bot] -= (T_inner[idx_bot] - amb) * cool_bottom
+                        v_chg_inner_buf.fill(0.0)
+                        
+                        # Gradient T[i+1] - T[i] using buffer
+                        np.subtract(T_inner[1:], T_inner[:-1], out=dT_layer_buf)
+                        
+                        # Flux
+                        dT_layer_buf *= z_eff_inner
+                        np.clip(dT_layer_buf, -50, 50, out=dT_layer_buf)
+                        
+                        # Apply flux
+                        v_chg_inner_buf[:-1] += dT_layer_buf
+                        v_chg_inner_buf[1:]  -= dT_layer_buf
+                        
+                        # T += L*K + v + P
+                        L *= K_inner
+                        L += v_chg_inner_buf
+                        L += P_inner
+                        T_inner += L
                     else:
-                        T_inner[0] -= (T_inner[0] - amb) * cool_single
-
-                    # Smoothing (reduces checkerboard artifacts on coarse grids)
+                        # Single layer
+                        L *= K_inner
+                        L += P_inner
+                        T_inner += L
+                    
+                    # Clamp temperature
+                    np.clip(T_inner, amb, amb + 500, out=T_inner)
+                    
+                    # Convective cooling (Boundary Conditions)
+                    # Top Layer Inner
+                    T_inner[0] -= (T_inner[0] - amb) * cool_air
+                    
+                    # Bottom layer
+                    if layer_count > 1:
+                        T_inner[-1] -= (T_inner[-1] - amb) * ((1-H_map_inner)*cool_air + H_map_inner*cool_sink_factor)
+                    else:
+                        T_inner[0] -= (T_inner[0] - amb) * cool_air
+                    
+                    # Smoothing
                     if step_counter % 50 == 0:
+                        # Smoothing using slicing
                         sL = (T_up + T_down + T_left + T_right)
                         sL *= smooth_weight
                         sL += T_inner
-                        sL /= (1.0 + 4.0 * smooth_weight)
+                        sL /= (1 + 4*smooth_weight)
                         T_inner[:] = sL
-
+                
                 if settings['snapshots'] and (b % snap_int == 0):
-                    self.save_snapshot(T, H_map, amb, layer_names, snap_cnt)
+                    self.save_snapshot(T, H_map, settings['amb'], layer_names, snap_cnt)
                     snap_cnt += 1
-
         finally:
             if pd:
                 pd.Hide()
@@ -973,16 +984,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         rows = int(h_mm / res) + 4
         
         # Physics constants for mapping
-        k_fr4 = 0.3
-        k_cu  = 390.0
+        k_fr4_rel = 1.0
+        k_cu_rel  = 400.0
         layer_count = len(copper_ids)
         total_thick = max(0.2, settings['thick'])
         dielectric_thick = total_thick / max(1, (layer_count - 1))
-        v_base = k_fr4 / dielectric_thick
-        v_via  = k_cu  / dielectric_thick
+        v_base = 0.3 / dielectric_thick
+        v_via  = 390.0 / dielectric_thick
 
         try:
-            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu, v_base, v_via, self.pads_list)
+            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_rel, v_base, v_via, self.pads_list)
             
             output_file = os.path.join(os.path.dirname(__file__), "thermal_preview.png")
             count = len(K)
@@ -998,8 +1009,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 ax.set_title(f"Preview: {name}")
                 
                 # Show copper in green
-                k_disp = (K[i] - k_fr4) / max((k_cu - k_fr4), 1e-12)
-                k_disp = np.clip(k_disp, 0.0, 1.0)
+                k_disp = (K[i] - 1.0) / (400.0 - 1.0)
                 ax.imshow(k_disp, cmap='Greens', origin='upper', interpolation='none')
                 
                 # Overlay vias in red
