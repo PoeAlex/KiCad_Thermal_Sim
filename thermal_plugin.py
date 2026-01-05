@@ -5,6 +5,7 @@ import traceback
 import math
 import time
 import tempfile
+import re
 
 try:
     import numpy as np
@@ -16,6 +17,207 @@ try:
 except ImportError:
     HAS_LIBS = False
 
+
+# -----------------------------------------------------------------------------
+# Stackup parsing from saved .kicad_pcb (robust, avoids SWIG stackup limitations)
+# -----------------------------------------------------------------------------
+def _sexpr_extract_from_index(s, i):
+    """Return balanced '(...)' block starting at s[i] and the next index."""
+    depth = 0
+    for j in range(i, len(s)):
+        c = s[j]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return s[i:j+1], j+1
+    return None, None
+
+
+def _sexpr_extract_block(s, token, start=0):
+    key = "(" + token
+    i = s.find(key, start)
+    if i < 0:
+        return None
+    blk, _ = _sexpr_extract_from_index(s, i)
+    return blk
+
+
+def _sexpr_find_all_blocks(s, token):
+    key = "(" + token
+    blocks = []
+    i = 0
+    while True:
+        i = s.find(key, i)
+        if i < 0:
+            break
+        blk, end = _sexpr_extract_from_index(s, i)
+        if not blk:
+            break
+        blocks.append(blk)
+        i = end
+    return blocks
+
+
+def parse_stackup_from_board_file(board):
+    """
+    Parse stackup (and general thickness) from the saved .kicad_pcb file.
+
+    Returns dict with:
+      - board_thickness_mm (float|None)
+      - copper (list of dict): order, name, layer_id, thickness_mm
+      - dielectrics (list of dict): order, name, type, thickness_mm
+      - copper_ids (list[int]) in stackup order (top->bottom)
+      - dielectric_gaps_mm (list[float]) between adjacent copper layers (same length as copper_ids-1)
+    """
+    fn = ""
+    try:
+        fn = board.GetFileName()
+    except Exception:
+        fn = ""
+    if not fn:
+        return {"error": "Board has no filename (save board first)."}
+
+    try:
+        txt = open(fn, "r", encoding="utf-8", errors="ignore").read()
+    except Exception as e:
+        return {"error": f"Failed to read board file: {e}"}
+
+    # general thickness
+    board_thickness_mm = None
+    general = _sexpr_extract_block(txt, "general")
+    if general:
+        m = re.search(r"\(thickness\s+([0-9.]+)\)", general)
+        if m:
+            try:
+                board_thickness_mm = float(m.group(1))
+            except Exception:
+                board_thickness_mm = None
+
+    stackup = _sexpr_extract_block(txt, "stackup")
+    if not stackup:
+        return {"error": "No (stackup ...) found in file. Save board after editing stackup."}
+
+    layer_blocks = _sexpr_find_all_blocks(stackup, "layer")
+
+    copper = []
+    dielectrics = []
+
+    for idx, lb in enumerate(layer_blocks):
+        # Formats observed:
+        # (layer "F.Cu" 3 (type "copper") (thickness 0.035) ...)
+        # (layer "F.SilkS" (type "Top Silk Screen"))
+        # (layer dielectric 4 (type "core") (thickness ...))  (rare in some files)
+        name = None
+        order = None
+
+        m = re.match(r'\(layer\s+"([^"]+)"(?:\s+(\d+))?', lb)
+        if m:
+            name = m.group(1)
+            if m.group(2):
+                try:
+                    order = int(m.group(2))
+                except Exception:
+                    order = None
+        else:
+            m2 = re.match(r'\(layer\s+dielectric(?:\s+(\d+))?', lb)
+            if m2:
+                name = "dielectric"
+                if m2.group(1):
+                    try:
+                        order = int(m2.group(1))
+                    except Exception:
+                        order = None
+
+        if order is None:
+            # If no explicit numeric order, keep file order for those layers
+            order = idx
+
+        mt = re.search(r'\(type\s+"([^"]+)"\)', lb)
+        typ = (mt.group(1).strip().lower() if mt else "")
+
+        # thickness: prefer sum of sublayers if present
+        th_mm = None
+        sublayers = _sexpr_find_all_blocks(lb, "sublayer")
+        if sublayers:
+            vals = []
+            for sb in sublayers:
+                vals += [float(x) for x in re.findall(r"\(thickness\s+([0-9.]+)\)", sb)]
+            th_mm = sum(vals) if vals else None
+        else:
+            mm = re.search(r"\(thickness\s+([0-9.]+)\)", lb)
+            if mm:
+                try:
+                    th_mm = float(mm.group(1))
+                except Exception:
+                    th_mm = None
+
+        # Categorize
+        if typ == "copper" and name:
+            try:
+                lid = int(board.GetLayerID(name))
+            except Exception:
+                lid = None
+            copper.append({"order": order, "name": name, "layer_id": lid, "thickness_mm": th_mm})
+        elif ("core" in typ) or ("prepreg" in typ) or (typ == "dielectric") or (name == "dielectric"):
+            dielectrics.append({"order": order, "name": name or "dielectric", "type": typ or "dielectric", "thickness_mm": th_mm})
+
+    # Sort copper by explicit stackup order (NOT by layer id!)
+    copper.sort(key=lambda d: d["order"])
+
+    copper_ids = [d["layer_id"] for d in copper if isinstance(d.get("layer_id"), int)]
+    # dielectric gaps between adjacent copper layers: sum all dielectric items with order in-between
+    dielectric_gaps_mm = []
+    for a, b in zip(copper, copper[1:]):
+        oa, ob = a["order"], b["order"]
+        if oa > ob:
+            oa, ob = ob, oa
+        gap = 0.0
+        found = False
+        for d in dielectrics:
+            if oa < d["order"] < ob and d.get("thickness_mm") is not None:
+                gap += float(d["thickness_mm"])
+                found = True
+        dielectric_gaps_mm.append(gap if found else 0.0)
+
+    return {
+        "board_thickness_mm": board_thickness_mm,
+        "copper": copper,
+        "dielectrics": dielectrics,
+        "copper_ids": copper_ids,
+        "dielectric_gaps_mm": dielectric_gaps_mm,
+        "file_layer_count": len(layer_blocks),
+    }
+
+
+def format_stackup_report_um(stack):
+    """Human-readable stackup report (compact) for GUI; thickness shown in µm."""
+    if not stack or stack.get("error"):
+        return f"Stackup: {stack.get('error', 'unavailable')}"
+    lines = []
+    bt = stack.get("board_thickness_mm", None)
+    if bt is not None:
+        lines.append(f"Board thickness (general): {bt:.3f} mm")
+    copper = stack.get("copper", [])
+    if copper:
+        lines.append("Copper layers (top→bottom):")
+        for c in copper:
+            th = c.get("thickness_mm", None)
+            th_um = (th * 1000.0) if isinstance(th, (int, float)) else None
+            th_s = f"{th_um:.1f} µm" if th_um is not None else "(n/a)"
+            lid = c.get("layer_id", None)
+            lid_s = str(lid) if isinstance(lid, int) else "?"
+            lines.append(f"  {c['name']:<8s}  {th_s:<10s}  id={lid_s}")
+    gaps = stack.get("dielectric_gaps_mm", [])
+    if copper and gaps and len(gaps) == max(0, len(copper)-1):
+        lines.append("Dielectric gaps between copper layers:")
+        for i, g in enumerate(gaps):
+            a = copper[i]["name"]
+            b = copper[i+1]["name"]
+            lines.append(f"  {a} → {b}: {g*1000.0:.1f} µm")
+    return "\n".join(lines)
+
 try:
     import numba
     HAS_NUMBA = True
@@ -23,7 +225,7 @@ except ImportError:
     HAS_NUMBA = False
 
 class SettingsDialog(wx.Dialog):
-    def __init__(self, parent, selected_count, suggested_res, layer_names, preview_callback=None):
+    def __init__(self, parent, selected_count, suggested_res, layer_names, preview_callback=None, stackup_details="", pad_names=None):
         super().__init__(parent, title="Thermal Sim (Bulletproof)")
         
         self.layer_names = layer_names
@@ -38,9 +240,33 @@ class SettingsDialog(wx.Dialog):
             l_str += f" ({layer_names[0]}..{layer_names[-1]})"
         lbl_layers = wx.StaticText(self, label=l_str)
         info_box.Add(lbl_layers, 0, wx.ALL, 5)
-        
+
+        # Detailed stackup (from saved .kicad_pcb stackup), shown in µm
+        if stackup_details:
+            self.txt_stackup = wx.TextCtrl(
+                self,
+                value=stackup_details,
+                style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP
+            )
+            # Keep the dialog compact but scrollable
+            self.txt_stackup.SetMinSize((-1, 120))
+            info_box.Add(self.txt_stackup, 0, wx.EXPAND | wx.ALL, 5)
+
         sizer.Add(info_box, 0, wx.EXPAND|wx.ALL, 5)
-        
+
+        # --- Pads (selected / recognized) ---
+        pad_box = wx.StaticBoxSizer(wx.VERTICAL, self, "Pads")
+        pad_lines = pad_names if isinstance(pad_names, (list, tuple)) else []
+        pad_text = "\n".join(str(x) for x in pad_lines)
+        self.txt_pads = wx.TextCtrl(
+            self,
+            value=pad_text,
+            style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP
+        )
+        self.txt_pads.SetMinSize((-1, 90))
+        pad_box.Add(self.txt_pads, 1, wx.EXPAND | wx.ALL, 5)
+        sizer.Add(pad_box, 0, wx.EXPAND|wx.ALL, 5)
+
         # --- Setup ---
         box_main = wx.StaticBoxSizer(wx.VERTICAL, self, "Parameters")
         
@@ -211,40 +437,29 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             if enabled_layers.Contains(lid) and is_copper:
                 copper_ids.append(lid)
                 layer_names.append(board.GetLayerName(lid))
+        
+        # Determine physical copper order (top → bottom).
+        # NOTE: KiCad PCB_LAYER_ID numeric ordering is NOT the physical stackup order (e.g. B.Cu is often id=2).
+        stack_info = parse_stackup_from_board_file(board)
+        copper_ids_stack = stack_info.get("copper_ids") if isinstance(stack_info, dict) else None
 
-        # IMPORTANT (KiCad v9+):
-        # PCB layer IDs are *not* in physical stack order (e.g. B.Cu has ID=2, inner copper starts at 4).
-        # Therefore, never sort by numeric layer ID. Use CopperLayerToOrdinal() (or a name-based fallback)
-        # to obtain Top -> Inner(s) -> Bottom order.
-        def _copper_ordinal(lid: int) -> int:
+        if copper_ids_stack and len(copper_ids_stack) >= 2:
+            copper_ids = copper_ids_stack
+        else:
+            # Prefer KiCad's copper ordinal if available (top->bottom)
             try:
-                # CopperLayerToOrdinal expects a PCB_LAYER_ID; ToLAYER_ID() is safe across versions
-                if hasattr(pcbnew, "ToLAYER_ID") and hasattr(pcbnew, "CopperLayerToOrdinal"):
-                    return int(pcbnew.CopperLayerToOrdinal(pcbnew.ToLAYER_ID(int(lid))))
-                if hasattr(pcbnew, "CopperLayerToOrdinal"):
-                    return int(pcbnew.CopperLayerToOrdinal(int(lid)))
+                copper_ids = sorted(copper_ids, key=lambda lid: int(pcbnew.CopperLayerToOrdinal(lid)))
             except Exception:
-                pass
+                # Fallback: F.Cu first, B.Cu last, inner layers by "InN.Cu"
+                def _copper_key(lid):
+                    nm = board.GetLayerName(lid)
+                    if nm == "F.Cu": return -1000
+                    if nm == "B.Cu": return 1000
+                    m = re.match(r"In(\d+)\.Cu", nm)
+                    return int(m.group(1)) if m else 0
+                copper_ids = sorted(copper_ids, key=_copper_key)
 
-            # Fallback: parse common KiCad copper layer names
-            try:
-                nm = board.GetLayerName(lid).lower()
-            except Exception:
-                nm = str(lid)
-
-            if nm in ("f.cu",) or nm.startswith("f.cu"):
-                return -1
-            if nm in ("b.cu",) or nm.startswith("b.cu"):
-                return 10**9
-
-            mm = re.search(r"in\s*(\d+)", nm) or re.search(r"in(\d+)", nm)
-            if mm:
-                return int(mm.group(1))
-            return 10**8 + int(lid)
-
-        copper_ids.sort(key=_copper_ordinal)
-
-        # Re-map layer names in physical (stack) order
+        # Re-map layer names in sorted order
         layer_names = [board.GetLayerName(lid) for lid in copper_ids]
         copper_layer_count = len(copper_ids)
 
@@ -288,8 +503,28 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.bbox = bbox
         self.pads_list = pads_list
         
+        # Prepare compact GUI report: stackup (µm) + recognized pad names
+        try:
+            stackup_details = format_stackup_report_um(stack_info)
+        except Exception:
+            stackup_details = ""
+
+        pad_names = []
+        for nm, pad in selected_pads:
+            net = ""
+            try:
+                net = pad.GetNetname()
+            except Exception:
+                try:
+                    net = pad.GetNet().GetNetname()
+                except Exception:
+                    net = ""
+            pad_names.append(f"{nm} [{net}]" if net else nm)
+
         dlg = SettingsDialog(None, len(pads_list), suggested_res, layer_names, 
-                             preview_callback=self.generate_preview)
+                             preview_callback=self.generate_preview,
+                             stackup_details=stackup_details,
+                             pad_names=pad_names)
         if dlg.ShowModal() != wx.ID_OK:
             dlg.Destroy(); return
         settings = dlg.get_values()
