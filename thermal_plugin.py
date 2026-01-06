@@ -226,7 +226,7 @@ except ImportError:
     HAS_NUMBA = False
 
 class SettingsDialog(wx.Dialog):
-    def __init__(self, parent, selected_count, suggested_res, layer_names, preview_callback=None, stackup_details="", pad_names=None):
+    def __init__(self, parent, selected_count, suggested_res, layer_names, preview_callback=None, stackup_details="", pad_names=None, default_output_dir=""):
         super().__init__(parent, title="Thermal Sim")
         
         self.layer_names = layer_names
@@ -295,6 +295,17 @@ class SettingsDialog(wx.Dialog):
         self.chk_snapshots.Bind(wx.EVT_CHECKBOX, self.on_snapshots_toggle)
         
         sizer.Add(box_out, 0, wx.EXPAND|wx.ALL, 5)
+
+        # --- Output Folder ---
+        box_path = wx.StaticBoxSizer(wx.VERTICAL, self, "Output Folder")
+        row_path = wx.BoxSizer(wx.HORIZONTAL)
+        self.output_dir_input = wx.TextCtrl(self, value=default_output_dir)
+        btn_browse = wx.Button(self, label="Browse...")
+        btn_browse.Bind(wx.EVT_BUTTON, self.on_browse_output)
+        row_path.Add(self.output_dir_input, 1, wx.EXPAND|wx.RIGHT, 5)
+        row_path.Add(btn_browse, 0)
+        box_path.Add(row_path, 0, wx.EXPAND|wx.ALL, 5)
+        sizer.Add(box_path, 0, wx.EXPAND|wx.ALL, 5)
 
         # --- Filters ---
         box_filter = wx.StaticBoxSizer(wx.VERTICAL, self, "Geometry Filters")
@@ -378,6 +389,7 @@ class SettingsDialog(wx.Dialog):
                 'show_all': self.chk_all_layers.GetValue(),
                 'snapshots': self.chk_snapshots.GetValue(),
                 'snap_count': int(self.snap_count_input.GetValue()),
+                'output_dir': self.output_dir_input.GetValue().strip(),
                 'ignore_traces': self.chk_ignore_traces.GetValue(),
                 # 'ignore_polygons': self.chk_ignore_polygons.GetValue(), # Disabled by request
                 'ignore_polygons': False,
@@ -395,6 +407,19 @@ class SettingsDialog(wx.Dialog):
 
     def on_snapshots_toggle(self, event):
         self.snap_count_input.Enable(self.chk_snapshots.GetValue())
+
+    def on_browse_output(self, event):
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            path = filedialog.askdirectory(initialdir=self.output_dir_input.GetValue() or None)
+            root.destroy()
+            if path:
+                self.output_dir_input.SetValue(path)
+        except Exception:
+            wx.MessageBox("Could not open folder picker.", "Error")
 
 class ThermalPlugin(pcbnew.ActionPlugin):
     def defaults(self):
@@ -528,10 +553,22 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     net = ""
             pad_names.append(f"{nm} [{net}]" if net else nm)
 
-        dlg = SettingsDialog(None, len(pads_list), suggested_res, layer_names, 
+        default_output_dir = ""
+        try:
+            board_path = board.GetFileName()
+            if board_path:
+                default_output_dir = os.path.dirname(board_path)
+        except Exception:
+            default_output_dir = ""
+        if not default_output_dir:
+            doc_dir = os.path.expanduser("~/Documents")
+            default_output_dir = doc_dir if os.path.isdir(doc_dir) else os.path.dirname(__file__)
+
+        dlg = SettingsDialog(None, len(pads_list), suggested_res, layer_names,
                              preview_callback=self.generate_preview,
                              stackup_details=stackup_details,
-                             pad_names=pad_names)
+                             pad_names=pad_names,
+                             default_output_dir=default_output_dir)
         if dlg.ShowModal() != wx.ID_OK:
             dlg.Destroy(); return
         settings = dlg.get_values()
@@ -541,6 +578,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # --- Stackup-driven thicknesses (prefer parsed stackup over defaults) ---
         stackup_derived = self._derive_stackup_thicknesses(board, copper_ids, stack_info, settings)
         total_thick_mm = stackup_derived["total_thick_mm_used"]
+
+        # --- Output Folder Setup ---
+        base_output_dir = settings.get('output_dir') or default_output_dir or os.path.dirname(__file__)
+        if not os.path.isdir(base_output_dir):
+            base_output_dir = os.path.dirname(__file__)
+        run_dir = os.path.join(base_output_dir, time.strftime("ThermalSim_%Y%m%d_%H%M%S"))
+        try:
+            os.makedirs(run_dir, exist_ok=True)
+        except Exception:
+            run_dir = base_output_dir
 
         # --- 5. Grid Setup ---
         res = settings['res']
@@ -757,14 +804,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         snap_cnt = 1
         step_counter = 0
         amb = settings['amb']
-        snap_steps = set()
+        snap_steps = []
+        next_snap_idx = 0
         if settings.get('snapshots'):
             try:
                 snap_count = int(settings.get('snap_count', 5))
             except Exception:
                 snap_count = 5
             snap_count = max(1, min(50, snap_count))
-            snap_steps = {int(k * (steps / (snap_count + 1))) for k in range(1, snap_count + 1)}
+            snap_steps = [int(k * (steps / (snap_count + 1))) for k in range(1, snap_count + 1)]
+            snap_steps = sorted({s for s in snap_steps if 0 < s < steps})
         
         # Pre-compute smoothing kernel weights
         smooth_weight = 0.1
@@ -818,6 +867,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     break
                 
                 for _ in range(batch_size):
+                    if step_counter >= steps:
+                        break
                     step_counter += 1
                     
                     # Lateral Heat Diffusion (2D Laplacian) on inner pixels
@@ -872,11 +923,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         sL += T_inner
                         sL /= (1 + 4*smooth_weight)
                         T_inner[:] = sL
-                
-                if settings['snapshots'] and step_counter in snap_steps:
-                    t_elapsed = step_counter * dt
-                    self.save_snapshot(T, H_map, settings['amb'], layer_names, snap_cnt, t_elapsed)
-                    snap_cnt += 1
+
+                    if settings['snapshots']:
+                        while next_snap_idx < len(snap_steps) and step_counter >= snap_steps[next_snap_idx]:
+                            t_elapsed = step_counter * dt
+                            self.save_snapshot(T, H_map, settings['amb'], layer_names, snap_cnt, t_elapsed, out_dir=run_dir)
+                            snap_cnt += 1
+                            next_snap_idx += 1
+                if step_counter >= steps:
+                    break
         finally:
             if pd:
                 pd.Hide()
@@ -888,11 +943,11 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 pass
         if not aborted:
             if settings['show_all']:
-                heatmap_path = self.show_results_all_layers(T, H_map, settings['amb'], layer_names, t_elapsed=sim_time)
+                heatmap_path = self.show_results_all_layers(T, H_map, settings['amb'], layer_names, t_elapsed=sim_time, out_dir=run_dir)
             else:
-                heatmap_path = self.show_results_top_bot(T, H_map, settings['amb'], t_elapsed=sim_time)
-            preview_path = self._save_preview_image(settings, layer_names, open_file=False, stack_info=stack_info)
-            self._write_html_report(
+                heatmap_path = self.show_results_top_bot(T, H_map, settings['amb'], t_elapsed=sim_time, out_dir=run_dir)
+            preview_path = self._save_preview_image(settings, layer_names, open_file=False, stack_info=stack_info, out_dir=run_dir)
+            report_path = self._write_html_report(
                 settings=settings,
                 stack_info=stack_info,
                 stackup_derived=stackup_derived,
@@ -900,8 +955,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 layer_names=layer_names,
                 preview_path=preview_path,
                 heatmap_path=heatmap_path,
-                k_norm_info=k_norm_info
+                k_norm_info=k_norm_info,
+                out_dir=run_dir
             )
+            if report_path:
+                try:
+                    import webbrowser
+                    webbrowser.open("file://" + os.path.abspath(report_path))
+                except Exception:
+                    pass
 
     def create_multilayer_maps(self, board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu_layers, via_factor, pads_list):
         num_layers = len(copper_ids)
@@ -1170,9 +1232,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             for c in range(cs, ce): pixels.append((r, c))
         return pixels
 
-    def save_snapshot(self, T, H, amb, layer_names, idx, t_elapsed):
+    def save_snapshot(self, T, H, amb, layer_names, idx, t_elapsed, out_dir=None):
         try:
-            out_dir = os.path.dirname(__file__)
+            out_dir = out_dir or os.path.dirname(__file__)
             fname = os.path.join(out_dir, f"snap_{idx:02d}_t{t_elapsed:.1f}.png")
             self._save_stackup_plot(T, H, amb, layer_names, fname, t_elapsed=t_elapsed)
         except:
@@ -1243,8 +1305,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         plt.savefig(fname, dpi=150)
         plt.close()
 
-    def show_results_top_bot(self, T, H, amb, open_file=True, t_elapsed=None):
-        output_file = os.path.join(os.path.dirname(__file__), "thermal_final.png")
+    def show_results_top_bot(self, T, H, amb, open_file=True, t_elapsed=None, out_dir=None):
+        out_dir = out_dir or os.path.dirname(__file__)
+        output_file = os.path.join(out_dir, "thermal_final.png")
         vmax = np.max(T)
         if vmax > amb + 250: vmax = amb + 250
         
@@ -1274,8 +1337,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         if not output_file:
             wx.MessageBox("Board data missing for preview", "Error")
 
-    def show_results_all_layers(self, T, H, amb, layer_names, open_file=True, t_elapsed=None):
-        output_file = os.path.join(os.path.dirname(__file__), "thermal_stackup.png")
+    def show_results_all_layers(self, T, H, amb, layer_names, open_file=True, t_elapsed=None, out_dir=None):
+        out_dir = out_dir or os.path.dirname(__file__)
+        output_file = os.path.join(out_dir, "thermal_stackup.png")
         vmax = np.max(T)
         if vmax > amb + 250: vmax = amb + 250
         
@@ -1397,7 +1461,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "gap_fallback_used": use_uniform_gap,
         }
 
-    def _save_preview_image(self, settings, layer_names, open_file=False, stack_info=None):
+    def _save_preview_image(self, settings, layer_names, open_file=False, stack_info=None, out_dir=None):
         board = self.board
         copper_ids = self.copper_ids
         bbox = self.bbox
@@ -1435,7 +1499,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         try:
             K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_layers, via_factor, self.pads_list)
             
-            output_file = os.path.join(os.path.dirname(__file__), "thermal_preview.png")
+            out_dir = out_dir or settings.get('output_dir') or os.path.dirname(__file__)
+            if not os.path.isdir(out_dir):
+                out_dir = os.path.dirname(__file__)
+            output_file = os.path.join(out_dir, "thermal_preview.png")
             count = len(K)
             cols_grid = 2
             rows_grid = math.ceil(count / 2)
@@ -1524,8 +1591,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 wx.MessageBox(f"Preview error: {traceback.format_exc()}", "Error")
             return None
 
-    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path, k_norm_info=None):
-        out_dir = os.path.dirname(__file__)
+    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path, k_norm_info=None, out_dir=None):
+        out_dir = out_dir or os.path.dirname(__file__)
         report_path = os.path.join(out_dir, "thermal_report.html")
 
         def _fmt(val, suffix=""):
