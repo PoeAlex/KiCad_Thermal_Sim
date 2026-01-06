@@ -574,7 +574,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         k_cu_rel  = 400.0
         
         total_thick = max(0.2, settings['thick'])
-        dielectric_thick = total_thick / max(1, (layer_count - 1))
+        default_gap_mm = total_thick / max(1, (layer_count - 1))
+        stack_gap_mm = []
+        if isinstance(stack_info, dict):
+            stack_gap_mm = stack_info.get("dielectric_gaps_mm") or []
+        if len(stack_gap_mm) == max(0, layer_count - 1):
+            gap_mm = [g if (isinstance(g, (int, float)) and g > 0) else default_gap_mm for g in stack_gap_mm]
+        else:
+            gap_mm = [default_gap_mm] * max(0, layer_count - 1)
+        dielectric_thick = sum(gap_mm) / max(1, len(gap_mm))
         # Vertical conductance through dielectric vs via
         v_base = 0.3 / dielectric_thick   # FR4 vertical conductance
         v_via  = 390.0 / dielectric_thick  # Via copper conductance
@@ -589,8 +597,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         dx = res * 1e-3  # Grid spacing in meters
         
         # Physical layer thicknesses (convert to meters)
-        copper_thick = 35e-6  # 1oz copper = 35 microns
-        layer_spacing_m = (total_thick / max(1, layer_count - 1)) * 1e-3  # Convert mm to meters
+        copper_thick_mm = 0.035
+        if isinstance(stack_info, dict):
+            stack_cu = stack_info.get("copper") or []
+            stack_cu_thick = [c.get("thickness_mm") for c in stack_cu if c.get("thickness_mm")]
+            if len(stack_cu_thick) == layer_count:
+                copper_thick_mm = sum(stack_cu_thick) / max(1, len(stack_cu_thick))
+            elif stack_cu_thick:
+                copper_thick_mm = sum(stack_cu_thick) / max(1, len(stack_cu_thick))
+        copper_thick = copper_thick_mm * 1e-3
+        gap_m = [g * 1e-3 for g in gap_mm]
+        gap_m_avg = sum(gap_m) / max(1, len(gap_m)) if gap_m else 0.0
+        layer_spacing_m = gap_m_avg
         
         # Thermal diffusivity - use copper value for stability
         alpha_eff = 1.1e-4  # Copper thermal diffusivity (m^2/s)
@@ -694,10 +712,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         k_fr4_thermal = 0.3  # FR4 thermal conductivity W/(m·K)
         
         # Vertical coupling: heat transfer rate through FR4 between layers
-        if layer_count > 1 and layer_spacing_m > 0:
-            z_base = (k_fr4_thermal * pixel_area / layer_spacing_m) * dt / pixel_heat_cap
+        if layer_count > 1 and gap_m:
+            z_base = np.zeros((layer_count - 1), dtype=np.float64)
+            for idx, gap in enumerate(gap_m):
+                if gap > 0:
+                    z_base[idx] = (k_fr4_thermal * pixel_area / gap) * dt / pixel_heat_cap
         else:
-            z_base = 0.0
+            z_base = np.zeros((0,), dtype=np.float64)
         
         # Via enhancement factor (vias increase vertical conductance)
         # V_map has values: v_base for FR4, v_via for vias
@@ -705,7 +726,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         V_norm = V_map / v_base  # Will be 1 for FR4, ~1300 for vias
         # Clamp via enhancement to prevent instability
         V_enhance = np.clip(V_norm, 1.0, 50.0)  # Max 50x enhancement at vias
-        z_eff = z_base * V_enhance
+        if layer_count > 1 and z_base.size:
+            z_eff = V_enhance * z_base[:, np.newaxis, np.newaxis]
+        else:
+            z_eff = np.zeros((0, rows, cols), dtype=np.float64)
 
         snap_int = max(1, int(num_batches / 10))
         snap_cnt = 1
@@ -732,7 +756,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # Buffer for vertical transfer
         if layer_count > 1:
-            z_eff_inner = z_eff[1:-1, 1:-1]
+            z_eff_inner = z_eff[:, 1:-1, 1:-1]
             H_map_inner = H_map[1:-1, 1:-1]
             dT_layer_buf = np.zeros((layer_count-1, rows-2, cols-2))
             v_chg_inner_buf = np.zeros_like(T_inner)
