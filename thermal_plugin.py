@@ -7,6 +7,7 @@ import time
 import tempfile
 import re
 import html
+import json
 
 try:
     import numpy as np
@@ -226,7 +227,7 @@ except ImportError:
     HAS_NUMBA = False
 
 class SettingsDialog(wx.Dialog):
-    def __init__(self, parent, selected_count, suggested_res, layer_names, preview_callback=None, stackup_details="", pad_names=None, default_output_dir=""):
+    def __init__(self, parent, selected_count, suggested_res, layer_names, preview_callback=None, stackup_details="", pad_names=None, default_output_dir="", defaults=None):
         super().__init__(parent, title="Thermal Sim")
         
         self.layer_names = layer_names
@@ -362,6 +363,9 @@ class SettingsDialog(wx.Dialog):
         self.SetSizer(sizer)
         self.Fit()
         self.Center()
+
+        if defaults:
+            self._apply_defaults(defaults)
     
     def on_preview(self, event):
         if self.preview_callback:
@@ -409,17 +413,37 @@ class SettingsDialog(wx.Dialog):
         self.snap_count_input.Enable(self.chk_snapshots.GetValue())
 
     def on_browse_output(self, event):
+        start_dir = self.output_dir_input.GetValue()
+        if not start_dir or not os.path.isdir(start_dir):
+            start_dir = os.path.dirname(__file__)
+        dlg = wx.DirDialog(self, "Select Output Folder", defaultPath=start_dir, style=wx.DD_DEFAULT_STYLE)
+        if dlg.ShowModal() == wx.ID_OK:
+            self.output_dir_input.SetValue(dlg.GetPath())
+        dlg.Destroy()
+
+    def _apply_defaults(self, defaults):
         try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            path = filedialog.askdirectory(initialdir=self.output_dir_input.GetValue() or None)
-            root.destroy()
-            if path:
-                self.output_dir_input.SetValue(path)
+            self.power_input.SetValue(str(defaults.get('power_str', self.power_input.GetValue())))
+            self.time_input.SetValue(str(defaults.get('time', self.time_input.GetValue())))
+            self.amb_input.SetValue(str(defaults.get('amb', self.amb_input.GetValue())))
+            self.thick_input.SetValue(str(defaults.get('thick', self.thick_input.GetValue())))
+            self.res_input.SetValue(str(defaults.get('res', self.res_input.GetValue())))
+            self.chk_all_layers.SetValue(bool(defaults.get('show_all', self.chk_all_layers.GetValue())))
+            self.chk_snapshots.SetValue(bool(defaults.get('snapshots', self.chk_snapshots.GetValue())))
+            self.snap_count_input.SetValue(str(defaults.get('snap_count', self.snap_count_input.GetValue())))
+            self.snap_count_input.Enable(self.chk_snapshots.GetValue())
+            out_dir = defaults.get('output_dir')
+            if out_dir:
+                self.output_dir_input.SetValue(str(out_dir))
+            self.chk_ignore_traces.SetValue(bool(defaults.get('ignore_traces', self.chk_ignore_traces.GetValue())))
+            self.chk_limit_area.SetValue(bool(defaults.get('limit_area', self.chk_limit_area.GetValue())))
+            self.pad_dist_input.SetValue(str(defaults.get('pad_dist_mm', self.pad_dist_input.GetValue())))
+            self.pad_dist_input.Enable(self.chk_limit_area.GetValue())
+            self.chk_heatsink.SetValue(bool(defaults.get('use_heatsink', self.chk_heatsink.GetValue())))
+            self.pad_thick.SetValue(str(defaults.get('pad_th', self.pad_thick.GetValue())))
+            self.pad_k.SetValue(str(defaults.get('pad_k', self.pad_k.GetValue())))
         except Exception:
-            wx.MessageBox("Could not open folder picker.", "Error")
+            pass
 
 class ThermalPlugin(pcbnew.ActionPlugin):
     def defaults(self):
@@ -434,6 +458,24 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.copper_ids = []
         self.bbox = None
         self.pads_list = []
+
+    def _settings_path(self):
+        return os.path.join(os.path.dirname(__file__), "thermal_sim_last_settings.json")
+
+    def _load_settings(self):
+        try:
+            with open(self._settings_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_settings(self, settings):
+        try:
+            with open(self._settings_path(), "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2, sort_keys=True)
+        except Exception:
+            pass
 
     def Run(self):
         try:
@@ -553,27 +595,24 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     net = ""
             pad_names.append(f"{nm} [{net}]" if net else nm)
 
-        default_output_dir = ""
-        try:
-            board_path = board.GetFileName()
-            if board_path:
-                default_output_dir = os.path.dirname(board_path)
-        except Exception:
-            default_output_dir = ""
-        if not default_output_dir:
-            doc_dir = os.path.expanduser("~/Documents")
-            default_output_dir = doc_dir if os.path.isdir(doc_dir) else os.path.dirname(__file__)
+        default_output_dir = os.path.dirname(__file__)
+        last_settings = self._load_settings()
+        if last_settings.get("output_dir") and os.path.isdir(last_settings.get("output_dir")):
+            default_output_dir = last_settings.get("output_dir")
 
         dlg = SettingsDialog(None, len(pads_list), suggested_res, layer_names,
                              preview_callback=self.generate_preview,
                              stackup_details=stackup_details,
                              pad_names=pad_names,
-                             default_output_dir=default_output_dir)
+                             default_output_dir=default_output_dir,
+                             defaults=last_settings)
         if dlg.ShowModal() != wx.ID_OK:
             dlg.Destroy(); return
         settings = dlg.get_values()
         dlg.Destroy()
         if not settings: return
+
+        self._save_settings(settings)
 
         # --- Stackup-driven thicknesses (prefer parsed stackup over defaults) ---
         stackup_derived = self._derive_stackup_thicknesses(board, copper_ids, stack_info, settings)
@@ -583,7 +622,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         base_output_dir = settings.get('output_dir') or default_output_dir or os.path.dirname(__file__)
         if not os.path.isdir(base_output_dir):
             base_output_dir = os.path.dirname(__file__)
-        run_dir = os.path.join(base_output_dir, time.strftime("ThermalSim_%Y%m%d_%H%M%S"))
+        run_dir = os.path.join(base_output_dir, time.strftime("Thermalsim_%Y%m%d_%H%M%S"))
         try:
             os.makedirs(run_dir, exist_ok=True)
         except Exception:
@@ -814,6 +853,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snap_count = max(1, min(50, snap_count))
             snap_steps = [int(k * (steps / (snap_count + 1))) for k in range(1, snap_count + 1)]
             snap_steps = sorted({s for s in snap_steps if 0 < s < steps})
+        print(f"[ThermalSim] snapshots={settings.get('snapshots')} snap_count={settings.get('snap_count')} dt={dt:.6f} steps={steps} snap_steps={snap_steps}")
+        print(f"[ThermalSim] base_output_dir={base_output_dir} run_dir={run_dir}")
         
         # Pre-compute smoothing kernel weights
         smooth_weight = 0.1
@@ -947,6 +988,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             else:
                 heatmap_path = self.show_results_top_bot(T, H_map, settings['amb'], t_elapsed=sim_time, out_dir=run_dir)
             preview_path = self._save_preview_image(settings, layer_names, open_file=False, stack_info=stack_info, out_dir=run_dir)
+            snapshot_debug = {
+                "snapshots_enabled": settings.get('snapshots'),
+                "snap_count": settings.get('snap_count'),
+                "dt": dt,
+                "steps": steps,
+                "snap_steps": snap_steps,
+                "base_output_dir": base_output_dir,
+                "run_dir": run_dir,
+            }
             report_path = self._write_html_report(
                 settings=settings,
                 stack_info=stack_info,
@@ -956,8 +1006,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 preview_path=preview_path,
                 heatmap_path=heatmap_path,
                 k_norm_info=k_norm_info,
-                out_dir=run_dir
+                out_dir=run_dir,
+                snapshot_debug=snapshot_debug
             )
+            snapshot_count = 0
+            try:
+                snapshot_count = len([f for f in os.listdir(run_dir) if f.startswith("snap_") and f.lower().endswith(".png")])
+            except Exception:
+                snapshot_count = 0
+            print(f"[ThermalSim] snapshots_found={snapshot_count}")
+            if settings.get('snapshots') and snapshot_count == 0:
+                wx.MessageBox("Snapshots enabled but none were created.\nCheck settings and debug info in the report.", "Snapshot Warning")
             if report_path:
                 try:
                     import webbrowser
@@ -1591,7 +1650,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 wx.MessageBox(f"Preview error: {traceback.format_exc()}", "Error")
             return None
 
-    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path, k_norm_info=None, out_dir=None):
+    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path, k_norm_info=None, out_dir=None, snapshot_debug=None):
         out_dir = out_dir or os.path.dirname(__file__)
         report_path = os.path.join(out_dir, "thermal_report.html")
 
@@ -1648,9 +1707,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snapshots_html += f"<div><p class='small'>{_esc(label)}</p><img src='{_esc(fname)}' alt='{_esc(label)}'></div>"
         if k_norm_info is None:
             k_norm_info = {}
+        if snapshot_debug is None:
+            snapshot_debug = {}
         k_norm_rows = "\n".join(
             f"<tr><td>{_esc(str(k))}</td><td>{_esc(_fmt(v))}</td></tr>"
             for k, v in k_norm_info.items()
+        )
+        snapshot_debug_rows = "\n".join(
+            f"<tr><td>{_esc(str(k))}</td><td>{_esc(_fmt(v))}</td></tr>"
+            for k, v in snapshot_debug.items()
         )
 
         html_body = f"""<!DOCTYPE html>
@@ -1698,6 +1763,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
   <table>
     <tr><th>Key</th><th>Value</th></tr>
     {k_norm_rows}
+  </table>
+
+  <h2>Snapshot Debug</h2>
+  <table>
+    <tr><th>Key</th><th>Value</th></tr>
+    {snapshot_debug_rows}
   </table>
 
   <h2>Simulation Settings</h2>
