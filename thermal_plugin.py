@@ -712,14 +712,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # We aligned dt_limit with 0.15, so we match it here
         max_k = np.max(K)
         min_k = np.min(K)
-        diff_factor = 0.15 / max(k_cu_rel, 1.0)
+        target_max = 0.22
+        diff_factor = target_max / max(max_k, 1.0)
         K_safe = K * diff_factor
         max_k_safe = np.max(K_safe)
         min_k_safe = np.min(K_safe)
         k_norm_info = {
-            "strategy": "fixed",
+            "strategy": "scale_by_maxK",
+            "target_max": target_max,
             "k_min": min_k,
             "k_max": max_k,
+            "diff_factor": diff_factor,
             "k_safe_min": min_k_safe,
             "k_safe_max": max_k_safe,
             "copper_masked_heat_cap": True,
