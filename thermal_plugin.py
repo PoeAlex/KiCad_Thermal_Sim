@@ -641,8 +641,11 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         fr4_vol = pixel_area * np.array(fr4_effective_thick)
         fr4_heat_cap = fr4_vol * 1850 * 1100  # J/K
 
-        # Total heat capacity per pixel (per layer)
-        pixel_heat_cap = cu_heat_cap + fr4_heat_cap
+        # Total heat capacity per pixel (per layer) with copper mask
+        copper_mask = K > k_fr4_rel
+        cu_heat_cap_map = cu_heat_cap[:, None, None] * copper_mask
+        fr4_heat_cap_map = fr4_heat_cap[:, None, None]
+        pixel_heat_cap = cu_heat_cap_map + fr4_heat_cap_map
 
         # Power scale: dT per timestep = P * dt / heat_capacity
         power_scale = dt / pixel_heat_cap
@@ -672,11 +675,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             
             pixels = self.get_pad_pixels(pad, rows, cols, x_min, y_min, res)
             if pixels:
-                val = (p_vals[idx] * power_scale[target_idx]) / len(pixels)
+                power_scale_layer = power_scale[target_idx]
+                val = p_vals[idx] / len(pixels)
                 for r, c in pixels: 
                     # Bounds Check
                     if r < rows and c < cols:
-                        P_map[target_idx, r, c] += val
+                        P_map[target_idx, r, c] += val * power_scale_layer[r, c]
 
         # --- 9. SOLVER ---
         T = np.ones((layer_count, rows, cols)) * settings['amb']
@@ -707,8 +711,19 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # Diffusion coefficient - scaled for stability (Max 0.25)
         # We aligned dt_limit with 0.15, so we match it here
         max_k = np.max(K)
-        diff_factor = 0.15 / max(max_k, 1.0)
+        min_k = np.min(K)
+        diff_factor = 0.15 / max(k_cu_rel, 1.0)
         K_safe = K * diff_factor
+        max_k_safe = np.max(K_safe)
+        min_k_safe = np.min(K_safe)
+        k_norm_info = {
+            "strategy": "fixed",
+            "k_min": min_k,
+            "k_max": max_k,
+            "k_safe_min": min_k_safe,
+            "k_safe_max": max_k_safe,
+            "copper_masked_heat_cap": True,
+        }
         
         # Vertical heat transfer coefficient
         # Q = k_fr4 * A * dT / d, where d = layer spacing
@@ -719,16 +734,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # Vertical coupling: heat transfer rate through FR4 between layers
         if layer_count > 1 and gap_m:
             cap_pairs = 0.5 * (pixel_heat_cap[:-1] + pixel_heat_cap[1:])
-            z_base = (k_fr4_thermal * pixel_area / np.array(gap_m)) * dt / cap_pairs
+            z_base = (k_fr4_thermal * pixel_area / np.array(gap_m)[:, None, None]) * dt / cap_pairs
         else:
-            z_base = np.zeros((max(0, layer_count - 1),))
+            z_base = np.zeros((max(0, layer_count - 1), rows, cols))
         
         # Via enhancement factor (vias increase vertical conductance)
         # V_map has values: 1 for FR4, via_factor for vias
         # Normalize to get via locations: V_norm = 1 for FR4, higher for vias
         # Clamp via enhancement to prevent instability
         V_enhance = np.clip(V_map, 1.0, 50.0)  # Max 50x enhancement at vias
-        z_eff = z_base[:, None, None] * V_enhance
+        z_eff = z_base * V_enhance
 
         snap_int = max(1, int(num_batches / 10))
         snap_cnt = 1
@@ -825,13 +840,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     
                     # Convective cooling (Boundary Conditions)
                     # Top Layer Inner
-                    T_inner[0] -= (T_inner[0] - amb) * cool_air[0]
+                    T_inner[0] -= (T_inner[0] - amb) * cool_air[0, 1:-1, 1:-1]
                     
                     # Bottom layer
                     if layer_count > 1:
-                        T_inner[-1] -= (T_inner[-1] - amb) * ((1-H_map_inner)*cool_air[-1] + H_map_inner*cool_sink_factor)
+                        T_inner[-1] -= (T_inner[-1] - amb) * ((1-H_map_inner)*cool_air[-1, 1:-1, 1:-1] + H_map_inner*cool_sink_factor[1:-1, 1:-1])
                     else:
-                        T_inner[0] -= (T_inner[0] - amb) * cool_air[0]
+                        T_inner[0] -= (T_inner[0] - amb) * cool_air[0, 1:-1, 1:-1]
                     
                     # Smoothing
                     if step_counter % 50 == 0:
@@ -867,7 +882,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 pad_power=pad_power,
                 layer_names=layer_names,
                 preview_path=preview_path,
-                heatmap_path=heatmap_path
+                heatmap_path=heatmap_path,
+                k_norm_info=k_norm_info
             )
 
     def create_multilayer_maps(self, board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu_layers, via_factor, pads_list):
@@ -1440,7 +1456,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 wx.MessageBox(f"Preview error: {traceback.format_exc()}", "Error")
             return None
 
-    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path):
+    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path, k_norm_info=None):
         out_dir = os.path.dirname(__file__)
         report_path = os.path.join(out_dir, "thermal_report.html")
 
@@ -1479,6 +1495,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         gap_rows = "\n".join(
             f"<tr><td>{_esc(layer_names[i])} → {_esc(layer_names[i + 1])}</td><td>{_esc(_fmt(g, ' mm'))}</td></tr>"
             for i, g in enumerate(gaps_used)
+        )
+        if k_norm_info is None:
+            k_norm_info = {}
+        k_norm_rows = "\n".join(
+            f"<tr><td>{_esc(str(k))}</td><td>{_esc(_fmt(v))}</td></tr>"
+            for k, v in k_norm_info.items()
         )
 
         html_body = f"""<!DOCTYPE html>
@@ -1520,6 +1542,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
   <table>
     <tr><th>Interface</th><th>Gap</th></tr>
     {gap_rows}
+  </table>
+
+  <h2>Debug</h2>
+  <table>
+    <tr><th>Key</th><th>Value</th></tr>
+    {k_norm_rows}
   </table>
 
   <h2>Simulation Settings</h2>
