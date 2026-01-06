@@ -66,7 +66,7 @@ Informational. Shows how many copper layers were detected and that the tool will
 ## Parameters
 
 ### Total Power (W) for N Pad(s)
-Total dissipated power assigned to the **currently selected pads**.
+Total dissipated power assigned to the **currently selected pads**. E.g. if 1W means 1W on each selcted pad.
 
 **Impact**
 - Temperature rise scales approximately linearly with power.
