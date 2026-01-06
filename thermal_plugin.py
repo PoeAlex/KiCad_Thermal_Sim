@@ -531,6 +531,42 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         dlg.Destroy()
         if not settings: return
 
+        # --- Stackup-driven thicknesses (prefer parsed stackup over defaults) ---
+        stack_copper = stack_info.get("copper", []) if isinstance(stack_info, dict) else []
+        stack_gaps = stack_info.get("dielectric_gaps_mm", []) if isinstance(stack_info, dict) else []
+        stack_board_thick = stack_info.get("board_thickness_mm") if isinstance(stack_info, dict) else None
+
+        copper_thickness_by_id = {}
+        copper_thickness_by_name = {}
+        for c in stack_copper:
+            th = c.get("thickness_mm")
+            if isinstance(th, (int, float)):
+                lid = c.get("layer_id")
+                name = c.get("name")
+                if isinstance(lid, int):
+                    copper_thickness_by_id[lid] = th
+                if isinstance(name, str):
+                    copper_thickness_by_name[name] = th
+
+        copper_thicknesses_mm = []
+        for lid in copper_ids:
+            th = copper_thickness_by_id.get(lid)
+            if th is None:
+                lname = board.GetLayerName(lid)
+                th = copper_thickness_by_name.get(lname)
+            if isinstance(th, (int, float)):
+                copper_thicknesses_mm.append(th)
+
+        avg_copper_thick_mm = (sum(copper_thicknesses_mm) / len(copper_thicknesses_mm)) if copper_thicknesses_mm else None
+        valid_gaps = [g for g in stack_gaps if isinstance(g, (int, float)) and g > 0]
+        avg_gap_mm = (sum(valid_gaps) / len(valid_gaps)) if valid_gaps else None
+
+        total_thick_mm = settings['thick']
+        if isinstance(stack_board_thick, (int, float)) and stack_board_thick > 0:
+            total_thick_mm = stack_board_thick
+        elif valid_gaps and copper_thicknesses_mm:
+            total_thick_mm = sum(valid_gaps) + sum(copper_thicknesses_mm)
+
         # --- 5. Grid Setup ---
         res = settings['res']
         if (w_mm/res)*(h_mm/res) > 200000: # Memory protection
@@ -573,8 +609,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         k_fr4_rel = 1.0
         k_cu_rel  = 400.0
         
-        total_thick = max(0.2, settings['thick'])
-        dielectric_thick = total_thick / max(1, (layer_count - 1))
+        total_thick = max(0.2, total_thick_mm)
+        dielectric_thick = avg_gap_mm if isinstance(avg_gap_mm, (int, float)) and avg_gap_mm > 0 else total_thick / max(1, (layer_count - 1))
         # Vertical conductance through dielectric vs via
         v_base = 0.3 / dielectric_thick   # FR4 vertical conductance
         v_via  = 390.0 / dielectric_thick  # Via copper conductance
@@ -589,8 +625,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         dx = res * 1e-3  # Grid spacing in meters
         
         # Physical layer thicknesses (convert to meters)
-        copper_thick = 35e-6  # 1oz copper = 35 microns
-        layer_spacing_m = (total_thick / max(1, layer_count - 1)) * 1e-3  # Convert mm to meters
+        copper_thick = (avg_copper_thick_mm * 1e-3) if isinstance(avg_copper_thick_mm, (int, float)) else 35e-6  # 1oz copper = 35 microns
+        layer_spacing_mm = avg_gap_mm if isinstance(avg_gap_mm, (int, float)) and avg_gap_mm > 0 else (total_thick / max(1, layer_count - 1))
+        layer_spacing_m = layer_spacing_mm * 1e-3  # Convert mm to meters
         
         # Thermal diffusivity - use copper value for stability
         alpha_eff = 1.1e-4  # Copper thermal diffusivity (m^2/s)
