@@ -534,9 +534,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # --- Stackup-driven thicknesses (prefer parsed stackup over defaults) ---
         stackup_derived = self._derive_stackup_thicknesses(board, copper_ids, stack_info, settings)
-        avg_copper_thick_mm = stackup_derived["avg_copper_thick_mm"]
-        avg_gap_mm = stackup_derived["avg_gap_mm"]
-        total_thick_mm = stackup_derived["total_thick_mm"]
+        total_thick_mm = stackup_derived["total_thick_mm_used"]
 
         # --- 5. Grid Setup ---
         res = settings['res']
@@ -579,16 +577,19 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # We use relative values for stability
         k_fr4_rel = 1.0
         k_cu_rel  = 400.0
-        
+        via_factor = 390.0 / 0.3
+        ref_cu_thick_m = 35e-6
+
         total_thick = max(0.2, total_thick_mm)
-        dielectric_thick = avg_gap_mm if isinstance(avg_gap_mm, (int, float)) and avg_gap_mm > 0 else total_thick / max(1, (layer_count - 1))
-        # Vertical conductance through dielectric vs via
-        v_base = 0.3 / dielectric_thick   # FR4 vertical conductance
-        v_via  = 390.0 / dielectric_thick  # Via copper conductance
+        cu_thick_mm_used = stackup_derived["copper_thickness_mm_used"]
+        gap_mm_used = stackup_derived["gap_mm_used"]
+        cu_thick_m = [max(1e-9, th * 1e-3) for th in cu_thick_mm_used]
+        gap_m = [max(1e-9, g * 1e-3) for g in gap_mm_used]
+        k_cu_layers = [k_cu_rel * (th / ref_cu_thick_m) for th in cu_thick_m]
         
         # Create geometry maps
         try:
-            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_rel, v_base, v_via, pads_list)
+            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_layers, via_factor, pads_list)
         except Exception as e:
             wx.MessageBox(f"Error mapping geometry: {e}", "Error"); return
 
@@ -596,8 +597,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         dx = res * 1e-3  # Grid spacing in meters
         
         # Physical layer thicknesses (convert to meters)
-        copper_thick = (avg_copper_thick_mm * 1e-3) if isinstance(avg_copper_thick_mm, (int, float)) else 35e-6  # 1oz copper = 35 microns
-        layer_spacing_mm = avg_gap_mm if isinstance(avg_gap_mm, (int, float)) and avg_gap_mm > 0 else (total_thick / max(1, layer_count - 1))
+        layer_spacing_mm = (total_thick / max(1, layer_count - 1))
         layer_spacing_m = layer_spacing_mm * 1e-3  # Convert mm to meters
         
         # Thermal diffusivity - use copper value for stability
@@ -621,18 +621,29 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         
         pixel_area = dx * dx
         # Copper contribution per layer
-        cu_vol = pixel_area * copper_thick
+        cu_vol = pixel_area * np.array(cu_thick_m)
         cu_heat_cap = cu_vol * rho_cu * cp_cu  # J/K per pixel of copper
-        
+
         # For multi-layer, add some FR4 contribution (FR4: rho=1850, cp=1100)
         # Use a thin effective FR4 layer to model partial thermal mass coupling
-        fr4_effective_thick = min(layer_spacing_m * 0.1, 0.0001)  # 10% of spacing, max 0.1mm
-        fr4_vol = pixel_area * fr4_effective_thick
+        fr4_effective_thick = []
+        if layer_count > 1 and gap_m:
+            for i in range(layer_count):
+                if i == 0:
+                    gap = gap_m[0]
+                elif i == layer_count - 1:
+                    gap = gap_m[-1]
+                else:
+                    gap = 0.5 * (gap_m[i - 1] + gap_m[i])
+                fr4_effective_thick.append(min(gap * 0.1, 0.0001))
+        else:
+            fr4_effective_thick = [min(layer_spacing_m * 0.1, 0.0001)] * layer_count
+        fr4_vol = pixel_area * np.array(fr4_effective_thick)
         fr4_heat_cap = fr4_vol * 1850 * 1100  # J/K
-        
-        # Total heat capacity per pixel
+
+        # Total heat capacity per pixel (per layer)
         pixel_heat_cap = cu_heat_cap + fr4_heat_cap
-        
+
         # Power scale: dT per timestep = P * dt / heat_capacity
         power_scale = dt / pixel_heat_cap
         
@@ -661,7 +672,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             
             pixels = self.get_pad_pixels(pad, rows, cols, x_min, y_min, res)
             if pixels:
-                val = (p_vals[idx] * power_scale) / len(pixels)
+                val = (p_vals[idx] * power_scale[target_idx]) / len(pixels)
                 for r, c in pixels: 
                     # Bounds Check
                     if r < rows and c < cols:
@@ -681,7 +692,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         pad_k = settings['pad_k']
         # Effective heat transfer through thermal pad
         h_sink = (pad_k / pad_thick_m) * 0.1  # Simplified sink model
-        cool_sink_factor = (h_sink * pixel_area / pixel_heat_cap) * dt
+        cool_sink_factor = (h_sink * pixel_area / pixel_heat_cap[-1]) * dt
 
         # Use larger batches for speed - reduce Python loop overhead
         batch_size = 200
@@ -706,18 +717,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         k_fr4_thermal = 0.3  # FR4 thermal conductivity W/(m·K)
         
         # Vertical coupling: heat transfer rate through FR4 between layers
-        if layer_count > 1 and layer_spacing_m > 0:
-            z_base = (k_fr4_thermal * pixel_area / layer_spacing_m) * dt / pixel_heat_cap
+        if layer_count > 1 and gap_m:
+            cap_pairs = 0.5 * (pixel_heat_cap[:-1] + pixel_heat_cap[1:])
+            z_base = (k_fr4_thermal * pixel_area / np.array(gap_m)) * dt / cap_pairs
         else:
-            z_base = 0.0
+            z_base = np.zeros((max(0, layer_count - 1),))
         
         # Via enhancement factor (vias increase vertical conductance)
-        # V_map has values: v_base for FR4, v_via for vias
+        # V_map has values: 1 for FR4, via_factor for vias
         # Normalize to get via locations: V_norm = 1 for FR4, higher for vias
-        V_norm = V_map / v_base  # Will be 1 for FR4, ~1300 for vias
         # Clamp via enhancement to prevent instability
-        V_enhance = np.clip(V_norm, 1.0, 50.0)  # Max 50x enhancement at vias
-        z_eff = z_base * V_enhance
+        V_enhance = np.clip(V_map, 1.0, 50.0)  # Max 50x enhancement at vias
+        z_eff = z_base[:, None, None] * V_enhance
 
         snap_int = max(1, int(num_batches / 10))
         snap_cnt = 1
@@ -744,7 +755,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # Buffer for vertical transfer
         if layer_count > 1:
-            z_eff_inner = z_eff[1:-1, 1:-1]
+            z_eff_inner = z_eff[:, 1:-1, 1:-1]
             H_map_inner = H_map[1:-1, 1:-1]
             dT_layer_buf = np.zeros((layer_count-1, rows-2, cols-2))
             v_chg_inner_buf = np.zeros_like(T_inner)
@@ -814,13 +825,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     
                     # Convective cooling (Boundary Conditions)
                     # Top Layer Inner
-                    T_inner[0] -= (T_inner[0] - amb) * cool_air
+                    T_inner[0] -= (T_inner[0] - amb) * cool_air[0]
                     
                     # Bottom layer
                     if layer_count > 1:
-                        T_inner[-1] -= (T_inner[-1] - amb) * ((1-H_map_inner)*cool_air + H_map_inner*cool_sink_factor)
+                        T_inner[-1] -= (T_inner[-1] - amb) * ((1-H_map_inner)*cool_air[-1] + H_map_inner*cool_sink_factor)
                     else:
-                        T_inner[0] -= (T_inner[0] - amb) * cool_air
+                        T_inner[0] -= (T_inner[0] - amb) * cool_air[0]
                     
                     # Smoothing
                     if step_counter % 50 == 0:
@@ -859,10 +870,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 heatmap_path=heatmap_path
             )
 
-    def create_multilayer_maps(self, board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu, v_base, v_via, pads_list):
+    def create_multilayer_maps(self, board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu_layers, via_factor, pads_list):
         num_layers = len(copper_ids)
         K = np.ones((num_layers, rows, cols)) * k_fr4
-        V = np.ones((rows, cols)) * v_base
+        V = np.ones((rows, cols))
         H = np.zeros((rows, cols))
 
         limit_area = settings.get('limit_area', False)
@@ -987,9 +998,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # Map layer IDs to indices for fast lookup
         lid_to_idx = {lid: i for i, lid in enumerate(copper_ids)}
         
-        def safe_fill(lid, bbox, val):
+        def safe_fill(lid, bbox):
             if lid in lid_to_idx:
-                fill_box(lid_to_idx[lid], bbox, val)
+                idx = lid_to_idx[lid]
+                fill_box(idx, bbox, k_cu_layers[idx])
 
         try:
             tracks = board.Tracks() if hasattr(board, 'Tracks') else board.GetTracks()
@@ -998,11 +1010,11 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 if settings.get('ignore_traces') and not is_via:
                     continue
                 lid = t.GetLayer()
-                safe_fill(lid, t.GetBoundingBox(), k_cu)
+                safe_fill(lid, t.GetBoundingBox())
                 
                 # Check if it is a via
                 if is_via:
-                    fill_via(t.GetBoundingBox(), v_via)
+                    fill_via(t.GetBoundingBox(), via_factor)
 
             footprints = board.Footprints() if hasattr(board, 'Footprints') else board.GetFootprints()
             for fp in footprints:
@@ -1010,11 +1022,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     bb = pad.GetBoundingBox()
                     if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
                         # PTH pads exist on all copper layers
-                        for i in range(num_layers): fill_box(i, bb, k_cu)
-                        fill_via(bb, v_via)
+                        for i in range(num_layers):
+                            fill_box(i, bb, k_cu_layers[i])
+                        fill_via(bb, via_factor)
                     else:
                         # SMD pads
-                        safe_fill(pad.GetLayer(), bb, k_cu)
+                        safe_fill(pad.GetLayer(), bb)
 
             zones = board.Zones() if hasattr(board, 'Zones') else board.GetZones()
             for z in zones:
@@ -1065,7 +1078,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
                 for lid in z_lids:
                     if lid in lid_to_idx:
-                        fill_zone(lid_to_idx[lid], lid, z, k_cu)
+                        idx = lid_to_idx[lid]
+                        fill_zone(idx, lid, z, k_cu_layers[idx])
                 
                 if settings['use_heatsink']:
                     z_ls = z.GetLayerSet()
@@ -1308,32 +1322,41 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 if isinstance(name, str):
                     copper_thickness_by_name[name] = th
 
-        copper_thicknesses_mm = []
+        copper_thickness_mm_used = []
         for lid in copper_ids:
             th = copper_thickness_by_id.get(lid)
             if th is None:
                 lname = board.GetLayerName(lid)
                 th = copper_thickness_by_name.get(lname)
-            if isinstance(th, (int, float)):
-                copper_thicknesses_mm.append(th)
+            if not isinstance(th, (int, float)) or th <= 0:
+                th = 0.035
+            copper_thickness_mm_used.append(th)
 
-        avg_copper_thick_mm = (sum(copper_thicknesses_mm) / len(copper_thicknesses_mm)) if copper_thicknesses_mm else None
-        valid_gaps = [g for g in stack_gaps if isinstance(g, (int, float)) and g > 0]
-        avg_gap_mm = (sum(valid_gaps) / len(valid_gaps)) if valid_gaps else None
-
-        total_thick_mm = settings['thick']
+        total_thick_mm_used = settings['thick']
         if isinstance(stack_board_thick, (int, float)) and stack_board_thick > 0:
-            total_thick_mm = stack_board_thick
-        elif valid_gaps and copper_thicknesses_mm:
-            total_thick_mm = sum(valid_gaps) + sum(copper_thicknesses_mm)
+            total_thick_mm_used = stack_board_thick
+
+        fallback_gap_mm = total_thick_mm_used / max(1, len(copper_ids) - 1)
+        gap_mm_used = []
+        use_uniform_gap = False
+        if len(stack_gaps) != max(0, len(copper_ids) - 1):
+            use_uniform_gap = True
+        else:
+            for g in stack_gaps:
+                if not isinstance(g, (int, float)) or g <= 0:
+                    use_uniform_gap = True
+                    break
+        if use_uniform_gap:
+            gap_mm_used = [fallback_gap_mm] * max(0, len(copper_ids) - 1)
+        else:
+            gap_mm_used = [float(g) for g in stack_gaps]
 
         return {
-            "avg_copper_thick_mm": avg_copper_thick_mm,
-            "avg_gap_mm": avg_gap_mm,
-            "total_thick_mm": total_thick_mm,
+            "total_thick_mm_used": total_thick_mm_used,
             "stack_board_thick_mm": stack_board_thick,
-            "copper_thicknesses_mm": copper_thicknesses_mm,
-            "dielectric_gaps_mm": valid_gaps,
+            "copper_thickness_mm_used": copper_thickness_mm_used,
+            "gap_mm_used": gap_mm_used,
+            "gap_fallback_used": use_uniform_gap,
         }
 
     def _save_preview_image(self, settings, layer_names, open_file=False, stack_info=None):
@@ -1361,18 +1384,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # Physics constants for mapping
         k_fr4_rel = 1.0
         k_cu_rel  = 400.0
+        via_factor = 390.0 / 0.3
+        ref_cu_thick_m = 35e-6
         layer_count = len(copper_ids)
         if stack_info is None:
             stack_info = parse_stackup_from_board_file(board)
         stackup_derived = self._derive_stackup_thicknesses(board, copper_ids, stack_info, settings)
-        total_thick = max(0.2, stackup_derived["total_thick_mm"])
-        avg_gap_mm = stackup_derived["avg_gap_mm"]
-        dielectric_thick = avg_gap_mm if isinstance(avg_gap_mm, (int, float)) and avg_gap_mm > 0 else total_thick / max(1, (layer_count - 1))
-        v_base = 0.3 / dielectric_thick
-        v_via  = 390.0 / dielectric_thick
+        total_thick = max(0.2, stackup_derived["total_thick_mm_used"])
+        cu_thick_m = [max(1e-9, th * 1e-3) for th in stackup_derived["copper_thickness_mm_used"]]
+        k_cu_layers = [k_cu_rel * (th / ref_cu_thick_m) for th in cu_thick_m]
 
         try:
-            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_rel, v_base, v_via, self.pads_list)
+            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_layers, via_factor, self.pads_list)
 
             output_file = os.path.join(os.path.dirname(__file__), "thermal_preview.png")
             count = len(K)
@@ -1392,7 +1415,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 ax.imshow(k_disp, cmap='Greens', origin='upper', interpolation='none')
 
                 # Overlay vias in red
-                v_mask = V_map > v_base
+                v_mask = V_map > 1.0
                 if np.any(v_mask):
                     ax.imshow(np.ma.masked_where(~v_mask, v_mask), cmap='Reds', origin='upper', alpha=0.8, interpolation='none')
 
@@ -1431,11 +1454,11 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         def _esc(text):
             return html.escape(text if text is not None else "")
 
-        stackup_text = format_stackup_report_um(stack_info) if stack_info else "Stackup unavailable"
-        copper_thick_mm = stackup_derived.get("avg_copper_thick_mm")
-        gap_mm = stackup_derived.get("avg_gap_mm")
-        total_thick_mm = stackup_derived.get("total_thick_mm")
+        total_thick_mm = stackup_derived.get("total_thick_mm_used")
         board_thick_mm = stackup_derived.get("stack_board_thick_mm")
+        copper_thicknesses = stackup_derived.get("copper_thickness_mm_used", [])
+        gaps_used = stackup_derived.get("gap_mm_used", [])
+        gap_fallback_used = stackup_derived.get("gap_fallback_used", False)
 
         preview_rel = os.path.basename(preview_path) if preview_path else ""
         heatmap_rel = os.path.basename(heatmap_path) if heatmap_path else ""
@@ -1449,6 +1472,14 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             for name, power in pad_power
         )
         layer_list = ", ".join(_esc(name) for name in layer_names)
+        copper_rows = "\n".join(
+            f"<tr><td>{_esc(layer_names[i])}</td><td>{_esc(_fmt(th, ' mm'))}</td></tr>"
+            for i, th in enumerate(copper_thicknesses)
+        )
+        gap_rows = "\n".join(
+            f"<tr><td>{_esc(layer_names[i])} → {_esc(layer_names[i + 1])}</td><td>{_esc(_fmt(g, ' mm'))}</td></tr>"
+            for i, g in enumerate(gaps_used)
+        )
 
         html_body = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1470,17 +1501,25 @@ class ThermalPlugin(pcbnew.ActionPlugin):
   <h1>KiCad Thermal Sim Report</h1>
   <p class="small">Generated by Thermal Sim plugin.</p>
 
-  <h2>Stackup (parsed)</h2>
-  <pre>{_esc(stackup_text)}</pre>
-
-  <h2>Derived Thicknesses</h2>
+  <h2>Thicknesses Used in Simulation</h2>
   <table>
     <tr><th>Metric</th><th>Value</th></tr>
     <tr><td>Board thickness (stackup)</td><td>{_esc(_fmt(board_thick_mm, " mm"))}</td></tr>
-    <tr><td>Derived total thickness</td><td>{_esc(_fmt(total_thick_mm, " mm"))}</td></tr>
-    <tr><td>Avg copper thickness</td><td>{_esc(_fmt(copper_thick_mm, " mm"))}</td></tr>
-    <tr><td>Avg dielectric gap</td><td>{_esc(_fmt(gap_mm, " mm"))}</td></tr>
+    <tr><td>Total thickness used</td><td>{_esc(_fmt(total_thick_mm, " mm"))}</td></tr>
+    <tr><td>Uniform gap fallback used</td><td>{_esc(str(bool(gap_fallback_used)))}</td></tr>
     <tr><td>Layer names</td><td>{layer_list}</td></tr>
+  </table>
+
+  <h2>Copper Thickness per Layer</h2>
+  <table>
+    <tr><th>Layer</th><th>Thickness</th></tr>
+    {copper_rows}
+  </table>
+
+  <h2>Dielectric Gap per Interface</h2>
+  <table>
+    <tr><th>Interface</th><th>Gap</th></tr>
+    {gap_rows}
   </table>
 
   <h2>Simulation Settings</h2>
