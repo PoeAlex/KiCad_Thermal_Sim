@@ -1415,29 +1415,73 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         try:
             K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_layers, via_factor, self.pads_list)
-
+            
             output_file = os.path.join(os.path.dirname(__file__), "thermal_preview.png")
             count = len(K)
             cols_grid = 2
             rows_grid = math.ceil(count / 2)
-
+            
             fig, axes = plt.subplots(rows_grid, cols_grid, figsize=(12, 4*rows_grid), squeeze=False)
             axes = axes.flatten()
 
+            # Build pad masks per layer
+            pad_masks = [np.zeros((rows, cols), dtype=bool) for _ in range(count)]
+            pad_labels = []
+            label_limit = 10
+            for pad in self.pads_list or []:
+                pad_lid = pad.GetLayer()
+                target_indices = []
+                if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
+                    target_indices = list(range(count))
+                elif pad_lid in copper_ids:
+                    target_indices = [copper_ids.index(pad_lid)]
+                else:
+                    lname = board.GetLayerName(pad_lid).upper()
+                    target_indices = [count - 1 if ("B." in lname or "BOT" in lname) else 0]
+
+                pixels = self.get_pad_pixels(pad, rows, cols, x_min, y_min, res)
+                if pixels:
+                    for idx in target_indices:
+                        for r, c in pixels:
+                            if r < rows and c < cols:
+                                pad_masks[idx][r, c] = True
+                    if len(pad_labels) < label_limit:
+                        try:
+                            pos = pad.GetPosition()
+                            cx = int((pos.x * 1e-6 - x_min) / res)
+                            cy = int((pos.y * 1e-6 - y_min) / res)
+                        except Exception:
+                            cx, cy = None, None
+                        if cx is not None and cy is not None:
+                            label = pad.GetNumber() if hasattr(pad, "GetNumber") else ""
+                            pad_labels.append((target_indices[0], cx, cy, label))
+            
             for i in range(count):
                 ax = axes[i]
                 name = layer_names[i] if i < len(layer_names) else f"Layer {i}"
                 ax.set_title(f"Preview: {name}")
+                
+                # Show copper as a mask overlay
+                copper_mask = K[i] > k_fr4_rel
+                ax.imshow(copper_mask, cmap='Greens', origin='upper', interpolation='none', alpha=0.35)
 
-                # Show copper in green
-                k_disp = (K[i] - 1.0) / (400.0 - 1.0)
-                ax.imshow(k_disp, cmap='Greens', origin='upper', interpolation='none')
-
+                # Heatsink overlay (board-level)
+                if settings.get('use_heatsink'):
+                    ax.imshow(np.ma.masked_where(H_map <= 0, H_map), cmap='Blues', origin='upper', interpolation='none', alpha=0.45)
+                
                 # Overlay vias in red
                 v_mask = V_map > 1.0
                 if np.any(v_mask):
-                    ax.imshow(np.ma.masked_where(~v_mask, v_mask), cmap='Reds', origin='upper', alpha=0.8, interpolation='none')
+                    ax.imshow(np.ma.masked_where(~v_mask, v_mask), cmap='Reds', origin='upper', alpha=0.5, interpolation='none')
 
+                # Overlay pads (heat sources)
+                pad_mask = pad_masks[i]
+                if np.any(pad_mask):
+                    ax.imshow(np.ma.masked_where(~pad_mask, pad_mask), cmap='autumn', origin='upper', alpha=0.9, interpolation='none')
+                    for layer_idx, cx, cy, label in pad_labels:
+                        if layer_idx == i:
+                            ax.text(cx, cy, str(label), color='black', fontsize=8, ha='center', va='center')
+                
                 ax.axis('off')
 
             for j in range(count, len(axes)):
