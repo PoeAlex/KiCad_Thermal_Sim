@@ -1692,9 +1692,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         )
         snapshot_items = []
         try:
-            for fname in os.listdir(out_dir):
-                if not (fname.startswith("snap_") and fname.lower().endswith(".png")):
-                    continue
+            import glob
+            for path in glob.glob(os.path.join(out_dir, "snap_*.png")):
+                fname = os.path.basename(path)
                 m = re.search(r"_t([0-9.]+)", fname)
                 t_val = float(m.group(1)) if m else None
                 snapshot_items.append((t_val, fname))
