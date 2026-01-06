@@ -6,6 +6,7 @@ import math
 import time
 import tempfile
 import re
+import html
 
 try:
     import numpy as np
@@ -532,40 +533,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         if not settings: return
 
         # --- Stackup-driven thicknesses (prefer parsed stackup over defaults) ---
-        stack_copper = stack_info.get("copper", []) if isinstance(stack_info, dict) else []
-        stack_gaps = stack_info.get("dielectric_gaps_mm", []) if isinstance(stack_info, dict) else []
-        stack_board_thick = stack_info.get("board_thickness_mm") if isinstance(stack_info, dict) else None
-
-        copper_thickness_by_id = {}
-        copper_thickness_by_name = {}
-        for c in stack_copper:
-            th = c.get("thickness_mm")
-            if isinstance(th, (int, float)):
-                lid = c.get("layer_id")
-                name = c.get("name")
-                if isinstance(lid, int):
-                    copper_thickness_by_id[lid] = th
-                if isinstance(name, str):
-                    copper_thickness_by_name[name] = th
-
-        copper_thicknesses_mm = []
-        for lid in copper_ids:
-            th = copper_thickness_by_id.get(lid)
-            if th is None:
-                lname = board.GetLayerName(lid)
-                th = copper_thickness_by_name.get(lname)
-            if isinstance(th, (int, float)):
-                copper_thicknesses_mm.append(th)
-
-        avg_copper_thick_mm = (sum(copper_thicknesses_mm) / len(copper_thicknesses_mm)) if copper_thicknesses_mm else None
-        valid_gaps = [g for g in stack_gaps if isinstance(g, (int, float)) and g > 0]
-        avg_gap_mm = (sum(valid_gaps) / len(valid_gaps)) if valid_gaps else None
-
-        total_thick_mm = settings['thick']
-        if isinstance(stack_board_thick, (int, float)) and stack_board_thick > 0:
-            total_thick_mm = stack_board_thick
-        elif valid_gaps and copper_thicknesses_mm:
-            total_thick_mm = sum(valid_gaps) + sum(copper_thicknesses_mm)
+        stackup_derived = self._derive_stackup_thicknesses(board, copper_ids, stack_info, settings)
+        avg_copper_thick_mm = stackup_derived["avg_copper_thick_mm"]
+        avg_gap_mm = stackup_derived["avg_gap_mm"]
+        total_thick_mm = stackup_derived["total_thick_mm"]
 
         # --- 5. Grid Setup ---
         res = settings['res']
@@ -669,6 +640,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             p_parts = [float(x.strip()) for x in settings['power_str'].split(',')]
             p_vals = [p_parts[0]]*len(pads_list) if len(p_parts)==1 else p_parts
         except: return
+        pad_power = []
+        for idx, pad_name in enumerate(pad_names):
+            power_val = p_vals[idx] if idx < len(p_vals) else None
+            pad_power.append((pad_name, power_val))
 
         for idx, pad in enumerate(pads_list):
             pad_lid = pad.GetLayer()
@@ -870,9 +845,19 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 pass
         if not aborted:
             if settings['show_all']:
-                self.show_results_all_layers(T, H_map, settings['amb'], layer_names)
+                heatmap_path = self.show_results_all_layers(T, H_map, settings['amb'], layer_names)
             else:
-                self.show_results_top_bot(T, H_map, settings['amb'])
+                heatmap_path = self.show_results_top_bot(T, H_map, settings['amb'])
+            preview_path = self._save_preview_image(settings, layer_names, open_file=False, stack_info=stack_info)
+            self._write_html_report(
+                settings=settings,
+                stack_info=stack_info,
+                stackup_derived=stackup_derived,
+                pad_power=pad_power,
+                layer_names=layer_names,
+                preview_path=preview_path,
+                heatmap_path=heatmap_path
+            )
 
     def create_multilayer_maps(self, board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu, v_base, v_via, pads_list):
         num_layers = len(copper_ids)
@@ -1208,7 +1193,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         plt.savefig(fname, dpi=150)
         plt.close()
 
-    def show_results_top_bot(self, T, H, amb):
+    def show_results_top_bot(self, T, H, amb, open_file=True):
         output_file = os.path.join(os.path.dirname(__file__), "thermal_final.png")
         vmax = np.max(T)
         if vmax > amb + 250: vmax = amb + 250
@@ -1225,88 +1210,20 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         plt.tight_layout()
         plt.savefig(output_file)
         plt.close()
-        if sys.platform == 'win32': os.startfile(output_file)
-        else: 
-            import subprocess
-            subprocess.call(['xdg-open', output_file])
+        if open_file:
+            if sys.platform == 'win32': os.startfile(output_file)
+            else:
+                import subprocess
+                subprocess.call(['xdg-open', output_file])
+        return output_file
 
     def generate_preview(self, settings, layer_names):
         """Generates a preview image of detected copper and vias"""
-        board = self.board
-        copper_ids = self.copper_ids
-        bbox = self.bbox
-        
-        if not board or not bbox:
+        output_file = self._save_preview_image(settings, layer_names, open_file=True)
+        if not output_file:
             wx.MessageBox("Board data missing for preview", "Error")
-            return
 
-
-        # Keep zone fills up-to-date (required for HitTestFilledArea-based zone mapping in KiCad 9)
-        try:
-            pcbnew.ZONE_FILLER(board).Fill(board.Zones())
-        except Exception:
-            pass
-
-        res = settings['res']
-        w_mm = bbox.GetWidth() * 1e-6
-        h_mm = bbox.GetHeight() * 1e-6
-        x_min = bbox.GetX() * 1e-6
-        y_min = bbox.GetY() * 1e-6
-        cols = int(w_mm / res) + 4
-        rows = int(h_mm / res) + 4
-        
-        # Physics constants for mapping
-        k_fr4_rel = 1.0
-        k_cu_rel  = 400.0
-        layer_count = len(copper_ids)
-        total_thick = max(0.2, settings['thick'])
-        dielectric_thick = total_thick / max(1, (layer_count - 1))
-        v_base = 0.3 / dielectric_thick
-        v_via  = 390.0 / dielectric_thick
-
-        try:
-            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_rel, v_base, v_via, self.pads_list)
-            
-            output_file = os.path.join(os.path.dirname(__file__), "thermal_preview.png")
-            count = len(K)
-            cols_grid = 2
-            rows_grid = math.ceil(count / 2)
-            
-            fig, axes = plt.subplots(rows_grid, cols_grid, figsize=(12, 4*rows_grid), squeeze=False)
-            axes = axes.flatten()
-            
-            for i in range(count):
-                ax = axes[i]
-                name = layer_names[i] if i < len(layer_names) else f"Layer {i}"
-                ax.set_title(f"Preview: {name}")
-                
-                # Show copper in green
-                k_disp = (K[i] - 1.0) / (400.0 - 1.0)
-                ax.imshow(k_disp, cmap='Greens', origin='upper', interpolation='none')
-                
-                # Overlay vias in red
-                v_mask = V_map > v_base
-                if np.any(v_mask):
-                    ax.imshow(np.ma.masked_where(~v_mask, v_mask), cmap='Reds', origin='upper', alpha=0.8, interpolation='none')
-                
-                ax.axis('off')
-
-            for j in range(count, len(axes)):
-                axes[j].axis('off')
-
-            plt.tight_layout()
-            plt.savefig(output_file, dpi=120)
-            plt.close()
-            
-            if sys.platform == 'win32': os.startfile(output_file)
-            else: 
-                import subprocess
-                subprocess.call(['xdg-open', output_file])
-                
-        except Exception as e:
-            wx.MessageBox(f"Preview error: {traceback.format_exc()}", "Error")
-
-    def show_results_all_layers(self, T, H, amb, layer_names):
+    def show_results_all_layers(self, T, H, amb, layer_names, open_file=True):
         output_file = os.path.join(os.path.dirname(__file__), "thermal_stackup.png")
         vmax = np.max(T)
         if vmax > amb + 250: vmax = amb + 250
@@ -1366,8 +1283,236 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         plt.savefig(output_file, dpi=150)
         plt.close()
         
-        if sys.platform == 'win32': 
-            os.startfile(output_file)
-        else: 
-            import subprocess
-            subprocess.call(['xdg-open', output_file])
+        if open_file:
+            if sys.platform == 'win32':
+                os.startfile(output_file)
+            else:
+                import subprocess
+                subprocess.call(['xdg-open', output_file])
+        return output_file
+
+    def _derive_stackup_thicknesses(self, board, copper_ids, stack_info, settings):
+        stack_copper = stack_info.get("copper", []) if isinstance(stack_info, dict) else []
+        stack_gaps = stack_info.get("dielectric_gaps_mm", []) if isinstance(stack_info, dict) else []
+        stack_board_thick = stack_info.get("board_thickness_mm") if isinstance(stack_info, dict) else None
+
+        copper_thickness_by_id = {}
+        copper_thickness_by_name = {}
+        for c in stack_copper:
+            th = c.get("thickness_mm")
+            if isinstance(th, (int, float)):
+                lid = c.get("layer_id")
+                name = c.get("name")
+                if isinstance(lid, int):
+                    copper_thickness_by_id[lid] = th
+                if isinstance(name, str):
+                    copper_thickness_by_name[name] = th
+
+        copper_thicknesses_mm = []
+        for lid in copper_ids:
+            th = copper_thickness_by_id.get(lid)
+            if th is None:
+                lname = board.GetLayerName(lid)
+                th = copper_thickness_by_name.get(lname)
+            if isinstance(th, (int, float)):
+                copper_thicknesses_mm.append(th)
+
+        avg_copper_thick_mm = (sum(copper_thicknesses_mm) / len(copper_thicknesses_mm)) if copper_thicknesses_mm else None
+        valid_gaps = [g for g in stack_gaps if isinstance(g, (int, float)) and g > 0]
+        avg_gap_mm = (sum(valid_gaps) / len(valid_gaps)) if valid_gaps else None
+
+        total_thick_mm = settings['thick']
+        if isinstance(stack_board_thick, (int, float)) and stack_board_thick > 0:
+            total_thick_mm = stack_board_thick
+        elif valid_gaps and copper_thicknesses_mm:
+            total_thick_mm = sum(valid_gaps) + sum(copper_thicknesses_mm)
+
+        return {
+            "avg_copper_thick_mm": avg_copper_thick_mm,
+            "avg_gap_mm": avg_gap_mm,
+            "total_thick_mm": total_thick_mm,
+            "stack_board_thick_mm": stack_board_thick,
+            "copper_thicknesses_mm": copper_thicknesses_mm,
+            "dielectric_gaps_mm": valid_gaps,
+        }
+
+    def _save_preview_image(self, settings, layer_names, open_file=False, stack_info=None):
+        board = self.board
+        copper_ids = self.copper_ids
+        bbox = self.bbox
+
+        if not board or not bbox:
+            return None
+
+        # Keep zone fills up-to-date (required for HitTestFilledArea-based zone mapping in KiCad 9)
+        try:
+            pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+        except Exception:
+            pass
+
+        res = settings['res']
+        w_mm = bbox.GetWidth() * 1e-6
+        h_mm = bbox.GetHeight() * 1e-6
+        x_min = bbox.GetX() * 1e-6
+        y_min = bbox.GetY() * 1e-6
+        cols = int(w_mm / res) + 4
+        rows = int(h_mm / res) + 4
+
+        # Physics constants for mapping
+        k_fr4_rel = 1.0
+        k_cu_rel  = 400.0
+        layer_count = len(copper_ids)
+        if stack_info is None:
+            stack_info = parse_stackup_from_board_file(board)
+        stackup_derived = self._derive_stackup_thicknesses(board, copper_ids, stack_info, settings)
+        total_thick = max(0.2, stackup_derived["total_thick_mm"])
+        avg_gap_mm = stackup_derived["avg_gap_mm"]
+        dielectric_thick = avg_gap_mm if isinstance(avg_gap_mm, (int, float)) and avg_gap_mm > 0 else total_thick / max(1, (layer_count - 1))
+        v_base = 0.3 / dielectric_thick
+        v_via  = 390.0 / dielectric_thick
+
+        try:
+            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_rel, v_base, v_via, self.pads_list)
+
+            output_file = os.path.join(os.path.dirname(__file__), "thermal_preview.png")
+            count = len(K)
+            cols_grid = 2
+            rows_grid = math.ceil(count / 2)
+
+            fig, axes = plt.subplots(rows_grid, cols_grid, figsize=(12, 4*rows_grid), squeeze=False)
+            axes = axes.flatten()
+
+            for i in range(count):
+                ax = axes[i]
+                name = layer_names[i] if i < len(layer_names) else f"Layer {i}"
+                ax.set_title(f"Preview: {name}")
+
+                # Show copper in green
+                k_disp = (K[i] - 1.0) / (400.0 - 1.0)
+                ax.imshow(k_disp, cmap='Greens', origin='upper', interpolation='none')
+
+                # Overlay vias in red
+                v_mask = V_map > v_base
+                if np.any(v_mask):
+                    ax.imshow(np.ma.masked_where(~v_mask, v_mask), cmap='Reds', origin='upper', alpha=0.8, interpolation='none')
+
+                ax.axis('off')
+
+            for j in range(count, len(axes)):
+                axes[j].axis('off')
+
+            plt.tight_layout()
+            plt.savefig(output_file, dpi=120)
+            plt.close()
+
+            if open_file:
+                if sys.platform == 'win32':
+                    os.startfile(output_file)
+                else:
+                    import subprocess
+                    subprocess.call(['xdg-open', output_file])
+            return output_file
+        except Exception:
+            if open_file:
+                wx.MessageBox(f"Preview error: {traceback.format_exc()}", "Error")
+            return None
+
+    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path):
+        out_dir = os.path.dirname(__file__)
+        report_path = os.path.join(out_dir, "thermal_report.html")
+
+        def _fmt(val, suffix=""):
+            if val is None:
+                return "n/a"
+            if isinstance(val, float):
+                return f"{val:.4f}{suffix}"
+            return f"{val}{suffix}"
+
+        def _esc(text):
+            return html.escape(text if text is not None else "")
+
+        stackup_text = format_stackup_report_um(stack_info) if stack_info else "Stackup unavailable"
+        copper_thick_mm = stackup_derived.get("avg_copper_thick_mm")
+        gap_mm = stackup_derived.get("avg_gap_mm")
+        total_thick_mm = stackup_derived.get("total_thick_mm")
+        board_thick_mm = stackup_derived.get("stack_board_thick_mm")
+
+        preview_rel = os.path.basename(preview_path) if preview_path else ""
+        heatmap_rel = os.path.basename(heatmap_path) if heatmap_path else ""
+
+        settings_rows = "\n".join(
+            f"<tr><td>{_esc(k)}</td><td>{_esc(str(v))}</td></tr>"
+            for k, v in settings.items()
+        )
+        pad_rows = "\n".join(
+            f"<tr><td>{_esc(name)}</td><td>{_esc(_fmt(power, ' W'))}</td></tr>"
+            for name, power in pad_power
+        )
+        layer_list = ", ".join(_esc(name) for name in layer_names)
+
+        html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>KiCad Thermal Sim Report</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 20px; }}
+    h1, h2 {{ margin-bottom: 6px; }}
+    table {{ border-collapse: collapse; width: 100%; margin-bottom: 16px; }}
+    th, td {{ border: 1px solid #ccc; padding: 6px 8px; text-align: left; }}
+    pre {{ background: #f7f7f7; padding: 10px; border: 1px solid #ddd; overflow-x: auto; }}
+    .images {{ display: flex; gap: 20px; flex-wrap: wrap; }}
+    .images img {{ max-width: 100%; height: auto; border: 1px solid #ccc; }}
+    .small {{ color: #666; font-size: 0.9em; }}
+  </style>
+</head>
+<body>
+  <h1>KiCad Thermal Sim Report</h1>
+  <p class="small">Generated by Thermal Sim plugin.</p>
+
+  <h2>Stackup (parsed)</h2>
+  <pre>{_esc(stackup_text)}</pre>
+
+  <h2>Derived Thicknesses</h2>
+  <table>
+    <tr><th>Metric</th><th>Value</th></tr>
+    <tr><td>Board thickness (stackup)</td><td>{_esc(_fmt(board_thick_mm, " mm"))}</td></tr>
+    <tr><td>Derived total thickness</td><td>{_esc(_fmt(total_thick_mm, " mm"))}</td></tr>
+    <tr><td>Avg copper thickness</td><td>{_esc(_fmt(copper_thick_mm, " mm"))}</td></tr>
+    <tr><td>Avg dielectric gap</td><td>{_esc(_fmt(gap_mm, " mm"))}</td></tr>
+    <tr><td>Layer names</td><td>{layer_list}</td></tr>
+  </table>
+
+  <h2>Simulation Settings</h2>
+  <table>
+    <tr><th>Setting</th><th>Value</th></tr>
+    {settings_rows}
+  </table>
+
+  <h2>Power per Pad</h2>
+  <table>
+    <tr><th>Pad</th><th>Power</th></tr>
+    {pad_rows}
+  </table>
+
+  <h2>Images</h2>
+  <div class="images">
+    <div>
+      <h3>Preview</h3>
+      {"<img src='" + _esc(preview_rel) + "' alt='Preview image'>" if preview_rel else "<p class='small'>Preview image not available.</p>"}
+    </div>
+    <div>
+      <h3>Heatmap</h3>
+      {"<img src='" + _esc(heatmap_rel) + "' alt='Heatmap image'>" if heatmap_rel else "<p class='small'>Heatmap image not available.</p>"}
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+        try:
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(html_body)
+        except Exception:
+            return None
+        return report_path
