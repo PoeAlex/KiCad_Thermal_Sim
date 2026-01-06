@@ -49,7 +49,7 @@ Typical paths:
 5. (Optional) enable geometry filters and/or the thermal pad zone.
 6. Click **Preview** (sanity check), then **Run**.
 
-![Stackup view](docs/images/gui.png "GUI")
+#
 
 ---
 
