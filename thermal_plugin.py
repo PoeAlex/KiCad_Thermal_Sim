@@ -227,7 +227,7 @@ except ImportError:
 
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, selected_count, suggested_res, layer_names, preview_callback=None, stackup_details="", pad_names=None):
-        super().__init__(parent, title="Thermal Sim (Bulletproof)")
+        super().__init__(parent, title="Thermal Sim")
         
         self.layer_names = layer_names
         self.preview_callback = preview_callback
@@ -237,8 +237,6 @@ class SettingsDialog(wx.Dialog):
         # --- Info ---
         info_box = wx.StaticBoxSizer(wx.VERTICAL, self, "Stackup")
         l_str = f"{len(layer_names)} Layers found"
-        if len(layer_names) > 0:
-            l_str += f" ({layer_names[0]}..{layer_names[-1]})"
         lbl_layers = wx.StaticText(self, label=l_str)
         info_box.Add(lbl_layers, 0, wx.ALL, 5)
 
@@ -271,7 +269,7 @@ class SettingsDialog(wx.Dialog):
         # --- Setup ---
         box_main = wx.StaticBoxSizer(wx.VERTICAL, self, "Parameters")
         
-        lbl_pwr = wx.StaticText(self, label=f"Total Power (W) for {selected_count} Pad(s):")
+        lbl_pwr = wx.StaticText(self, label="Pad Power (W): one value for all, or comma-separated per pad")
         box_main.Add(lbl_pwr, 0, wx.ALL, 5)
         self.power_input = wx.TextCtrl(self, value="1.0")
         box_main.Add(self.power_input, 0, wx.EXPAND|wx.ALL, 5)
@@ -392,7 +390,7 @@ class SettingsDialog(wx.Dialog):
 
 class ThermalPlugin(pcbnew.ActionPlugin):
     def defaults(self):
-        self.name = "2.5D Thermal Sim (Bulletproof)"
+        self.name = "2.5D Thermal Sim"
         self.category = "Simulation"
         self.description = "Crash-safe Multilayer Sim"
         self.show_toolbar_button = True
@@ -409,7 +407,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             self.RunSafe()
         except Exception:
             # Show every error so we know what's happening
-            wx.MessageBox(traceback.format_exc(), "Thermal Sim CRASH")
+            wx.MessageBox(traceback.format_exc(), "Thermal Sim Error")
 
     def RunSafe(self):
         if not HAS_LIBS:
@@ -1467,7 +1465,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
                 # Heatsink overlay (board-level)
                 if settings.get('use_heatsink'):
-                    ax.imshow(np.ma.masked_where(H_map <= 0, H_map), cmap='Blues', origin='upper', interpolation='none', alpha=0.45)
+                    is_bottom = (i == count - 1) or (name == "B.Cu")
+                    if is_bottom:
+                        ax.imshow(np.ma.masked_where(H_map <= 0, H_map), cmap='Blues', origin='upper', interpolation='none', alpha=0.45)
                 
                 # Overlay vias in red
                 v_mask = V_map > 1.0
@@ -1477,7 +1477,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 # Overlay pads (heat sources)
                 pad_mask = pad_masks[i]
                 if np.any(pad_mask):
-                    ax.imshow(np.ma.masked_where(~pad_mask, pad_mask), cmap='autumn', origin='upper', alpha=0.9, interpolation='none')
+                    ax.imshow(np.ma.masked_where(~pad_mask, pad_mask), cmap='autumn', origin='upper', alpha=0.6, interpolation='none')
                     for layer_idx, cx, cy, label in pad_labels:
                         if layer_idx == i:
                             ax.text(cx, cy, str(label), color='black', fontsize=8, ha='center', va='center')
