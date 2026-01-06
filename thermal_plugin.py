@@ -289,6 +289,10 @@ class SettingsDialog(wx.Dialog):
         self.chk_snapshots = wx.CheckBox(self, label="Save Snapshots")
         self.chk_snapshots.SetValue(False)
         box_out.Add(self.chk_snapshots, 0, wx.ALL, 5)
+
+        self.snap_count_input = self.add_field(box_out, "Snapshots count:", "5")
+        self.snap_count_input.Enable(False)
+        self.chk_snapshots.Bind(wx.EVT_CHECKBOX, self.on_snapshots_toggle)
         
         sizer.Add(box_out, 0, wx.EXPAND|wx.ALL, 5)
 
@@ -373,6 +377,7 @@ class SettingsDialog(wx.Dialog):
                 'res': float(self.res_input.GetValue()),
                 'show_all': self.chk_all_layers.GetValue(),
                 'snapshots': self.chk_snapshots.GetValue(),
+                'snap_count': int(self.snap_count_input.GetValue()),
                 'ignore_traces': self.chk_ignore_traces.GetValue(),
                 # 'ignore_polygons': self.chk_ignore_polygons.GetValue(), # Disabled by request
                 'ignore_polygons': False,
@@ -387,6 +392,9 @@ class SettingsDialog(wx.Dialog):
 
     def on_limit_area_toggle(self, event):
         self.pad_dist_input.Enable(self.chk_limit_area.GetValue())
+
+    def on_snapshots_toggle(self, event):
+        self.snap_count_input.Enable(self.chk_snapshots.GetValue())
 
 class ThermalPlugin(pcbnew.ActionPlugin):
     def defaults(self):
@@ -746,10 +754,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         V_enhance = np.clip(V_map, 1.0, 50.0)  # Max 50x enhancement at vias
         z_eff = z_base * V_enhance
 
-        snap_int = max(1, int(num_batches / 10))
         snap_cnt = 1
         step_counter = 0
         amb = settings['amb']
+        snap_steps = set()
+        if settings.get('snapshots'):
+            try:
+                snap_count = int(settings.get('snap_count', 5))
+            except Exception:
+                snap_count = 5
+            snap_count = max(1, min(50, snap_count))
+            snap_steps = {int(k * (steps / (snap_count + 1))) for k in range(1, snap_count + 1)}
         
         # Pre-compute smoothing kernel weights
         smooth_weight = 0.1
@@ -858,8 +873,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         sL /= (1 + 4*smooth_weight)
                         T_inner[:] = sL
                 
-                if settings['snapshots'] and (b % snap_int == 0):
-                    self.save_snapshot(T, H_map, settings['amb'], layer_names, snap_cnt)
+                if settings['snapshots'] and step_counter in snap_steps:
+                    t_elapsed = step_counter * dt
+                    self.save_snapshot(T, H_map, settings['amb'], layer_names, snap_cnt, t_elapsed)
                     snap_cnt += 1
         finally:
             if pd:
@@ -872,9 +888,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 pass
         if not aborted:
             if settings['show_all']:
-                heatmap_path = self.show_results_all_layers(T, H_map, settings['amb'], layer_names)
+                heatmap_path = self.show_results_all_layers(T, H_map, settings['amb'], layer_names, t_elapsed=sim_time)
             else:
-                heatmap_path = self.show_results_top_bot(T, H_map, settings['amb'])
+                heatmap_path = self.show_results_top_bot(T, H_map, settings['amb'], t_elapsed=sim_time)
             preview_path = self._save_preview_image(settings, layer_names, open_file=False, stack_info=stack_info)
             self._write_html_report(
                 settings=settings,
@@ -1154,15 +1170,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             for c in range(cs, ce): pixels.append((r, c))
         return pixels
 
-    def save_snapshot(self, T, H, amb, layer_names, idx):
+    def save_snapshot(self, T, H, amb, layer_names, idx, t_elapsed):
         try:
             out_dir = os.path.dirname(__file__)
-            fname = os.path.join(out_dir, f"snap_{idx:02d}.png")
-            self._save_stackup_plot(T, H, amb, layer_names, fname)
+            fname = os.path.join(out_dir, f"snap_{idx:02d}_t{t_elapsed:.1f}.png")
+            self._save_stackup_plot(T, H, amb, layer_names, fname, t_elapsed=t_elapsed)
         except:
             tmp = tempfile.gettempdir()
-            fname = os.path.join(tmp, f"thermal_snap_{idx:02d}.png")
-            self._save_stackup_plot(T, H, amb, layer_names, fname)
+            fname = os.path.join(tmp, f"thermal_snap_{idx:02d}_t{t_elapsed:.1f}.png")
+            self._save_stackup_plot(T, H, amb, layer_names, fname, t_elapsed=t_elapsed)
 
     def _save_plot(self, T, amb, fname):
         vmax = np.max(T)
@@ -1177,7 +1193,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         plt.savefig(fname, bbox_inches='tight')
         plt.close()
 
-    def _save_stackup_plot(self, T, H, amb, layer_names, fname):
+    def _save_stackup_plot(self, T, H, amb, layer_names, fname, t_elapsed=None):
         vmax = np.max(T)
         if vmax > amb + 250: vmax = amb + 250
 
@@ -1210,7 +1226,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             ax = axes[i]
             name = labels[i]
             max_temp = np.max(T[i])
-            ax.set_title(f"{name} - Max: {max_temp:.1f}°C")
+            if t_elapsed is not None:
+                ax.set_title(f"{name} - t = {t_elapsed:.1f} s - Max: {max_temp:.1f}°C")
+            else:
+                ax.set_title(f"{name} - Max: {max_temp:.1f}°C")
             im = ax.imshow(T[i], cmap='inferno', origin='upper', vmin=amb, vmax=vmax, interpolation='bilinear')
             plt.colorbar(im, ax=ax)
             ax.axis('off')
@@ -1224,16 +1243,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         plt.savefig(fname, dpi=150)
         plt.close()
 
-    def show_results_top_bot(self, T, H, amb, open_file=True):
+    def show_results_top_bot(self, T, H, amb, open_file=True, t_elapsed=None):
         output_file = os.path.join(os.path.dirname(__file__), "thermal_final.png")
         vmax = np.max(T)
         if vmax > amb + 250: vmax = amb + 250
         
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-        ax1.set_title(f"TOP Layer (Max: {np.max(T[0]):.1f} °C)")
+        time_label = f"t = {t_elapsed:.1f} s - " if t_elapsed is not None else ""
+        ax1.set_title(f"TOP Layer ({time_label}Max: {np.max(T[0]):.1f} °C)")
         im1 = ax1.imshow(T[0], cmap='inferno', origin='upper', vmin=amb, vmax=vmax, interpolation='bilinear')
         plt.colorbar(im1, ax=ax1)
-        ax2.set_title(f"BOTTOM Layer (Max: {np.max(T[-1]):.1f} °C)")
+        ax2.set_title(f"BOTTOM Layer ({time_label}Max: {np.max(T[-1]):.1f} °C)")
         im2 = ax2.imshow(T[-1], cmap='inferno', origin='upper', vmin=amb, vmax=vmax, interpolation='bilinear')
         plt.colorbar(im2, ax=ax2)
         if np.max(H) > 0:
@@ -1254,7 +1274,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         if not output_file:
             wx.MessageBox("Board data missing for preview", "Error")
 
-    def show_results_all_layers(self, T, H, amb, layer_names, open_file=True):
+    def show_results_all_layers(self, T, H, amb, layer_names, open_file=True, t_elapsed=None):
         output_file = os.path.join(os.path.dirname(__file__), "thermal_stackup.png")
         vmax = np.max(T)
         if vmax > amb + 250: vmax = amb + 250
@@ -1297,7 +1317,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             ax = axes[i]
             name = labels[i]
             max_temp = np.max(T[i])
-            ax.set_title(f"{name} - Max: {max_temp:.1f}°C")
+            time_label = f"t = {t_elapsed:.1f} s - " if t_elapsed is not None else ""
+            ax.set_title(f"{name} - {time_label}Max: {max_temp:.1f}°C")
             im = ax.imshow(T[i], cmap='inferno', origin='upper', vmin=amb, vmax=vmax, interpolation='bilinear')
             plt.colorbar(im, ax=ax)
             ax.axis('off')
@@ -1543,6 +1564,21 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             f"<tr><td>{_esc(layer_names[i])} → {_esc(layer_names[i + 1])}</td><td>{_esc(_fmt(g, ' mm'))}</td></tr>"
             for i, g in enumerate(gaps_used)
         )
+        snapshot_items = []
+        try:
+            for fname in os.listdir(out_dir):
+                if not (fname.startswith("snap_") and fname.lower().endswith(".png")):
+                    continue
+                m = re.search(r"_t([0-9.]+)", fname)
+                t_val = float(m.group(1)) if m else None
+                snapshot_items.append((t_val, fname))
+        except Exception:
+            snapshot_items = []
+        snapshot_items.sort(key=lambda x: (x[0] if x[0] is not None else 1e9, x[1]))
+        snapshots_html = ""
+        for t_val, fname in snapshot_items:
+            label = f"t = {t_val:.1f} s" if t_val is not None else fname
+            snapshots_html += f"<div><p class='small'>{_esc(label)}</p><img src='{_esc(fname)}' alt='{_esc(label)}'></div>"
         if k_norm_info is None:
             k_norm_info = {}
         k_norm_rows = "\n".join(
@@ -1619,6 +1655,11 @@ class ThermalPlugin(pcbnew.ActionPlugin):
       <h3>Heatmap</h3>
       {"<img src='" + _esc(heatmap_rel) + "' alt='Heatmap image'>" if heatmap_rel else "<p class='small'>Heatmap image not available.</p>"}
     </div>
+  </div>
+
+  <h2>Snapshots</h2>
+  <div class="images">
+    {snapshots_html if snapshots_html else "<p class='small'>No snapshots captured.</p>"}
   </div>
 </body>
 </html>
