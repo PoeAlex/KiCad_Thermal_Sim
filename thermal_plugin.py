@@ -14,6 +14,8 @@ try:
     import matplotlib
     matplotlib.use('Agg')  # Use non-interactive backend for file output
     import matplotlib.pyplot as plt
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
     import wx
     HAS_LIBS = True
 except ImportError:
@@ -486,7 +488,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
     def RunSafe(self):
         if not HAS_LIBS:
-            wx.MessageBox("Please install numpy & matplotlib!", "Error"); return
+            wx.MessageBox("Please install numpy, matplotlib, and scipy!", "Error"); return
 
         board = pcbnew.GetBoard()
 
@@ -705,6 +707,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # --- 8. Power Injection ---
         P_map = np.zeros((layer_count, rows, cols))
+        P_watts_map = np.zeros((layer_count, rows, cols))
         
         # Calculate thermal mass per pixel
         # Copper dominates transient thermal behavior
@@ -773,6 +776,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     # Bounds Check
                     if r < rows and c < cols:
                         P_map[target_idx, r, c] += val * power_scale_layer[r, c]
+                        P_watts_map[target_idx, r, c] += val
 
         # --- 9. SOLVER ---
         T = np.ones((layer_count, rows, cols)) * settings['amb']
@@ -781,64 +785,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # h * A * (T - Tamb) = heat loss, h ~ 10 W/m^2.K for natural convection
         h_conv = 10.0  # W/m^2.K
         pixel_area = dx * dx
-        cool_air = (h_conv * pixel_area / pixel_heat_cap) * dt
-        
         # Thermal pad/heatsink cooling
         pad_thick_m = max(0.0001, settings['pad_th'] * 1e-3)
         pad_k = settings['pad_k']
         # Effective heat transfer through thermal pad
         h_sink = (pad_k / pad_thick_m) * 0.1  # Simplified sink model
-        cool_sink_factor = (h_sink * pixel_area / pixel_heat_cap[-1]) * dt
-
-        # Use larger batches for speed - reduce Python loop overhead
-        batch_size = 200
-        num_batches = max(1, int(steps / batch_size))
-        actual_steps = num_batches * batch_size
         
         pd = wx.ProgressDialog("Simulating...", "Initializing...", 100, style=wx.PD_CAN_ABORT|wx.PD_APP_MODAL|wx.PD_REMAINING_TIME)
         start_time = time.time()
         aborted = False
-        roll = np.roll
-        
-        # Diffusion coefficient - scaled for stability (Max 0.25)
-        # We aligned dt_limit with 0.15, so we match it here
-        max_k = np.max(K)
-        min_k = np.min(K)
-        target_max = 0.22
-        diff_factor = target_max / max(max_k, 1.0)
-        K_safe = K * diff_factor
-        max_k_safe = np.max(K_safe)
-        min_k_safe = np.min(K_safe)
-        k_norm_info = {
-            "strategy": "scale_by_maxK",
-            "target_max": target_max,
-            "k_min": min_k,
-            "k_max": max_k,
-            "diff_factor": diff_factor,
-            "k_safe_min": min_k_safe,
-            "k_safe_max": max_k_safe,
-            "copper_masked_heat_cap": True,
-        }
-        
-        # Vertical heat transfer coefficient
-        # Q = k_fr4 * A * dT / d, where d = layer spacing
-        # dT/dt = Q / (m * cp) = k_fr4 * A * dT / (d * m * cp)
-        # For pixel: coefficient = k_fr4 * pixel_area / (layer_spacing * pixel_heat_cap) * dt
-        k_fr4_thermal = 0.3  # FR4 thermal conductivity W/(m·K)
-        
-        # Vertical coupling: heat transfer rate through FR4 between layers
-        if layer_count > 1 and gap_m:
-            cap_pairs = 0.5 * (pixel_heat_cap[:-1] + pixel_heat_cap[1:])
-            z_base = (k_fr4_thermal * pixel_area / np.array(gap_m)[:, None, None]) * dt / cap_pairs
-        else:
-            z_base = np.zeros((max(0, layer_count - 1), rows, cols))
-        
-        # Via enhancement factor (vias increase vertical conductance)
-        # V_map has values: 1 for FR4, via_factor for vias
-        # Normalize to get via locations: V_norm = 1 for FR4, higher for vias
-        # Clamp via enhancement to prevent instability
-        V_enhance = np.clip(V_map, 1.0, 50.0)  # Max 50x enhancement at vias
-        z_eff = z_base * V_enhance
 
         snap_cnt = 1
         step_counter = 0
@@ -855,133 +810,105 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snap_steps = sorted({s for s in snap_steps if 0 < s < steps})
         print(f"[ThermalSim] snapshots={settings.get('snapshots')} snap_count={settings.get('snap_count')} dt={dt:.6f} steps={steps} snap_steps={snap_steps}")
         print(f"[ThermalSim] base_output_dir={base_output_dir} run_dir={run_dir}")
-        
-        # Pre-compute smoothing kernel weights
-        smooth_weight = 0.1
-        
-        v_chg = np.zeros_like(T)
-        
-        # --- OPTIMIZATION: Slicing Views & Buffers ---
-        # Pre-allocate slice views to avoid constructing them inside the loop
-        # Inner domain (excluding 1 pixel border)
-        T_inner = T[:, 1:-1, 1:-1]
-        K_inner = K_safe[:, 1:-1, 1:-1]
-        P_inner = P_map[:, 1:-1, 1:-1]
-        
-        # Neighbor slices
-        T_up    = T[:, :-2, 1:-1]
-        T_down  = T[:, 2:, 1:-1]
-        T_left  = T[:, 1:-1, :-2]
-        T_right = T[:, 1:-1, 2:]
 
-        # Buffer for vertical transfer
-        if layer_count > 1:
-            z_eff_inner = z_eff[:, 1:-1, 1:-1]
-            H_map_inner = H_map[1:-1, 1:-1]
-            dT_layer_buf = np.zeros((layer_count-1, rows-2, cols-2))
-            v_chg_inner_buf = np.zeros_like(T_inner)
-        else:
-            # For single layer, these are not strictly used but defined to be safe
-            H_map_inner = H_map[1:-1, 1:-1]
-            z_eff_inner = None
-            dT_layer_buf = None
-            v_chg_inner_buf = None
-
-
+        solver_info = {
+            "method": "implicit_time_step",
+            "pardiso_used": False,
+            "status": "initializing",
+        }
+        try:
+            pd.Update(5, "Building sparse system...")
+            build = self._build_implicit_sparse_system(
+                V_map=V_map,
+                H_map=H_map,
+                P_watts_map=P_watts_map,
+                copper_mask=copper_mask,
+                cu_thick_m=cu_thick_m,
+                fr4_effective_thick=fr4_effective_thick,
+                dx=dx,
+                gap_m=gap_m,
+                amb=amb,
+                h_conv=h_conv,
+                h_sink=h_sink,
+                layer_count=layer_count,
+                rows=rows,
+                cols=cols,
+                pixel_heat_cap=pixel_heat_cap,
+                dt=dt
+            )
+            if build is None:
+                solver_info["status"] = "failed_build"
+                aborted = True
+            else:
+                A, b_const, cdt_vec, solver_info = build
+            if not aborted:
+                pd.Update(15, "Preparing solver...")
+                solver_fn = None
+                try:
+                    from pypardiso import spsolve as pardiso_spsolve
+                    solver_info["method"] = "implicit_time_step_pardiso"
+                    solver_info["pardiso_used"] = True
+                    solver_fn = lambda rhs: pardiso_spsolve(A, rhs)
+                except Exception:
+                    solver_info["method"] = "implicit_time_step_superlu"
+                    solver_info["pardiso_used"] = False
+                    solver_fn = spla.factorized(A)
+                solver_info["status"] = "ok"
+            pd.Update(20, "Running implicit steps...")
+        finally:
+            pass
 
         try:
-            for b in range(num_batches):
-                percent = int((b / num_batches) * 100)
-                elapsed = time.time() - start_time
-                msg = f"Step {b*batch_size}/{steps}"
-                
-                # Check for cancel
-                keep_going = True
-                try:
-                    keep_going = pd.Update(percent, msg)
-                except:
-                    # Handle cases where dialog might be dead
-                    keep_going = False
-                    
-                if not keep_going: 
-                    aborted = True
-                    break
-                
-                for _ in range(batch_size):
-                    if step_counter >= steps:
-                        break
-                    step_counter += 1
-                    
-                    # Lateral Heat Diffusion (2D Laplacian) on inner pixels
-                    # L = Neighbors - 4*Center
-                    L = (T_up + T_down + T_left + T_right)
-                    L -= 4 * T_inner
-                    
-                    # Vertical Heat Transfer
-                    if layer_count > 1:
-                        v_chg_inner_buf.fill(0.0)
-                        
-                        # Gradient T[i+1] - T[i] using buffer
-                        np.subtract(T_inner[1:], T_inner[:-1], out=dT_layer_buf)
-                        
-                        # Flux
-                        dT_layer_buf *= z_eff_inner
-                        np.clip(dT_layer_buf, -50, 50, out=dT_layer_buf)
-                        
-                        # Apply flux
-                        v_chg_inner_buf[:-1] += dT_layer_buf
-                        v_chg_inner_buf[1:]  -= dT_layer_buf
-                        
-                        # T += L*K + v + P
-                        L *= K_inner
-                        L += v_chg_inner_buf
-                        L += P_inner
-                        T_inner += L
-                    else:
-                        # Single layer
-                        L *= K_inner
-                        L += P_inner
-                        T_inner += L
-                    
-                    # Clamp temperature
-                    np.clip(T_inner, amb, amb + 500, out=T_inner)
-                    
-                    # Convective cooling (Boundary Conditions)
-                    # Top Layer Inner
-                    T_inner[0] -= (T_inner[0] - amb) * cool_air[0, 1:-1, 1:-1]
-                    
-                    # Bottom layer
-                    if layer_count > 1:
-                        T_inner[-1] -= (T_inner[-1] - amb) * ((1-H_map_inner)*cool_air[-1, 1:-1, 1:-1] + H_map_inner*cool_sink_factor[1:-1, 1:-1])
-                    else:
-                        T_inner[0] -= (T_inner[0] - amb) * cool_air[0, 1:-1, 1:-1]
-                    
-                    # Smoothing
-                    if step_counter % 50 == 0:
-                        # Smoothing using slicing
-                        sL = (T_up + T_down + T_left + T_right)
-                        sL *= smooth_weight
-                        sL += T_inner
-                        sL /= (1 + 4*smooth_weight)
-                        T_inner[:] = sL
+            if not aborted:
+                n_inner = (rows - 2) * (cols - 2)
+                total_nodes = layer_count * n_inner
+                update_stride = max(1, int(steps / 50))
+                rhs = np.zeros(total_nodes)
+                while step_counter < steps and not aborted:
+                    if step_counter % update_stride == 0:
+                        percent = int(20 + (step_counter / max(1, steps)) * 80)
+                        msg = f"Step {step_counter}/{steps}"
+                        try:
+                            keep_going = pd.Update(percent, msg)
+                        except Exception:
+                            keep_going = False
+                        if not keep_going:
+                            aborted = True
+                            break
 
+                    T_vec = T[:, 1:-1, 1:-1].reshape(total_nodes)
+                    np.multiply(cdt_vec, T_vec, out=rhs)
+                    rhs += b_const
+                    try:
+                        T_new = solver_fn(rhs)
+                    except Exception as exc:
+                        solver_info["status"] = f"failed: {exc}"
+                        aborted = True
+                        break
+
+                    T[:, 1:-1, 1:-1] = T_new.reshape(layer_count, rows - 2, cols - 2)
+                    np.clip(T, amb, amb + 500, out=T)
+                    T[:, 0, :] = amb
+                    T[:, -1, :] = amb
+                    T[:, :, 0] = amb
+                    T[:, :, -1] = amb
+
+                    step_counter += 1
                     if settings['snapshots']:
                         while next_snap_idx < len(snap_steps) and step_counter >= snap_steps[next_snap_idx]:
                             t_elapsed = step_counter * dt
                             self.save_snapshot(T, H_map, settings['amb'], layer_names, snap_cnt, t_elapsed, out_dir=run_dir)
                             snap_cnt += 1
                             next_snap_idx += 1
-                if step_counter >= steps:
-                    break
         finally:
             if pd:
                 pd.Hide()
                 pd.Destroy()
-            # Force event processing to ensure modal state is cleared
             try:
                 wx.GetApp().Yield()
-            except:
+            except Exception:
                 pass
+
         if not aborted:
             if settings['show_all']:
                 heatmap_path = self.show_results_all_layers(T, H_map, settings['amb'], layer_names, t_elapsed=sim_time, out_dir=run_dir)
@@ -1005,9 +932,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 layer_names=layer_names,
                 preview_path=preview_path,
                 heatmap_path=heatmap_path,
-                k_norm_info=k_norm_info,
+                k_norm_info=None,
                 out_dir=run_dir,
-                snapshot_debug=snapshot_debug
+                snapshot_debug=snapshot_debug,
+                solver_info=solver_info
             )
             snapshot_count = 0
             try:
@@ -1650,7 +1578,100 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 wx.MessageBox(f"Preview error: {traceback.format_exc()}", "Error")
             return None
 
-    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path, k_norm_info=None, out_dir=None, snapshot_debug=None):
+    def _build_implicit_sparse_system(self, V_map, H_map, P_watts_map, copper_mask, cu_thick_m, fr4_effective_thick, dx, gap_m, amb, h_conv, h_sink, layer_count, rows, cols, pixel_heat_cap, dt):
+        nr = rows - 2
+        nc = cols - 2
+        if nr <= 0 or nc <= 0:
+            return None
+
+        k_cu_thermal = 390.0
+        k_fr4_thermal = 0.3
+        thickness_map = np.where(copper_mask, np.array(cu_thick_m)[:, None, None], np.array(fr4_effective_thick)[:, None, None])
+        k_map = np.where(copper_mask, k_cu_thermal, k_fr4_thermal)
+        diff_coeff_area = (k_map * thickness_map) / (dx * dx)
+
+        pixel_area = dx * dx
+        P_area = P_watts_map / pixel_area
+        C_area = pixel_heat_cap / pixel_area
+        Cdt = C_area / dt
+
+        h_map = np.zeros_like(copper_mask, dtype=float)
+        h_map[0] = h_conv
+        if layer_count > 1:
+            h_map[-1] = (1 - H_map) * h_conv + H_map * h_sink
+
+        g_area = None
+        if layer_count > 1 and gap_m:
+            V_enhance = np.clip(V_map, 1.0, 50.0)
+            g_area = (k_fr4_thermal / np.array(gap_m)[:, None, None]) * V_enhance
+
+        n_inner = nr * nc
+        total_nodes = layer_count * n_inner
+        rows_idx = []
+        cols_idx = []
+        data = []
+        b_const = np.zeros(total_nodes)
+        cdt_vec = np.zeros(total_nodes)
+
+        for layer in range(layer_count):
+            diff_layer = diff_coeff_area[layer, 1:-1, 1:-1]
+            h_layer = h_map[layer, 1:-1, 1:-1]
+            P_layer = P_area[layer, 1:-1, 1:-1]
+            Cdt_layer = Cdt[layer, 1:-1, 1:-1]
+            g_up = g_area[layer - 1, 1:-1, 1:-1] if g_area is not None and layer > 0 else None
+            g_down = g_area[layer, 1:-1, 1:-1] if g_area is not None and layer < layer_count - 1 else None
+            layer_offset = layer * n_inner
+
+            for r in range(nr):
+                row_offset = r * nc
+                for c in range(nc):
+                    idx = layer_offset + row_offset + c
+                    d = diff_layer[r, c]
+                    cdt_val = Cdt_layer[r, c]
+                    diag = cdt_val + 4.0 * d + h_layer[r, c]
+                    b_val = P_layer[r, c] + h_layer[r, c] * amb
+
+                    if r == 0:
+                        b_val += d * amb
+                    else:
+                        rows_idx.append(idx); cols_idx.append(idx - nc); data.append(-d)
+                    if r == nr - 1:
+                        b_val += d * amb
+                    else:
+                        rows_idx.append(idx); cols_idx.append(idx + nc); data.append(-d)
+                    if c == 0:
+                        b_val += d * amb
+                    else:
+                        rows_idx.append(idx); cols_idx.append(idx - 1); data.append(-d)
+                    if c == nc - 1:
+                        b_val += d * amb
+                    else:
+                        rows_idx.append(idx); cols_idx.append(idx + 1); data.append(-d)
+
+                    if g_up is not None:
+                        g = g_up[r, c]
+                        diag += g
+                        rows_idx.append(idx); cols_idx.append(idx - n_inner); data.append(-g)
+                    if g_down is not None:
+                        g = g_down[r, c]
+                        diag += g
+                        rows_idx.append(idx); cols_idx.append(idx + n_inner); data.append(-g)
+
+                    rows_idx.append(idx); cols_idx.append(idx); data.append(diag)
+                    b_const[idx] = b_val
+                    cdt_vec[idx] = cdt_val
+
+        A = sp.csr_matrix((data, (rows_idx, cols_idx)), shape=(total_nodes, total_nodes))
+        solver_info = {
+            "method": "implicit_time_step",
+            "matrix_size": total_nodes,
+            "nonzeros": int(A.nnz),
+            "pardiso_used": False,
+            "status": "ok",
+        }
+        return A, b_const, cdt_vec, solver_info
+
+    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path, k_norm_info=None, out_dir=None, snapshot_debug=None, solver_info=None):
         out_dir = out_dir or os.path.dirname(__file__)
         report_path = os.path.join(out_dir, "thermal_report.html")
 
@@ -1709,6 +1730,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             k_norm_info = {}
         if snapshot_debug is None:
             snapshot_debug = {}
+        if solver_info is None:
+            solver_info = {}
         k_norm_rows = "\n".join(
             f"<tr><td>{_esc(str(k))}</td><td>{_esc(_fmt(v))}</td></tr>"
             for k, v in k_norm_info.items()
@@ -1716,6 +1739,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         snapshot_debug_rows = "\n".join(
             f"<tr><td>{_esc(str(k))}</td><td>{_esc(_fmt(v))}</td></tr>"
             for k, v in snapshot_debug.items()
+        )
+        solver_rows = "\n".join(
+            f"<tr><td>{_esc(str(k))}</td><td>{_esc(_fmt(v))}</td></tr>"
+            for k, v in solver_info.items()
         )
 
         html_body = f"""<!DOCTYPE html>
@@ -1769,6 +1796,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
   <table>
     <tr><th>Key</th><th>Value</th></tr>
     {snapshot_debug_rows}
+  </table>
+
+  <h2>Solver Details</h2>
+  <table>
+    <tr><th>Key</th><th>Value</th></tr>
+    {solver_rows}
   </table>
 
   <h2>Simulation Settings</h2>
