@@ -855,6 +855,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snap_steps = sorted({s for s in snap_steps if 0 < s < steps})
         print(f"[ThermalSim] snapshots={settings.get('snapshots')} snap_count={settings.get('snap_count')} dt={dt:.6f} steps={steps} snap_steps={snap_steps}")
         print(f"[ThermalSim] base_output_dir={base_output_dir} run_dir={run_dir}")
+        print("[ThermalSim] boundary_mode=neumann_no_flux (edge replication, borders not pinned to ambient)")
         
         # Pre-compute smoothing kernel weights
         smooth_weight = 0.1
@@ -912,6 +913,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         break
                     step_counter += 1
                     
+                    # --- BOUNDARY CONDITION: Neumann (no-flux) ---
+                    # Replicate edges so dT/dn = 0 at borders (no artificial ambient sink).
+                    T[:, 0, 1:-1] = T[:, 1, 1:-1]
+                    T[:, -1, 1:-1] = T[:, -2, 1:-1]
+                    T[:, 1:-1, 0] = T[:, 1:-1, 1]
+                    T[:, 1:-1, -1] = T[:, 1:-1, -2]
+                    T[:, 0, 0] = T[:, 1, 1]
+                    T[:, 0, -1] = T[:, 1, -2]
+                    T[:, -1, 0] = T[:, -2, 1]
+                    T[:, -1, -1] = T[:, -2, -2]
+
                     # Lateral Heat Diffusion (2D Laplacian) on inner pixels
                     # L = Neighbors - 4*Center
                     L = (T_up + T_down + T_left + T_right)
