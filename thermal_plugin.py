@@ -678,6 +678,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         gap_m = [max(1e-9, g * 1e-3) for g in gap_mm_used]
         k_cu_layers = [k_cu] * len(cu_thick_m)
 
+        active_mask = None
+        if settings.get('limit_area') and settings.get('pad_dist_mm', 0.0) > 0:
+            active_mask = self.build_pad_distance_mask(pads_list, rows, cols, x_min, y_min, res, settings['pad_dist_mm'])
+        if active_mask is None:
+            active_mask = np.ones((rows, cols), dtype=bool)
+
         # Create geometry maps
         try:
             K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu_layers, via_factor, pads_list)
@@ -705,6 +711,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             power_val = p_vals[idx] if idx < len(p_vals) else None
             pad_power.append((pad_name, power_val))
 
+        pad_mask_stats = {"bbox_pixels": 0, "mask_pixels": 0, "fallback_pads": 0, "total_pads": 0}
         for idx, pad in enumerate(pads_list):
             pad_lid = pad.GetLayer()
             target_idx = 0 # Default: Top
@@ -719,12 +726,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 if "B." in lname or "BOT" in lname: target_idx = layer_count - 1
                 else: target_idx = 0
 
-            pixels = self.get_pad_pixels(pad, rows, cols, x_min, y_min, res)
+            pixels = self.get_pad_pixels(pad, rows, cols, x_min, y_min, res, stats=pad_mask_stats)
             if pixels:
                 val = p_vals[idx] / len(pixels)
                 for r, c in pixels:
                     # Bounds Check
-                    if r < rows and c < cols:
+                    if r < rows and c < cols and active_mask[r, c]:
                         P_map[target_idx, r, c] += val
 
         # --- 9. SOLVER (Implicit Backward-Euler, matrix-free) ---
@@ -735,11 +742,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         if dz_layers.size != layer_count:
             dz_layers = np.full(layer_count, max(1e-9, (total_thick * 1e-3) / max(1, layer_count)))
 
-        copper_mask = K > (k_fr4 * 1.5)
+        active_mask_3d = np.broadcast_to(active_mask, (layer_count, rows, cols))
+        copper_mask = (K > (k_fr4 * 1.5)) & active_mask_3d
         rho_map = np.where(copper_mask, rho_cu, rho_fr4)
         cp_map = np.where(copper_mask, cp_cu, cp_fr4)
         cell_volume = dz_layers[:, None, None] * area
         heat_cap = rho_map * cp_map * cell_volume
+        heat_cap *= active_mask_3d
         C_over_dt = heat_cap / max(dt, 1e-9)
 
         h_conv = 10.0  # W/m^2.K
@@ -749,6 +758,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             Hconv_map[-1] = h_conv * area
         else:
             Hconv_map[0] = h_conv * area
+        Hconv_map *= active_mask_3d
 
         pad_thick_m = max(0.0001, settings['pad_th'] * 1e-3)
         pad_k = settings['pad_k']
@@ -756,9 +766,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         Gp_map = np.zeros_like(K)
         if settings.get('use_heatsink') and layer_count >= 1:
             Gp_map[-1] = H_map * h_sink * area
+        Gp_map *= active_mask_3d
 
         Gx = 0.5 * (K[:, :, :-1] + K[:, :, 1:]) * (dy * dz_layers[:, None, None]) / max(dx, 1e-12)
         Gy = 0.5 * (K[:, :-1, :] + K[:, 1:, :]) * (dx * dz_layers[:, None, None]) / max(dy, 1e-12)
+
+        active_x = active_mask_3d[:, :, :-1] & active_mask_3d[:, :, 1:]
+        active_y = active_mask_3d[:, :-1, :] & active_mask_3d[:, 1:, :]
+        Gx *= active_x
+        Gy *= active_y
 
         Gz = None
         if layer_count > 1:
@@ -776,6 +792,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 via_len = 0.5 * dz_layers[i] + gap + 0.5 * dz_layers[i + 1]
                 Gvia_add = via_indicator * (k_cu * via_area / max(via_len, eps))
                 Gz[i] += Gvia_add
+            active_z = active_mask_3d[:-1] & active_mask_3d[1:]
+            Gz *= active_z
 
         diag = C_over_dt + Hconv_map + Gp_map
         diag[:, :, :-1] += Gx
@@ -785,6 +803,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         if layer_count > 1 and Gz is not None:
             diag[:-1] += Gz
             diag[1:] += Gz
+        inactive_mask = ~active_mask_3d
+        diag[inactive_mask] = 1.0
         M_inv = 1.0 / np.maximum(diag, 1e-12)
 
         def apply_A(x):
@@ -920,6 +940,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     step_counter += 1
 
                     b_vec = (C_over_dt * T) + P_map + (Hconv_map * amb) + (Gp_map * amb)
+                    if np.any(inactive_mask):
+                        b_vec[inactive_mask] = diag[inactive_mask] * amb
                     T_new, ok, iters, res = pcg(apply_A, b_vec, T, M_inv, tol, max_iter)
                     if not ok:
                         T_new, ok, iters, res = bicgstab(apply_A, b_vec, T, M_inv, tol, max_iter)
@@ -953,6 +975,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 pass
         avg_iter = (iter_total / iter_count) if iter_count else 0.0
         converged_steps = max(0, iter_count - fail_count)
+        active_cells = int(np.count_nonzero(active_mask))
+        active_ratio = float(active_cells) / float(rows * cols) if rows * cols else 0.0
+        convection_cells_top = active_cells if layer_count >= 1 else 0
+        convection_cells_bot = active_cells if layer_count > 1 else active_cells
+        via_stats = getattr(self, "_last_via_stats", {}) or {}
+        pth_bbox_pixels = via_stats.get("pth_bbox_pixels", 0)
+        pth_via_pixels = via_stats.get("pth_via_pixels", 0)
+        via_ratio = (float(pth_via_pixels) / float(pth_bbox_pixels)) if pth_bbox_pixels else 0.0
+        pad_mask_ratio = (float(pad_mask_stats.get("mask_pixels", 0)) / float(pad_mask_stats.get("bbox_pixels", 1))) if pad_mask_stats.get("bbox_pixels") else 0.0
         k_norm_info = {
             "solver": "implicit backward-euler (matrix-free)",
             "dt_s": dt,
@@ -966,6 +997,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "last_residual": last_residual if last_residual is not None else "n/a",
             "k_fr4_w_mk": k_fr4,
             "k_cu_w_mk": k_cu,
+            "active_domain_ratio": active_ratio,
+            "active_cells": active_cells,
+            "convection_cells_top": convection_cells_top,
+            "convection_cells_bottom": convection_cells_bot,
+            "pth_via_pixels": pth_via_pixels,
+            "pth_bbox_pixels": pth_bbox_pixels,
+            "pth_via_to_bbox_ratio": via_ratio,
+            "pth_via_default_drill_mm": via_stats.get("via_fallback_diam_mm", 0.3),
+            "pth_missing_drill_count": via_stats.get("pth_missing_drill", 0),
+            "pad_mask_ratio": pad_mask_ratio,
+            "pad_mask_fallback_pads": pad_mask_stats.get("fallback_pads", 0),
+            "pad_mask_assumption": "shape-based mask w/ rotation; bbox fallback when geometry missing",
         }
         if not aborted:
             if settings['show_all']:
@@ -1019,6 +1062,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         K = np.ones((num_layers, rows, cols)) * k_fr4
         V = np.ones((rows, cols))
         H = np.zeros((rows, cols))
+        via_stats = {
+            "pth_pads": 0,
+            "pth_missing_drill": 0,
+            "pth_bbox_pixels": 0,
+            "pth_via_pixels": 0,
+            "via_fallback_diam_mm": 0.3,
+        }
 
         limit_area = settings.get('limit_area', False)
         radius_mm = settings.get('pad_dist_mm', 0.0) if limit_area else 0.0
@@ -1077,6 +1127,50 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         if np.any(region_mask):
                             V_slice = V[rs:re, cs:ce]
                             np.maximum(V_slice, val, out=V_slice, where=region_mask)
+
+        def fill_via_circle(center_mm, radius_mm, val):
+            if radius_mm <= 0:
+                return 0
+            x0 = center_mm[0] - radius_mm
+            y0 = center_mm[1] - radius_mm
+            x1 = center_mm[0] + radius_mm
+            y1 = center_mm[1] + radius_mm
+            cs = max(0, int((x0 - x_min)/res))
+            rs = max(0, int((y0 - y_min)/res))
+            ce = min(cols, int((x1 - x_min)/res)+1)
+            re = min(rows, int((y1 - y_min)/res)+1)
+            if cs >= ce or rs >= re:
+                return 0
+            rr = radius_mm * radius_mm
+            added = 0
+            for r in range(rs, re):
+                y = y_min + (r + 0.5) * res
+                dy = y - center_mm[1]
+                for c in range(cs, ce):
+                    x = x_min + (c + 0.5) * res
+                    dx = x - center_mm[0]
+                    if (dx * dx + dy * dy) <= rr:
+                        if area_mask is None or area_mask[r, c]:
+                            if V[r, c] < val:
+                                V[r, c] = val
+                                added += 1
+            return added
+
+        def drill_diameter_mm(obj):
+            try:
+                if hasattr(obj, "GetDrillSize"):
+                    drill = obj.GetDrillSize()
+                    if drill:
+                        dia = max(getattr(drill, "x", 0), getattr(drill, "y", 0)) * 1e-6
+                        if dia > 0:
+                            return dia
+                if hasattr(obj, "GetDrill"):
+                    dia = obj.GetDrill() * 1e-6
+                    if dia > 0:
+                        return dia
+            except Exception:
+                return None
+            return None
 
         def fill_hs(bbox):
             x0, y0 = bbox.GetX()*1e-6, bbox.GetY()*1e-6
@@ -1158,17 +1252,50 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 
                 # Check if it is a via
                 if is_via:
-                    fill_via(t.GetBoundingBox(), via_factor)
+                    try:
+                        pos = t.GetPosition()
+                        center_mm = (pos.x * 1e-6, pos.y * 1e-6)
+                    except Exception:
+                        center_mm = None
+                    drill_diam = drill_diameter_mm(t) or via_stats["via_fallback_diam_mm"]
+                    radius_mm = max(0.5 * drill_diam, 0.15)
+                    if center_mm:
+                        fill_via_circle(center_mm, radius_mm, via_factor)
+                    else:
+                        fill_via(t.GetBoundingBox(), via_factor)
 
             footprints = board.Footprints() if hasattr(board, 'Footprints') else board.GetFootprints()
             for fp in footprints:
                 for pad in fp.Pads():
                     bb = pad.GetBoundingBox()
                     if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
+                        via_stats["pth_pads"] += 1
                         # PTH pads exist on all copper layers
                         for i in range(num_layers):
                             fill_box(i, bb, k_cu_layers[i])
-                        fill_via(bb, via_factor)
+                        try:
+                            pos = pad.GetPosition()
+                            center_mm = (pos.x * 1e-6, pos.y * 1e-6)
+                        except Exception:
+                            center_mm = None
+                        drill_diam = drill_diameter_mm(pad)
+                        if not drill_diam:
+                            via_stats["pth_missing_drill"] += 1
+                            drill_diam = via_stats["via_fallback_diam_mm"]
+                        radius_mm = max(0.5 * drill_diam, 0.15)
+                        if center_mm:
+                            added = fill_via_circle(center_mm, radius_mm, via_factor)
+                            via_stats["pth_via_pixels"] += added
+                            x0, y0 = bb.GetX()*1e-6, bb.GetY()*1e-6
+                            w, h = bb.GetWidth()*1e-6, bb.GetHeight()*1e-6
+                            cs = max(0, int((x0 - x_min)/res))
+                            rs = max(0, int((y0 - y_min)/res))
+                            ce = min(cols, int((x0+w - x_min)/res)+1)
+                            re = min(rows, int((y0+h - y_min)/res)+1)
+                            if cs < ce and rs < re:
+                                via_stats["pth_bbox_pixels"] += (ce - cs) * (re - rs)
+                        else:
+                            fill_via(bb, via_factor)
                     else:
                         # SMD pads
                         safe_fill(pad.GetLayer(), bb)
@@ -1237,6 +1364,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         except Exception as e:
             pass # Silent fail for single element errors
 
+        self._last_via_stats = via_stats
         return K, V, H
 
     def build_pad_distance_mask(self, pads_list, rows, cols, x_min, y_min, res, radius_mm):
@@ -1268,7 +1396,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             mask[rs:re, cs:ce] |= dist_sq <= radius_sq
         return mask
 
-    def get_pad_pixels(self, pad, rows, cols, x_min, y_min, res):
+    def get_pad_pixels(self, pad, rows, cols, x_min, y_min, res, stats=None):
         bb = pad.GetBoundingBox()
         x0, y0 = bb.GetX()*1e-6, bb.GetY()*1e-6
         w, h   = bb.GetWidth()*1e-6, bb.GetHeight()*1e-6
@@ -1276,9 +1404,88 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         rs = max(0, int((y0 - y_min)/res))
         ce = min(cols, int((x0+w - x_min)/res)+1)
         re = min(rows, int((y0+h - y_min)/res)+1)
+        if stats is not None:
+            stats["total_pads"] = stats.get("total_pads", 0) + 1
+            stats["bbox_pixels"] = stats.get("bbox_pixels", 0) + max(0, (ce - cs) * (re - rs))
+
+        try:
+            pos = pad.GetPosition()
+            cx = pos.x * 1e-6
+            cy = pos.y * 1e-6
+        except Exception:
+            cx, cy = None, None
+
+        shape = getattr(pad, "GetShape", lambda: None)()
+        size = getattr(pad, "GetSize", lambda: None)()
+        size_x = getattr(size, "x", 0) * 1e-6 if size else 0
+        size_y = getattr(size, "y", 0) * 1e-6 if size else 0
+        angle = 0.0
+        try:
+            angle = (pad.GetOrientation() / 10.0) * math.pi / 180.0
+        except Exception:
+            angle = 0.0
+        cos_a = math.cos(-angle)
+        sin_a = math.sin(-angle)
+
+        used_shape = True
+        if cx is None or cy is None or size_x <= 0 or size_y <= 0 or shape is None:
+            used_shape = False
+
+        def in_pad(x_mm, y_mm):
+            if not used_shape:
+                return True
+            dx = x_mm - cx
+            dy = y_mm - cy
+            lx = dx * cos_a - dy * sin_a
+            ly = dx * sin_a + dy * cos_a
+            half_x = 0.5 * size_x
+            half_y = 0.5 * size_y
+            if shape == pcbnew.PAD_SHAPE_CIRCLE:
+                r = min(half_x, half_y)
+                return (lx * lx + ly * ly) <= (r * r)
+            if shape == pcbnew.PAD_SHAPE_OVAL:
+                if size_x >= size_y:
+                    rect_half = max(0.0, half_x - half_y)
+                    if abs(lx) <= rect_half and abs(ly) <= half_y:
+                        return True
+                    dxo = abs(lx) - rect_half
+                    return (dxo * dxo + ly * ly) <= (half_y * half_y)
+                rect_half = max(0.0, half_y - half_x)
+                if abs(ly) <= rect_half and abs(lx) <= half_x:
+                    return True
+                dyo = abs(ly) - rect_half
+                return (dyo * dyo + lx * lx) <= (half_x * half_x)
+            if shape == pcbnew.PAD_SHAPE_ROUNDRECT:
+                try:
+                    rr = pad.GetRoundRectRadius() * 1e-6
+                except Exception:
+                    rr = 0.0
+                if rr <= 0:
+                    return abs(lx) <= half_x and abs(ly) <= half_y
+                inner_x = max(0.0, half_x - rr)
+                inner_y = max(0.0, half_y - rr)
+                if abs(lx) <= inner_x and abs(ly) <= half_y:
+                    return True
+                if abs(ly) <= inner_y and abs(lx) <= half_x:
+                    return True
+                dxo = abs(lx) - inner_x
+                dyo = abs(ly) - inner_y
+                return (dxo * dxo + dyo * dyo) <= (rr * rr)
+            if shape == pcbnew.PAD_SHAPE_RECT:
+                return abs(lx) <= half_x and abs(ly) <= half_y
+            return abs(lx) <= half_x and abs(ly) <= half_y
+
         pixels = []
         for r in range(rs, re):
-            for c in range(cs, ce): pixels.append((r, c))
+            y = y_min + (r + 0.5) * res
+            for c in range(cs, ce):
+                x = x_min + (c + 0.5) * res
+                if in_pad(x, y):
+                    pixels.append((r, c))
+        if stats is not None:
+            stats["mask_pixels"] = stats.get("mask_pixels", 0) + len(pixels)
+            if not used_shape:
+                stats["fallback_pads"] = stats.get("fallback_pads", 0) + 1
         return pixels
 
     def save_snapshot(self, T, H, amb, layer_names, idx, t_elapsed, out_dir=None):
@@ -1543,6 +1750,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         total_thick = max(0.2, stackup_derived["total_thick_mm_used"])
         cu_thick_m = [max(1e-9, th * 1e-3) for th in stackup_derived["copper_thickness_mm_used"]]
         k_cu_layers = [k_cu] * len(cu_thick_m)
+        active_mask = None
+        if settings.get('limit_area') and settings.get('pad_dist_mm', 0.0) > 0:
+            active_mask = self.build_pad_distance_mask(self.pads_list, rows, cols, x_min, y_min, res, settings['pad_dist_mm'])
 
         try:
             K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu_layers, via_factor, self.pads_list)
@@ -1598,6 +1808,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 # Show copper as a mask overlay
                 copper_mask = K[i] > k_fr4
                 ax.imshow(copper_mask, cmap='Greens', origin='upper', interpolation='none', alpha=0.35)
+                if active_mask is not None and np.any(~active_mask):
+                    inactive = np.ma.masked_where(active_mask, ~active_mask)
+                    ax.imshow(inactive, cmap='Greys', origin='upper', interpolation='none', alpha=0.25)
 
                 # Heatsink overlay (board-level)
                 if settings.get('use_heatsink'):
