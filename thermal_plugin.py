@@ -877,6 +877,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             bot_idx = bot_base + top_idx
             diag_extra[bot_idx] += diag_add_bot
             b[bot_idx] += diag_add_bot * amb
+            hA = np.zeros(N, dtype=np.float64)
+            hA[top_idx] += diag_add_top
+            hA[bot_idx] += diag_add_bot
 
             K = K_base + sp.diags(diag_extra, format="csr")
             D = C / dt
@@ -919,6 +922,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             update_interval = max(1, steps // 100)
             snapshot_stats = []
             total_solve_time = 0.0
+            pin = float(np.sum(Q))
+            e_prev = 0.0
 
             try:
                 Tnm1 = np.ones(N, dtype=np.float64) * amb
@@ -927,6 +932,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 Tn = solve_be(rhs1)
                 total_solve_time += time.perf_counter() - solve_start
                 step_counter = 1
+                e_prev = float(np.sum(C * (Tnm1 - amb)))
 
                 while step_counter < steps:
                     step_counter += 1
@@ -955,12 +961,35 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             T_view = Tn.reshape((layer_count, rows, cols))
                             max_top = float(np.max(T_view[0]))
                             max_bot = float(np.max(T_view[-1]))
-                            energy = float(np.sum(C * Tn))
+                            delta_t = Tn - amb
+                            energy = float(np.sum(C * delta_t))
+                            pout = float(np.sum(hA * delta_t))
+                            dE = energy - e_prev
+                            rhs_balance = dt * (pin - pout)
+                            eps_abs = abs(dE - rhs_balance)
+                            eps_rel = eps_abs / max(abs(dt * pin), 1e-9)
+                            balance_warn = eps_rel > 0.01 or eps_abs > 0.01
+                            print(
+                                "[ThermalSim][EnergyBalance] "
+                                f"t={t_elapsed:.3f}s E={energy:.6f}J Pin={pin:.6f}W "
+                                f"Pout={pout:.6f}W eps_abs={eps_abs:.6f}J eps_rel={eps_rel:.6f}"
+                            )
+                            if balance_warn:
+                                print(
+                                    "[ThermalSim][EnergyBalance][WARN] "
+                                    f"eps_rel={eps_rel:.6f} eps_abs={eps_abs:.6f}J"
+                                )
+                            e_prev = energy
                             snapshot_stats.append({
                                 "t": t_elapsed,
                                 "max_top": max_top,
                                 "max_bottom": max_bot,
-                                "energy": energy
+                                "energy": energy,
+                                "pin": pin,
+                                "pout": pout,
+                                "eps_abs": eps_abs,
+                                "eps_rel": eps_rel,
+                                "energy_warn": balance_warn
                             })
                             self.save_snapshot(T_view, H_map, amb, layer_names, snap_cnt, t_elapsed, out_dir=run_dir)
                             snap_cnt += 1
@@ -979,6 +1008,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             avg_solve_time = total_solve_time / max(step_counter, 1)
             T = Tn.reshape((layer_count, rows, cols))
             t_elapsed = sim_time
+            delta_t_final = Tn - amb
+            pout_final = float(np.sum(hA * delta_t_final))
+            rel_diff = abs(pin - pout_final) / max(abs(pin), 1e-9)
+            print(
+                "[ThermalSim][EnergyBalance][Final] "
+                f"Pin={pin:.6f}W Pout={pout_final:.6f}W rel_diff={rel_diff:.6f}"
+            )
             k_norm_info = {
                 "strategy": "implicit_fvm_bdf2",
                 "backend": backend,
@@ -994,7 +1030,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 "h_sink": h_sink,
                 "contact_factor": contact_factor,
                 "factorization_s": factor_time,
-                "avg_solve_s": avg_solve_time
+                "avg_solve_s": avg_solve_time,
+                "pin_w": pin,
+                "pout_final_w": pout_final,
+                "steady_rel_diff": rel_diff
             }
             snapshot_stats_json = json.dumps(snapshot_stats) if snapshot_stats else ""
             snapshot_debug_extra = {
