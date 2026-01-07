@@ -968,6 +968,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     else:
                         T_inner[0] -= (T_inner[0] - amb) * cool_air[0, 1:-1, 1:-1]
                     
+                    # --- BOUNDARY CONDITION: Neumann (no-flux) ---
+                    # Re-apply after updates so edges track the latest inner values.
+                    T[:, 0, 1:-1] = T[:, 1, 1:-1]
+                    T[:, -1, 1:-1] = T[:, -2, 1:-1]
+                    T[:, 1:-1, 0] = T[:, 1:-1, 1]
+                    T[:, 1:-1, -1] = T[:, 1:-1, -2]
+                    T[:, 0, 0] = T[:, 1, 1]
+                    T[:, 0, -1] = T[:, 1, -2]
+                    T[:, -1, 0] = T[:, -2, 1]
+                    T[:, -1, -1] = T[:, -2, -2]
+
                     # Smoothing
                     if step_counter % 50 == 0:
                         # Smoothing using slicing
@@ -976,6 +987,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         sL += T_inner
                         sL /= (1 + 4*smooth_weight)
                         T_inner[:] = sL
+                        # --- BOUNDARY CONDITION: Neumann (no-flux) ---
+                        # Keep edges consistent after smoothing.
+                        T[:, 0, 1:-1] = T[:, 1, 1:-1]
+                        T[:, -1, 1:-1] = T[:, -2, 1:-1]
+                        T[:, 1:-1, 0] = T[:, 1:-1, 1]
+                        T[:, 1:-1, -1] = T[:, 1:-1, -2]
+                        T[:, 0, 0] = T[:, 1, 1]
+                        T[:, 0, -1] = T[:, 1, -2]
+                        T[:, -1, 0] = T[:, -2, 1]
+                        T[:, -1, -1] = T[:, -2, -2]
 
                     if settings['snapshots']:
                         while next_snap_idx < len(snap_steps) and step_counter >= snap_steps[next_snap_idx]:
