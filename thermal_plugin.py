@@ -14,6 +14,8 @@ try:
     import matplotlib
     matplotlib.use('Agg')  # Use non-interactive backend for file output
     import matplotlib.pyplot as plt
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
     import wx
     HAS_LIBS = True
 except ImportError:
@@ -486,7 +488,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
     def RunSafe(self):
         if not HAS_LIBS:
-            wx.MessageBox("Please install numpy & matplotlib!", "Error"); return
+            wx.MessageBox("Please install numpy, matplotlib, and scipy!", "Error"); return
 
         board = pcbnew.GetBoard()
 
@@ -705,6 +707,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # --- 8. Power Injection ---
         P_map = np.zeros((layer_count, rows, cols))
+        P_watts_map = np.zeros((layer_count, rows, cols))
         
         # Calculate thermal mass per pixel
         # Copper dominates transient thermal behavior
@@ -773,6 +776,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     # Bounds Check
                     if r < rows and c < cols:
                         P_map[target_idx, r, c] += val * power_scale_layer[r, c]
+                        P_watts_map[target_idx, r, c] += val
 
         # --- 9. SOLVER ---
         T = np.ones((layer_count, rows, cols)) * settings['amb']
@@ -982,7 +986,40 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 wx.GetApp().Yield()
             except:
                 pass
+        solver_info = {
+            "method": "explicit_time_step",
+            "pardiso_used": False,
+            "status": "ok",
+        }
         if not aborted:
+            solver_pd = None
+            try:
+                solver_pd = wx.ProgressDialog("Solving...", "SciPy steady-state solve...", 100, style=wx.PD_APP_MODAL)
+                solver_pd.Update(10, "Building sparse system...")
+                steady_T, solver_info = self._solve_steady_state_sparse(
+                    K=K,
+                    V_map=V_map,
+                    H_map=H_map,
+                    P_watts_map=P_watts_map,
+                    copper_mask=copper_mask,
+                    cu_thick_m=cu_thick_m,
+                    fr4_effective_thick=fr4_effective_thick,
+                    dx=dx,
+                    gap_m=gap_m,
+                    amb=amb,
+                    h_conv=h_conv,
+                    h_sink=h_sink,
+                    layer_count=layer_count,
+                    rows=rows,
+                    cols=cols
+                )
+                solver_pd.Update(100, "Solver complete")
+                if steady_T is not None:
+                    T = steady_T
+            finally:
+                if solver_pd:
+                    solver_pd.Hide()
+                    solver_pd.Destroy()
             if settings['show_all']:
                 heatmap_path = self.show_results_all_layers(T, H_map, settings['amb'], layer_names, t_elapsed=sim_time, out_dir=run_dir)
             else:
@@ -1007,7 +1044,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 heatmap_path=heatmap_path,
                 k_norm_info=k_norm_info,
                 out_dir=run_dir,
-                snapshot_debug=snapshot_debug
+                snapshot_debug=snapshot_debug,
+                solver_info=solver_info
             )
             snapshot_count = 0
             try:
@@ -1650,7 +1688,113 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 wx.MessageBox(f"Preview error: {traceback.format_exc()}", "Error")
             return None
 
-    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path, k_norm_info=None, out_dir=None, snapshot_debug=None):
+    def _solve_steady_state_sparse(self, K, V_map, H_map, P_watts_map, copper_mask, cu_thick_m, fr4_effective_thick, dx, gap_m, amb, h_conv, h_sink, layer_count, rows, cols):
+        nr = rows - 2
+        nc = cols - 2
+        if nr <= 0 or nc <= 0:
+            return None, {"method": "scipy_sparse", "status": "skipped_invalid_grid"}
+
+        k_cu_thermal = 390.0
+        k_fr4_thermal = 0.3
+        thickness_map = np.where(copper_mask, np.array(cu_thick_m)[:, None, None], np.array(fr4_effective_thick)[:, None, None])
+        k_map = np.where(copper_mask, k_cu_thermal, k_fr4_thermal)
+        diff_coeff_area = (k_map * thickness_map) / (dx * dx)
+
+        pixel_area = dx * dx
+        P_area = P_watts_map / pixel_area
+
+        h_map = np.zeros_like(K)
+        h_map[0] = h_conv
+        if layer_count > 1:
+            h_map[-1] = (1 - H_map) * h_conv + H_map * h_sink
+
+        g_area = None
+        if layer_count > 1 and gap_m:
+            V_enhance = np.clip(V_map, 1.0, 50.0)
+            g_area = (k_fr4_thermal / np.array(gap_m)[:, None, None]) * V_enhance
+
+        n_inner = nr * nc
+        total_nodes = layer_count * n_inner
+        rows_idx = []
+        cols_idx = []
+        data = []
+        b = np.zeros(total_nodes)
+
+        for layer in range(layer_count):
+            diff_layer = diff_coeff_area[layer, 1:-1, 1:-1]
+            h_layer = h_map[layer, 1:-1, 1:-1]
+            P_layer = P_area[layer, 1:-1, 1:-1]
+            g_up = g_area[layer - 1, 1:-1, 1:-1] if g_area is not None and layer > 0 else None
+            g_down = g_area[layer, 1:-1, 1:-1] if g_area is not None and layer < layer_count - 1 else None
+            layer_offset = layer * n_inner
+
+            for r in range(nr):
+                row_offset = r * nc
+                for c in range(nc):
+                    idx = layer_offset + row_offset + c
+                    d = diff_layer[r, c]
+                    diag = 4.0 * d + h_layer[r, c]
+                    b_val = P_layer[r, c] + h_layer[r, c] * amb
+
+                    if r == 0:
+                        b_val += d * amb
+                    else:
+                        rows_idx.append(idx); cols_idx.append(idx - nc); data.append(-d)
+                    if r == nr - 1:
+                        b_val += d * amb
+                    else:
+                        rows_idx.append(idx); cols_idx.append(idx + nc); data.append(-d)
+                    if c == 0:
+                        b_val += d * amb
+                    else:
+                        rows_idx.append(idx); cols_idx.append(idx - 1); data.append(-d)
+                    if c == nc - 1:
+                        b_val += d * amb
+                    else:
+                        rows_idx.append(idx); cols_idx.append(idx + 1); data.append(-d)
+
+                    if g_up is not None:
+                        g = g_up[r, c]
+                        diag += g
+                        rows_idx.append(idx); cols_idx.append(idx - n_inner); data.append(-g)
+                    if g_down is not None:
+                        g = g_down[r, c]
+                        diag += g
+                        rows_idx.append(idx); cols_idx.append(idx + n_inner); data.append(-g)
+
+                    rows_idx.append(idx); cols_idx.append(idx); data.append(diag)
+                    b[idx] = b_val
+
+        A = sp.csr_matrix((data, (rows_idx, cols_idx)), shape=(total_nodes, total_nodes))
+        solver_info = {
+            "method": "scipy_sparse",
+            "matrix_size": total_nodes,
+            "nonzeros": int(A.nnz),
+            "pardiso_used": False,
+        }
+
+        try:
+            try:
+                from pypardiso import spsolve as pardiso_spsolve
+                solver_info["method"] = "pardiso"
+                solver_info["pardiso_used"] = True
+                T_vec = pardiso_spsolve(A, b)
+            except Exception:
+                T_vec = spla.spsolve(A, b)
+        except Exception as exc:
+            solver_info["status"] = f"failed: {exc}"
+            return None, solver_info
+
+        T = np.ones((layer_count, rows, cols)) * amb
+        for layer in range(layer_count):
+            start = layer * n_inner
+            end = start + n_inner
+            T[layer, 1:-1, 1:-1] = T_vec[start:end].reshape(nr, nc)
+        np.clip(T, amb, amb + 500, out=T)
+        solver_info["status"] = "ok"
+        return T, solver_info
+
+    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path, k_norm_info=None, out_dir=None, snapshot_debug=None, solver_info=None):
         out_dir = out_dir or os.path.dirname(__file__)
         report_path = os.path.join(out_dir, "thermal_report.html")
 
@@ -1709,6 +1853,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             k_norm_info = {}
         if snapshot_debug is None:
             snapshot_debug = {}
+        if solver_info is None:
+            solver_info = {}
         k_norm_rows = "\n".join(
             f"<tr><td>{_esc(str(k))}</td><td>{_esc(_fmt(v))}</td></tr>"
             for k, v in k_norm_info.items()
@@ -1716,6 +1862,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         snapshot_debug_rows = "\n".join(
             f"<tr><td>{_esc(str(k))}</td><td>{_esc(_fmt(v))}</td></tr>"
             for k, v in snapshot_debug.items()
+        )
+        solver_rows = "\n".join(
+            f"<tr><td>{_esc(str(k))}</td><td>{_esc(_fmt(v))}</td></tr>"
+            for k, v in solver_info.items()
         )
 
         html_body = f"""<!DOCTYPE html>
@@ -1769,6 +1919,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
   <table>
     <tr><th>Key</th><th>Value</th></tr>
     {snapshot_debug_rows}
+  </table>
+
+  <h2>Solver Details</h2>
+  <table>
+    <tr><th>Key</th><th>Value</th></tr>
+    {solver_rows}
   </table>
 
   <h2>Simulation Settings</h2>
