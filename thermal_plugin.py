@@ -923,7 +923,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snapshot_stats = []
             total_solve_time = 0.0
             pin = float(np.sum(Q))
+            prev_step = 0
             e_prev = 0.0
+            pout_prev = 0.0
+            balance_history = []
 
             try:
                 Tnm1 = np.ones(N, dtype=np.float64) * amb
@@ -933,6 +936,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 total_solve_time += time.perf_counter() - solve_start
                 step_counter = 1
                 e_prev = float(np.sum(C * (Tnm1 - amb)))
+                pout_prev = float(np.sum(hA * (Tnm1 - amb)))
 
                 while step_counter < steps:
                     step_counter += 1
@@ -964,10 +968,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             delta_t = Tn - amb
                             energy = float(np.sum(C * delta_t))
                             pout = float(np.sum(hA * delta_t))
+                            delta_steps = step_counter - prev_step
+                            interval_t = delta_steps * dt
+                            pout_avg = 0.5 * (pout_prev + pout)
                             dE = energy - e_prev
-                            rhs_balance = dt * (pin - pout)
+                            rhs_balance = interval_t * (pin - pout_avg)
                             eps_abs = abs(dE - rhs_balance)
-                            eps_rel = eps_abs / max(abs(dt * pin), 1e-9)
+                            eps_rel = eps_abs / max(abs(interval_t * pin), 1e-9)
                             balance_warn = eps_rel > 0.01 or eps_abs > 0.01
                             print(
                                 "[ThermalSim][EnergyBalance] "
@@ -979,7 +986,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                                     "[ThermalSim][EnergyBalance][WARN] "
                                     f"eps_rel={eps_rel:.6f} eps_abs={eps_abs:.6f}J"
                                 )
+                            balance_history.append({
+                                "delta_t": interval_t,
+                                "dE": dE
+                            })
+                            prev_step = step_counter
                             e_prev = energy
+                            pout_prev = pout
                             snapshot_stats.append({
                                 "t": t_elapsed,
                                 "max_top": max_top,
@@ -1010,11 +1023,20 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             t_elapsed = sim_time
             delta_t_final = Tn - amb
             pout_final = float(np.sum(hA * delta_t_final))
-            rel_diff = abs(pin - pout_final) / max(abs(pin), 1e-9)
-            print(
-                "[ThermalSim][EnergyBalance][Final] "
-                f"Pin={pin:.6f}W Pout={pout_final:.6f}W rel_diff={rel_diff:.6f}"
-            )
+            steady_ok = False
+            rel_diff = None
+            if balance_history:
+                recent = balance_history[-min(3, len(balance_history)):]
+                steady_ok = all(
+                    abs(item["dE"]) / max(abs(item["delta_t"] * pin), 1e-9) < 0.01
+                    for item in recent
+                )
+            if steady_ok:
+                rel_diff = abs(pin - pout_final) / max(abs(pin), 1e-9)
+                print(
+                    "[ThermalSim][EnergyBalance][Final] "
+                    f"Pin={pin:.6f}W Pout={pout_final:.6f}W rel_diff={rel_diff:.6f}"
+                )
             k_norm_info = {
                 "strategy": "implicit_fvm_bdf2",
                 "backend": backend,
