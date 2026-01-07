@@ -8,6 +8,7 @@ import tempfile
 import re
 import html
 import json
+import importlib.util
 
 try:
     import numpy as np
@@ -18,6 +19,22 @@ try:
     HAS_LIBS = True
 except ImportError:
     HAS_LIBS = False
+
+HAS_SCIPY = False
+HAS_PARDISO = False
+PARDISO_SOLVER = None
+PARDISO_NAME = None
+
+if HAS_LIBS and importlib.util.find_spec("scipy") is not None:
+    import scipy
+    from scipy import sparse
+    from scipy.sparse import linalg as spla
+    HAS_SCIPY = True
+    if importlib.util.find_spec("pypardiso") is not None:
+        import pypardiso
+        HAS_PARDISO = True
+        PARDISO_SOLVER = pypardiso.spsolve
+        PARDISO_NAME = "pypardiso.spsolve"
 
 
 # -----------------------------------------------------------------------------
@@ -487,6 +504,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
     def RunSafe(self):
         if not HAS_LIBS:
             wx.MessageBox("Please install numpy & matplotlib!", "Error"); return
+        if not HAS_SCIPY:
+            wx.MessageBox("Please install scipy for the accurate solver.", "Error"); return
 
         board = pcbnew.GetBoard()
 
@@ -819,6 +838,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "k_safe_max": max_k_safe,
             "copper_masked_heat_cap": True,
         }
+        solver_info = {
+            "transient_method": "explicit finite-difference",
+            "steady_state_refinement": False,
+            "steady_state_status": "not run",
+            "steady_state_solver": "scipy.sparse.linalg.spsolve",
+            "pardiso_used": False,
+        }
         
         # Vertical heat transfer coefficient
         # Q = k_fr4 * A * dT / d, where d = layer spacing
@@ -983,6 +1009,20 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             except:
                 pass
         if not aborted:
+            steady_T, steady_info = self._solve_steady_state_sparse(
+                K_safe=K_safe,
+                P_map=P_map,
+                z_eff=z_eff,
+                cool_air=cool_air,
+                cool_sink_factor=cool_sink_factor,
+                H_map=H_map,
+                amb=amb,
+            )
+            if steady_T is not None:
+                T = steady_T
+            if isinstance(steady_info, dict):
+                solver_info.update(steady_info)
+
             if settings['show_all']:
                 heatmap_path = self.show_results_all_layers(T, H_map, settings['amb'], layer_names, t_elapsed=sim_time, out_dir=run_dir)
             else:
@@ -1006,6 +1046,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 preview_path=preview_path,
                 heatmap_path=heatmap_path,
                 k_norm_info=k_norm_info,
+                solver_info=solver_info,
                 out_dir=run_dir,
                 snapshot_debug=snapshot_debug
             )
@@ -1248,6 +1289,142 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             pass # Silent fail for single element errors
 
         return K, V, H
+
+    def _solve_steady_state_sparse(self, K_safe, P_map, z_eff, cool_air, cool_sink_factor, H_map, amb):
+        layer_count, rows, cols = K_safe.shape
+        inner_rows = rows - 2
+        inner_cols = cols - 2
+        if inner_rows <= 0 or inner_cols <= 0:
+            return None, {
+                "steady_state_refinement": False,
+                "steady_state_status": "skipped (grid too small)",
+            }
+
+        K_inner = K_safe[:, 1:-1, 1:-1]
+        P_inner = P_map[:, 1:-1, 1:-1]
+        H_map_inner = H_map[1:-1, 1:-1]
+
+        cool_map = np.zeros_like(K_inner)
+        cool_map[0] = cool_air[0, 1:-1, 1:-1]
+        if layer_count > 1:
+            cool_bottom = ((1 - H_map_inner) * cool_air[-1, 1:-1, 1:-1]
+                           + H_map_inner * cool_sink_factor[1:-1, 1:-1])
+            cool_map[-1] = cool_bottom
+        else:
+            cool_map[0] = cool_air[0, 1:-1, 1:-1]
+
+        z_eff_inner = z_eff[:, 1:-1, 1:-1] if layer_count > 1 else None
+
+        n_per_layer = inner_rows * inner_cols
+        n_total = n_per_layer * layer_count
+        rows_idx = []
+        cols_idx = []
+        data = []
+        rhs = np.zeros(n_total, dtype=float)
+
+        def flat_index(layer, r, c):
+            return layer * n_per_layer + r * inner_cols + c
+
+        for layer in range(layer_count):
+            for r in range(inner_rows):
+                for c in range(inner_cols):
+                    idx = flat_index(layer, r, c)
+                    k_val = K_inner[layer, r, c]
+                    diag = 4.0 * k_val
+                    rhs_val = P_inner[layer, r, c]
+
+                    cool_val = cool_map[layer, r, c]
+                    if cool_val != 0.0:
+                        diag += cool_val
+                        rhs_val += cool_val * amb
+
+                    if r == 0:
+                        rhs_val += k_val * amb
+                    else:
+                        n_idx = flat_index(layer, r - 1, c)
+                        rows_idx.append(idx)
+                        cols_idx.append(n_idx)
+                        data.append(-k_val)
+
+                    if r == inner_rows - 1:
+                        rhs_val += k_val * amb
+                    else:
+                        n_idx = flat_index(layer, r + 1, c)
+                        rows_idx.append(idx)
+                        cols_idx.append(n_idx)
+                        data.append(-k_val)
+
+                    if c == 0:
+                        rhs_val += k_val * amb
+                    else:
+                        n_idx = flat_index(layer, r, c - 1)
+                        rows_idx.append(idx)
+                        cols_idx.append(n_idx)
+                        data.append(-k_val)
+
+                    if c == inner_cols - 1:
+                        rhs_val += k_val * amb
+                    else:
+                        n_idx = flat_index(layer, r, c + 1)
+                        rows_idx.append(idx)
+                        cols_idx.append(n_idx)
+                        data.append(-k_val)
+
+                    if layer_count > 1:
+                        if layer > 0:
+                            z_down = z_eff_inner[layer - 1, r, c]
+                            if z_down != 0.0:
+                                diag += z_down
+                                n_idx = flat_index(layer - 1, r, c)
+                                rows_idx.append(idx)
+                                cols_idx.append(n_idx)
+                                data.append(-z_down)
+                        if layer < layer_count - 1:
+                            z_up = z_eff_inner[layer, r, c]
+                            if z_up != 0.0:
+                                diag += z_up
+                                n_idx = flat_index(layer + 1, r, c)
+                                rows_idx.append(idx)
+                                cols_idx.append(n_idx)
+                                data.append(-z_up)
+
+                    rows_idx.append(idx)
+                    cols_idx.append(idx)
+                    data.append(diag)
+                    rhs[idx] = rhs_val
+
+        A = sparse.coo_matrix((data, (rows_idx, cols_idx)), shape=(n_total, n_total)).tocsr()
+        solver_used = "scipy.sparse.linalg.spsolve"
+        pardiso_used = False
+        if HAS_PARDISO and PARDISO_SOLVER is not None:
+            solver_used = PARDISO_NAME or "pypardiso.spsolve"
+            pardiso_used = True
+
+        try:
+            if pardiso_used:
+                T_flat = PARDISO_SOLVER(A, rhs)
+            else:
+                T_flat = spla.spsolve(A, rhs)
+        except Exception as exc:
+            return None, {
+                "steady_state_refinement": False,
+                "steady_state_status": f"failed ({exc})",
+                "steady_state_solver": solver_used,
+                "pardiso_used": pardiso_used,
+            }
+
+        T_solved = np.ones((layer_count, rows, cols)) * amb
+        T_solved[:, 1:-1, 1:-1] = T_flat.reshape(layer_count, inner_rows, inner_cols)
+        np.clip(T_solved, amb, amb + 500, out=T_solved)
+
+        return T_solved, {
+            "steady_state_refinement": True,
+            "steady_state_status": "applied",
+            "steady_state_solver": solver_used,
+            "pardiso_used": pardiso_used,
+            "matrix_size": n_total,
+            "matrix_nonzeros": int(A.nnz),
+        }
 
     def build_pad_distance_mask(self, pads_list, rows, cols, x_min, y_min, res, radius_mm):
         if not pads_list:
@@ -1650,7 +1827,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 wx.MessageBox(f"Preview error: {traceback.format_exc()}", "Error")
             return None
 
-    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path, k_norm_info=None, out_dir=None, snapshot_debug=None):
+    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path, k_norm_info=None, solver_info=None, out_dir=None, snapshot_debug=None):
         out_dir = out_dir or os.path.dirname(__file__)
         report_path = os.path.join(out_dir, "thermal_report.html")
 
@@ -1707,11 +1884,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snapshots_html += f"<div><p class='small'>{_esc(label)}</p><img src='{_esc(fname)}' alt='{_esc(label)}'></div>"
         if k_norm_info is None:
             k_norm_info = {}
+        if solver_info is None:
+            solver_info = {}
         if snapshot_debug is None:
             snapshot_debug = {}
         k_norm_rows = "\n".join(
             f"<tr><td>{_esc(str(k))}</td><td>{_esc(_fmt(v))}</td></tr>"
             for k, v in k_norm_info.items()
+        )
+        solver_rows = "\n".join(
+            f"<tr><td>{_esc(str(k))}</td><td>{_esc(_fmt(v))}</td></tr>"
+            for k, v in solver_info.items()
         )
         snapshot_debug_rows = "\n".join(
             f"<tr><td>{_esc(str(k))}</td><td>{_esc(_fmt(v))}</td></tr>"
@@ -1763,6 +1946,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
   <table>
     <tr><th>Key</th><th>Value</th></tr>
     {k_norm_rows}
+  </table>
+
+  <h2>Solver Details</h2>
+  <table>
+    <tr><th>Key</th><th>Value</th></tr>
+    {solver_rows}
   </table>
 
   <h2>Snapshot Debug</h2>
