@@ -26,7 +26,7 @@ try:
         HAS_PARDISO = True
     except ImportError:
         HAS_PARDISO = False
-    HAS_LIBS = True
+    HAS_LIBS = HAS_SCIPY
 except ImportError:
     HAS_LIBS = False
     HAS_SCIPY = False
@@ -499,7 +499,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
     def RunSafe(self):
         if not HAS_LIBS:
-            wx.MessageBox("Please install numpy & matplotlib!", "Error"); return
+            wx.MessageBox("Please install numpy, matplotlib, and scipy!", "Error"); return
 
         board = pcbnew.GetBoard()
 
@@ -1876,6 +1876,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             k_norm_info = {}
         if snapshot_debug is None:
             snapshot_debug = {}
+        pardiso_used = k_norm_info.get("scipy_solver") == "pardiso"
         k_norm_rows = "\n".join(
             f"<tr><td>{_esc(str(k))}</td><td>{_esc(_fmt(v))}</td></tr>"
             for k, v in k_norm_info.items()
@@ -1929,6 +1930,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
   <h2>Debug</h2>
   <table>
     <tr><th>Key</th><th>Value</th></tr>
+    <tr><td>Pardiso used</td><td>{_esc(str(bool(pardiso_used)))}</td></tr>
     {k_norm_rows}
   </table>
 
