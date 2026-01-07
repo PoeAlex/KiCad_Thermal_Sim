@@ -1192,7 +1192,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             msg = (
                 "Solver failed.\n\n"
                 f"{traceback.format_exc()}\n"
-                f"Params: N={N_val}, nnz={nnz_val}, dt={dt}, steps={steps}, backend={backend_val}"
+                f"Params: N={N_val}, nnz={nnz_val}, dt_base={dt}, steps_target={steps_target}, backend={backend_val}"
             )
             wx.MessageBox(msg, "Solver Error")
             return
@@ -1205,9 +1205,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snapshot_debug = {
                 "snapshots_enabled": settings.get('snapshots'),
                 "snap_count": settings.get('snap_count'),
-                "dt": dt,
-                "steps": steps,
-                "snap_steps": snap_steps,
+                "dt_base": dt,
+                "steps_target": steps_target,
+                "steps_total": step_counter,
+                "snap_times": snap_times,
                 "base_output_dir": base_output_dir,
                 "run_dir": run_dir,
             }
