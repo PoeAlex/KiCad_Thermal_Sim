@@ -8,6 +8,7 @@ import tempfile
 import re
 import html
 import json
+import importlib.util
 
 try:
     import numpy as np
@@ -18,6 +19,16 @@ try:
     HAS_LIBS = True
 except ImportError:
     HAS_LIBS = False
+
+from scipy import sparse
+from scipy.sparse import linalg as spla
+
+HAS_PARDISO = False
+pypardiso = None
+_pardiso_spec = importlib.util.find_spec("pypardiso")
+if _pardiso_spec is not None:
+    import pypardiso
+    HAS_PARDISO = True
 
 
 # -----------------------------------------------------------------------------
@@ -685,41 +696,25 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         except Exception as e:
             wx.MessageBox(f"Error mapping geometry: {e}", "Error"); return
 
-        # --- 7. Time Step Calculation ---
-        dx = res * 1e-3  # Grid spacing in meters
-        
-        # Physical layer thicknesses (convert to meters)
+        # --- 7. Physical constants & unit conversions ---
+        dx = res * 1e-3
+        dy = dx
+        cell_area = dx * dy
         layer_spacing_mm = (total_thick / max(1, layer_count - 1))
-        layer_spacing_m = layer_spacing_mm * 1e-3  # Convert mm to meters
-        
-        # Thermal diffusivity - use copper value for stability
-        alpha_eff = 1.1e-4  # Copper thermal diffusivity (m^2/s)
-        
-        # CFL stability: dt < dx^2 / (4 * alpha) for 2D explicit
-        # 0.15 for speed while maintaining stability
-        dt_limit = 0.15 * (dx**2) / alpha_eff
-        dt = min(dt_limit, 0.010)  # Cap at 10ms
-        sim_time = settings['time']
-        steps = max(200, int(sim_time / dt))
-        dt = sim_time / steps  # Recalculate dt to match exactly
+        layer_spacing_m = layer_spacing_mm * 1e-3
 
-        # --- 8. Power Injection ---
-        P_map = np.zeros((layer_count, rows, cols))
-        
-        # Calculate thermal mass per pixel
-        # Copper dominates transient thermal behavior
-        # Copper: rho=8900 kg/m³, cp=385 J/kg·K
-        rho_cu, cp_cu = 8900, 385
-        
-        pixel_area = dx * dx
-        # Copper contribution per layer
-        cu_vol = pixel_area * np.array(cu_thick_m)
-        cu_heat_cap = cu_vol * rho_cu * cp_cu  # J/K per pixel of copper
+        k_cu = 390.0
+        k_fr4 = 0.3
+        rho_cu, cp_cu = 8960.0, 385.0
+        rho_fr4, cp_fr4 = 1850.0, 1100.0
 
-        # For multi-layer, add some FR4 contribution (FR4: rho=1850, cp=1100)
-        # Use a thin effective FR4 layer to model partial thermal mass coupling
-        fr4_effective_thick = []
-        if layer_count > 1 and gap_m:
+        fr4_baseline_rel = 1.0
+        copper_threshold = 1.5
+        copper_mask = K > (fr4_baseline_rel * copper_threshold)
+
+        # Effective dielectric thickness per plane
+        if gap_m and len(gap_m) >= 1:
+            t_fr4_eff = []
             for i in range(layer_count):
                 if i == 0:
                     gap = gap_m[0]
@@ -727,122 +722,172 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     gap = gap_m[-1]
                 else:
                     gap = 0.5 * (gap_m[i - 1] + gap_m[i])
-                fr4_effective_thick.append(min(gap * 0.1, 0.0001))
+                t_fr4_eff.append(gap)
         else:
-            fr4_effective_thick = [min(layer_spacing_m * 0.1, 0.0001)] * layer_count
-        fr4_vol = pixel_area * np.array(fr4_effective_thick)
-        fr4_heat_cap = fr4_vol * 1850 * 1100  # J/K
+            t_fr4_eff = [layer_spacing_m] * layer_count
+        t_fr4_eff = np.clip(np.array(t_fr4_eff, dtype=np.float64), 1e-5, 5e-3)
 
-        # Total heat capacity per pixel (per layer) with copper mask
-        copper_mask = K > k_fr4_rel
-        cu_heat_cap_map = cu_heat_cap[:, None, None] * copper_mask
-        fr4_heat_cap_map = fr4_heat_cap[:, None, None]
-        pixel_heat_cap = cu_heat_cap_map + fr4_heat_cap_map
+        cu_thick_arr = np.array(cu_thick_m, dtype=np.float64)
+        cu_vol = cell_area * cu_thick_arr[:, None, None]
+        fr4_vol = cell_area * t_fr4_eff[:, None, None]
+        dielectric_under_copper_factor = 1.0
 
-        # Power scale: dT per timestep = P * dt / heat_capacity
-        power_scale = dt / pixel_heat_cap
-        
+        c_cu = rho_cu * cp_cu * cu_vol
+        c_fr4 = rho_fr4 * cp_fr4 * fr4_vol
+        C_layer = np.where(copper_mask, c_cu, c_fr4)
+        C_layer += copper_mask * (c_fr4 * dielectric_under_copper_factor)
+        C = C_layer.reshape(-1)
+
+        # --- 8. Assemble conductance matrix K ---
+        eps = 1e-12
+        plane_size = rows * cols
+        idx_grid = np.arange(plane_size, dtype=np.int64).reshape(rows, cols)
+        row_idx = []
+        col_idx = []
+        data_vals = []
+
+        for l in range(layer_count):
+            base = l * plane_size
+            idx = base + idx_grid
+            copper_mask_l = copper_mask[l]
+            k_layer = np.where(copper_mask_l, k_cu, k_fr4)
+            t_layer = np.where(copper_mask_l, cu_thick_arr[l], t_fr4_eff[l])
+
+            if cols > 1:
+                k_h = 2.0 * k_layer[:, :-1] * k_layer[:, 1:] / (k_layer[:, :-1] + k_layer[:, 1:] + eps)
+                t_edge = 0.5 * (t_layer[:, :-1] + t_layer[:, 1:])
+                Gx = k_h * (t_edge * dy) / dx
+                i = idx[:, :-1].ravel()
+                j = idx[:, 1:].ravel()
+                g = Gx.ravel()
+                row_idx.append(np.concatenate([i, j, i, j]))
+                col_idx.append(np.concatenate([i, j, j, i]))
+                data_vals.append(np.concatenate([g, g, -g, -g]))
+
+            if rows > 1:
+                k_h = 2.0 * k_layer[:-1, :] * k_layer[1:, :] / (k_layer[:-1, :] + k_layer[1:, :] + eps)
+                t_edge = 0.5 * (t_layer[:-1, :] + t_layer[1:, :])
+                Gy = k_h * (t_edge * dx) / dy
+                i = idx[:-1, :].ravel()
+                j = idx[1:, :].ravel()
+                g = Gy.ravel()
+                row_idx.append(np.concatenate([i, j, i, j]))
+                col_idx.append(np.concatenate([i, j, j, i]))
+                data_vals.append(np.concatenate([g, g, -g, -g]))
+
+        Vmax = 50.0
+        if layer_count > 1:
+            V_enh = np.clip(V_map, 1.0, Vmax)
+            for l in range(layer_count - 1):
+                gap = max(gap_m[l], 1e-6)
+                Gz = (k_fr4 * cell_area / gap) * V_enh
+                i = (l * plane_size + idx_grid).ravel()
+                j = ((l + 1) * plane_size + idx_grid).ravel()
+                g = Gz.ravel()
+                row_idx.append(np.concatenate([i, j, i, j]))
+                col_idx.append(np.concatenate([i, j, j, i]))
+                data_vals.append(np.concatenate([g, g, -g, -g]))
+
+        row_idx = np.concatenate(row_idx) if row_idx else np.array([], dtype=np.int64)
+        col_idx = np.concatenate(col_idx) if col_idx else np.array([], dtype=np.int64)
+        data_vals = np.concatenate(data_vals) if data_vals else np.array([], dtype=np.float64)
+        K_offdiag = sparse.coo_matrix((data_vals, (row_idx, col_idx)), shape=(plane_size * layer_count, plane_size * layer_count))
+        K_mat = K_offdiag.tocsc()
+
+        # --- 9. Robin boundary conditions to ambient ---
+        amb = settings['amb']
+        diag_extra = np.zeros(plane_size * layer_count, dtype=np.float64)
+        b = np.zeros(plane_size * layer_count, dtype=np.float64)
+
+        h_top = 10.0
+        h_air_bot = 10.0
+        contact_factor = 0.2
+        if settings.get('use_heatsink'):
+            pad_thick_m = max(1e-5, settings['pad_th'] * 1e-3)
+            h_sink = (settings['pad_k'] / pad_thick_m) * contact_factor
+        else:
+            h_sink = 200.0 * contact_factor
+
+        top_slice = slice(0, plane_size)
+        diag_add = h_top * cell_area
+        diag_extra[top_slice] += diag_add
+        b[top_slice] += diag_add * amb
+
+        bot_slice = slice((layer_count - 1) * plane_size, layer_count * plane_size)
+        h_bot_eff = (1.0 - H_map) * h_air_bot + H_map * h_sink
+        diag_add = (h_bot_eff * cell_area).ravel()
+        diag_extra[bot_slice] += diag_add
+        b[bot_slice] += diag_add * amb
+
+        K_mat = K_mat + sparse.diags(diag_extra, format="csc")
+        nnz = int(K_mat.nnz)
+
+        # --- 10. Heat sources (Q) ---
         try:
             p_parts = [float(x.strip()) for x in settings['power_str'].split(',')]
-            p_vals = [p_parts[0]]*len(pads_list) if len(p_parts)==1 else p_parts
-        except: return
+            p_vals = [p_parts[0]] * len(pads_list) if len(p_parts) == 1 else p_parts
+        except Exception:
+            return
         pad_power = []
         for idx, pad_name in enumerate(pad_names):
             power_val = p_vals[idx] if idx < len(p_vals) else None
             pad_power.append((pad_name, power_val))
 
+        Q = np.zeros(plane_size * layer_count, dtype=np.float64)
         for idx, pad in enumerate(pads_list):
             pad_lid = pad.GetLayer()
-            target_idx = 0 # Default: Top
-            
-            # --- CRASH FIX: Ensure layer exists ---
+            target_idx = 0
             if pad_lid in copper_ids:
                 target_idx = copper_ids.index(pad_lid)
             else:
-                # Pad is on layer not in copper_ids (e.g. "All Layers")
-                # Default to Top (0) or Bottom (-1) based on name
                 lname = board.GetLayerName(pad_lid).upper()
-                if "B." in lname or "BOT" in lname: target_idx = layer_count - 1
-                else: target_idx = 0
-            
+                if "B." in lname or "BOT" in lname:
+                    target_idx = layer_count - 1
+                else:
+                    target_idx = 0
             pixels = self.get_pad_pixels(pad, rows, cols, x_min, y_min, res)
-            if pixels:
-                power_scale_layer = power_scale[target_idx]
-                val = p_vals[idx] / len(pixels)
-                for r, c in pixels: 
-                    # Bounds Check
-                    if r < rows and c < cols:
-                        P_map[target_idx, r, c] += val * power_scale_layer[r, c]
+            if not pixels:
+                continue
+            pix = np.array(pixels, dtype=np.int64)
+            r = pix[:, 0]
+            c = pix[:, 1]
+            in_bounds = (r >= 0) & (r < rows) & (c >= 0) & (c < cols)
+            if not np.any(in_bounds):
+                continue
+            r = r[in_bounds]
+            c = c[in_bounds]
+            flat = target_idx * plane_size + r * cols + c
+            q_each = p_vals[idx] / max(1, flat.size)
+            np.add.at(Q, flat, q_each)
 
-        # --- 9. SOLVER ---
-        T = np.ones((layer_count, rows, cols)) * settings['amb']
-        
-        # Convective cooling coefficient
-        # h * A * (T - Tamb) = heat loss, h ~ 10 W/m^2.K for natural convection
-        h_conv = 10.0  # W/m^2.K
-        pixel_area = dx * dx
-        cool_air = (h_conv * pixel_area / pixel_heat_cap) * dt
-        
-        # Thermal pad/heatsink cooling
-        pad_thick_m = max(0.0001, settings['pad_th'] * 1e-3)
-        pad_k = settings['pad_k']
-        # Effective heat transfer through thermal pad
-        h_sink = (pad_k / pad_thick_m) * 0.1  # Simplified sink model
-        cool_sink_factor = (h_sink * pixel_area / pixel_heat_cap[-1]) * dt
+        # --- 11. Implicit transient solver (BDF2) ---
+        sim_time = settings['time']
+        steps = int(sim_time * 20)
+        steps = max(400, min(4000, steps))
+        dt = sim_time / max(1, steps)
 
-        # Use larger batches for speed - reduce Python loop overhead
-        batch_size = 200
-        num_batches = max(1, int(steps / batch_size))
-        actual_steps = num_batches * batch_size
-        
-        pd = wx.ProgressDialog("Simulating...", "Initializing...", 100, style=wx.PD_CAN_ABORT|wx.PD_APP_MODAL|wx.PD_REMAINING_TIME)
-        start_time = time.time()
-        aborted = False
-        roll = np.roll
-        
-        # Diffusion coefficient - scaled for stability (Max 0.25)
-        # We aligned dt_limit with 0.15, so we match it here
-        max_k = np.max(K)
-        min_k = np.min(K)
-        target_max = 0.22
-        diff_factor = target_max / max(max_k, 1.0)
-        K_safe = K * diff_factor
-        max_k_safe = np.max(K_safe)
-        min_k_safe = np.min(K_safe)
-        k_norm_info = {
-            "strategy": "scale_by_maxK",
-            "target_max": target_max,
-            "k_min": min_k,
-            "k_max": max_k,
-            "diff_factor": diff_factor,
-            "k_safe_min": min_k_safe,
-            "k_safe_max": max_k_safe,
-            "copper_masked_heat_cap": True,
-        }
-        
-        # Vertical heat transfer coefficient
-        # Q = k_fr4 * A * dT / d, where d = layer spacing
-        # dT/dt = Q / (m * cp) = k_fr4 * A * dT / (d * m * cp)
-        # For pixel: coefficient = k_fr4 * pixel_area / (layer_spacing * pixel_heat_cap) * dt
-        k_fr4_thermal = 0.3  # FR4 thermal conductivity W/(m·K)
-        
-        # Vertical coupling: heat transfer rate through FR4 between layers
-        if layer_count > 1 and gap_m:
-            cap_pairs = 0.5 * (pixel_heat_cap[:-1] + pixel_heat_cap[1:])
-            z_base = (k_fr4_thermal * pixel_area / np.array(gap_m)[:, None, None]) * dt / cap_pairs
+        D = C / dt
+        A_be = K_mat + sparse.diags(D, format="csc")
+        A_bdf2 = K_mat + sparse.diags(1.5 * D, format="csc")
+
+        use_pardiso = bool(HAS_PARDISO and settings.get("use_pardiso"))
+        backend = "pardiso" if use_pardiso else "scipy"
+
+        factor_start = time.time()
+        if use_pardiso:
+            if hasattr(pypardiso, "factorized"):
+                solve_be = pypardiso.factorized(A_be)
+                solve_bdf2 = pypardiso.factorized(A_bdf2)
+            else:
+                solve_be = lambda rhs: pypardiso.spsolve(A_be, rhs)
+                solve_bdf2 = lambda rhs: pypardiso.spsolve(A_bdf2, rhs)
         else:
-            z_base = np.zeros((max(0, layer_count - 1), rows, cols))
-        
-        # Via enhancement factor (vias increase vertical conductance)
-        # V_map has values: 1 for FR4, via_factor for vias
-        # Normalize to get via locations: V_norm = 1 for FR4, higher for vias
-        # Clamp via enhancement to prevent instability
-        V_enhance = np.clip(V_map, 1.0, 50.0)  # Max 50x enhancement at vias
-        z_eff = z_base * V_enhance
+            solve_be = spla.factorized(A_be)
+            solve_bdf2 = spla.factorized(A_bdf2)
+        factor_time = time.time() - factor_start
 
         snap_cnt = 1
         step_counter = 0
-        amb = settings['amb']
         snap_steps = []
         next_snap_idx = 0
         if settings.get('snapshots'):
@@ -855,133 +900,99 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snap_steps = sorted({s for s in snap_steps if 0 < s < steps})
         print(f"[ThermalSim] snapshots={settings.get('snapshots')} snap_count={settings.get('snap_count')} dt={dt:.6f} steps={steps} snap_steps={snap_steps}")
         print(f"[ThermalSim] base_output_dir={base_output_dir} run_dir={run_dir}")
-        
-        # Pre-compute smoothing kernel weights
-        smooth_weight = 0.1
-        
-        v_chg = np.zeros_like(T)
-        
-        # --- OPTIMIZATION: Slicing Views & Buffers ---
-        # Pre-allocate slice views to avoid constructing them inside the loop
-        # Inner domain (excluding 1 pixel border)
-        T_inner = T[:, 1:-1, 1:-1]
-        K_inner = K_safe[:, 1:-1, 1:-1]
-        P_inner = P_map[:, 1:-1, 1:-1]
-        
-        # Neighbor slices
-        T_up    = T[:, :-2, 1:-1]
-        T_down  = T[:, 2:, 1:-1]
-        T_left  = T[:, 1:-1, :-2]
-        T_right = T[:, 1:-1, 2:]
 
-        # Buffer for vertical transfer
-        if layer_count > 1:
-            z_eff_inner = z_eff[:, 1:-1, 1:-1]
-            H_map_inner = H_map[1:-1, 1:-1]
-            dT_layer_buf = np.zeros((layer_count-1, rows-2, cols-2))
-            v_chg_inner_buf = np.zeros_like(T_inner)
-        else:
-            # For single layer, these are not strictly used but defined to be safe
-            H_map_inner = H_map[1:-1, 1:-1]
-            z_eff_inner = None
-            dT_layer_buf = None
-            v_chg_inner_buf = None
-
-
+        pd = wx.ProgressDialog("Simulating...", "Initializing...", 100, style=wx.PD_CAN_ABORT|wx.PD_APP_MODAL|wx.PD_REMAINING_TIME)
+        aborted = False
+        update_stride = max(1, steps // 100)
+        max_top_snaps = []
+        max_bot_snaps = []
+        energy_snaps = []
+        solve_time_accum = 0.0
 
         try:
-            for b in range(num_batches):
-                percent = int((b / num_batches) * 100)
-                elapsed = time.time() - start_time
-                msg = f"Step {b*batch_size}/{steps}"
-                
-                # Check for cancel
-                keep_going = True
-                try:
-                    keep_going = pd.Update(percent, msg)
-                except:
-                    # Handle cases where dialog might be dead
-                    keep_going = False
-                    
-                if not keep_going: 
-                    aborted = True
-                    break
-                
-                for _ in range(batch_size):
-                    if step_counter >= steps:
-                        break
-                    step_counter += 1
-                    
-                    # Lateral Heat Diffusion (2D Laplacian) on inner pixels
-                    # L = Neighbors - 4*Center
-                    L = (T_up + T_down + T_left + T_right)
-                    L -= 4 * T_inner
-                    
-                    # Vertical Heat Transfer
-                    if layer_count > 1:
-                        v_chg_inner_buf.fill(0.0)
-                        
-                        # Gradient T[i+1] - T[i] using buffer
-                        np.subtract(T_inner[1:], T_inner[:-1], out=dT_layer_buf)
-                        
-                        # Flux
-                        dT_layer_buf *= z_eff_inner
-                        np.clip(dT_layer_buf, -50, 50, out=dT_layer_buf)
-                        
-                        # Apply flux
-                        v_chg_inner_buf[:-1] += dT_layer_buf
-                        v_chg_inner_buf[1:]  -= dT_layer_buf
-                        
-                        # T += L*K + v + P
-                        L *= K_inner
-                        L += v_chg_inner_buf
-                        L += P_inner
-                        T_inner += L
-                    else:
-                        # Single layer
-                        L *= K_inner
-                        L += P_inner
-                        T_inner += L
-                    
-                    # Clamp temperature
-                    np.clip(T_inner, amb, amb + 500, out=T_inner)
-                    
-                    # Convective cooling (Boundary Conditions)
-                    # Top Layer Inner
-                    T_inner[0] -= (T_inner[0] - amb) * cool_air[0, 1:-1, 1:-1]
-                    
-                    # Bottom layer
-                    if layer_count > 1:
-                        T_inner[-1] -= (T_inner[-1] - amb) * ((1-H_map_inner)*cool_air[-1, 1:-1, 1:-1] + H_map_inner*cool_sink_factor[1:-1, 1:-1])
-                    else:
-                        T_inner[0] -= (T_inner[0] - amb) * cool_air[0, 1:-1, 1:-1]
-                    
-                    # Smoothing
-                    if step_counter % 50 == 0:
-                        # Smoothing using slicing
-                        sL = (T_up + T_down + T_left + T_right)
-                        sL *= smooth_weight
-                        sL += T_inner
-                        sL /= (1 + 4*smooth_weight)
-                        T_inner[:] = sL
+            T0 = np.full(plane_size * layer_count, amb, dtype=np.float64)
+            rhs1 = D * T0 + Q + b
+            solve_start = time.time()
+            T1 = solve_be(rhs1)
+            solve_time_accum += time.time() - solve_start
+            Tnm1 = T0
+            Tn = T1
+            step_counter = 1
+            if settings.get('snapshots') and snap_steps:
+                while next_snap_idx < len(snap_steps) and step_counter >= snap_steps[next_snap_idx]:
+                    t_elapsed = step_counter * dt
+                    T_snap = Tn.reshape((layer_count, rows, cols))
+                    self.save_snapshot(T_snap, H_map, amb, layer_names, snap_cnt, t_elapsed, out_dir=run_dir)
+                    max_top_snaps.append(float(np.max(T_snap[0])))
+                    max_bot_snaps.append(float(np.max(T_snap[-1])))
+                    energy_snaps.append(float(np.sum(C * Tn)))
+                    snap_cnt += 1
+                    next_snap_idx += 1
 
-                    if settings['snapshots']:
-                        while next_snap_idx < len(snap_steps) and step_counter >= snap_steps[next_snap_idx]:
-                            t_elapsed = step_counter * dt
-                            self.save_snapshot(T, H_map, settings['amb'], layer_names, snap_cnt, t_elapsed, out_dir=run_dir)
-                            snap_cnt += 1
-                            next_snap_idx += 1
-                if step_counter >= steps:
-                    break
+            for step_counter in range(2, steps + 1):
+                if step_counter % update_stride == 0 or step_counter == steps:
+                    percent = int((step_counter / steps) * 100)
+                    msg = f"Step {step_counter}/{steps}"
+                    keep_going = True
+                    try:
+                        keep_going = pd.Update(percent, msg)
+                    except Exception:
+                        keep_going = False
+                    if not keep_going:
+                        aborted = True
+                        break
+
+                rhs = (2.0 * D) * Tn - (0.5 * D) * Tnm1 + Q + b
+                solve_start = time.time()
+                Tnp1 = solve_bdf2(rhs)
+                solve_time_accum += time.time() - solve_start
+                Tnm1, Tn = Tn, Tnp1
+
+                if settings.get('snapshots') and snap_steps:
+                    while next_snap_idx < len(snap_steps) and step_counter >= snap_steps[next_snap_idx]:
+                        t_elapsed = step_counter * dt
+                        T_snap = Tn.reshape((layer_count, rows, cols))
+                        self.save_snapshot(T_snap, H_map, amb, layer_names, snap_cnt, t_elapsed, out_dir=run_dir)
+                        max_top_snaps.append(float(np.max(T_snap[0])))
+                        max_bot_snaps.append(float(np.max(T_snap[-1])))
+                        energy_snaps.append(float(np.sum(C * Tn)))
+                        snap_cnt += 1
+                        next_snap_idx += 1
+        except Exception:
+            err_msg = traceback.format_exc()
+            wx.MessageBox(
+                f"Solver error:\n{err_msg}\n\nN={plane_size * layer_count}, nnz={nnz}, dt={dt}, steps={steps}, backend={backend}",
+                "Solver Error"
+            )
+            return
         finally:
             if pd:
                 pd.Hide()
                 pd.Destroy()
-            # Force event processing to ensure modal state is cleared
             try:
                 wx.GetApp().Yield()
-            except:
+            except Exception:
                 pass
+
+        T = Tn.reshape((layer_count, rows, cols))
+        avg_solve = solve_time_accum / max(1, steps)
+        k_norm_info = {
+            "backend": backend,
+            "nodes": plane_size * layer_count,
+            "nnz": nnz,
+            "dt_s": dt,
+            "steps": steps,
+            "factorization_s": factor_time,
+            "avg_solve_s": avg_solve,
+            "copper_threshold_rel": copper_threshold,
+            "h_top_W_m2K": h_top,
+            "h_air_bot_W_m2K": h_air_bot,
+            "h_sink_W_m2K": h_sink,
+            "contact_factor": contact_factor,
+            "Vmax": Vmax,
+            "t_fr4_eff_min_m": float(np.min(t_fr4_eff)),
+            "t_fr4_eff_max_m": float(np.max(t_fr4_eff)),
+        }
         if not aborted:
             if settings['show_all']:
                 heatmap_path = self.show_results_all_layers(T, H_map, settings['amb'], layer_names, t_elapsed=sim_time, out_dir=run_dir)
@@ -994,6 +1005,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 "dt": dt,
                 "steps": steps,
                 "snap_steps": snap_steps,
+                "snap_max_top_C": max_top_snaps,
+                "snap_max_bot_C": max_bot_snaps,
+                "snap_energy_J": energy_snaps,
                 "base_output_dir": base_output_dir,
                 "run_dir": run_dir,
             }
