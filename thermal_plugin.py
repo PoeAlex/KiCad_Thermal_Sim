@@ -21,10 +21,16 @@ try:
         HAS_SCIPY = True
     except ImportError:
         HAS_SCIPY = False
+    try:
+        from pypardiso import spsolve as pardiso_spsolve
+        HAS_PARDISO = True
+    except ImportError:
+        HAS_PARDISO = False
     HAS_LIBS = True
 except ImportError:
     HAS_LIBS = False
     HAS_SCIPY = False
+    HAS_PARDISO = False
 
 
 # -----------------------------------------------------------------------------
@@ -1429,23 +1435,25 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     b[idx] = rhs
 
         A = sparse.coo_matrix((data, (rows_idx, cols_idx)), shape=(node_count, node_count)).tocsr()
-        try:
-            sol, info = sparse_linalg.cg(A, b, atol=1e-8, tol=1e-6, maxiter=2000)
-        except TypeError:
-            sol, info = sparse_linalg.cg(A, b, tol=1e-6, maxiter=2000)
-
-        if info != 0:
+        if HAS_PARDISO:
             try:
-                sol = sparse_linalg.spsolve(A, b)
+                sol = pardiso_spsolve(A, b)
                 info = 0
-            except Exception:
+            except Exception as exc:
+                return None, {"scipy_used": False, "scipy_reason": f"pardiso_failed ({exc})"}
+        else:
+            try:
+                sol, info = sparse_linalg.cg(A, b, atol=1e-8, tol=1e-6, maxiter=2000)
+            except TypeError:
+                sol, info = sparse_linalg.cg(A, b, tol=1e-6, maxiter=2000)
+            if info != 0:
                 return None, {"scipy_used": False, "scipy_reason": f"cg_failed ({info})"}
 
         T = sol.reshape((layer_count, rows, cols))
         info_dict = {
             "scipy_used": True,
             "scipy_nodes": node_count,
-            "scipy_solver": "cg",
+            "scipy_solver": "pardiso" if HAS_PARDISO else "cg",
             "scipy_cg_info": info,
         }
         return T, info_dict
