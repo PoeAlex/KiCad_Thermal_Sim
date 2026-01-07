@@ -664,24 +664,20 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # --- 6. Maps ---
         layer_count = len(copper_ids)
         
-        # Physical parameters - relative thermal conductivity
-        # FR4: ~0.3 W/mK, Copper: ~390 W/mK => ratio ~1300
-        # We use relative values for stability
-        k_fr4_rel = 1.0
-        k_cu_rel  = 400.0
-        via_factor = 390.0 / 0.3
-        ref_cu_thick_m = 35e-6
+        # Physical parameters - absolute thermal conductivity
+        k_fr4_thermal = 0.3  # W/mK
+        k_cu_thermal = 390.0  # W/mK
 
         total_thick = max(0.2, total_thick_mm)
         cu_thick_mm_used = stackup_derived["copper_thickness_mm_used"]
         gap_mm_used = stackup_derived["gap_mm_used"]
         cu_thick_m = [max(1e-9, th * 1e-3) for th in cu_thick_mm_used]
         gap_m = [max(1e-9, g * 1e-3) for g in gap_mm_used]
-        k_cu_layers = [k_cu_rel * (th / ref_cu_thick_m) for th in cu_thick_m]
+        k_cu_layers = [k_cu_thermal] * layer_count
         
         # Create geometry maps
         try:
-            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_layers, via_factor, pads_list)
+            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_thermal, k_cu_layers, pads_list)
         except Exception as e:
             wx.MessageBox(f"Error mapping geometry: {e}", "Error"); return
 
@@ -693,11 +689,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         layer_spacing_m = layer_spacing_mm * 1e-3  # Convert mm to meters
         
         # Thermal diffusivity - use copper value for stability
-        alpha_eff = 1.1e-4  # Copper thermal diffusivity (m^2/s)
+        rho_cu, cp_cu = 8900, 385
+        alpha_eff = k_cu_thermal / (rho_cu * cp_cu)
         
         # CFL stability: dt < dx^2 / (4 * alpha) for 2D explicit
-        # 0.15 for speed while maintaining stability
-        dt_limit = 0.15 * (dx**2) / alpha_eff
+        safety_factor = 0.2
+        dt_limit = safety_factor * (dx**2) / (4 * alpha_eff)
         dt = min(dt_limit, 0.010)  # Cap at 10ms
         sim_time = settings['time']
         steps = max(200, int(sim_time / dt))
@@ -707,38 +704,46 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         P_map = np.zeros((layer_count, rows, cols))
         
         # Calculate thermal mass per pixel
-        # Copper dominates transient thermal behavior
         # Copper: rho=8900 kg/m³, cp=385 J/kg·K
-        rho_cu, cp_cu = 8900, 385
+        # FR4: rho=1850 kg/m³, cp=1100 J/kg·K
+        rho_fr4, cp_fr4 = 1850, 1100
         
         pixel_area = dx * dx
-        # Copper contribution per layer
+        # Copper contribution per layer (only where copper exists)
         cu_vol = pixel_area * np.array(cu_thick_m)
         cu_heat_cap = cu_vol * rho_cu * cp_cu  # J/K per pixel of copper
 
-        # For multi-layer, add some FR4 contribution (FR4: rho=1850, cp=1100)
-        # Use a thin effective FR4 layer to model partial thermal mass coupling
-        fr4_effective_thick = []
+        # FR4 contribution: assign half-gap above + half-gap below per copper layer
+        fr4_thick_m = []
+        total_thick_m = total_thick * 1e-3
         if layer_count > 1 and gap_m:
             for i in range(layer_count):
                 if i == 0:
-                    gap = gap_m[0]
+                    gap = 0.5 * gap_m[0]
                 elif i == layer_count - 1:
-                    gap = gap_m[-1]
+                    gap = 0.5 * gap_m[-1]
                 else:
                     gap = 0.5 * (gap_m[i - 1] + gap_m[i])
-                fr4_effective_thick.append(min(gap * 0.1, 0.0001))
+                fr4_thick_m.append(gap)
+        elif layer_count == 1:
+            fr4_thick_m = [max(total_thick_m - cu_thick_m[0], 0.0)]
         else:
-            fr4_effective_thick = [min(layer_spacing_m * 0.1, 0.0001)] * layer_count
-        fr4_vol = pixel_area * np.array(fr4_effective_thick)
-        fr4_heat_cap = fr4_vol * 1850 * 1100  # J/K
+            fr4_thick_m = [0.5 * layer_spacing_m] * layer_count
+        min_fr4_thick = 1e-6
+        fr4_thick_m = [max(min_fr4_thick, th) for th in fr4_thick_m]
+        fr4_vol = pixel_area * np.array(fr4_thick_m)
+        fr4_heat_cap = fr4_vol * rho_fr4 * cp_fr4  # J/K
 
         # Total heat capacity per pixel (per layer) with copper mask
-        copper_mask = K > k_fr4_rel
+        copper_mask = K > k_fr4_thermal
         cu_heat_cap_map = cu_heat_cap[:, None, None] * copper_mask
         fr4_heat_cap_map = fr4_heat_cap[:, None, None]
         pixel_heat_cap = cu_heat_cap_map + fr4_heat_cap_map
 
+        # Prevent zero heat capacity
+        min_heat_cap = 1e-12
+        np.maximum(pixel_heat_cap, min_heat_cap, out=pixel_heat_cap)
+        
         # Power scale: dT per timestep = P * dt / heat_capacity
         power_scale = dt / pixel_heat_cap
         
@@ -767,12 +772,11 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             
             pixels = self.get_pad_pixels(pad, rows, cols, x_min, y_min, res)
             if pixels:
-                power_scale_layer = power_scale[target_idx]
                 val = p_vals[idx] / len(pixels)
                 for r, c in pixels: 
                     # Bounds Check
                     if r < rows and c < cols:
-                        P_map[target_idx, r, c] += val * power_scale_layer[r, c]
+                        P_map[target_idx, r, c] += val
 
         # --- 9. SOLVER ---
         T = np.ones((layer_count, rows, cols)) * settings['amb']
@@ -800,23 +804,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         aborted = False
         roll = np.roll
         
-        # Diffusion coefficient - scaled for stability (Max 0.25)
-        # We aligned dt_limit with 0.15, so we match it here
         max_k = np.max(K)
         min_k = np.min(K)
-        target_max = 0.22
-        diff_factor = target_max / max(max_k, 1.0)
-        K_safe = K * diff_factor
-        max_k_safe = np.max(K_safe)
-        min_k_safe = np.min(K_safe)
         k_norm_info = {
-            "strategy": "scale_by_maxK",
-            "target_max": target_max,
+            "strategy": "absolute_k",
             "k_min": min_k,
             "k_max": max_k,
-            "diff_factor": diff_factor,
-            "k_safe_min": min_k_safe,
-            "k_safe_max": max_k_safe,
             "copper_masked_heat_cap": True,
         }
         
@@ -824,21 +817,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # Q = k_fr4 * A * dT / d, where d = layer spacing
         # dT/dt = Q / (m * cp) = k_fr4 * A * dT / (d * m * cp)
         # For pixel: coefficient = k_fr4 * pixel_area / (layer_spacing * pixel_heat_cap) * dt
-        k_fr4_thermal = 0.3  # FR4 thermal conductivity W/(m·K)
+        k_cu_thermal = 390.0  # Copper thermal conductivity W/(m·K)
         
-        # Vertical coupling: heat transfer rate through FR4 between layers
+        # Vertical coupling: heat transfer rate through FR4 and vias between layers
         if layer_count > 1 and gap_m:
             cap_pairs = 0.5 * (pixel_heat_cap[:-1] + pixel_heat_cap[1:])
-            z_base = (k_fr4_thermal * pixel_area / np.array(gap_m)[:, None, None]) * dt / cap_pairs
+            gap_arr = np.array(gap_m)[:, None, None]
+            G_fr4 = (k_fr4_thermal * pixel_area) / gap_arr
+            G_via = (k_cu_thermal * V_map[None, :, :]) / gap_arr
+            z_eff = (G_fr4 + G_via) * dt / cap_pairs
         else:
-            z_base = np.zeros((max(0, layer_count - 1), rows, cols))
-        
-        # Via enhancement factor (vias increase vertical conductance)
-        # V_map has values: 1 for FR4, via_factor for vias
-        # Normalize to get via locations: V_norm = 1 for FR4, higher for vias
-        # Clamp via enhancement to prevent instability
-        V_enhance = np.clip(V_map, 1.0, 50.0)  # Max 50x enhancement at vias
-        z_eff = z_base * V_enhance
+            z_eff = np.zeros((max(0, layer_count - 1), rows, cols))
 
         snap_cnt = 1
         step_counter = 0
@@ -857,23 +846,49 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         print(f"[ThermalSim] base_output_dir={base_output_dir} run_dir={run_dir}")
         print("[ThermalSim] boundary_mode=neumann_no_flux (edge replication, borders not pinned to ambient)")
         
-        # Pre-compute smoothing kernel weights
-        smooth_weight = 0.1
-        
         v_chg = np.zeros_like(T)
+        thickness_map = fr4_heat_cap_map / (rho_fr4 * cp_fr4 * pixel_area)
+        thickness_map += (cu_thick_m[:, None, None] * copper_mask)
         
         # --- OPTIMIZATION: Slicing Views & Buffers ---
         # Pre-allocate slice views to avoid constructing them inside the loop
         # Inner domain (excluding 1 pixel border)
         T_inner = T[:, 1:-1, 1:-1]
-        K_inner = K_safe[:, 1:-1, 1:-1]
+        K_inner = K[:, 1:-1, 1:-1]
         P_inner = P_map[:, 1:-1, 1:-1]
+        power_scale_inner = power_scale[:, 1:-1, 1:-1]
+        thickness_inner = thickness_map[:, 1:-1, 1:-1]
         
         # Neighbor slices
         T_up    = T[:, :-2, 1:-1]
         T_down  = T[:, 2:, 1:-1]
         T_left  = T[:, 1:-1, :-2]
         T_right = T[:, 1:-1, 2:]
+        K_up    = K[:, :-2, 1:-1]
+        K_down  = K[:, 2:, 1:-1]
+        K_left  = K[:, 1:-1, :-2]
+        K_right = K[:, 1:-1, 2:]
+        thickness_up = thickness_map[:, :-2, 1:-1]
+        thickness_down = thickness_map[:, 2:, 1:-1]
+        thickness_left = thickness_map[:, 1:-1, :-2]
+        thickness_right = thickness_map[:, 1:-1, 2:]
+
+        def harmonic_mean(a, b):
+            denom = a + b
+            return np.where(denom > 0.0, (2.0 * a * b) / denom, 0.0)
+
+        k_face_up = harmonic_mean(K_inner, K_up)
+        k_face_down = harmonic_mean(K_inner, K_down)
+        k_face_left = harmonic_mean(K_inner, K_left)
+        k_face_right = harmonic_mean(K_inner, K_right)
+        t_face_up = 0.5 * (thickness_inner + thickness_up)
+        t_face_down = 0.5 * (thickness_inner + thickness_down)
+        t_face_left = 0.5 * (thickness_inner + thickness_left)
+        t_face_right = 0.5 * (thickness_inner + thickness_right)
+        g_face_up = k_face_up * t_face_up
+        g_face_down = k_face_down * t_face_down
+        g_face_left = k_face_left * t_face_left
+        g_face_right = k_face_right * t_face_right
 
         # Buffer for vertical transfer
         if layer_count > 1:
@@ -924,10 +939,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     T[:, -1, 0] = T[:, -2, 1]
                     T[:, -1, -1] = T[:, -2, -2]
 
-                    # Lateral Heat Diffusion (2D Laplacian) on inner pixels
-                    # L = Neighbors - 4*Center
-                    L = (T_up + T_down + T_left + T_right)
-                    L -= 4 * T_inner
+                    # Lateral Heat Diffusion (finite-volume flux divergence)
+                    L = (g_face_up * (T_up - T_inner))
+                    L += (g_face_down * (T_down - T_inner))
+                    L += (g_face_left * (T_left - T_inner))
+                    L += (g_face_right * (T_right - T_inner))
+                    L *= power_scale_inner
                     
                     # Vertical Heat Transfer
                     if layer_count > 1:
@@ -945,14 +962,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         v_chg_inner_buf[1:]  -= dT_layer_buf
                         
                         # T += L*K + v + P
-                        L *= K_inner
                         L += v_chg_inner_buf
-                        L += P_inner
+                        L += P_inner * power_scale_inner
                         T_inner += L
                     else:
                         # Single layer
-                        L *= K_inner
-                        L += P_inner
+                        L += P_inner * power_scale_inner
                         T_inner += L
                     
                     # Clamp temperature
@@ -978,25 +993,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     T[:, 0, -1] = T[:, 1, -2]
                     T[:, -1, 0] = T[:, -2, 1]
                     T[:, -1, -1] = T[:, -2, -2]
-
-                    # Smoothing
-                    if step_counter % 50 == 0:
-                        # Smoothing using slicing
-                        sL = (T_up + T_down + T_left + T_right)
-                        sL *= smooth_weight
-                        sL += T_inner
-                        sL /= (1 + 4*smooth_weight)
-                        T_inner[:] = sL
-                        # --- BOUNDARY CONDITION: Neumann (no-flux) ---
-                        # Keep edges consistent after smoothing.
-                        T[:, 0, 1:-1] = T[:, 1, 1:-1]
-                        T[:, -1, 1:-1] = T[:, -2, 1:-1]
-                        T[:, 1:-1, 0] = T[:, 1:-1, 1]
-                        T[:, 1:-1, -1] = T[:, 1:-1, -2]
-                        T[:, 0, 0] = T[:, 1, 1]
-                        T[:, 0, -1] = T[:, 1, -2]
-                        T[:, -1, 0] = T[:, -2, 1]
-                        T[:, -1, -1] = T[:, -2, -2]
 
                     if settings['snapshots']:
                         while next_snap_idx < len(snap_steps) and step_counter >= snap_steps[next_snap_idx]:
@@ -1057,10 +1053,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 except Exception:
                     pass
 
-    def create_multilayer_maps(self, board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu_layers, via_factor, pads_list):
+    def create_multilayer_maps(self, board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu_layers, pads_list):
         num_layers = len(copper_ids)
         K = np.ones((num_layers, rows, cols)) * k_fr4
-        V = np.ones((rows, cols))
+        V = np.zeros((rows, cols))
         H = np.zeros((rows, cols))
 
         limit_area = settings.get('limit_area', False)
@@ -1104,22 +1100,27 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             K_slice = K[l_idx, rs:re, cs:ce]
                             np.maximum(K_slice, val, out=K_slice, where=region_mask)
 
-        def fill_via(bbox, val):
-            x0, y0 = bbox.GetX()*1e-6, bbox.GetY()*1e-6
-            w, h   = bbox.GetWidth()*1e-6, bbox.GetHeight()*1e-6
-            cs = max(0, int((x0 - x_min)/res))
-            rs = max(0, int((y0 - y_min)/res))
-            ce = min(cols, int((x0+w - x_min)/res)+1)
-            re = min(rows, int((y0+h - y_min)/res)+1)
-            if cs < ce and rs < re:
-                 if rs < rows and cs < cols:
-                    if area_mask is None:
-                        V[rs:re, cs:ce] = np.maximum(V[rs:re, cs:ce], val)
-                    else:
-                        region_mask = area_mask[rs:re, cs:ce]
-                        if np.any(region_mask):
-                            V_slice = V[rs:re, cs:ce]
-                            np.maximum(V_slice, val, out=V_slice, where=region_mask)
+        def fill_via_circle(x_mm, y_mm, radius_mm, via_area_m2):
+            if radius_mm <= 0:
+                return
+            cs = max(0, int((x_mm - radius_mm - x_min)/res))
+            rs = max(0, int((y_mm - radius_mm - y_min)/res))
+            ce = min(cols, int((x_mm + radius_mm - x_min)/res)+1)
+            re = min(rows, int((y_mm + radius_mm - y_min)/res)+1)
+            if cs >= ce or rs >= re:
+                return
+
+            ys = y_min + (np.arange(rs, re) + 0.5) * res
+            xs = x_min + (np.arange(cs, ce) + 0.5) * res
+            dy = ys[:, None] - y_mm
+            dx = xs[None, :] - x_mm
+            dist_sq = dx * dx + dy * dy
+            mask = dist_sq <= (radius_mm * radius_mm)
+            if area_mask is not None:
+                mask &= area_mask[rs:re, cs:ce]
+            if np.any(mask):
+                V_slice = V[rs:re, cs:ce]
+                V_slice[mask] += via_area_m2
 
         def fill_hs(bbox):
             x0, y0 = bbox.GetX()*1e-6, bbox.GetY()*1e-6
@@ -1190,6 +1191,109 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 idx = lid_to_idx[lid]
                 fill_box(idx, bbox, k_cu_layers[idx])
 
+        def to_mm(value_iu):
+            return value_iu * 1e-6
+
+        def segment_roi(x0, y0, x1, y1, half_w):
+            min_x = min(x0, x1) - half_w
+            max_x = max(x0, x1) + half_w
+            min_y = min(y0, y1) - half_w
+            max_y = max(y0, y1) + half_w
+            cs = max(0, int((min_x - x_min) / res))
+            rs = max(0, int((min_y - y_min) / res))
+            ce = min(cols, int((max_x - x_min) / res) + 1)
+            re = min(rows, int((max_y - y_min) / res) + 1)
+            return rs, re, cs, ce
+
+        def rasterize_segment(l_idx, x0, y0, x1, y1, width_mm, val):
+            half_w = 0.5 * width_mm
+            rs, re, cs, ce = segment_roi(x0, y0, x1, y1, half_w)
+            if rs >= re or cs >= ce:
+                return
+            ys = y_min + (np.arange(rs, re) + 0.5) * res
+            xs = x_min + (np.arange(cs, ce) + 0.5) * res
+            Y, X = np.meshgrid(ys, xs, indexing='ij')
+            dx = x1 - x0
+            dy = y1 - y0
+            denom = dx * dx + dy * dy
+            if denom > 0:
+                t = ((X - x0) * dx + (Y - y0) * dy) / denom
+                t = np.clip(t, 0.0, 1.0)
+                proj_x = x0 + t * dx
+                proj_y = y0 + t * dy
+                dist_sq = (X - proj_x) ** 2 + (Y - proj_y) ** 2
+            else:
+                dist_sq = (X - x0) ** 2 + (Y - y0) ** 2
+            mask = dist_sq <= (half_w * half_w)
+            if area_mask is not None:
+                mask &= area_mask[rs:re, cs:ce]
+            if np.any(mask):
+                K_slice = K[l_idx, rs:re, cs:ce]
+                np.maximum(K_slice, val, out=K_slice, where=mask)
+
+        def rasterize_track(lid, track):
+            if lid not in lid_to_idx:
+                return
+            idx = lid_to_idx[lid]
+            try:
+                start = track.GetStart()
+                end = track.GetEnd()
+                width = track.GetWidth()
+            except Exception:
+                safe_fill(lid, track.GetBoundingBox())
+                return
+            x0 = to_mm(start.x)
+            y0 = to_mm(start.y)
+            x1 = to_mm(end.x)
+            y1 = to_mm(end.y)
+            width_mm = to_mm(width)
+            if width_mm <= 0:
+                safe_fill(lid, track.GetBoundingBox())
+                return
+            rasterize_segment(idx, x0, y0, x1, y1, width_mm, k_cu_layers[idx])
+
+        def get_via_diameter_mm(via_obj):
+            for attr in ("GetWidth", "GetViaDiameter", "GetDiameter"):
+                if hasattr(via_obj, attr):
+                    try:
+                        val = getattr(via_obj, attr)()
+                        if val:
+                            return to_mm(val)
+                    except Exception:
+                        continue
+            try:
+                bb = via_obj.GetBoundingBox()
+                return to_mm(min(bb.GetWidth(), bb.GetHeight()))
+            except Exception:
+                return 0.0
+
+        def get_via_drill_mm(via_obj):
+            for attr in ("GetDrill", "GetDrillValue"):
+                if hasattr(via_obj, attr):
+                    try:
+                        val = getattr(via_obj, attr)()
+                        if val:
+                            return to_mm(val)
+                    except Exception:
+                        continue
+            return 0.0
+
+        def rasterize_via(via_obj):
+            try:
+                pos = via_obj.GetPosition()
+                x_mm = to_mm(pos.x)
+                y_mm = to_mm(pos.y)
+            except Exception:
+                return
+            dia_mm = get_via_diameter_mm(via_obj)
+            drill_mm = get_via_drill_mm(via_obj)
+            radius_mm = 0.5 * (dia_mm if dia_mm > 0 else drill_mm)
+            if radius_mm <= 0:
+                return
+            drill_for_area = drill_mm if drill_mm > 0 else (dia_mm if dia_mm > 0 else 0.0)
+            via_area_m2 = math.pi * (0.5 * drill_for_area * 1e-3) ** 2
+            fill_via_circle(x_mm, y_mm, radius_mm, via_area_m2)
+
         try:
             tracks = board.Tracks() if hasattr(board, 'Tracks') else board.GetTracks()
             for t in tracks:
@@ -1197,11 +1301,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 if settings.get('ignore_traces') and not is_via:
                     continue
                 lid = t.GetLayer()
-                safe_fill(lid, t.GetBoundingBox())
+                if not is_via:
+                    rasterize_track(lid, t)
                 
                 # Check if it is a via
                 if is_via:
-                    fill_via(t.GetBoundingBox(), via_factor)
+                    rasterize_via(t)
 
             footprints = board.Footprints() if hasattr(board, 'Footprints') else board.GetFootprints()
             for fp in footprints:
@@ -1211,7 +1316,27 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         # PTH pads exist on all copper layers
                         for i in range(num_layers):
                             fill_box(i, bb, k_cu_layers[i])
-                        fill_via(bb, via_factor)
+                        try:
+                            pos = pad.GetPosition()
+                            x_mm = to_mm(pos.x)
+                            y_mm = to_mm(pos.y)
+                        except Exception:
+                            continue
+                        drill = None
+                        if hasattr(pad, "GetDrillSize"):
+                            try:
+                                ds = pad.GetDrillSize()
+                                drill = 0.5 * (to_mm(ds.x) + to_mm(ds.y))
+                            except Exception:
+                                drill = None
+                        if not drill:
+                            try:
+                                size = pad.GetSize()
+                                drill = min(to_mm(size.x), to_mm(size.y))
+                            except Exception:
+                                drill = None
+                        if drill:
+                            fill_via_circle(x_mm, y_mm, 0.5 * drill, math.pi * (0.5 * drill * 1e-3) ** 2)
                     else:
                         # SMD pads
                         safe_fill(pad.GetLayer(), bb)
@@ -1320,8 +1445,32 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         ce = min(cols, int((x0+w - x_min)/res)+1)
         re = min(rows, int((y0+h - y_min)/res)+1)
         pixels = []
-        for r in range(rs, re):
-            for c in range(cs, ce): pixels.append((r, c))
+        if not hasattr(pad, "HitTest"):
+            for r in range(rs, re):
+                for c in range(cs, ce):
+                    pixels.append((r, c))
+            return pixels
+
+        def to_iu(value_mm):
+            try:
+                return pcbnew.FromMM(value_mm)
+            except Exception:
+                return int(value_mm * 1e6)
+
+        try:
+            for r in range(rs, re):
+                y = y_min + (r + 0.5) * res
+                y_iu = to_iu(y)
+                for c in range(cs, ce):
+                    x = x_min + (c + 0.5) * res
+                    pos = pcbnew.VECTOR2I(to_iu(x), y_iu)
+                    if pad.HitTest(pos):
+                        pixels.append((r, c))
+        except Exception:
+            pixels = []
+            for r in range(rs, re):
+                for c in range(cs, ce):
+                    pixels.append((r, c))
         return pixels
 
     def save_snapshot(self, T, H, amb, layer_names, idx, t_elapsed, out_dir=None):
@@ -1576,20 +1725,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         rows = int(h_mm / res) + 4
 
         # Physics constants for mapping
-        k_fr4_rel = 1.0
-        k_cu_rel  = 400.0
-        via_factor = 390.0 / 0.3
-        ref_cu_thick_m = 35e-6
+        k_fr4_thermal = 0.3
+        k_cu_thermal = 390.0
         layer_count = len(copper_ids)
         if stack_info is None:
             stack_info = parse_stackup_from_board_file(board)
         stackup_derived = self._derive_stackup_thicknesses(board, copper_ids, stack_info, settings)
         total_thick = max(0.2, stackup_derived["total_thick_mm_used"])
         cu_thick_m = [max(1e-9, th * 1e-3) for th in stackup_derived["copper_thickness_mm_used"]]
-        k_cu_layers = [k_cu_rel * (th / ref_cu_thick_m) for th in cu_thick_m]
+        k_cu_layers = [k_cu_thermal] * layer_count
 
         try:
-            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_layers, via_factor, self.pads_list)
+            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_thermal, k_cu_layers, self.pads_list)
             
             out_dir = out_dir or settings.get('output_dir') or os.path.dirname(__file__)
             if not os.path.isdir(out_dir):
@@ -1640,7 +1787,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 ax.set_title(f"Preview: {name}")
                 
                 # Show copper as a mask overlay
-                copper_mask = K[i] > k_fr4_rel
+                copper_mask = K[i] > k_fr4_thermal
                 ax.imshow(copper_mask, cmap='Greens', origin='upper', interpolation='none', alpha=0.35)
 
                 # Heatsink overlay (board-level)
@@ -1650,7 +1797,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         ax.imshow(np.ma.masked_where(H_map <= 0, H_map), cmap='Blues', origin='upper', interpolation='none', alpha=0.45)
                 
                 # Overlay vias in red
-                v_mask = V_map > 1.0
+                v_mask = V_map > 0.0
                 if np.any(v_mask):
                     ax.imshow(np.ma.masked_where(~v_mask, v_mask), cmap='Reds', origin='upper', alpha=0.5, interpolation='none')
 
