@@ -1421,7 +1421,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         size_y = getattr(size, "y", 0) * 1e-6 if size else 0
         angle = 0.0
         try:
-            angle = (pad.GetOrientation() / 10.0) * math.pi / 180.0
+            orient = pad.GetOrientation()
+            if hasattr(orient, "AsRadians"):
+                angle = orient.AsRadians()
+            elif hasattr(orient, "AsDegrees"):
+                angle = orient.AsDegrees() * math.pi / 180.0
+            else:
+                angle = (float(orient) / 10.0) * math.pi / 180.0
         except Exception:
             angle = 0.0
         cos_a = math.cos(-angle)
