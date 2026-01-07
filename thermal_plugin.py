@@ -694,8 +694,11 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         dx = res * 1e-3  # Grid spacing in meters
         dy = dx
         sim_time = settings['time']
+        alpha_cu = k_cu / (rho_cu * cp_cu)
+        dt_accuracy = 0.25 * (dx * dx) / max(alpha_cu, 1e-12)
         target_dt = 0.2
-        steps = max(1, int(math.ceil(sim_time / target_dt)))
+        dt = min(target_dt, dt_accuracy)
+        steps = max(1, int(math.ceil(sim_time / dt)))
         dt = sim_time / steps
 
         # --- 8. Power Injection (W per cell) ---
@@ -738,9 +741,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         T = np.ones((layer_count, rows, cols)) * settings['amb']
 
         area = dx * dy
-        dz_layers = np.array(cu_thick_m[:layer_count], dtype=float)
-        if dz_layers.size != layer_count:
-            dz_layers = np.full(layer_count, max(1e-9, (total_thick * 1e-3) / max(1, layer_count)))
+        if gap_m and len(gap_m) == max(0, layer_count - 1):
+            dz_layers = []
+            for i in range(layer_count):
+                gap_above = gap_m[i - 1] if i > 0 else 0.0
+                gap_below = gap_m[i] if i < layer_count - 1 else 0.0
+                dz_layers.append(cu_thick_m[i] + 0.5 * (gap_above + gap_below))
+            dz_layers = np.array(dz_layers, dtype=float)
+        else:
+            dz_layers = np.array(cu_thick_m[:layer_count], dtype=float)
+            if dz_layers.size != layer_count:
+                dz_layers = np.full(layer_count, max(1e-9, (total_thick * 1e-3) / max(1, layer_count)))
 
         active_mask_3d = np.broadcast_to(active_mask, (layer_count, rows, cols))
         copper_mask = (K > (k_fr4 * 1.5)) & active_mask_3d
@@ -988,6 +999,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "solver": "implicit backward-euler (matrix-free)",
             "dt_s": dt,
             "steps": steps,
+            "dt_accuracy_s": dt_accuracy,
             "tol": tol,
             "max_iter": max_iter,
             "avg_iter": avg_iter,
