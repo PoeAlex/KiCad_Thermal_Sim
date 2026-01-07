@@ -663,89 +663,41 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         
         # --- 6. Maps ---
         layer_count = len(copper_ids)
-        
-        # Physical parameters - relative thermal conductivity
-        # FR4: ~0.3 W/mK, Copper: ~390 W/mK => ratio ~1300
-        # We use relative values for stability
-        k_fr4_rel = 1.0
-        k_cu_rel  = 400.0
-        via_factor = 390.0 / 0.3
-        ref_cu_thick_m = 35e-6
+
+        # Physical parameters (absolute units)
+        k_fr4 = 0.30  # W/m·K
+        k_cu = 390.0  # W/m·K
+        via_factor = k_cu / max(k_fr4, 1e-9)
 
         total_thick = max(0.2, total_thick_mm)
         cu_thick_mm_used = stackup_derived["copper_thickness_mm_used"]
         gap_mm_used = stackup_derived["gap_mm_used"]
         cu_thick_m = [max(1e-9, th * 1e-3) for th in cu_thick_mm_used]
         gap_m = [max(1e-9, g * 1e-3) for g in gap_mm_used]
-        k_cu_layers = [k_cu_rel * (th / ref_cu_thick_m) for th in cu_thick_m]
-        
-        # Create geometry maps
+        k_cu_layers = [k_cu] * layer_count
+
+        # Create geometry maps (K = copper presence, V_map = via proxy, H_map = heatsink mask)
         try:
-            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4_rel, k_cu_layers, via_factor, pads_list)
+            K, V_map, H_map = self.create_multilayer_maps(board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu_layers, via_factor, pads_list)
         except Exception as e:
             wx.MessageBox(f"Error mapping geometry: {e}", "Error"); return
 
-        # --- 7. Time Step Calculation ---
+        # --- 7. Time Step Calculation (implicit solver) ---
         dx = res * 1e-3  # Grid spacing in meters
-        
-        # Physical layer thicknesses (convert to meters)
-        layer_spacing_mm = (total_thick / max(1, layer_count - 1))
-        layer_spacing_m = layer_spacing_mm * 1e-3  # Convert mm to meters
-        
-        # Thermal diffusivity - use copper value for stability
-        alpha_eff = 1.1e-4  # Copper thermal diffusivity (m^2/s)
-        
-        # CFL stability: dt < dx^2 / (4 * alpha) for 2D explicit
-        # 0.15 for speed while maintaining stability
-        dt_limit = 0.15 * (dx**2) / alpha_eff
-        dt = min(dt_limit, 0.010)  # Cap at 10ms
+        dy = dx
         sim_time = settings['time']
-        steps = max(200, int(sim_time / dt))
-        dt = sim_time / steps  # Recalculate dt to match exactly
+        target_dt = 0.25  # s, implicit solver allows larger dt; keep moderate for accuracy
+        steps = max(50, int(math.ceil(sim_time / target_dt)))
+        dt = sim_time / max(1, steps)
 
-        # --- 8. Power Injection ---
+        # --- 8. Power Injection (Watts per pixel) ---
         P_map = np.zeros((layer_count, rows, cols))
-        
-        # Calculate thermal mass per pixel
-        # Copper dominates transient thermal behavior
-        # Copper: rho=8900 kg/m³, cp=385 J/kg·K
-        rho_cu, cp_cu = 8900, 385
-        
-        pixel_area = dx * dx
-        # Copper contribution per layer
-        cu_vol = pixel_area * np.array(cu_thick_m)
-        cu_heat_cap = cu_vol * rho_cu * cp_cu  # J/K per pixel of copper
 
-        # For multi-layer, add some FR4 contribution (FR4: rho=1850, cp=1100)
-        # Use a thin effective FR4 layer to model partial thermal mass coupling
-        fr4_effective_thick = []
-        if layer_count > 1 and gap_m:
-            for i in range(layer_count):
-                if i == 0:
-                    gap = gap_m[0]
-                elif i == layer_count - 1:
-                    gap = gap_m[-1]
-                else:
-                    gap = 0.5 * (gap_m[i - 1] + gap_m[i])
-                fr4_effective_thick.append(min(gap * 0.1, 0.0001))
-        else:
-            fr4_effective_thick = [min(layer_spacing_m * 0.1, 0.0001)] * layer_count
-        fr4_vol = pixel_area * np.array(fr4_effective_thick)
-        fr4_heat_cap = fr4_vol * 1850 * 1100  # J/K
-
-        # Total heat capacity per pixel (per layer) with copper mask
-        copper_mask = K > k_fr4_rel
-        cu_heat_cap_map = cu_heat_cap[:, None, None] * copper_mask
-        fr4_heat_cap_map = fr4_heat_cap[:, None, None]
-        pixel_heat_cap = cu_heat_cap_map + fr4_heat_cap_map
-
-        # Power scale: dT per timestep = P * dt / heat_capacity
-        power_scale = dt / pixel_heat_cap
-        
         try:
             p_parts = [float(x.strip()) for x in settings['power_str'].split(',')]
-            p_vals = [p_parts[0]]*len(pads_list) if len(p_parts)==1 else p_parts
-        except: return
+            p_vals = [p_parts[0]] * len(pads_list) if len(p_parts) == 1 else p_parts
+        except Exception:
+            return
         pad_power = []
         for idx, pad_name in enumerate(pad_names):
             power_val = p_vals[idx] if idx < len(p_vals) else None
@@ -753,8 +705,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         for idx, pad in enumerate(pads_list):
             pad_lid = pad.GetLayer()
-            target_idx = 0 # Default: Top
-            
+            target_idx = 0  # Default: Top
+
             # --- CRASH FIX: Ensure layer exists ---
             if pad_lid in copper_ids:
                 target_idx = copper_ids.index(pad_lid)
@@ -762,87 +714,191 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 # Pad is on layer not in copper_ids (e.g. "All Layers")
                 # Default to Top (0) or Bottom (-1) based on name
                 lname = board.GetLayerName(pad_lid).upper()
-                if "B." in lname or "BOT" in lname: target_idx = layer_count - 1
-                else: target_idx = 0
-            
+                if "B." in lname or "BOT" in lname:
+                    target_idx = layer_count - 1
+                else:
+                    target_idx = 0
+
             pixels = self.get_pad_pixels(pad, rows, cols, x_min, y_min, res)
             if pixels:
-                power_scale_layer = power_scale[target_idx]
                 val = p_vals[idx] / len(pixels)
-                for r, c in pixels: 
+                for r, c in pixels:
                     # Bounds Check
                     if r < rows and c < cols:
-                        P_map[target_idx, r, c] += val * power_scale_layer[r, c]
+                        P_map[target_idx, r, c] += val
 
-        # --- 9. SOLVER ---
+        # --- 9. Implicit Solver Setup ---
+        try:
+            import scipy.sparse as sp
+            import scipy.sparse.linalg as spla
+        except Exception:
+            wx.MessageBox("SciPy is required for the implicit solver.\nInstall scipy in the KiCad Python environment and retry.", "SciPy Required")
+            return
+
+        try:
+            from pypardiso import spsolve as pardiso_spsolve
+            has_pardiso = True
+        except Exception:
+            pardiso_spsolve = None
+            has_pardiso = False
+
         T = np.ones((layer_count, rows, cols)) * settings['amb']
-        
-        # Convective cooling coefficient
-        # h * A * (T - Tamb) = heat loss, h ~ 10 W/m^2.K for natural convection
-        h_conv = 10.0  # W/m^2.K
-        pixel_area = dx * dx
-        cool_air = (h_conv * pixel_area / pixel_heat_cap) * dt
-        
-        # Thermal pad/heatsink cooling
-        pad_thick_m = max(0.0001, settings['pad_th'] * 1e-3)
-        pad_k = settings['pad_k']
-        # Effective heat transfer through thermal pad
-        h_sink = (pad_k / pad_thick_m) * 0.1  # Simplified sink model
-        cool_sink_factor = (h_sink * pixel_area / pixel_heat_cap[-1]) * dt
+        amb = settings['amb']
+        nrc = rows * cols
+        total_nodes = layer_count * nrc
+        eps = 1e-12
 
-        # Use larger batches for speed - reduce Python loop overhead
-        batch_size = 200
+        # Copper coverage (0..1) and material maps
+        copper_mask = (K > k_fr4).astype(float)
+        k_xy = k_fr4 * (1.0 - copper_mask) + k_cu * copper_mask
+
+        # Heat capacity per pixel: C = rho * cp * V
+        rho_cu, cp_cu = 8900.0, 385.0
+        rho_fr4, cp_fr4 = 1850.0, 1100.0
+        pixel_area = dx * dy
+        if layer_count > 1 and gap_m:
+            fr4_thick = []
+            for i in range(layer_count):
+                if i == 0:
+                    fr4_thick.append(0.5 * gap_m[0])
+                elif i == layer_count - 1:
+                    fr4_thick.append(0.5 * gap_m[-1])
+                else:
+                    fr4_thick.append(0.5 * (gap_m[i - 1] + gap_m[i]))
+        else:
+            fr4_thick = [max(1e-9, total_thick * 1e-3)] * layer_count
+
+        C_map = np.zeros((layer_count, rows, cols))
+        for i in range(layer_count):
+            v_cu = pixel_area * cu_thick_m[i] * copper_mask[i]
+            v_fr4 = pixel_area * fr4_thick[i] * (1.0 - copper_mask[i])
+            C_map[i] = rho_cu * cp_cu * v_cu + rho_fr4 * cp_fr4 * v_fr4
+        C_map = np.maximum(C_map, 1e-12)
+
+        # Assemble sparse conductance matrix using finite-volume resistor network.
+        diag = np.zeros(total_nodes)
+        rows_idx = []
+        cols_idx = []
+        data_vals = []
+
+        def add_off_diag(i_idx, j_idx, g_vals):
+            rows_idx.extend(i_idx.tolist())
+            cols_idx.extend(j_idx.tolist())
+            data_vals.extend((-g_vals).tolist())
+
+        # Lateral conduction within layers
+        for l in range(layer_count):
+            base = l * nrc
+            idx_grid = base + (np.arange(rows)[:, None] * cols) + np.arange(cols)[None, :]
+            t_layer = cu_thick_m[l]
+            k_layer = k_xy[l]
+
+            # Right neighbors
+            k1 = k_layer[:, :-1]
+            k2 = k_layer[:, 1:]
+            k_eff = 2.0 * k1 * k2 / (k1 + k2 + eps)
+            g_lr = k_eff * (t_layer * dy) / dx
+            i_lr = idx_grid[:, :-1].ravel()
+            j_lr = idx_grid[:, 1:].ravel()
+            g_lr_f = g_lr.ravel()
+            diag[i_lr] += g_lr_f
+            diag[j_lr] += g_lr_f
+            add_off_diag(i_lr, j_lr, g_lr_f)
+            add_off_diag(j_lr, i_lr, g_lr_f)
+
+            # Down neighbors
+            k1 = k_layer[:-1, :]
+            k2 = k_layer[1:, :]
+            k_eff = 2.0 * k1 * k2 / (k1 + k2 + eps)
+            g_ud = k_eff * (t_layer * dx) / dy
+            i_ud = idx_grid[:-1, :].ravel()
+            j_ud = idx_grid[1:, :].ravel()
+            g_ud_f = g_ud.ravel()
+            diag[i_ud] += g_ud_f
+            diag[j_ud] += g_ud_f
+            add_off_diag(i_ud, j_ud, g_ud_f)
+            add_off_diag(j_ud, i_ud, g_ud_f)
+
+        # Vertical conduction between layers
+        if layer_count > 1 and gap_m:
+            via_gain = 0.5  # conservative scaling for via-enhanced conductance
+            via_cap = 10.0  # strict cap on via enhancement
+            via_scale = np.clip(V_map, 1.0, via_cap) - 1.0
+            for l in range(layer_count - 1):
+                gap = gap_m[l]
+                g_base = (k_fr4 * pixel_area) / gap
+                g_via = g_base * via_gain * via_scale
+                g_z = g_base + g_via
+                i_z = (l * nrc) + np.arange(nrc)
+                j_z = ((l + 1) * nrc) + np.arange(nrc)
+                g_flat = g_z.ravel()
+                diag[i_z] += g_flat
+                diag[j_z] += g_flat
+                add_off_diag(i_z, j_z, g_flat)
+                add_off_diag(j_z, i_z, g_flat)
+
+        # Convection on outer surfaces
+        h_conv = 10.0  # W/m^2·K
+        g_conv = h_conv * pixel_area
+        top_idx = np.arange(nrc)
+        bottom_idx = (layer_count - 1) * nrc + np.arange(nrc)
+        diag[top_idx] += g_conv
+        diag[bottom_idx] += g_conv
+
+        # Optional heatsink (conductance to housing temperature)
+        b_sink = np.zeros(total_nodes)
+        if settings['use_heatsink']:
+            pad_thick_m = max(1e-6, settings['pad_th'] * 1e-3)
+            pad_k = settings['pad_k']
+            g_sink = (pad_k / pad_thick_m) * pixel_area
+            sink_vals = g_sink * H_map.ravel()
+            diag[bottom_idx] += sink_vals
+            b_sink[bottom_idx] = sink_vals * amb
+
+        # Backward Euler: (C/dt + G) * T^{n+1} - sum(G_ij * T_j^{n+1})
+        #               = (C/dt) * T^n + P + convection/sink terms
+        # Build system matrix A = C/dt + G, with off-diagonals -G_ij.
+        C_vec = C_map.ravel()
+        C_over_dt = C_vec / dt
+        diag += C_over_dt
+        rows_idx.extend(np.arange(total_nodes).tolist())
+        cols_idx.extend(np.arange(total_nodes).tolist())
+        data_vals.extend(diag.tolist())
+
+        A = sp.coo_matrix((data_vals, (rows_idx, cols_idx)), shape=(total_nodes, total_nodes)).tocsc()
+
+        if has_pardiso:
+            solver_name = "PARDISO"
+            solve_fn = lambda b: pardiso_spsolve(A, b)
+        else:
+            solver_name = "SuperLU"
+            solve_fn = spla.factorized(A)
+
+        b_conv = np.zeros(total_nodes)
+        b_conv[top_idx] = g_conv * amb
+        b_conv[bottom_idx] = g_conv * amb
+
+        P_vec = P_map.ravel()
+        b_static = P_vec + b_conv + b_sink
+
+        # Use larger batches for progress updates
+        batch_size = max(1, min(200, int(steps / 20) if steps > 0 else 1))
         num_batches = max(1, int(steps / batch_size))
-        actual_steps = num_batches * batch_size
         
+        k_norm_info = {
+            "solver": "implicit sparse",
+            "linear_backend": solver_name,
+            "matrix_size": total_nodes,
+            "nnz": int(A.nnz),
+            "dt_s": dt,
+            "steps": steps,
+        }
+
         pd = wx.ProgressDialog("Simulating...", "Initializing...", 100, style=wx.PD_CAN_ABORT|wx.PD_APP_MODAL|wx.PD_REMAINING_TIME)
         start_time = time.time()
         aborted = False
-        roll = np.roll
-        
-        # Diffusion coefficient - scaled for stability (Max 0.25)
-        # We aligned dt_limit with 0.15, so we match it here
-        max_k = np.max(K)
-        min_k = np.min(K)
-        target_max = 0.22
-        diff_factor = target_max / max(max_k, 1.0)
-        K_safe = K * diff_factor
-        max_k_safe = np.max(K_safe)
-        min_k_safe = np.min(K_safe)
-        k_norm_info = {
-            "strategy": "scale_by_maxK",
-            "target_max": target_max,
-            "k_min": min_k,
-            "k_max": max_k,
-            "diff_factor": diff_factor,
-            "k_safe_min": min_k_safe,
-            "k_safe_max": max_k_safe,
-            "copper_masked_heat_cap": True,
-        }
-        
-        # Vertical heat transfer coefficient
-        # Q = k_fr4 * A * dT / d, where d = layer spacing
-        # dT/dt = Q / (m * cp) = k_fr4 * A * dT / (d * m * cp)
-        # For pixel: coefficient = k_fr4 * pixel_area / (layer_spacing * pixel_heat_cap) * dt
-        k_fr4_thermal = 0.3  # FR4 thermal conductivity W/(m·K)
-        
-        # Vertical coupling: heat transfer rate through FR4 between layers
-        if layer_count > 1 and gap_m:
-            cap_pairs = 0.5 * (pixel_heat_cap[:-1] + pixel_heat_cap[1:])
-            z_base = (k_fr4_thermal * pixel_area / np.array(gap_m)[:, None, None]) * dt / cap_pairs
-        else:
-            z_base = np.zeros((max(0, layer_count - 1), rows, cols))
-        
-        # Via enhancement factor (vias increase vertical conductance)
-        # V_map has values: 1 for FR4, via_factor for vias
-        # Normalize to get via locations: V_norm = 1 for FR4, higher for vias
-        # Clamp via enhancement to prevent instability
-        V_enhance = np.clip(V_map, 1.0, 50.0)  # Max 50x enhancement at vias
-        z_eff = z_base * V_enhance
-
         snap_cnt = 1
         step_counter = 0
-        amb = settings['amb']
         snap_steps = []
         next_snap_idx = 0
         if settings.get('snapshots'):
@@ -855,120 +911,35 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snap_steps = sorted({s for s in snap_steps if 0 < s < steps})
         print(f"[ThermalSim] snapshots={settings.get('snapshots')} snap_count={settings.get('snap_count')} dt={dt:.6f} steps={steps} snap_steps={snap_steps}")
         print(f"[ThermalSim] base_output_dir={base_output_dir} run_dir={run_dir}")
-        
-        # Pre-compute smoothing kernel weights
-        smooth_weight = 0.1
-        
-        v_chg = np.zeros_like(T)
-        
-        # --- OPTIMIZATION: Slicing Views & Buffers ---
-        # Pre-allocate slice views to avoid constructing them inside the loop
-        # Inner domain (excluding 1 pixel border)
-        T_inner = T[:, 1:-1, 1:-1]
-        K_inner = K_safe[:, 1:-1, 1:-1]
-        P_inner = P_map[:, 1:-1, 1:-1]
-        
-        # Neighbor slices
-        T_up    = T[:, :-2, 1:-1]
-        T_down  = T[:, 2:, 1:-1]
-        T_left  = T[:, 1:-1, :-2]
-        T_right = T[:, 1:-1, 2:]
 
-        # Buffer for vertical transfer
-        if layer_count > 1:
-            z_eff_inner = z_eff[:, 1:-1, 1:-1]
-            H_map_inner = H_map[1:-1, 1:-1]
-            dT_layer_buf = np.zeros((layer_count-1, rows-2, cols-2))
-            v_chg_inner_buf = np.zeros_like(T_inner)
-        else:
-            # For single layer, these are not strictly used but defined to be safe
-            H_map_inner = H_map[1:-1, 1:-1]
-            z_eff_inner = None
-            dT_layer_buf = None
-            v_chg_inner_buf = None
-
-
-
+        T_vec = T.ravel()
         try:
             for b in range(num_batches):
                 percent = int((b / num_batches) * 100)
-                elapsed = time.time() - start_time
                 msg = f"Step {b*batch_size}/{steps}"
-                
-                # Check for cancel
+
                 keep_going = True
                 try:
                     keep_going = pd.Update(percent, msg)
-                except:
-                    # Handle cases where dialog might be dead
+                except Exception:
                     keep_going = False
-                    
-                if not keep_going: 
+
+                if not keep_going:
                     aborted = True
                     break
-                
+
                 for _ in range(batch_size):
                     if step_counter >= steps:
                         break
+                    b_vec = (C_over_dt * T_vec) + b_static
+                    T_vec = np.asarray(solve_fn(b_vec)).ravel()
                     step_counter += 1
-                    
-                    # Lateral Heat Diffusion (2D Laplacian) on inner pixels
-                    # L = Neighbors - 4*Center
-                    L = (T_up + T_down + T_left + T_right)
-                    L -= 4 * T_inner
-                    
-                    # Vertical Heat Transfer
-                    if layer_count > 1:
-                        v_chg_inner_buf.fill(0.0)
-                        
-                        # Gradient T[i+1] - T[i] using buffer
-                        np.subtract(T_inner[1:], T_inner[:-1], out=dT_layer_buf)
-                        
-                        # Flux
-                        dT_layer_buf *= z_eff_inner
-                        np.clip(dT_layer_buf, -50, 50, out=dT_layer_buf)
-                        
-                        # Apply flux
-                        v_chg_inner_buf[:-1] += dT_layer_buf
-                        v_chg_inner_buf[1:]  -= dT_layer_buf
-                        
-                        # T += L*K + v + P
-                        L *= K_inner
-                        L += v_chg_inner_buf
-                        L += P_inner
-                        T_inner += L
-                    else:
-                        # Single layer
-                        L *= K_inner
-                        L += P_inner
-                        T_inner += L
-                    
-                    # Clamp temperature
-                    np.clip(T_inner, amb, amb + 500, out=T_inner)
-                    
-                    # Convective cooling (Boundary Conditions)
-                    # Top Layer Inner
-                    T_inner[0] -= (T_inner[0] - amb) * cool_air[0, 1:-1, 1:-1]
-                    
-                    # Bottom layer
-                    if layer_count > 1:
-                        T_inner[-1] -= (T_inner[-1] - amb) * ((1-H_map_inner)*cool_air[-1, 1:-1, 1:-1] + H_map_inner*cool_sink_factor[1:-1, 1:-1])
-                    else:
-                        T_inner[0] -= (T_inner[0] - amb) * cool_air[0, 1:-1, 1:-1]
-                    
-                    # Smoothing
-                    if step_counter % 50 == 0:
-                        # Smoothing using slicing
-                        sL = (T_up + T_down + T_left + T_right)
-                        sL *= smooth_weight
-                        sL += T_inner
-                        sL /= (1 + 4*smooth_weight)
-                        T_inner[:] = sL
 
                     if settings['snapshots']:
                         while next_snap_idx < len(snap_steps) and step_counter >= snap_steps[next_snap_idx]:
                             t_elapsed = step_counter * dt
-                            self.save_snapshot(T, H_map, settings['amb'], layer_names, snap_cnt, t_elapsed, out_dir=run_dir)
+                            T_snap = T_vec.reshape((layer_count, rows, cols))
+                            self.save_snapshot(T_snap, H_map, settings['amb'], layer_names, snap_cnt, t_elapsed, out_dir=run_dir)
                             snap_cnt += 1
                             next_snap_idx += 1
                 if step_counter >= steps:
@@ -982,6 +953,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 wx.GetApp().Yield()
             except:
                 pass
+        T = T_vec.reshape((layer_count, rows, cols))
         if not aborted:
             if settings['show_all']:
                 heatmap_path = self.show_results_all_layers(T, H_map, settings['amb'], layer_names, t_elapsed=sim_time, out_dir=run_dir)
