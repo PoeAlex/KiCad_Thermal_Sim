@@ -15,9 +15,16 @@ try:
     matplotlib.use('Agg')  # Use non-interactive backend for file output
     import matplotlib.pyplot as plt
     import wx
+    try:
+        from scipy import sparse
+        from scipy.sparse import linalg as sparse_linalg
+        HAS_SCIPY = True
+    except ImportError:
+        HAS_SCIPY = False
     HAS_LIBS = True
 except ImportError:
     HAS_LIBS = False
+    HAS_SCIPY = False
 
 
 # -----------------------------------------------------------------------------
@@ -705,6 +712,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # --- 8. Power Injection ---
         P_map = np.zeros((layer_count, rows, cols))
+        P_watt_map = np.zeros((layer_count, rows, cols))
         
         # Calculate thermal mass per pixel
         # Copper dominates transient thermal behavior
@@ -773,6 +781,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     # Bounds Check
                     if r < rows and c < cols:
                         P_map[target_idx, r, c] += val * power_scale_layer[r, c]
+                        P_watt_map[target_idx, r, c] += val
 
         # --- 9. SOLVER ---
         T = np.ones((layer_count, rows, cols)) * settings['amb']
@@ -982,6 +991,27 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 wx.GetApp().Yield()
             except:
                 pass
+        scipy_info = {}
+        if not aborted and HAS_SCIPY:
+            T_scipy, scipy_info = self._solve_steady_state_scipy(
+                copper_mask=copper_mask,
+                cu_thick_m=cu_thick_m,
+                fr4_effective_thick=fr4_effective_thick,
+                gap_m=gap_m,
+                V_map=V_map,
+                H_map=H_map,
+                P_watt_map=P_watt_map,
+                amb=settings['amb'],
+                dx=dx,
+                h_conv=h_conv,
+                h_sink=h_sink
+            )
+            if T_scipy is not None:
+                T = T_scipy
+
+        if scipy_info:
+            k_norm_info.update(scipy_info)
+
         if not aborted:
             if settings['show_all']:
                 heatmap_path = self.show_results_all_layers(T, H_map, settings['amb'], layer_names, t_elapsed=sim_time, out_dir=run_dir)
@@ -1290,6 +1320,135 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         for r in range(rs, re):
             for c in range(cs, ce): pixels.append((r, c))
         return pixels
+
+    def _solve_steady_state_scipy(self, copper_mask, cu_thick_m, fr4_effective_thick, gap_m,
+                                  V_map, H_map, P_watt_map, amb, dx, h_conv, h_sink,
+                                  max_nodes=50000):
+        if not HAS_SCIPY:
+            return None, {"scipy_used": False, "scipy_reason": "scipy unavailable"}
+
+        layer_count, rows, cols = P_watt_map.shape
+        node_count = layer_count * rows * cols
+        if node_count > max_nodes:
+            return None, {
+                "scipy_used": False,
+                "scipy_reason": f"node_limit_exceeded ({node_count} > {max_nodes})"
+            }
+
+        k_cu = 390.0
+        k_fr4 = 0.3
+        cu_thick = np.array(cu_thick_m, dtype=float)
+        fr4_thick = np.array(fr4_effective_thick, dtype=float)
+
+        thickness_map = fr4_thick[:, None, None] * np.ones_like(P_watt_map)
+        thickness_map = np.where(copper_mask, cu_thick[:, None, None], thickness_map)
+        k_map = np.where(copper_mask, k_cu, k_fr4)
+
+        g_inplane = (k_map * thickness_map) / (dx * dx)
+
+        area = dx * dx
+        if layer_count > 1 and gap_m:
+            gap = np.array(gap_m, dtype=float)
+            g_vert_base = (k_fr4 * area) / gap
+            V_enhance = np.clip(V_map, 1.0, 50.0)
+            g_vert = g_vert_base[:, None, None] * V_enhance[None, :, :]
+        else:
+            g_vert = None
+
+        h_conv_area = h_conv * area
+        h_bottom = h_conv * (1.0 - H_map) + h_sink * H_map
+        h_bottom_area = h_bottom * area
+
+        data = []
+        rows_idx = []
+        cols_idx = []
+        b = np.zeros(node_count, dtype=float)
+
+        def node_index(layer, r, c):
+            return (layer * rows + r) * cols + c
+
+        for layer in range(layer_count):
+            for r in range(rows):
+                for c in range(cols):
+                    idx = node_index(layer, r, c)
+                    if r == 0 or c == 0 or r == rows - 1 or c == cols - 1:
+                        rows_idx.append(idx)
+                        cols_idx.append(idx)
+                        data.append(1.0)
+                        b[idx] = amb
+                        continue
+
+                    diag = 0.0
+                    rhs = P_watt_map[layer, r, c]
+
+                    g_center = g_inplane[layer, r, c]
+                    g_n = 0.5 * (g_center + g_inplane[layer, r - 1, c])
+                    g_s = 0.5 * (g_center + g_inplane[layer, r + 1, c])
+                    g_w = 0.5 * (g_center + g_inplane[layer, r, c - 1])
+                    g_e = 0.5 * (g_center + g_inplane[layer, r, c + 1])
+
+                    for g_val, n_r, n_c in (
+                        (g_n, r - 1, c),
+                        (g_s, r + 1, c),
+                        (g_w, r, c - 1),
+                        (g_e, r, c + 1),
+                    ):
+                        diag += g_val
+                        rows_idx.append(idx)
+                        cols_idx.append(node_index(layer, n_r, n_c))
+                        data.append(-g_val)
+
+                    if layer_count > 1:
+                        if layer > 0:
+                            g_val = g_vert[layer - 1, r, c]
+                            diag += g_val
+                            rows_idx.append(idx)
+                            cols_idx.append(node_index(layer - 1, r, c))
+                            data.append(-g_val)
+                        if layer < layer_count - 1:
+                            g_val = g_vert[layer, r, c]
+                            diag += g_val
+                            rows_idx.append(idx)
+                            cols_idx.append(node_index(layer + 1, r, c))
+                            data.append(-g_val)
+
+                    if layer_count == 1:
+                        diag += h_conv_area + h_bottom_area[r, c]
+                        rhs += (h_conv_area + h_bottom_area[r, c]) * amb
+                    else:
+                        if layer == 0:
+                            diag += h_conv_area
+                            rhs += h_conv_area * amb
+                        if layer == layer_count - 1:
+                            diag += h_bottom_area[r, c]
+                            rhs += h_bottom_area[r, c] * amb
+
+                    rows_idx.append(idx)
+                    cols_idx.append(idx)
+                    data.append(diag)
+                    b[idx] = rhs
+
+        A = sparse.coo_matrix((data, (rows_idx, cols_idx)), shape=(node_count, node_count)).tocsr()
+        try:
+            sol, info = sparse_linalg.cg(A, b, atol=1e-8, tol=1e-6, maxiter=2000)
+        except TypeError:
+            sol, info = sparse_linalg.cg(A, b, tol=1e-6, maxiter=2000)
+
+        if info != 0:
+            try:
+                sol = sparse_linalg.spsolve(A, b)
+                info = 0
+            except Exception:
+                return None, {"scipy_used": False, "scipy_reason": f"cg_failed ({info})"}
+
+        T = sol.reshape((layer_count, rows, cols))
+        info_dict = {
+            "scipy_used": True,
+            "scipy_nodes": node_count,
+            "scipy_solver": "cg",
+            "scipy_cg_info": info,
+        }
+        return T, info_dict
 
     def save_snapshot(self, T, H, amb, layer_names, idx, t_elapsed, out_dir=None):
         try:
