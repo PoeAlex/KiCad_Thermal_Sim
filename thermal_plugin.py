@@ -8,6 +8,7 @@ import tempfile
 import re
 import html
 import json
+import importlib.util
 
 try:
     import numpy as np
@@ -18,6 +19,11 @@ try:
     HAS_LIBS = True
 except ImportError:
     HAS_LIBS = False
+HAS_SCIPY = False
+if HAS_LIBS and importlib.util.find_spec("scipy") is not None:
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
+    HAS_SCIPY = True
 
 
 # -----------------------------------------------------------------------------
@@ -704,7 +710,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         dt = sim_time / steps  # Recalculate dt to match exactly
 
         # --- 8. Power Injection ---
-        P_map = np.zeros((layer_count, rows, cols))
+        P_map_w = np.zeros((layer_count, rows, cols))
         
         # Calculate thermal mass per pixel
         # Copper dominates transient thermal behavior
@@ -767,12 +773,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             
             pixels = self.get_pad_pixels(pad, rows, cols, x_min, y_min, res)
             if pixels:
-                power_scale_layer = power_scale[target_idx]
                 val = p_vals[idx] / len(pixels)
                 for r, c in pixels: 
                     # Bounds Check
                     if r < rows and c < cols:
-                        P_map[target_idx, r, c] += val * power_scale_layer[r, c]
+                        P_map_w[target_idx, r, c] += val
+
+        P_map = P_map_w * power_scale
 
         # --- 9. SOLVER ---
         T = np.ones((layer_count, rows, cols)) * settings['amb']
@@ -983,6 +990,26 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             except:
                 pass
         if not aborted:
+            scipy_info = {"scipy_available": HAS_SCIPY, "scipy_used": False}
+            if HAS_SCIPY:
+                T_scipy, scipy_info = self.solve_steady_state_scipy(
+                    P_map_w=P_map_w,
+                    T_init=T,
+                    copper_mask=copper_mask,
+                    cu_thick_m=np.array(cu_thick_m),
+                    fr4_thick_m=np.array(fr4_effective_thick),
+                    gap_m=gap_m,
+                    H_map=H_map,
+                    V_map=V_map,
+                    amb=amb,
+                    dx=dx,
+                    h_conv=h_conv,
+                    pad_k=pad_k,
+                    pad_thick_m=pad_thick_m,
+                )
+                if T_scipy is not None:
+                    T = T_scipy
+            k_norm_info.update(scipy_info)
             if settings['show_all']:
                 heatmap_path = self.show_results_all_layers(T, H_map, settings['amb'], layer_names, t_elapsed=sim_time, out_dir=run_dir)
             else:
@@ -1023,6 +1050,115 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     webbrowser.open("file://" + os.path.abspath(report_path))
                 except Exception:
                     pass
+
+    def solve_steady_state_scipy(self, P_map_w, T_init, copper_mask, cu_thick_m, fr4_thick_m, gap_m, H_map, V_map, amb, dx, h_conv, pad_k, pad_thick_m):
+        info = {
+            "scipy_available": HAS_SCIPY,
+            "scipy_used": False,
+        }
+        if not HAS_SCIPY:
+            info["scipy_reason"] = "scipy_unavailable"
+            return None, info
+
+        layer_count, rows, cols = P_map_w.shape
+        node_count = layer_count * rows * cols
+        info["scipy_nodes"] = node_count
+        max_nodes = 200000
+        if node_count > max_nodes:
+            info["scipy_reason"] = f"node_limit_exceeded({node_count}>{max_nodes})"
+            return None, info
+
+        k_fr4 = 0.3  # W/(m·K)
+        k_cu = 390.0  # W/(m·K)
+        pixel_area = dx * dx
+
+        k_xy_maps = np.zeros_like(P_map_w)
+        for i in range(layer_count):
+            k_xy_maps[i] = np.where(
+                copper_mask[i],
+                k_cu * cu_thick_m[i],
+                k_fr4 * fr4_thick_m[i],
+            )
+
+        V_enhance = np.clip(V_map, 1.0, 50.0)
+        h_sink = (pad_k / pad_thick_m) * 0.1
+
+        rows_list = []
+        cols_list = []
+        data_list = []
+        diag = np.zeros(node_count, dtype=float)
+        b = P_map_w.reshape(-1).astype(float).copy()
+
+        if layer_count == 1:
+            h_bottom = h_conv * (1.0 - H_map) + h_sink * H_map
+            h_total = h_conv + h_bottom
+
+        def idx(layer, r, c):
+            return (layer * rows + r) * cols + c
+
+        for layer in range(layer_count):
+            k_xy = k_xy_maps[layer]
+            for r in range(rows):
+                for c in range(cols):
+                    i = idx(layer, r, c)
+
+                    if layer_count == 1:
+                        h_here = h_total[r, c]
+                    elif layer == 0:
+                        h_here = h_conv
+                    elif layer == layer_count - 1:
+                        h_here = h_conv * (1.0 - H_map[r, c]) + h_sink * H_map[r, c]
+                    else:
+                        h_here = 0.0
+
+                    if h_here > 0:
+                        g_conv = h_here * pixel_area
+                        diag[i] += g_conv
+                        b[i] += g_conv * amb
+
+                    if c + 1 < cols:
+                        g = 0.5 * (k_xy[r, c] + k_xy[r, c + 1])
+                        if g > 0:
+                            j = idx(layer, r, c + 1)
+                            rows_list.extend([i, j])
+                            cols_list.extend([j, i])
+                            data_list.extend([-g, -g])
+                            diag[i] += g
+                            diag[j] += g
+
+                    if r + 1 < rows:
+                        g = 0.5 * (k_xy[r, c] + k_xy[r + 1, c])
+                        if g > 0:
+                            j = idx(layer, r + 1, c)
+                            rows_list.extend([i, j])
+                            cols_list.extend([j, i])
+                            data_list.extend([-g, -g])
+                            diag[i] += g
+                            diag[j] += g
+
+                    if layer < layer_count - 1 and gap_m:
+                        gap_val = gap_m[layer] if layer < len(gap_m) else None
+                        if gap_val:
+                            g = (k_fr4 * pixel_area / gap_val) * V_enhance[r, c]
+                            if g > 0:
+                                j = idx(layer + 1, r, c)
+                                rows_list.extend([i, j])
+                                cols_list.extend([j, i])
+                                data_list.extend([-g, -g])
+                                diag[i] += g
+                                diag[j] += g
+
+        A = sp.coo_matrix((data_list, (rows_list, cols_list)), shape=(node_count, node_count))
+        A = A + sp.diags(diag)
+        A = A.tocsr()
+        x0 = T_init.reshape(-1) if T_init is not None else None
+        x, cg_info = spla.cg(A, b, x0=x0, tol=1e-6, maxiter=2000)
+        info["scipy_cg_info"] = cg_info
+        if cg_info != 0:
+            info["scipy_reason"] = f"cg_failed({cg_info})"
+            return None, info
+        info["scipy_used"] = True
+        return x.reshape((layer_count, rows, cols)), info
 
     def create_multilayer_maps(self, board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu_layers, via_factor, pads_list):
         num_layers = len(copper_ids)
