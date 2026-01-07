@@ -811,15 +811,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         print(f"[ThermalSim] snapshots={settings.get('snapshots')} snap_count={settings.get('snap_count')} dt={dt:.6f} steps={steps} snap_steps={snap_steps}")
         print(f"[ThermalSim] base_output_dir={base_output_dir} run_dir={run_dir}")
 
-        solver_pd = None
         solver_info = {
             "method": "implicit_time_step",
             "pardiso_used": False,
             "status": "initializing",
         }
         try:
-            solver_pd = wx.ProgressDialog("Solving...", "Building sparse system...", 100, style=wx.PD_APP_MODAL)
-            solver_pd.Update(10, "Building sparse system...")
+            pd.Update(5, "Building sparse system...")
             build = self._build_implicit_sparse_system(
                 V_map=V_map,
                 H_map=H_map,
@@ -844,7 +842,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             else:
                 A, b_const, cdt_vec, solver_info = build
             if not aborted:
-                solver_pd.Update(30, "Preparing solver...")
+                pd.Update(15, "Preparing solver...")
                 solver_fn = None
                 try:
                     from pypardiso import spsolve as pardiso_spsolve
@@ -856,20 +854,19 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     solver_info["pardiso_used"] = False
                     solver_fn = spla.factorized(A)
                 solver_info["status"] = "ok"
-            solver_pd.Update(40, "Running implicit steps...")
+            pd.Update(20, "Running implicit steps...")
         finally:
-            if solver_pd:
-                solver_pd.Hide()
-                solver_pd.Destroy()
+            pass
 
         try:
             if not aborted:
                 n_inner = (rows - 2) * (cols - 2)
                 total_nodes = layer_count * n_inner
-                update_stride = max(1, int(steps / 100))
+                update_stride = max(1, int(steps / 50))
+                rhs = np.zeros(total_nodes)
                 while step_counter < steps and not aborted:
                     if step_counter % update_stride == 0:
-                        percent = int((step_counter / max(1, steps)) * 100)
+                        percent = int(20 + (step_counter / max(1, steps)) * 80)
                         msg = f"Step {step_counter}/{steps}"
                         try:
                             keep_going = pd.Update(percent, msg)
@@ -880,7 +877,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             break
 
                     T_vec = T[:, 1:-1, 1:-1].reshape(total_nodes)
-                    rhs = cdt_vec * T_vec + b_const
+                    np.multiply(cdt_vec, T_vec, out=rhs)
+                    rhs += b_const
                     try:
                         T_new = solver_fn(rhs)
                     except Exception as exc:
