@@ -848,7 +848,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         
         v_chg = np.zeros_like(T)
         thickness_map = fr4_heat_cap_map / (rho_fr4 * cp_fr4 * pixel_area)
-        thickness_map += (cu_thick_m[:, None, None] * copper_mask)
+        thickness_map += (np.array(cu_thick_m)[:, None, None] * copper_mask)
         
         # --- OPTIMIZATION: Slicing Views & Buffers ---
         # Pre-allocate slice views to avoid constructing them inside the loop
