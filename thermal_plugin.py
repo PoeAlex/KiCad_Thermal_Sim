@@ -847,7 +847,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         print("[ThermalSim] boundary_mode=neumann_no_flux (edge replication, borders not pinned to ambient)")
         
         v_chg = np.zeros_like(T)
-        thickness_map = fr4_heat_cap_map / (rho_fr4 * cp_fr4 * pixel_area)
+        thickness_map = np.broadcast_to(np.array(fr4_thick_m)[:, None, None], copper_mask.shape).copy()
         thickness_map += (np.array(cu_thick_m)[:, None, None] * copper_mask)
         
         # --- OPTIMIZATION: Slicing Views & Buffers ---
