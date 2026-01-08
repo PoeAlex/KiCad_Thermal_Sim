@@ -909,40 +909,90 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snapshot_stats = []
             total_solve_time = 0.0
             pin = float(np.sum(Q))
-            prev_time = 0.0
-            e_prev = 0.0
-            pout_prev = 0.0
             balance_history = []
             phase_metrics = []
+            total_factor_time = 0.0
+            factor_count = 0
 
             try:
-                phase_defs = [
-                    {"name": "A", "frac": 0.08, "dt_scale": 0.5},
-                    {"name": "B", "frac": 0.35, "dt_scale": 1.0},
-                    {"name": "C", "frac": 0.57, "dt_scale": 2.0},
-                ]
-                phase_times = [sim_time * p["frac"] for p in phase_defs]
-                phase_times[-1] = sim_time - sum(phase_times[:-1])
-                phase_steps = []
-                phase_dts = []
-                for phase_time, pdef in zip(phase_times, phase_defs):
-                    phase_dt = dt * pdef["dt_scale"]
-                    step_count = max(1, int(round(phase_time / phase_dt)))
-                    phase_dt = phase_time / step_count if phase_time > 0 else dt
-                    phase_steps.append(step_count)
-                    phase_dts.append(phase_dt)
-                total_steps = sum(phase_steps)
-                update_interval = max(1, total_steps // 100)
-
                 Tn = np.ones(N, dtype=np.float64) * amb
                 Tnm1 = Tn.copy()
-                e_prev = float(np.sum(C * (Tn - amb)))
-                pout_prev = float(np.sum(hA * (Tn - amb)))
+                e0 = float(np.sum(C * (Tn - amb)))
+                balance_integral = 0.0
+                pout_step = float(np.sum(hA * (Tn - amb)))
+                prev_snap_time = 0.0
+                prev_snap_energy = e0
+
+                use_multi_phase = backend == "PARDISO" or bool(settings.get("multi_phase", False))
+                if use_multi_phase:
+                    phase_defs = [
+                        {"name": "A", "frac": 0.08, "dt_scale": 0.5},
+                        {"name": "B", "frac": 0.35, "dt_scale": 1.0},
+                        {"name": "C", "frac": 0.57, "dt_scale": 2.0},
+                    ]
+                    phase_times = [sim_time * p["frac"] for p in phase_defs]
+                    phase_times[-1] = sim_time - sum(phase_times[:-1])
+                    phase_steps = []
+                    phase_dts = []
+                    for phase_time, pdef in zip(phase_times, phase_defs):
+                        phase_dt = dt * pdef["dt_scale"]
+                        step_count = max(1, int(round(phase_time / phase_dt)))
+                        phase_dt = phase_time / step_count if phase_time > 0 else dt
+                        phase_steps.append(step_count)
+                        phase_dts.append(phase_dt)
+                    total_steps = sum(phase_steps)
+                    update_interval = max(1, total_steps // 100)
+                    phase_plan = list(zip(phase_defs, phase_times, phase_steps, phase_dts))
+                else:
+                    total_steps = steps_target
+                    update_interval = max(1, total_steps // 100)
+                    phase_plan = [({"name": "single"}, sim_time, total_steps, dt)]
 
                 current_time = 0.0
-                for phase_idx, (pdef, phase_time, phase_step_count, phase_dt) in enumerate(
-                    zip(phase_defs, phase_times, phase_steps, phase_dts)
-                ):
+
+                def _record_snapshot(t_elapsed):
+                    nonlocal prev_snap_time, prev_snap_energy
+                    T_view = Tn.reshape((layer_count, rows, cols))
+                    max_top = float(np.max(T_view[0]))
+                    max_bot = float(np.max(T_view[-1]))
+                    delta_t = Tn - amb
+                    energy = float(np.sum(C * delta_t))
+                    dE = energy - e0
+                    eps_abs = abs(dE - balance_integral)
+                    eps_rel = eps_abs / max(abs(t_elapsed * pin), 1e-9)
+                    balance_warn = eps_rel > 0.01 or eps_abs > 0.01
+                    print(
+                        "[ThermalSim][EnergyBalance] "
+                        f"t={t_elapsed:.3f}s E={energy:.6f}J Pin={pin:.6f}W "
+                        f"Pout={pout_step:.6f}W eps_abs={eps_abs:.6f}J eps_rel={eps_rel:.6f}"
+                    )
+                    if balance_warn:
+                        print(
+                            "[ThermalSim][EnergyBalance][WARN] "
+                            f"eps_rel={eps_rel:.6f} eps_abs={eps_abs:.6f}J"
+                        )
+                    interval_t = t_elapsed - prev_snap_time
+                    if interval_t > 0:
+                        balance_history.append({
+                            "delta_t": interval_t,
+                            "dE": energy - prev_snap_energy
+                        })
+                    prev_snap_time = t_elapsed
+                    prev_snap_energy = energy
+                    snapshot_stats.append({
+                        "t": t_elapsed,
+                        "max_top": max_top,
+                        "max_bottom": max_bot,
+                        "energy": energy,
+                        "pin": pin,
+                        "pout": pout_step,
+                        "eps_abs": eps_abs,
+                        "eps_rel": eps_rel,
+                        "energy_warn": balance_warn
+                    })
+                    self.save_snapshot(T_view, H_map, amb, layer_names, snap_cnt, t_elapsed, out_dir=run_dir)
+
+                for pdef, phase_time, phase_step_count, phase_dt in phase_plan:
                     if phase_step_count <= 0:
                         continue
                     assembly_start = time.perf_counter()
@@ -964,19 +1014,29 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         solve_be = lu_be.solve
                         solve_bdf2 = lu_bdf2.solve
                     factor_time = time.perf_counter() - factor_start
+                    total_factor_time += factor_time
+                    factor_count += 1
 
                     phase_solve_time = 0.0
                     phase_steps_done = 0
 
+                    def _advance_step(rhs, solver, dt_k):
+                        nonlocal Tnm1, Tn, current_time, step_counter, pout_step, balance_integral
+                        solve_start = time.perf_counter()
+                        Tnp1 = solver(rhs)
+                        solve_elapsed = time.perf_counter() - solve_start
+                        Tnm1, Tn = Tn, Tnp1
+                        current_time += dt_k
+                        step_counter += 1
+                        delta_t = Tn - amb
+                        pout_step = float(np.sum(hA * delta_t))
+                        balance_integral += dt_k * (pin - pout_step)
+                        return solve_elapsed
+
                     rhs1 = D * Tn + Q + b
-                    solve_start = time.perf_counter()
-                    Tnp1 = solve_be(rhs1)
-                    solve_elapsed = time.perf_counter() - solve_start
+                    solve_elapsed = _advance_step(rhs1, solve_be, phase_dt)
                     phase_solve_time += solve_elapsed
                     total_solve_time += solve_elapsed
-                    Tnm1, Tn = Tn, Tnp1
-                    current_time += phase_dt
-                    step_counter += 1
                     phase_steps_done += 1
 
                     if step_counter % update_interval == 0 or step_counter == total_steps:
@@ -994,61 +1054,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     if settings['snapshots']:
                         while next_snap_idx < len(snap_times) and current_time >= snap_times[next_snap_idx]:
                             t_elapsed = snap_times[next_snap_idx]
-                            T_view = Tn.reshape((layer_count, rows, cols))
-                            max_top = float(np.max(T_view[0]))
-                            max_bot = float(np.max(T_view[-1]))
-                            delta_t = Tn - amb
-                            energy = float(np.sum(C * delta_t))
-                            pout = float(np.sum(hA * delta_t))
-                            interval_t = t_elapsed - prev_time
-                            pout_avg = 0.5 * (pout_prev + pout)
-                            dE = energy - e_prev
-                            rhs_balance = interval_t * (pin - pout_avg)
-                            eps_abs = abs(dE - rhs_balance)
-                            eps_rel = eps_abs / max(abs(interval_t * pin), 1e-9)
-                            balance_warn = eps_rel > 0.01 or eps_abs > 0.01
-                            print(
-                                "[ThermalSim][EnergyBalance] "
-                                f"t={t_elapsed:.3f}s E={energy:.6f}J Pin={pin:.6f}W "
-                                f"Pout={pout:.6f}W eps_abs={eps_abs:.6f}J eps_rel={eps_rel:.6f}"
-                            )
-                            if balance_warn:
-                                print(
-                                    "[ThermalSim][EnergyBalance][WARN] "
-                                    f"eps_rel={eps_rel:.6f} eps_abs={eps_abs:.6f}J"
-                                )
-                            balance_history.append({
-                                "delta_t": interval_t,
-                                "dE": dE
-                            })
-                            prev_time = t_elapsed
-                            e_prev = energy
-                            pout_prev = pout
-                            snapshot_stats.append({
-                                "t": t_elapsed,
-                                "max_top": max_top,
-                                "max_bottom": max_bot,
-                                "energy": energy,
-                                "pin": pin,
-                                "pout": pout,
-                                "eps_abs": eps_abs,
-                                "eps_rel": eps_rel,
-                                "energy_warn": balance_warn
-                            })
-                            self.save_snapshot(T_view, H_map, amb, layer_names, snap_cnt, t_elapsed, out_dir=run_dir)
+                            _record_snapshot(t_elapsed)
                             snap_cnt += 1
                             next_snap_idx += 1
 
                     while phase_steps_done < phase_step_count:
                         rhs = (2.0 * D) * Tn - (0.5 * D) * Tnm1 + Q + b
-                        solve_start = time.perf_counter()
-                        Tnp1 = solve_bdf2(rhs)
-                        solve_elapsed = time.perf_counter() - solve_start
+                        solve_elapsed = _advance_step(rhs, solve_bdf2, phase_dt)
                         phase_solve_time += solve_elapsed
                         total_solve_time += solve_elapsed
-                        Tnm1, Tn = Tn, Tnp1
-                        current_time += phase_dt
-                        step_counter += 1
                         phase_steps_done += 1
 
                         if step_counter % update_interval == 0 or step_counter == total_steps:
@@ -1066,48 +1080,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         if settings['snapshots']:
                             while next_snap_idx < len(snap_times) and current_time >= snap_times[next_snap_idx]:
                                 t_elapsed = snap_times[next_snap_idx]
-                                T_view = Tn.reshape((layer_count, rows, cols))
-                                max_top = float(np.max(T_view[0]))
-                                max_bot = float(np.max(T_view[-1]))
-                                delta_t = Tn - amb
-                                energy = float(np.sum(C * delta_t))
-                                pout = float(np.sum(hA * delta_t))
-                                interval_t = t_elapsed - prev_time
-                                pout_avg = 0.5 * (pout_prev + pout)
-                                dE = energy - e_prev
-                                rhs_balance = interval_t * (pin - pout_avg)
-                                eps_abs = abs(dE - rhs_balance)
-                                eps_rel = eps_abs / max(abs(interval_t * pin), 1e-9)
-                                balance_warn = eps_rel > 0.01 or eps_abs > 0.01
-                                print(
-                                    "[ThermalSim][EnergyBalance] "
-                                    f"t={t_elapsed:.3f}s E={energy:.6f}J Pin={pin:.6f}W "
-                                    f"Pout={pout:.6f}W eps_abs={eps_abs:.6f}J eps_rel={eps_rel:.6f}"
-                                )
-                                if balance_warn:
-                                    print(
-                                        "[ThermalSim][EnergyBalance][WARN] "
-                                        f"eps_rel={eps_rel:.6f} eps_abs={eps_abs:.6f}J"
-                                    )
-                                balance_history.append({
-                                    "delta_t": interval_t,
-                                    "dE": dE
-                                })
-                                prev_time = t_elapsed
-                                e_prev = energy
-                                pout_prev = pout
-                                snapshot_stats.append({
-                                    "t": t_elapsed,
-                                    "max_top": max_top,
-                                    "max_bottom": max_bot,
-                                    "energy": energy,
-                                    "pin": pin,
-                                    "pout": pout,
-                                    "eps_abs": eps_abs,
-                                    "eps_rel": eps_rel,
-                                    "energy_warn": balance_warn
-                                })
-                                self.save_snapshot(T_view, H_map, amb, layer_names, snap_cnt, t_elapsed, out_dir=run_dir)
+                                _record_snapshot(t_elapsed)
                                 snap_cnt += 1
                                 next_snap_idx += 1
                         if aborted:
@@ -1124,8 +1097,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     })
                     if aborted:
                         break
-                if not aborted:
-                    current_time = sim_time
             finally:
                 if pd:
                     pd.Hide()
@@ -1157,6 +1128,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             k_norm_info = {
                 "strategy": "implicit_fvm_bdf2",
                 "backend": backend,
+                "multi_phase": use_multi_phase,
                 "N": N,
                 "nnz_K": int(K.nnz),
                 "dt_base": dt,
@@ -1169,7 +1141,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 "h_air_bottom": h_air_bot,
                 "h_sink": h_sink,
                 "contact_factor": contact_factor,
-                "factorization_s": factor_time,
+                "factorization_s": total_factor_time,
+                "factorizations": factor_count,
                 "avg_solve_s": avg_solve_time,
                 "pin_w": pin,
                 "pout_final_w": pout_final,
@@ -1180,6 +1153,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 "solver_backend": backend,
                 "solve_steps": step_counter,
                 "avg_solve_s": avg_solve_time,
+                "factorizations": factor_count,
+                "factorization_s": total_factor_time,
                 "phase_metrics": json.dumps(phase_metrics),
                 "snapshot_stats": snapshot_stats_json
             }
