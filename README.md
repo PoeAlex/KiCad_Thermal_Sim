@@ -34,7 +34,7 @@ Typical paths:
 - **Linux**: `~/.local/share/kicad/9.0/scripting/plugins/`
 - **macOS**: `~/Library/Application Support/kicad/9.0/scripting/plugins/`
 
-3. ***Install Matplotlib!*** Open Kicad 9.0 Command Prompt and type in "pip install matplotlib" and Enter
+3. ***Install Matplotlib and scipy!*** Open Kicad 9.0 Command Prompt and type in "pip install matplotlib" and "pip install scipy".
 4. Restart KiCad.
 5. In PCB Editor, run it via **Tools → External Plugins** (or the plugin menu, depending on KiCad version).
 
