@@ -748,6 +748,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         else:
             t_fr4_eff = [max(total_thick_mm * 1e-3, 1e-5)] * layer_count
         t_fr4_eff = np.clip(np.array(t_fr4_eff), 1e-6, 5e-3)
+        t_fr4_eff_mm = (t_fr4_eff * 1e3).tolist()
         t_cu = np.array(cu_thick_m)
 
         dielectric_under_copper_factor = 1.0
@@ -924,7 +925,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             )
             print(f"[ThermalSim] base_output_dir={base_output_dir} run_dir={run_dir}")
 
-            pd = wx.ProgressDialog("Simulating...", "Initializing...", 100, style=wx.PD_CAN_ABORT|wx.PD_APP_MODAL|wx.PD_REMAINING_TIME)
+            pd = wx.ProgressDialog(
+                "Simulating...",
+                "Initializing...",
+                100,
+                style=wx.PD_CAN_ABORT | wx.PD_APP_MODAL | wx.PD_REMAINING_TIME | wx.PD_AUTO_HIDE
+            )
             start_time = time.time()
             aborted = False
             snapshot_stats = []
@@ -937,6 +943,19 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             factor_count = 0
 
             try:
+                def _progress_update(current, total):
+                    percent = int((current / total) * 100) if total else 0
+                    msg = f"Step {current}/{total}"
+                    keep_going = True
+                    try:
+                        result = pd.Update(percent, msg)
+                        keep_going = result[0] if isinstance(result, tuple) else result
+                        if hasattr(pd, "WasCancelled") and pd.WasCancelled():
+                            keep_going = False
+                    except Exception:
+                        keep_going = False
+                    return keep_going
+
                 Tn = np.ones(N, dtype=np.float64) * amb
                 Tnm1 = Tn.copy()
                 e0 = float(np.sum(C * (Tn - amb)))
@@ -1073,15 +1092,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     phase_steps_done += 1
 
                     if step_counter % update_interval == 0 or step_counter == total_steps:
-                        percent = int((step_counter / total_steps) * 100)
-                        msg = f"Step {step_counter}/{total_steps}"
-                        keep_going = True
-                        try:
-                            keep_going = pd.Update(percent, msg)
-                        except Exception:
-                            keep_going = False
-                        if not keep_going:
+                        if not _progress_update(step_counter, total_steps):
                             aborted = True
+                            print("[ThermalSim] Simulation cancelled by user.")
                             break
 
                     if settings['snapshots']:
@@ -1099,15 +1112,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         phase_steps_done += 1
 
                         if step_counter % update_interval == 0 or step_counter == total_steps:
-                            percent = int((step_counter / total_steps) * 100)
-                            msg = f"Step {step_counter}/{total_steps}"
-                            keep_going = True
-                            try:
-                                keep_going = pd.Update(percent, msg)
-                            except Exception:
-                                keep_going = False
-                            if not keep_going:
+                            if not _progress_update(step_counter, total_steps):
                                 aborted = True
+                                print("[ThermalSim] Simulation cancelled by user.")
                                 break
 
                         if settings['snapshots']:
@@ -1132,6 +1139,11 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         break
             finally:
                 if pd:
+                    if not aborted:
+                        try:
+                            pd.Update(100, "Done")
+                        except Exception:
+                            pass
                     pd.Hide()
                     pd.Destroy()
                 try:
@@ -1170,6 +1182,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 "copper_threshold_rel": copper_threshold_rel,
                 "t_fr4_eff_min": float(np.min(t_fr4_eff)),
                 "t_fr4_eff_max": float(np.max(t_fr4_eff)),
+                "t_fr4_eff_per_plane_mm": t_fr4_eff_mm,
                 "pad_cap_input_areal": pad_cap_areal,
                 "pad_cap_per_cell": pad_cap_per_cell,
                 "pad_cap_total": pad_cap_total,
@@ -1209,9 +1222,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             return
         if not aborted:
             if settings['show_all']:
-                heatmap_path = self.show_results_all_layers(T, H_map, settings['amb'], layer_names, t_elapsed=sim_time, out_dir=run_dir)
+                heatmap_path = self.show_results_all_layers(T, H_map, settings['amb'], layer_names, open_file=False, t_elapsed=sim_time, out_dir=run_dir)
             else:
-                heatmap_path = self.show_results_top_bot(T, H_map, settings['amb'], t_elapsed=sim_time, out_dir=run_dir)
+                heatmap_path = self.show_results_top_bot(T, H_map, settings['amb'], open_file=False, t_elapsed=sim_time, out_dir=run_dir)
             preview_path = self._save_preview_image(settings, layer_names, open_file=False, stack_info=stack_info, out_dir=run_dir)
             snapshot_debug = {
                 "snapshots_enabled": settings.get('snapshots'),
@@ -1930,6 +1943,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             f"<tr><td>{_esc(layer_names[i])} → {_esc(layer_names[i + 1])}</td><td>{_esc(_fmt(g, ' mm'))}</td></tr>"
             for i, g in enumerate(gaps_used)
         )
+        t_fr4_eff_mm = []
+        if isinstance(k_norm_info, dict):
+            t_fr4_eff_mm = k_norm_info.get("t_fr4_eff_per_plane_mm") or []
+        fr4_eff_rows = "\n".join(
+            f"<tr><td>{_esc(layer_names[i])}</td><td>{_esc(_fmt(val, ' mm'))}</td></tr>"
+            for i, val in enumerate(t_fr4_eff_mm)
+        )
         snapshot_items = []
         if snapshot_files is not None:
             for item in snapshot_files:
@@ -2007,6 +2027,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
   <table>
     <tr><th>Interface</th><th>Gap</th></tr>
     {gap_rows}
+  </table>
+  <h2>Effective Dielectric Thickness per Plane</h2>
+  <p class="small">t_fr4_eff is per-plane effective dielectric thickness derived by averaging adjacent interface gaps; therefore its max may be lower than the maximum single interface gap.</p>
+  <table>
+    <tr><th>Plane</th><th>t_fr4_eff</th></tr>
+    {fr4_eff_rows if fr4_eff_rows else "<tr><td colspan='2'>n/a</td></tr>"}
   </table>
 
   <h2>Debug</h2>
