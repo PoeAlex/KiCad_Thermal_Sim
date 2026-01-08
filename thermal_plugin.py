@@ -8,6 +8,8 @@ import tempfile
 import re
 import html
 import json
+import shutil
+import subprocess
 import importlib.util
 
 import scipy.sparse as sp
@@ -347,6 +349,7 @@ class SettingsDialog(wx.Dialog):
         
         self.pad_thick = self.add_field(box_cool, "Pad Thickness (mm):", "1.0")
         self.pad_k     = self.add_field(box_cool, "Pad Cond. (W/mK):", "3.0")
+        self.pad_cap = self.add_field(box_cool, "Pad Heat Cap. (J/m²·K):", "0.0")
         
         sizer.Add(box_cool, 0, wx.EXPAND|wx.ALL, 5)
         
@@ -412,7 +415,8 @@ class SettingsDialog(wx.Dialog):
                 'pad_dist_mm': float(self.pad_dist_input.GetValue()),
                 'use_heatsink': self.chk_heatsink.GetValue(),
                 'pad_th': float(self.pad_thick.GetValue()),
-                'pad_k': float(self.pad_k.GetValue())
+                'pad_k': float(self.pad_k.GetValue()),
+                'pad_cap_areal': float(self.pad_cap.GetValue())
             }
         except ValueError:
             return None
@@ -453,6 +457,7 @@ class SettingsDialog(wx.Dialog):
             self.chk_heatsink.SetValue(bool(defaults.get('use_heatsink', self.chk_heatsink.GetValue())))
             self.pad_thick.SetValue(str(defaults.get('pad_th', self.pad_thick.GetValue())))
             self.pad_k.SetValue(str(defaults.get('pad_k', self.pad_k.GetValue())))
+            self.pad_cap.SetValue(str(defaults.get('pad_cap_areal', self.pad_cap.GetValue())))
         except Exception:
             pass
 
@@ -638,6 +643,14 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             os.makedirs(run_dir, exist_ok=True)
         except Exception:
             run_dir = base_output_dir
+        try:
+            os.makedirs(run_dir, exist_ok=True)
+            test_path = os.path.join(run_dir, ".write_test")
+            with open(test_path, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(test_path)
+        except Exception:
+            run_dir = tempfile.mkdtemp(prefix="ThermalSim_")
 
         # --- 5. Grid Setup ---
         res = settings['res']
@@ -734,7 +747,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 t_fr4_eff.append(gap)
         else:
             t_fr4_eff = [max(total_thick_mm * 1e-3, 1e-5)] * layer_count
-        t_fr4_eff = np.clip(np.array(t_fr4_eff), 1e-5, 5e-3)
+        t_fr4_eff = np.clip(np.array(t_fr4_eff), 1e-6, 5e-3)
         t_cu = np.array(cu_thick_m)
 
         dielectric_under_copper_factor = 1.0
@@ -746,6 +759,14 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             C_layer = np.where(mask, rho_cu * cp_cu * V_cu, rho_fr4 * cp_fr4 * V_fr4)
             C_layer += mask * (rho_fr4 * cp_fr4 * V_fr4 * dielectric_under_copper_factor)
             C_layers[l] = C_layer
+        pad_cap_areal = float(settings.get('pad_cap_areal', 0.0) or 0.0)
+        pad_cap_per_cell = 0.0
+        pad_cap_total = 0.0
+        if pad_cap_areal > 0.0 and np.any(H_map):
+            pad_cap_per_cell = pad_cap_areal * pixel_area
+            pad_cap_add = pad_cap_per_cell * H_map
+            C_layers[-1] += pad_cap_add
+            pad_cap_total = float(np.sum(pad_cap_add))
         C = C_layers.reshape(-1)
 
         try:
@@ -907,6 +928,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             start_time = time.time()
             aborted = False
             snapshot_stats = []
+            snapshot_files = []
             total_solve_time = 0.0
             pin = float(np.sum(Q))
             balance_history = []
@@ -990,7 +1012,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         "eps_rel": eps_rel,
                         "energy_warn": balance_warn
                     })
-                    self.save_snapshot(T_view, H_map, amb, layer_names, snap_cnt, t_elapsed, out_dir=run_dir)
+                    snap_path = self.save_snapshot(T_view, H_map, amb, layer_names, snap_cnt, t_elapsed, out_dir=run_dir)
+                    if snap_path:
+                        try:
+                            snap_abs = os.path.abspath(snap_path)
+                            run_abs = os.path.abspath(run_dir)
+                            if not snap_abs.startswith(run_abs):
+                                dest = os.path.join(run_dir, os.path.basename(snap_path))
+                                shutil.copy2(snap_path, dest)
+                                snap_path = dest
+                        except Exception:
+                            pass
+                        snapshot_files.append((t_elapsed, os.path.basename(snap_path)))
 
                 for pdef, phase_time, phase_step_count, phase_dt in phase_plan:
                     if phase_step_count <= 0:
@@ -1137,6 +1170,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 "copper_threshold_rel": copper_threshold_rel,
                 "t_fr4_eff_min": float(np.min(t_fr4_eff)),
                 "t_fr4_eff_max": float(np.max(t_fr4_eff)),
+                "pad_cap_input_areal": pad_cap_areal,
+                "pad_cap_per_cell": pad_cap_per_cell,
+                "pad_cap_total": pad_cap_total,
                 "h_top": h_top,
                 "h_air_bottom": h_air_bot,
                 "h_sink": h_sink,
@@ -1198,22 +1234,32 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 heatmap_path=heatmap_path,
                 k_norm_info=k_norm_info,
                 out_dir=run_dir,
-                snapshot_debug=snapshot_debug
+                snapshot_debug=snapshot_debug,
+                snapshot_files=snapshot_files
             )
             snapshot_count = 0
-            try:
-                snapshot_count = len([f for f in os.listdir(run_dir) if f.startswith("snap_") and f.lower().endswith(".png")])
-            except Exception:
-                snapshot_count = 0
+            snapshot_count = len(snapshot_files)
             print(f"[ThermalSim] snapshots_found={snapshot_count}")
             if settings.get('snapshots') and snapshot_count == 0:
                 wx.MessageBox("Snapshots enabled but none were created.\nCheck settings and debug info in the report.", "Snapshot Warning")
             if report_path:
-                try:
-                    import webbrowser
-                    webbrowser.open("file://" + os.path.abspath(report_path))
-                except Exception:
-                    pass
+                def _open_outputs():
+                    try:
+                        import webbrowser
+                        webbrowser.open("file://" + os.path.abspath(report_path))
+                    except Exception:
+                        pass
+                    if heatmap_path:
+                        try:
+                            if sys.platform.startswith("win"):
+                                os.startfile(os.path.abspath(heatmap_path))
+                            elif sys.platform == "darwin":
+                                subprocess.Popen(["open", os.path.abspath(heatmap_path)])
+                            else:
+                                subprocess.Popen(["xdg-open", os.path.abspath(heatmap_path)])
+                        except Exception:
+                            pass
+                wx.CallAfter(_open_outputs)
 
     def create_multilayer_maps(self, board, copper_ids, rows, cols, x_min, y_min, res, settings, k_fr4, k_cu_layers, via_factor, pads_list):
         num_layers = len(copper_ids)
@@ -1483,14 +1529,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         return pixels
 
     def save_snapshot(self, T, H, amb, layer_names, idx, t_elapsed, out_dir=None):
+        out_dir = out_dir or os.path.dirname(__file__)
         try:
-            out_dir = out_dir or os.path.dirname(__file__)
+            os.makedirs(out_dir, exist_ok=True)
             fname = os.path.join(out_dir, f"snap_{idx:02d}_t{t_elapsed:.1f}.png")
             self._save_stackup_plot(T, H, amb, layer_names, fname, t_elapsed=t_elapsed)
-        except:
+            return fname
+        except Exception:
             tmp = tempfile.gettempdir()
-            fname = os.path.join(tmp, f"thermal_snap_{idx:02d}_t{t_elapsed:.1f}.png")
+            fname = os.path.join(tmp, f"snap_{idx:02d}_t{t_elapsed:.1f}.png")
             self._save_stackup_plot(T, H, amb, layer_names, fname, t_elapsed=t_elapsed)
+            return fname
 
     def _save_plot(self, T, amb, fname):
         vmax = np.max(T)
@@ -1841,7 +1890,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 wx.MessageBox(f"Preview error: {traceback.format_exc()}", "Error")
             return None
 
-    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path, k_norm_info=None, out_dir=None, snapshot_debug=None):
+    def _write_html_report(self, settings, stack_info, stackup_derived, pad_power, layer_names, preview_path, heatmap_path, k_norm_info=None, out_dir=None, snapshot_debug=None, snapshot_files=None):
         out_dir = out_dir or os.path.dirname(__file__)
         report_path = os.path.join(out_dir, "thermal_report.html")
 
@@ -1882,15 +1931,25 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             for i, g in enumerate(gaps_used)
         )
         snapshot_items = []
-        try:
-            import glob
-            for path in glob.glob(os.path.join(out_dir, "snap_*.png")):
-                fname = os.path.basename(path)
-                m = re.search(r"_t([0-9.]+)", fname)
-                t_val = float(m.group(1)) if m else None
-                snapshot_items.append((t_val, fname))
-        except Exception:
-            snapshot_items = []
+        if snapshot_files is not None:
+            for item in snapshot_files:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    t_val, fname = item
+                else:
+                    fname = os.path.basename(str(item))
+                    m = re.search(r"_t([0-9.]+)", fname)
+                    t_val = float(m.group(1)) if m else None
+                snapshot_items.append((t_val, os.path.basename(fname)))
+        else:
+            try:
+                import glob
+                for path in glob.glob(os.path.join(out_dir, "snap_*.png")):
+                    fname = os.path.basename(path)
+                    m = re.search(r"_t([0-9.]+)", fname)
+                    t_val = float(m.group(1)) if m else None
+                    snapshot_items.append((t_val, fname))
+            except Exception:
+                snapshot_items = []
         snapshot_items.sort(key=lambda x: (x[0] if x[0] is not None else 1e9, x[1]))
         snapshots_html = ""
         for t_val, fname in snapshot_items:
