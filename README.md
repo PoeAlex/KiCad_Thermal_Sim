@@ -1,4 +1,4 @@
-# KiCad Thermal Sim — Fast Multi-Layer Copper Thermal Estimator for KiCad
+# KiCad Thermal Sim — Fast Multi-Layer Copper Thermal Simulation for KiCad
 
 ![Stackup view](docs/images/results.png "simulation results")
 
