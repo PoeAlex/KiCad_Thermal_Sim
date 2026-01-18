@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "name": "KiCad Thermal Sim",
+  "identifier": "com.github.poealex.kicad-thermal-sim",
+  "type": "plugin",
+  "license": "MIT",
+  "author": {
+    "name": "Alex Poe",
+    "homepage": "https://github.com/PoeAlex/KiCad_Thermal_Sim",
+    "issues": "https://github.com/PoeAlex/KiCad_Thermal_Sim/issues"
+  },
+  "maintainer": {
+    "name": "Alex Poe",
+    "homepage": "https://github.com/PoeAlex/KiCad_Thermal_Sim",
+    "issues": "https://github.com/PoeAlex/KiCad_Thermal_Sim/issues"
+  },
+  "versions": [
+    {
+      "version": "0.1.0",
+      "status": "testing",
+      "kicad_version": "9.0",
+      "runtime": "swig"
+    }
+  ]
+}
