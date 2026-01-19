@@ -1,19 +1,33 @@
 {
   "schema_version": 1,
   "name": "KiCad Thermal Sim",
-  "identifier": "com.github.poealex.kicad-thermal-sim",
+  "description": "KiCad PCB editor plugin for fast PCB thermal estimation.",
+  "description_full": "KiCad PCB editor plugin for fast PCB thermal estimation (copper-based conduction with simplified boundary conditions).",
+  "identifier": "kicad-thermal-sim",
   "type": "plugin",
   "license": "MIT",
+
   "author": {
     "name": "Alex Poe",
-    "homepage": "https://github.com/PoeAlex/KiCad_Thermal_Sim",
-    "issues": "https://github.com/PoeAlex/KiCad_Thermal_Sim/issues"
+    "contact": {
+      "homepage": "https://github.com/PoeAlex/KiCad_Thermal_Sim",
+      "issues": "https://github.com/PoeAlex/KiCad_Thermal_Sim/issues"
+    }
   },
+
   "maintainer": {
     "name": "Alex Poe",
-    "homepage": "https://github.com/PoeAlex/KiCad_Thermal_Sim",
-    "issues": "https://github.com/PoeAlex/KiCad_Thermal_Sim/issues"
+    "contact": {
+      "homepage": "https://github.com/PoeAlex/KiCad_Thermal_Sim",
+      "issues": "https://github.com/PoeAlex/KiCad_Thermal_Sim/issues"
+    }
   },
+
+  "resources": {
+    "homepage": "https://github.com/PoeAlex/KiCad_Thermal_Sim",
+    "documentation": "https://github.com/PoeAlex/KiCad_Thermal_Sim#readme"
+  },
+
   "versions": [
     {
       "version": "0.1.0",
