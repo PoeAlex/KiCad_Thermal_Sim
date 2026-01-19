@@ -10,10 +10,16 @@ import html
 import json
 import shutil
 import subprocess
+import importlib
 import importlib.util
 
-import scipy.sparse as sp
-import scipy.sparse.linalg as spla
+import numpy as np
+import wx
+
+sp = None
+spla = None
+matplotlib = None
+plt = None
 
 _pardiso_spec = importlib.util.find_spec("pypardiso")
 if _pardiso_spec is not None:
@@ -22,15 +28,41 @@ if _pardiso_spec is not None:
 else:
     HAS_PARDISO = False
 
-try:
-    import numpy as np
-    import matplotlib
-    matplotlib.use('Agg')  # Use non-interactive backend for file output
-    import matplotlib.pyplot as plt
-    import wx
-    HAS_LIBS = True
-except ImportError:
-    HAS_LIBS = False
+def _show_message(message, title="Thermal Sim"):
+    if hasattr(pcbnew, "wxMessageBox"):
+        pcbnew.wxMessageBox(message, title)
+    else:
+        wx.MessageBox(message, title)
+
+
+def ensure_deps_or_notify():
+    global sp, spla, matplotlib, plt
+    if sp is not None and spla is not None and plt is not None:
+        return True
+
+    missing = []
+    errors = []
+    for module in ("scipy", "matplotlib"):
+        if importlib.util.find_spec(module) is None:
+            missing.append(module)
+            errors.append(f"ModuleNotFoundError: No module named '{module}'")
+
+    if missing:
+        lines = ["Missing optional Python dependencies:"]
+        lines += [f"- {module}: {error}" for module, error in zip(missing, errors)]
+        lines.append("")
+        lines.append(f"KiCad Python: {sys.executable}")
+        lines.append("Install with:")
+        lines.append("  pip install scipy matplotlib")
+        _show_message("\n".join(lines), "Thermal Sim - Missing Dependencies")
+        return False
+
+    sp = importlib.import_module("scipy.sparse")
+    spla = importlib.import_module("scipy.sparse.linalg")
+    matplotlib = importlib.import_module("matplotlib")
+    matplotlib.use("Agg")  # Use non-interactive backend for file output
+    plt = importlib.import_module("matplotlib.pyplot")
+    return True
 
 
 # -----------------------------------------------------------------------------
@@ -233,10 +265,11 @@ def format_stackup_report_um(stack):
             lines.append(f"  {a} → {b}: {g*1000.0:.1f} µm")
     return "\n".join(lines)
 
-try:
-    import numba
+_numba_spec = importlib.util.find_spec("numba")
+if _numba_spec is not None:
+    numba = importlib.import_module("numba")
     HAS_NUMBA = True
-except ImportError:
+else:
     HAS_NUMBA = False
 
 class SettingsDialog(wx.Dialog):
@@ -501,8 +534,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             wx.MessageBox(traceback.format_exc(), "Thermal Sim Error")
 
     def RunSafe(self):
-        if not HAS_LIBS:
-            wx.MessageBox("Please install numpy & matplotlib!", "Error"); return
+        if not ensure_deps_or_notify():
+            return
 
         board = pcbnew.GetBoard()
 

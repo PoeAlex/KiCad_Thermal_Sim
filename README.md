@@ -40,6 +40,12 @@ Typical paths:
 
 ---
 
+## Dependencies
+
+This plugin requires **scipy** and **matplotlib** to run the simulation/plotting. The plugin will still show up in KiCad even if these packages are missing, and will prompt you with a clear error message when you click it. Install the packages into **KiCad’s Python environment** (use the `sys.executable` path shown in the prompt), for example: `pip install scipy matplotlib`.
+
+---
+
 ### PCM installation (Install from file…)
 To install via KiCad’s Plugin and Content Manager (PCM), create a ZIP from the contents of the `pcm_package/` folder (do **not** run these commands here; they are provided as examples only).
 
