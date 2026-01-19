@@ -40,6 +40,26 @@ Typical paths:
 
 ---
 
+### PCM installation (Install from file…)
+To install via KiCad’s Plugin and Content Manager (PCM), create a ZIP from the contents of the `pcm_package/` folder (do **not** run these commands here; they are provided as examples only).
+
+**Important:** “The ZIP must contain plugins/, (optional) resources/, and metadata.json at the archive root (no extra top-level folder).”
+
+**Windows (PowerShell)**:
+```powershell
+Compress-Archive -Path pcm_package\* -DestinationPath KiCad_Thermal_Sim-PCM.zip
+```
+
+**Linux/macOS**:
+```sh
+cd pcm_package
+zip -r ../KiCad_Thermal_Sim-PCM.zip .
+```
+
+Then open KiCad → **Plugin and Content Manager** → **Install from file…** and select the ZIP.
+
+---
+
 ## Quick start
 
 1. Open your PCB in **KiCad PCB Editor**.
