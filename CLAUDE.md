@@ -18,38 +18,61 @@ Optional: `pypardiso` (Intel MKL solver), `numba` (JIT compilation)
 
 ## Architecture
 
-**Single-file implementation** (`thermal_plugin.py`, ~2087 lines):
+**Modular implementation** (8 modules):
 
-- **Lines 78-206**: `parse_stackup_from_board_file()` - Parses .kicad_pcb S-expression to extract copper layers and dielectric thicknesses
-- **Lines 242-462**: `SettingsDialog` (wx.Dialog) - GUI for simulation parameters
-- **Lines 464-2087**: `ThermalPlugin` (pcbnew.ActionPlugin) - Main plugin class
-  - `RunSafe()` (503-1276): Core simulation loop including matrix assembly and BDF2 solver
-  - `create_multilayer_maps()` (1277-1500): Extracts copper geometry from PCB into conductivity arrays
-  - `_write_html_report()` (1906-2087): Generates HTML output with embedded images
+```
+ThermalSim/
+├── __init__.py           # Plugin registration
+├── capabilities.py       # Feature detection (HAS_LIBS, HAS_PARDISO, HAS_NUMBA)
+├── stackup_parser.py     # S-expression parser for .kicad_pcb files
+├── gui_dialogs.py        # SettingsDialog (wx.Dialog)
+├── geometry_mapper.py    # PCB-to-grid mapping (FillContext, create_multilayer_maps)
+├── thermal_solver.py     # Matrix assembly, BDF2 solver (SolverConfig, SolverResult)
+├── visualization.py      # Matplotlib plotting functions
+├── thermal_report.py     # HTML report generation
+└── thermal_plugin.py     # Controller/orchestrator (ThermalPlugin class)
+```
 
-**Key data structures:**
-- `K[layers, rows, cols]`: Relative thermal conductivity map (k_FR4=1.0, k_Cu≈400)
+### Module Responsibilities
+
+| Module | Purpose |
+|--------|---------|
+| `capabilities.py` | Runtime detection of numpy, matplotlib, pypardiso, numba |
+| `stackup_parser.py` | Parse copper/dielectric layers from .kicad_pcb S-expressions |
+| `gui_dialogs.py` | wxPython dialog for simulation parameters |
+| `geometry_mapper.py` | Convert PCB geometry to discretized conductivity arrays |
+| `thermal_solver.py` | Sparse matrix assembly, BDF2 time integration |
+| `visualization.py` | Generate thermal plots and preview images |
+| `thermal_report.py` | Generate HTML summary report |
+| `thermal_plugin.py` | Orchestrate workflow, KiCad ActionPlugin interface |
+
+### Key Data Structures
+
+- `FillContext` (geometry_mapper.py): Holds K, V, H arrays and grid parameters
+- `SolverConfig` (thermal_solver.py): Simulation configuration (time, steps, etc.)
+- `SolverResult` (thermal_solver.py): Results including T array and diagnostics
+- `K[layers, rows, cols]`: Relative thermal conductivity map (k_FR4=1.0, k_Cu~400)
 - `V_map[rows, cols]`: Via enhancement factors for vertical coupling
 - `H_map[rows, cols]`: Heatsink/thermal-pad mask (User.Eco1 layer)
 
-## Physical Constants (hardcoded)
+## Physical Constants
 
-| Constant | Value | Location |
-|----------|-------|----------|
-| k_Cu | 390 W/(m·K) | Line 729 |
-| k_FR4 | 0.3 W/(m·K) | Line 730 |
-| h_convection | 10 W/(m²·K) | Lines 885, 891 |
-| via_factor | 1300 (k_Cu/k_FR4) | Line 696 |
+| Constant | Value | Module |
+|----------|-------|--------|
+| k_Cu | 390 W/(m-K) | thermal_plugin.py, thermal_solver.py |
+| k_FR4 | 0.3 W/(m-K) | thermal_plugin.py, thermal_solver.py |
+| h_convection | 10 W/(m^2-K) | thermal_solver.py |
+| via_factor | 1300 (k_Cu/k_FR4) | thermal_plugin.py, geometry_mapper.py |
 
 ## Testing
 
 No automated tests exist. Manual testing workflow:
 1. Open a PCB in KiCad PCB Editor
 2. Select pads as heat sources
-3. Run plugin via Tools → External Plugins → 2.5D Thermal Sim
+3. Run plugin via Tools -> External Plugins -> 2.5D Thermal Sim
 4. Use "Preview" button for geometry verification before "Run"
 
-Debug output goes to KiCad's Scripting Console (View → Scripting Console):
+Debug output goes to KiCad's Scripting Console (View -> Scripting Console):
 ```python
 print(f"[ThermalSim] debug info here")
 ```
@@ -59,7 +82,7 @@ print(f"[ThermalSim] debug info here")
 - **Sparse matrix assembly**: COO format converted to CSR (scipy.sparse)
 - **Time integration**: BDF2 (Backward Differentiation Formula, 2nd order)
 - **Linear solver**: scipy.sparse.linalg.splu (SuperLU) or optional pypardiso
-- **Multi-phase time stepping**: Phase A (8%, dt×0.5), Phase B (35%, dt×1.0), Phase C (57%, dt×2.0)
+- **Multi-phase time stepping**: Phase A (8%, dt*0.5), Phase B (35%, dt*1.0), Phase C (57%, dt*2.0)
 
 ## pcbnew API Usage
 
@@ -78,3 +101,35 @@ Generated in timestamped subfolder (e.g., `Thermalsim_20260131_143022/`):
 - `thermal_stackup.png` or `thermal_final.png` - Temperature results
 - `snap_*.png` - Time-series snapshots (if enabled)
 - `thermal_sim_last_settings.json` - Persisted user settings (in plugin root)
+
+## Module Dependencies
+
+```
+capabilities.py (no internal dependencies)
+     |
+stackup_parser.py (no internal dependencies)
+     |
+gui_dialogs.py (no internal dependencies)
+     |
+geometry_mapper.py (no internal dependencies)
+     |
+thermal_solver.py --> capabilities.py
+     |
+visualization.py (no internal dependencies)
+     |
+thermal_report.py (no internal dependencies)
+     |
+thermal_plugin.py --> all modules
+     |
+__init__.py --> thermal_plugin.py
+```
+
+## Docstring Standard
+
+All public functions use NumPy-style docstrings:
+- Summary (1 line)
+- Extended description (optional)
+- Parameters with types
+- Returns with types
+- Raises (if relevant)
+- Examples (for complex functions)
