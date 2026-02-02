@@ -1,0 +1,11 @@
+# Test dependencies for ThermalSim
+# Install with: pip install -r requirements-test.txt
+
+pytest>=7.0
+pytest-mock>=3.0
+pytest-cov>=4.0
+
+# Core dependencies (also needed for plugin)
+numpy>=1.20
+scipy>=1.7
+matplotlib>=3.5

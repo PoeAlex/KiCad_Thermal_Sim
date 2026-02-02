@@ -66,7 +66,44 @@ ThermalSim/
 
 ## Testing
 
-No automated tests exist. Manual testing workflow:
+### Unit Tests (pytest)
+
+Run tests using the batch file (handles mock injection):
+```bash
+run_tests.bat                    # All tests
+run_tests.bat -k "test_solver"   # Single test file
+run_tests.bat -m physics         # Physics validation tests only
+run_tests.bat --cov=ThermalSim   # With coverage report
+```
+
+Test structure:
+```
+tests/
+├── conftest.py           # Mock injection, fixtures
+├── mocks/
+│   ├── pcbnew_mock.py    # Full KiCad pcbnew mock
+│   └── wx_mock.py        # wxPython mock
+├── fixtures/
+│   ├── sample_boards.py  # .kicad_pcb content generators
+│   ├── stackup_configs.py
+│   └── temperature_arrays.py
+└── unit/
+    ├── test_thermal_solver.py   # Physics validation (critical)
+    ├── test_stackup_parser.py   # S-expression parsing
+    ├── test_geometry_mapper.py  # Grid mapping
+    ├── test_visualization.py    # PNG generation
+    ├── test_thermal_report.py   # HTML report
+    ├── test_gui_dialogs.py      # Settings parsing
+    └── test_capabilities.py     # Feature detection
+```
+
+Key physics tests in `test_thermal_solver.py`:
+- `test_steady_state_energy_balance` - Pin ≈ Pout at equilibrium
+- `test_bdf2_convergence_order` - O(dt²) error reduction
+- `test_monotonic_temperature_decrease_from_source` - Physical validity
+
+### Manual Testing in KiCad
+
 1. Open a PCB in KiCad PCB Editor
 2. Select pads as heat sources
 3. Run plugin via Tools -> External Plugins -> 2.5D Thermal Sim
