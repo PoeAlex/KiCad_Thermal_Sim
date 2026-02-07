@@ -1,6 +1,6 @@
 # KiCad Thermal Sim — Fast Multi-Layer Copper Thermal Simulation for KiCad
 
-![Stackup view](docs/images/results.png "simulation results")
+![Simulation results](docs/images/result.png "6-layer thermal simulation results")
 
 **KiCad Thermal Sim** is a lightweight KiCad PCB Editor plugin that performs a fast, layout-oriented **heat spreading simulation across all copper layers** (F.Cu…B.Cu including inner layers).
 
@@ -25,19 +25,35 @@ This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineer
 
 ## Installation
 
-### Recommended: Copy into KiCad’s scripting/plugins directory
-1. Download or clone this repository.
-2. Copy the plugin folder (containing `__init__.py` and the main script) into KiCad’s plugin directory:
+### Option A: KiCad Plugin Manager (recommended)
 
-Typical paths:
-- **Windows**: `%APPDATA%\kicad\9.0\scripting\plugins\`
-- **Linux**: `~/.local/share/kicad/9.0/scripting/plugins/`
-- **macOS**: `~/Library/Application Support/kicad/9.0/scripting/plugins/`
-
-3. ***Install Matplotlib and scipy!*** Open Kicad 9.0 Command Prompt and type in `pip install matplotlib scipy`.
-   - Optional for faster solves: `pip install pypardiso` (Intel MKL sparse solver)
+1. Download the latest `ThermalSim-vX.Y.Z.zip` from the [Releases](https://github.com/PoeAlex/KiCad_Thermal_Sim/releases) page.
+2. In KiCad, open **Plugin and Content Manager**.
+3. Click **Install from File…** and select the downloaded ZIP.
 4. Restart KiCad.
-5. In PCB Editor, run it via **Tools → External Plugins** (or the plugin menu, depending on KiCad version).
+5. On first run, the plugin will detect missing dependencies and offer to install them automatically.
+
+### Option B: Manual copy
+
+1. Download or clone this repository.
+2. Copy the `ThermalSim` folder into KiCad's plugin directory:
+
+   - **Windows**: `%APPDATA%\kicad\9.0\scripting\plugins\`
+   - **Linux**: `~/.local/share/kicad/9.0/scripting/plugins/`
+   - **macOS**: `~/Library/Application Support/kicad/9.0/scripting/plugins/`
+
+3. Restart KiCad.
+4. On first run, the plugin will offer to install missing packages (`numpy`, `scipy`, `matplotlib`) automatically. Alternatively, install them manually in the **KiCad 9.0 Command Prompt**:
+   ```
+   pip install numpy scipy matplotlib
+   ```
+   Optional for faster solves: `pip install pypardiso` (Intel MKL sparse solver)
+
+5. In PCB Editor, run via **Tools → External Plugins → 2.5D Thermal Sim**.
+
+### Auto-Dependency Installation
+
+If required packages are missing, the plugin automatically shows an install dialog instead of crashing. The dialog runs `pip install` in the background and streams the output. After installation, restart KiCad.
 
 ---
 
@@ -45,28 +61,27 @@ Typical paths:
 
 1. Open your PCB in **KiCad PCB Editor**.
 2. Select one or multiple **pads** that represent your heat sources.
-3. Run the plugin.
+3. Run the plugin via **Tools → External Plugins → 2.5D Thermal Sim**.
 4. Set **Power** (constant value or PWL file path), **Duration**, **Ambient**, and **Resolution**.
-5. (Optional) enable geometry filters and/or the thermal pad zone.
+5. (Optional) Switch to the **Advanced** tab for geometry filters, thermal pad, and solver settings.
 6. Click **Preview** (sanity check), then **Run**.
 
-![Stackup view](docs/images/gui.png "GUI")
+![GUI main tab](docs/images/gui_main.png "Simulation tab")
+
+![GUI advanced tab](docs/images/gui_adv.png "Advanced tab")
 
 ---
 
-## GUI settings (exactly as in the plugin)
+## GUI settings
 
-Below is a 1:1 explanation of the options visible in the current GUI.
+The dialog has two tabs: **Simulation** (main parameters) and **Advanced** (geometry filters, thermal pad, solver).
 
-### Stackup
-**“N Layers found (F.Cu…B.Cu)”**  
-Informational. Shows how many copper layers were detected and that the tool will simulate from top to bottom.
+### Simulation tab
 
----
+#### Board Info
+Shows detected copper layers with thicknesses and dielectric gaps parsed from the board stackup. Selected heat-source pads are listed below.
 
-## Parameters
-
-### Power (W or PWL file path)
+#### Power (W or PWL file path)
 Power assigned to each selected pad. The field accepts:
 
 | Entry | Meaning |
@@ -92,150 +107,48 @@ Use the **Browse PWL...** button to pick a file. Clicking it multiple times appe
 - Time values must be monotonically increasing
 - Linear interpolation between breakpoints; holds first/last value outside range
 
-**Impact**
-- Temperature rise scales approximately linearly with power.
-- PWL profiles enable simulation of ramp-up, pulsed loads, and thermal cycling.
-- Constant and PWL entries can be freely mixed across pads.
+#### Duration (sec)
+Total simulated time. Shorter durations emphasize transient peaks; longer durations approach quasi steady-state.
+
+#### Ambient Temp (°C)
+Reference temperature. All results are relative to ambient.
+
+#### Resolution (mm)
+Spatial discretization step size. Smaller (0.2–0.5 mm) gives better hotspot localization but is slower. Larger (0.8–1.5 mm) is faster but smears peaks.
+
+#### Output
+- **Show All Layers** — display results for all copper layers (stackup view)
+- **Save Snapshots** — store intermediate time-step images
+- **Snapshot Count** — number of intermediate snapshots
+- **Output Folder** — where results are saved
+
+### Advanced tab
+
+#### Geometry Filters
+- **Ignore Traces** — exclude copper traces from the conductivity map (zones/pours/pads still contribute)
+- **Limit Area to Pads** — restrict simulation domain to an area around selected pads (major speedup on large boards)
+- **Limit Distance (mm)** — radius around pads when area limiting is enabled (practical starting point: 20–40 mm)
+
+#### Thermal Pad (User.Eco1)
+- **Enable Pad Simulation** — treat `User.Eco1` geometry as a thermal interface zone with enhanced bottom-side heat removal
+- **Pad Thickness (mm)** — TIM thickness (thicker = higher resistance)
+- **Pad Cond. (W/mK)** — TIM thermal conductivity
+- **Pad Heat Cap. (J/m²K)** — additional thermal capacitance of the thermal pad
+
+#### Solver
+- **Convection h (W/m²K)** — convection coefficient for top/bottom surfaces (default: 10)
+- **PCB Thickness (mm)** — overall board thickness (auto-detected from stackup if available)
+
+#### Capabilities
+Shows detected solver backend (SciPy, PyPardiso).
 
 ---
 
-### Duration (sec)
-Total simulated time.
+## Preview
 
-**Impact**
-- Shorter durations emphasize transient peaks close to the heat source.
-- Longer durations move the board toward a quasi steady-state (depending on convection).
+The **Preview** button generates a geometry visualization showing copper distribution, pad locations, and via regions on each layer — useful for verifying the simulation setup before running.
 
----
-
-### Ambient Temp (°C)
-Ambient reference temperature.
-
-**Impact**
-- All results are relative to ambient; increasing ambient shifts the whole temperature field upward.
-
----
-
-### PCB Thickness (mm)
-Overall board thickness used in the model (affects vertical coupling and thermal mass assumptions).
-
-**Impact**
-- Thicker boards generally reduce short-term temperature rise (more thermal mass),
-  and change vertical conduction characteristics between layers.
-
----
-
-## Output
-
-### Show All Layers
-If enabled, the plugin displays results for **all copper layers**.
-
-**Impact**
-- More comprehensive visualization (stackup view).
-- Slightly more plotting overhead.
-
----
-
-### Save Snapshots
-If enabled, the plugin stores additional images during/after the run (depending on implementation).
-
-**Impact**
-- Useful for documentation and comparing iterations.
-- Increases runtime and creates more output files.
-
----
-
-## Geometry Filters
-
-### Ignore Traces
-Excludes copper traces from the conductivity map (zones/pours/pads still contribute).
-
-**Impact**
-- Faster mapping and often slightly more conservative if traces are thin.
-- Disable this if traces are an important heat spreading path in your design.
-
----
-
-### Limit Area to Pads
-Restricts the simulation domain to an area around the selected pads.
-
-**Impact**
-- Major speedup on large boards.
-- If the limited area is too small, you cut off real heat spreading paths and may underestimate
-  spreading and steady-state behavior.
-
----
-
-### Limit Distance (mm)
-Only active when **Limit Area to Pads** is enabled. Sets the radius/extent around the selected pads.
-
-**Impact**
-- Larger distance → more accurate global spreading, slower.
-- Smaller distance → faster, but can underpredict spreading.
-
-Practical starting point: **20–40 mm**, then increase if results look “boxed in”.
-
----
-
-## Thermal Pad (User.Eco1)
-
-### Enable Pad Simulation
-Enables a bottom-side enhanced cooling/thermal interface zone derived from geometry on **`User.Eco1`**.
-
-**How it works**
-- Any area on `User.Eco1` is treated as a “thermal pad contact region” that increases heat removal
-  at the bottom surface in those pixels.
-
-**Impact**
-- Useful to approximate contact to a chassis/heatsink/thermal pad under the PCB.
-- If enabled without matching real mechanics, it can make results overly optimistic.
-
----
-
-### Pad Thickness (mm)
-Thickness of the thermal interface material (TIM) / pad.
-
-**Impact**
-- Thicker pad → higher thermal resistance → less heat removal (board runs hotter).
-- Thinner pad → lower thermal resistance → more heat removal.
-
----
-
-### Pad Cond. (W/mK)
-Thermal conductivity of the pad/TIM material.
-
-**Impact**
-- Higher conductivity → better heat removal (cooler board).
-- Lower conductivity → worse heat removal (hotter board).
-
-Typical TIM pads vary widely (order of magnitude). Use datasheet values if available.
-
----
-
-## Grid Resolution
-
-### Resolution (mm)
-Spatial discretization step size (grid cell size).
-
-**Impact**
-- Smaller resolution (e.g., 0.2–0.5 mm) → better hotspot localization, slower.
-- Larger resolution (e.g., 0.8–1.5 mm) → faster, but power is smeared across fewer cells → peaks can be lower.
-
----
-
-## Buttons
-
-### Preview
-Runs a quick pre-check and visualization to confirm:
-- pad selection was detected
-- domain limiting behaves as expected
-- thermal pad zone (User.Eco1) is being found (if enabled)
-
-### Run
-Executes the simulation.
-
-### Cancel
-Closes the dialog.
+![Preview](docs/images/preview.png "KiCad editor with geometry preview")
 
 ---
 
@@ -256,9 +169,10 @@ The plugin is split into focused modules:
 
 | Module | Purpose |
 |--------|---------|
-| `capabilities.py` | Runtime detection of numpy, matplotlib, pypardiso, numba |
+| `capabilities.py` | Runtime detection of numpy, scipy, matplotlib, pypardiso, numba |
+| `dependency_installer.py` | Auto-install dialog for missing packages via pip |
 | `stackup_parser.py` | Parse copper/dielectric layers from .kicad_pcb S-expressions |
-| `gui_dialogs.py` | wxPython dialog for simulation parameters |
+| `gui_dialogs.py` | wxPython dialog for simulation parameters (tabbed UI) |
 | `geometry_mapper.py` | Convert PCB geometry to discretized conductivity arrays |
 | `thermal_solver.py` | Sparse matrix assembly, BDF2 time integration |
 | `pwl_parser.py` | Parse LTspice-style PWL power profiles |
@@ -268,9 +182,22 @@ The plugin is split into focused modules:
 
 ---
 
+## Building the PCM Package
+
+To create a KiCad Plugin Manager compatible ZIP:
+
+```bash
+python build_pcm_package.py
+python build_pcm_package.py --version 0.2.0 --output-dir dist
+```
+
+The script packages all plugin source files with a `metadata.json` conforming to the [KiCad PCM schema v1](https://dev-docs.kicad.org/en/apis-and-binding/pcm/). Output includes a SHA-256 hash for verification.
+
+---
+
 ## Testing
 
-211 unit tests covering physics validation, parsing, geometry mapping, visualization, and reporting.
+273 unit tests covering physics validation, parsing, geometry mapping, visualization, reporting, dependency installer, and PCM packaging.
 
 ```bash
 # Run all tests
@@ -281,6 +208,9 @@ run_tests.bat -k "test_solver"
 
 # Physics validation tests only
 run_tests.bat -m physics
+
+# With coverage report
+run_tests.bat --cov=ThermalSim
 ```
 
 See `CLAUDE.md` for full development documentation.
