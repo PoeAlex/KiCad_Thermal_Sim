@@ -163,12 +163,13 @@ class TestCallbackHandlers:
 class TestPipCommand:
     """Tests for pip command construction."""
 
-    def test_install_uses_sys_executable(self):
-        """Test that install uses the current Python interpreter."""
+    def test_install_uses_python_executable(self):
+        """Test that install uses _find_python() to locate the interpreter."""
         from ThermalSim.dependency_installer import DependencyInstallDialog
         dlg = DependencyInstallDialog(None, [("numpy", "numpy")])
 
         captured_cmd = []
+        fake_python = r"C:\Program Files\KiCad\bin\python.exe"
 
         def capture_thread(*args, **kwargs):
             # Extract the cmd argument from Thread(target=..., args=(cmd,))
@@ -180,10 +181,11 @@ class TestPipCommand:
             return mock_t
 
         import threading
-        with patch.object(threading, 'Thread', side_effect=capture_thread):
-            dlg._on_install(None)
+        with patch('ThermalSim.dependency_installer._find_python', return_value=fake_python):
+            with patch.object(threading, 'Thread', side_effect=capture_thread):
+                dlg._on_install(None)
 
-        assert captured_cmd[0] == sys.executable
+        assert captured_cmd[0] == fake_python
         assert captured_cmd[1:3] == ["-m", "pip"]
 
     def test_install_includes_all_packages(self):
@@ -207,3 +209,56 @@ class TestPipCommand:
         assert "numpy" in captured_cmd
         assert "scipy" in captured_cmd
         assert "matplotlib" in captured_cmd
+
+
+class TestFindPython:
+    """Tests for the _find_python() helper function."""
+
+    def test_returns_sys_executable_when_python(self):
+        """Test that _find_python returns sys.executable when it is already python."""
+        from ThermalSim.dependency_installer import _find_python
+
+        with patch('ThermalSim.dependency_installer.sys') as mock_sys:
+            mock_sys.executable = r"C:\Python39\python.exe"
+            mock_sys.prefix = r"C:\Python39"
+            result = _find_python()
+        assert result == r"C:\Python39\python.exe"
+
+    def test_finds_python_in_exe_dir(self):
+        """Test that _find_python finds python.exe next to kicad.exe."""
+        from ThermalSim.dependency_installer import _find_python
+
+        with patch('ThermalSim.dependency_installer.sys') as mock_sys:
+            mock_sys.executable = r"C:\Program Files\KiCad\bin\kicad.exe"
+            mock_sys.prefix = r"C:\Program Files\KiCad"
+            with patch('os.path.isfile') as mock_isfile:
+                def isfile_side_effect(path):
+                    return path == r"C:\Program Files\KiCad\bin\python.exe"
+                mock_isfile.side_effect = isfile_side_effect
+                result = _find_python()
+        assert result == r"C:\Program Files\KiCad\bin\python.exe"
+
+    def test_finds_python_in_sys_prefix(self):
+        """Test that _find_python falls back to sys.prefix."""
+        from ThermalSim.dependency_installer import _find_python
+
+        with patch('ThermalSim.dependency_installer.sys') as mock_sys:
+            mock_sys.executable = r"C:\Program Files\KiCad\bin\kicad.exe"
+            mock_sys.prefix = r"C:\Program Files\KiCad\python"
+            with patch('os.path.isfile') as mock_isfile:
+                def isfile_side_effect(path):
+                    return path == r"C:\Program Files\KiCad\python\python.exe"
+                mock_isfile.side_effect = isfile_side_effect
+                result = _find_python()
+        assert result == r"C:\Program Files\KiCad\python\python.exe"
+
+    def test_falls_back_to_sys_executable(self):
+        """Test that _find_python falls back to sys.executable if nothing found."""
+        from ThermalSim.dependency_installer import _find_python
+
+        with patch('ThermalSim.dependency_installer.sys') as mock_sys:
+            mock_sys.executable = r"C:\Program Files\KiCad\bin\kicad.exe"
+            mock_sys.prefix = r"C:\Program Files\KiCad"
+            with patch('os.path.isfile', return_value=False):
+                result = _find_python()
+        assert result == r"C:\Program Files\KiCad\bin\kicad.exe"

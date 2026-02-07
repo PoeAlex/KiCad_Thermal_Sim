@@ -16,6 +16,38 @@ import threading
 import wx
 
 
+def _find_python():
+    """Find the Python interpreter for pip commands.
+
+    In embedded environments (e.g. KiCad), sys.executable points to the
+    host application (kicad.exe / pcbnew.exe) rather than python.exe.
+    This function locates the actual Python interpreter.
+    """
+    import os
+
+    exe = sys.executable
+    # If sys.executable is already Python, use it directly
+    if "python" in os.path.basename(exe).lower():
+        return exe
+
+    # Look for python.exe in the same directory as the host application
+    # (KiCad ships python.exe alongside kicad.exe in the bin/ folder)
+    exe_dir = os.path.dirname(exe)
+    for name in ("python.exe", "python3.exe", "python"):
+        candidate = os.path.join(exe_dir, name)
+        if os.path.isfile(candidate):
+            return candidate
+
+    # Try sys.prefix (Python installation root)
+    for name in ("python.exe", "python3.exe", "python"):
+        candidate = os.path.join(sys.prefix, name)
+        if os.path.isfile(candidate):
+            return candidate
+
+    # Last resort: fall back to sys.executable
+    return exe
+
+
 class DependencyInstallDialog(wx.Dialog):
     """
     Dialog that shows missing packages and installs them via pip.
@@ -92,7 +124,7 @@ class DependencyInstallDialog(wx.Dialog):
         self._append_log("Starting installation...\n")
 
         pip_names = [pip for _, pip in self._missing]
-        cmd = [sys.executable, "-m", "pip", "install"] + pip_names
+        cmd = [_find_python(), "-m", "pip", "install"] + pip_names
 
         self._append_log(f"> {' '.join(cmd)}\n\n")
 
