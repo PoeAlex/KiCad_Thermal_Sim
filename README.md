@@ -182,40 +182,7 @@ The plugin is split into focused modules:
 
 ---
 
-## Building the PCM Package
 
-To create a KiCad Plugin Manager compatible ZIP:
-
-```bash
-python build_pcm_package.py
-python build_pcm_package.py --version 0.2.0 --output-dir dist
-```
-
-The script packages all plugin source files with a `metadata.json` conforming to the [KiCad PCM schema v1](https://dev-docs.kicad.org/en/apis-and-binding/pcm/). Output includes a SHA-256 hash for verification.
-
----
-
-## Testing
-
-273 unit tests covering physics validation, parsing, geometry mapping, visualization, reporting, dependency installer, and PCM packaging.
-
-```bash
-# Run all tests
-run_tests.bat
-
-# Run specific tests
-run_tests.bat -k "test_solver"
-
-# Physics validation tests only
-run_tests.bat -m physics
-
-# With coverage report
-run_tests.bat --cov=ThermalSim
-```
-
-See `CLAUDE.md` for full development documentation.
-
----
 
 ## Limitations
 
