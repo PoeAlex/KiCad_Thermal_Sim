@@ -49,11 +49,11 @@ class TestBuildPcmPackage:
         zips = list(tmp_path.glob("*.zip"))
         with zipfile.ZipFile(zips[0], 'r') as zf:
             names = zf.namelist()
-            assert "plugins/ThermalSim/__init__.py" in names
-            assert "plugins/ThermalSim/thermal_plugin.py" in names
-            assert "plugins/ThermalSim/capabilities.py" in names
-            assert "plugins/ThermalSim/thermal_solver.py" in names
-            assert "plugins/ThermalSim/dependency_installer.py" in names
+            assert "plugins/__init__.py" in names
+            assert "plugins/thermal_plugin.py" in names
+            assert "plugins/capabilities.py" in names
+            assert "plugins/thermal_solver.py" in names
+            assert "plugins/dependency_installer.py" in names
 
     def test_metadata_valid_json(self, tmp_path):
         """Test that metadata.json is valid JSON."""
@@ -74,6 +74,7 @@ class TestBuildPcmPackage:
             assert "name" in meta
             assert "versions" in meta
             assert "author" in meta
+            assert "resources" in meta
 
     def test_metadata_identifier(self, tmp_path):
         """Test metadata identifier."""

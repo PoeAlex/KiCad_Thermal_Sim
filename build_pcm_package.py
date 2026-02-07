@@ -130,7 +130,7 @@ def build_zip(version, output_dir):
             if not os.path.isfile(src_path):
                 print(f"WARNING: {filename} not found, skipping", file=sys.stderr)
                 continue
-            arc_name = f"plugins/ThermalSim/{filename}"
+            arc_name = f"plugins/{filename}"
             zf.write(src_path, arc_name)
 
     return zip_path
