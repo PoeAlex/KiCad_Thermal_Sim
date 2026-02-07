@@ -553,7 +553,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             amb=amb,
             dt_base=dt,
             steps_target=steps_target,
-            use_pardiso=HAS_PARDISO and settings.get("use_pardiso", False),
+            use_pardiso=HAS_PARDISO,
             use_multi_phase=True,
             snapshots_enabled=settings.get('snapshots', False),
             snap_times=snap_times
@@ -592,8 +592,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "t_fr4_eff_max": float(np.max(t_fr4_eff)),
             "t_fr4_eff_per_plane_mm": t_fr4_eff_mm,
             "pad_cap_input_areal": pad_cap_areal,
-            "h_top": 10.0,
-            "h_air_bottom": 10.0,
+            "h_top": float(settings.get('h_conv', 10.0)),
+            "h_air_bottom": float(settings.get('h_conv', 10.0)),
         })
 
         # Save results

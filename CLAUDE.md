@@ -61,7 +61,7 @@ ThermalSim/
 |----------|-------|--------|
 | k_Cu | 390 W/(m-K) | thermal_plugin.py, thermal_solver.py |
 | k_FR4 | 0.3 W/(m-K) | thermal_plugin.py, thermal_solver.py |
-| h_convection | 10 W/(m^2-K) | thermal_solver.py |
+| h_convection | 10 W/(m^2-K) default, user-configurable via `h_conv` setting | thermal_solver.py, gui_dialogs.py |
 | via_factor | 1300 (k_Cu/k_FR4) | thermal_plugin.py, geometry_mapper.py |
 
 ## Testing

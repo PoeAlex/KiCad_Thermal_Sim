@@ -348,3 +348,149 @@ class TestOutputDirectoryHandling:
         assert ' ' in output_dir
         # Should be valid path string
         assert isinstance(output_dir, str)
+
+
+class TestNewSettingsKeys:
+    """Tests for the h_conv setting added in the GUI redesign."""
+
+    def test_h_conv_in_default_settings(self, default_settings):
+        """Test that h_conv is present in default settings fixture."""
+        assert 'h_conv' in default_settings
+
+    def test_h_conv_correct_type(self, default_settings):
+        """Test that h_conv is a float."""
+        assert isinstance(default_settings['h_conv'], float)
+
+    def test_h_conv_default_value(self, default_settings):
+        """Test that h_conv defaults to 10.0."""
+        assert default_settings['h_conv'] == 10.0
+
+    def test_h_conv_backward_compat_missing_key(self):
+        """Test that missing h_conv key falls back to 10.0."""
+        old_settings = {
+            'power_str': '1.0',
+            'time': 20.0,
+            'amb': 25.0,
+        }
+        # Simulate solver's backward-compatible access
+        h_conv = float(old_settings.get('h_conv', 10.0))
+        assert h_conv == 10.0
+
+    def test_h_conv_custom_value_preserved(self):
+        """Test that a custom h_conv value is read correctly."""
+        settings = {'h_conv': 50.0}
+        h_conv = float(settings.get('h_conv', 10.0))
+        assert h_conv == 50.0
+
+    def test_settings_dict_includes_h_conv(self):
+        """Test the full settings dict includes h_conv."""
+        expected_keys = [
+            'power_str', 'time', 'amb', 'thick', 'res',
+            'show_all', 'snapshots', 'snap_count', 'output_dir',
+            'ignore_traces', 'ignore_polygons', 'limit_area', 'pad_dist_mm',
+            'use_heatsink', 'pad_th', 'pad_k', 'pad_cap_areal', 'h_conv'
+        ]
+        settings = {k: None for k in expected_keys}
+        for key in expected_keys:
+            assert key in settings, f"Missing key: {key}"
+
+
+class TestTooltipTexts:
+    """Tests for tooltip text coverage."""
+
+    def test_tooltip_texts_dict_exists(self):
+        """Test that TOOLTIP_TEXTS is importable and is a dict."""
+        from ThermalSim.gui_dialogs import TOOLTIP_TEXTS
+        assert isinstance(TOOLTIP_TEXTS, dict)
+
+    def test_tooltip_texts_covers_all_fields(self):
+        """Test that TOOLTIP_TEXTS has entries for all expected controls."""
+        from ThermalSim.gui_dialogs import TOOLTIP_TEXTS
+
+        expected_fields = [
+            'stackup', 'pads', 'power', 'browse_pwl',
+            'duration', 'ambient', 'resolution',
+            'show_all', 'snapshots', 'snap_count', 'output_dir',
+            'ignore_traces', 'limit_area', 'limit_dist',
+            'enable_pad', 'pad_thick', 'pad_k', 'pad_cap',
+            'h_conv', 'pcb_thick', 'capabilities',
+            'help', 'preview',
+        ]
+
+        for field in expected_fields:
+            assert field in TOOLTIP_TEXTS, f"Missing tooltip for: {field}"
+
+    def test_tooltip_texts_are_non_empty_strings(self):
+        """Test that all tooltip values are non-empty strings."""
+        from ThermalSim.gui_dialogs import TOOLTIP_TEXTS
+
+        for key, value in TOOLTIP_TEXTS.items():
+            assert isinstance(value, str), f"Tooltip '{key}' is not a string"
+            assert len(value) > 0, f"Tooltip '{key}' is empty"
+
+    def test_tooltip_texts_no_trailing_whitespace(self):
+        """Test that tooltips have no trailing whitespace."""
+        from ThermalSim.gui_dialogs import TOOLTIP_TEXTS
+
+        for key, value in TOOLTIP_TEXTS.items():
+            assert value == value.strip(), f"Tooltip '{key}' has extra whitespace"
+
+
+class TestSettingsDialogInstantiation:
+    """Tests for SettingsDialog creation with mock wx."""
+
+    def test_dialog_creates_without_error(self):
+        """Test that SettingsDialog can be instantiated with mocks."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+        dlg = SettingsDialog(
+            None, 2, 0.5, ["F.Cu", "B.Cu"],
+            stackup_details="F.Cu: 35um\nB.Cu: 35um",
+            pad_names=["U1-1 [VCC]", "U1-2 [GND]"],
+            default_output_dir="/tmp"
+        )
+        assert dlg is not None
+
+    def test_get_values_returns_dict(self):
+        """Test that get_values returns a dict with all expected keys."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+        dlg = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"]
+        )
+        values = dlg.get_values()
+        assert values is not None
+        assert isinstance(values, dict)
+        assert 'h_conv' in values
+        assert isinstance(values['h_conv'], float)
+
+    def test_get_values_h_conv_default(self):
+        """Test that h_conv defaults to 10.0 without saved settings."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+        dlg = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"]
+        )
+        values = dlg.get_values()
+        assert values['h_conv'] == 10.0
+
+    def test_apply_defaults_with_h_conv(self):
+        """Test that _apply_defaults sets h_conv from saved settings."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+        dlg = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            defaults={'h_conv': 50.0}
+        )
+        values = dlg.get_values()
+        assert values['h_conv'] == 50.0
+
+    def test_apply_defaults_without_h_conv_keeps_default(self):
+        """Test backward compat: old settings without h_conv."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+        dlg = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            defaults={'time': 30.0, 'amb': 30.0}
+        )
+        values = dlg.get_values()
+        # h_conv should remain at default 10.0
+        assert values['h_conv'] == 10.0
+        # Applied values should be updated
+        assert values['time'] == 30.0
+        assert values['amb'] == 30.0

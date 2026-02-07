@@ -193,7 +193,8 @@ def default_settings():
         'use_heatsink': False,
         'pad_th': 1.0,
         'pad_k': 3.0,
-        'pad_cap_areal': 0.0
+        'pad_cap_areal': 0.0,
+        'h_conv': 10.0
     }
 
 

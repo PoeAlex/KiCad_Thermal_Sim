@@ -242,14 +242,14 @@ def build_stiffness_matrix(
     b = np.zeros(N, dtype=np.float64)
 
     # Top surface convection
-    h_top = 10.0
+    h_top = float(settings.get('h_conv', 10.0))
     diag_add_top = h_top * pixel_area
     top_idx = np.arange(RC, dtype=np.int64)
     diag_extra[top_idx] += diag_add_top
     b[top_idx] += diag_add_top * amb
 
     # Bottom surface: air convection + heatsink
-    h_air_bot = 10.0
+    h_air_bot = float(settings.get('h_conv', 10.0))
     pad_thick_m = max(0.0001, settings['pad_th'] * 1e-3)
     pad_k = settings['pad_k']
     contact_factor = 0.2

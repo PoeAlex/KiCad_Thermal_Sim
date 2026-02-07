@@ -8,12 +8,31 @@ used by ThermalSim.
 import sys
 
 
+class _WxAdvMock:
+    """Mock wx.adv module."""
+
+    class HyperlinkCtrl:
+        def __init__(self, parent, id=-1, label="", url="", **kwargs):
+            self.label = label
+            self.url = url
+
+        def SetToolTip(self, tip):
+            pass
+
+
 class _WxMock:
     """Mock wx module."""
 
     ID_OK = 5100
     ID_CANCEL = 5101
+    ID_ANY = -1
     DD_DEFAULT_STYLE = 0
+    FD_OPEN = 0x01
+    FD_FILE_MUST_EXIST = 0x02
+    SP_ARROW_KEYS = 0x1000
+    SP_WRAP = 0x2000
+
+    adv = _WxAdvMock()
 
     class Dialog:
         def __init__(self, *args, **kwargs):
@@ -34,6 +53,35 @@ class _WxMock:
         def Center(self):
             pass
 
+        def SetSize(self, size):
+            pass
+
+        def SetMinSize(self, size):
+            pass
+
+        def SetToolTip(self, tip):
+            pass
+
+    class Panel:
+        def __init__(self, parent, **kwargs):
+            pass
+
+        def SetSizer(self, sizer):
+            pass
+
+        def SetToolTip(self, tip):
+            pass
+
+    class Notebook:
+        def __init__(self, parent, **kwargs):
+            pass
+
+        def AddPage(self, page, caption):
+            pass
+
+        def SetToolTip(self, tip):
+            pass
+
     class BoxSizer:
         VERTICAL = 1
         HORIZONTAL = 0
@@ -52,11 +100,21 @@ class _WxMock:
             super().__init__(orient)
 
     class StaticText:
-        def __init__(self, parent, label="", size=None):
+        def __init__(self, parent, label="", size=None, **kwargs):
             self.label = label
 
+        def SetToolTip(self, tip):
+            pass
+
+    class StaticLine:
+        def __init__(self, parent, **kwargs):
+            pass
+
+        def SetToolTip(self, tip):
+            pass
+
     class TextCtrl:
-        def __init__(self, parent, value="", style=0):
+        def __init__(self, parent, value="", style=0, **kwargs):
             self._value = value
 
         def GetValue(self):
@@ -66,6 +124,56 @@ class _WxMock:
             self._value = str(value)
 
         def Enable(self, enable=True):
+            pass
+
+        def SetMinSize(self, size):
+            pass
+
+        def SetToolTip(self, tip):
+            pass
+
+    class SpinCtrlDouble:
+        def __init__(self, parent, value="", min=0.0, max=100.0, inc=1.0,
+                     style=0, **kwargs):
+            self._value = float(value) if value else min
+            self._min = min
+            self._max = max
+
+        def GetValue(self):
+            return self._value
+
+        def SetValue(self, value):
+            self._value = float(value)
+
+        def SetDigits(self, digits):
+            pass
+
+        def Enable(self, enable=True):
+            pass
+
+        def SetToolTip(self, tip):
+            pass
+
+        def SetMinSize(self, size):
+            pass
+
+    class SpinCtrl:
+        def __init__(self, parent, value="", min=0, max=100,
+                     style=0, **kwargs):
+            self._value = int(value) if value else min
+            self._min = min
+            self._max = max
+
+        def GetValue(self):
+            return self._value
+
+        def SetValue(self, value):
+            self._value = int(value)
+
+        def Enable(self, enable=True):
+            pass
+
+        def SetToolTip(self, tip):
             pass
 
         def SetMinSize(self, size):
@@ -84,11 +192,17 @@ class _WxMock:
         def Bind(self, event, handler):
             pass
 
+        def SetToolTip(self, tip):
+            pass
+
     class Button:
         def __init__(self, parent, id=None, label=""):
             self.label = label
 
         def Bind(self, event, handler):
+            pass
+
+        def SetToolTip(self, tip):
             pass
 
     class DirDialog:
@@ -104,16 +218,35 @@ class _WxMock:
         def Destroy(self):
             pass
 
+    class FileDialog:
+        def __init__(self, parent, message="", defaultDir="", wildcard="",
+                     style=0, **kwargs):
+            self._path = ""
+
+        def ShowModal(self):
+            return _WxMock.ID_CANCEL
+
+        def GetPath(self):
+            return self._path
+
+        def Destroy(self):
+            pass
+
     # Constants
     VERTICAL = 1
     HORIZONTAL = 0
     ALL = 0x0F
     EXPAND = 0x01
     RIGHT = 0x02
+    LEFT = 0x04
+    TOP = 0x08
+    BOTTOM = 0x10
     TE_MULTILINE = 0x01
     TE_READONLY = 0x02
     TE_DONTWRAP = 0x04
     ALIGN_CENTER_VERTICAL = 0x08
+    ALIGN_RIGHT = 0x10
+    LI_HORIZONTAL = 0
 
     # Event types
     EVT_BUTTON = "EVT_BUTTON"
@@ -122,10 +255,14 @@ class _WxMock:
 
 def install_wx_mock():
     """Install wx mock into sys.modules."""
-    sys.modules['wx'] = _WxMock()
+    mock = _WxMock()
+    sys.modules['wx'] = mock
+    sys.modules['wx.adv'] = _WxAdvMock()
 
 
 def uninstall_wx_mock():
     """Remove wx mock from sys.modules."""
     if 'wx' in sys.modules and isinstance(sys.modules['wx'], type(_WxMock)):
         del sys.modules['wx']
+    if 'wx.adv' in sys.modules:
+        del sys.modules['wx.adv']
