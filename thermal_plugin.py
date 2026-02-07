@@ -25,6 +25,7 @@ from .stackup_parser import parse_stackup_from_board_file, format_stackup_report
 from .gui_dialogs import SettingsDialog
 from .geometry_mapper import create_multilayer_maps, build_pad_distance_mask, get_pad_pixels
 from .thermal_solver import SolverConfig, build_stiffness_matrix, run_simulation
+from .pwl_parser import parse_pwl_file
 from .visualization import (
     save_snapshot, show_results_top_bot, show_results_all_layers, save_preview_image
 )
@@ -423,21 +424,41 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             C_layers[-1] += pad_cap_per_cell * H_map
         C = C_layers.reshape(-1)
 
-        # Power injection
-        try:
-            p_parts = [float(x.strip()) for x in settings['power_str'].split(',')]
-            p_vals = [p_parts[0]] * len(pads_list) if len(p_parts) == 1 else p_parts
-        except:
-            return
-
-        pad_power = [(pad_names[i], p_vals[i] if i < len(p_vals) else None) for i in range(len(pad_names))]
-
+        # Power injection (supports constant values and PWL file paths)
         RC = rows * cols
         N = RC * layer_count
-        Q = np.zeros(N, dtype=np.float64)
+
+        entries = [x.strip() for x in settings['power_str'].split(',')]
+        if len(entries) == 1:
+            entries = entries * len(pads_list)
+
+        # Parse each entry as constant float or PWL file path
+        pad_sources = []  # ('const', float) or ('pwl', (times, powers))
+        for entry in entries:
+            try:
+                pad_sources.append(('const', float(entry)))
+            except ValueError:
+                try:
+                    times_pwl, powers_pwl = parse_pwl_file(entry)
+                    pad_sources.append(('pwl', (times_pwl, powers_pwl)))
+                except (FileNotFoundError, ValueError) as e:
+                    wx.MessageBox(
+                        f"Error reading PWL file:\n{entry}\n\n{e}",
+                        "PWL Error"
+                    )
+                    return
+
+        if len(pad_sources) != len(pads_list) and len(pad_sources) != 1:
+            wx.MessageBox(
+                f"Number of power entries ({len(pad_sources)}) does not match "
+                f"number of pads ({len(pads_list)}).",
+                "Warning"
+            )
+
+        # Build per-pad unit Q vectors (spatial distribution at 1W)
+        Q_units = []
         for idx, pad in enumerate(pads_list):
-            if idx >= len(p_vals):
-                continue
+            Q_pad = np.zeros(N, dtype=np.float64)
             pad_lid = pad.GetLayer()
             target_idx = 0
             if pad_lid in copper_ids:
@@ -453,7 +474,45 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 r, c = r[valid], c[valid]
                 if r.size > 0:
                     idxs = target_idx * RC + r * cols + c
-                    np.add.at(Q, idxs, p_vals[idx] / float(r.size))
+                    np.add.at(Q_pad, idxs, 1.0 / float(r.size))
+            Q_units.append(Q_pad)
+
+        # Build constant Q and detect PWL usage
+        has_pwl = any(s[0] == 'pwl' for s in pad_sources)
+
+        Q = np.zeros(N, dtype=np.float64)
+        for i, (stype, sval) in enumerate(pad_sources):
+            if i >= len(Q_units):
+                break
+            if stype == 'const':
+                Q += sval * Q_units[i]
+            else:
+                Q += float(np.interp(0.0, sval[0], sval[1])) * Q_units[i]
+
+        Q_func = None
+        if has_pwl:
+            def Q_func(t, _sources=pad_sources, _units=Q_units, _N=N):
+                Q_t = np.zeros(_N, dtype=np.float64)
+                for i, (stype, sval) in enumerate(_sources):
+                    if i >= len(_units):
+                        break
+                    if stype == 'const':
+                        Q_t += sval * _units[i]
+                    else:
+                        Q_t += float(np.interp(t, sval[0], sval[1])) * _units[i]
+                return Q_t
+
+        # Build pad_power for reporting
+        pad_power = []
+        for i, name in enumerate(pad_names):
+            if i < len(pad_sources):
+                stype, sval = pad_sources[i]
+                if stype == 'const':
+                    pad_power.append((name, sval))
+                else:
+                    pad_power.append((name, f"PWL:{entries[i]}"))
+            else:
+                pad_power.append((name, None))
 
         # Build stiffness matrix
         K_matrix, b, hA, _ = build_stiffness_matrix(
@@ -504,7 +563,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             result = run_simulation(
                 config, K_matrix, C, Q, b, hA,
                 layer_count, rows, cols,
-                progress_callback, snapshot_callback
+                progress_callback, snapshot_callback,
+                Q_func=Q_func
             )
         except Exception:
             pd.Destroy()

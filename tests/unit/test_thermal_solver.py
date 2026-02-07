@@ -659,6 +659,195 @@ class TestMultiLayerCoupling:
                 f"Avg temperature should decrease: L{i}={avg_temps[i]:.2f}, L{i+1}={avg_temps[i+1]:.2f}"
 
 
+class TestTimeVaryingQ:
+    """Tests for time-varying heat source (Q_func) support."""
+
+    @pytest.fixture
+    def qfunc_setup(self):
+        """Create setup for Q_func tests."""
+        layer_count = 1
+        rows = 10
+        cols = 10
+        N = layer_count * rows * cols
+
+        k_fr4 = 0.3
+        dx = dy = 0.5e-3
+        pixel_area = dx * dy
+        h_conv = 10.0
+
+        diag = np.ones(N) * (4 * k_fr4 * 35e-6 / dx + h_conv * pixel_area)
+        K = sp.diags(diag, format='csr')
+
+        rho = 1850.0
+        cp = 600.0
+        C = np.ones(N) * rho * cp * 35e-6 * pixel_area
+
+        Q = np.zeros(N)
+        center_idx = N // 2
+        Q[center_idx] = 1.0
+
+        amb = 25.0
+        b = np.ones(N) * h_conv * pixel_area * amb
+        hA = np.ones(N) * h_conv * pixel_area
+
+        return {
+            'K': K, 'C': C, 'Q': Q, 'b': b, 'hA': hA,
+            'layer_count': layer_count,
+            'rows': rows, 'cols': cols,
+            'N': N, 'amb': amb,
+            'center_idx': center_idx,
+        }
+
+    def test_Q_func_none_backward_compat(self, qfunc_setup):
+        """Test that Q_func=None gives identical result to current code."""
+        config = SolverConfig(
+            sim_time=1.0,
+            amb=qfunc_setup['amb'],
+            dt_base=0.05,
+            steps_target=20,
+            use_multi_phase=False
+        )
+
+        # Run without Q_func
+        result_no_qfunc = run_simulation(
+            config=config,
+            K=qfunc_setup['K'], C=qfunc_setup['C'],
+            Q=qfunc_setup['Q'], b=qfunc_setup['b'],
+            hA=qfunc_setup['hA'],
+            layer_count=qfunc_setup['layer_count'],
+            rows=qfunc_setup['rows'], cols=qfunc_setup['cols'],
+            Q_func=None
+        )
+
+        # Run with Q_func that returns the same constant Q
+        Q_const = qfunc_setup['Q'].copy()
+
+        def const_qfunc(t, _Q=Q_const):
+            return _Q.copy()
+
+        result_with_qfunc = run_simulation(
+            config=config,
+            K=qfunc_setup['K'], C=qfunc_setup['C'],
+            Q=qfunc_setup['Q'], b=qfunc_setup['b'],
+            hA=qfunc_setup['hA'],
+            layer_count=qfunc_setup['layer_count'],
+            rows=qfunc_setup['rows'], cols=qfunc_setup['cols'],
+            Q_func=const_qfunc
+        )
+
+        np.testing.assert_allclose(
+            result_no_qfunc.T, result_with_qfunc.T, rtol=1e-10,
+            err_msg="Q_func returning constant Q should match Q_func=None"
+        )
+
+    @pytest.mark.physics
+    def test_time_varying_Q_step_function(self, qfunc_setup):
+        """Test power on for first half, off for second half; verify temp drops."""
+        center_idx = qfunc_setup['center_idx']
+        N = qfunc_setup['N']
+
+        Q_on = np.zeros(N)
+        Q_on[center_idx] = 1.0
+        Q_off = np.zeros(N)
+
+        sim_time = 2.0
+
+        def step_qfunc(t):
+            if t <= sim_time / 2:
+                return Q_on.copy()
+            else:
+                return Q_off.copy()
+
+        config = SolverConfig(
+            sim_time=sim_time,
+            amb=qfunc_setup['amb'],
+            dt_base=0.05,
+            steps_target=40,
+            use_multi_phase=False
+        )
+
+        result = run_simulation(
+            config=config,
+            K=qfunc_setup['K'], C=qfunc_setup['C'],
+            Q=Q_on, b=qfunc_setup['b'],
+            hA=qfunc_setup['hA'],
+            layer_count=qfunc_setup['layer_count'],
+            rows=qfunc_setup['rows'], cols=qfunc_setup['cols'],
+            Q_func=step_qfunc
+        )
+
+        # Compare with always-on simulation
+        result_always_on = run_simulation(
+            config=config,
+            K=qfunc_setup['K'], C=qfunc_setup['C'],
+            Q=Q_on, b=qfunc_setup['b'],
+            hA=qfunc_setup['hA'],
+            layer_count=qfunc_setup['layer_count'],
+            rows=qfunc_setup['rows'], cols=qfunc_setup['cols'],
+            Q_func=None
+        )
+
+        # With power off in second half, final temp should be lower
+        max_step = float(np.max(result.T))
+        max_on = float(np.max(result_always_on.T))
+        assert max_step < max_on, \
+            f"Step function result ({max_step:.2f}) should be cooler than always-on ({max_on:.2f})"
+
+    @pytest.mark.physics
+    def test_time_varying_Q_energy_balance(self, qfunc_setup):
+        """Test that ramp Q produces higher final temp than zero Q."""
+        center_idx = qfunc_setup['center_idx']
+        N = qfunc_setup['N']
+        amb = qfunc_setup['amb']
+
+        # Ramp power: 0W -> 2W over 1 second
+        Q_unit = np.zeros(N)
+        Q_unit[center_idx] = 1.0
+
+        def ramp_qfunc(t):
+            power = min(2.0, 2.0 * t)  # Linear ramp, capped at 2W
+            return power * Q_unit
+
+        sim_time = 1.0
+        config = SolverConfig(
+            sim_time=sim_time,
+            amb=amb,
+            dt_base=0.02,
+            steps_target=50,
+            use_multi_phase=False
+        )
+
+        # Run with ramp Q_func
+        result_ramp = run_simulation(
+            config=config,
+            K=qfunc_setup['K'], C=qfunc_setup['C'],
+            Q=np.zeros(N), b=qfunc_setup['b'],
+            hA=qfunc_setup['hA'],
+            layer_count=qfunc_setup['layer_count'],
+            rows=qfunc_setup['rows'], cols=qfunc_setup['cols'],
+            Q_func=ramp_qfunc
+        )
+
+        # Run with no heat source
+        result_zero = run_simulation(
+            config=config,
+            K=qfunc_setup['K'], C=qfunc_setup['C'],
+            Q=np.zeros(N), b=qfunc_setup['b'],
+            hA=qfunc_setup['hA'],
+            layer_count=qfunc_setup['layer_count'],
+            rows=qfunc_setup['rows'], cols=qfunc_setup['cols'],
+            Q_func=None
+        )
+
+        assert not result_ramp.aborted
+        assert result_ramp.step_counter > 0
+        # Ramp heating should produce a warmer center than no heating
+        T_ramp_center = result_ramp.T.flatten()[center_idx]
+        T_zero_center = result_zero.T.flatten()[center_idx]
+        assert T_ramp_center > T_zero_center, \
+            f"Ramp Q should heat center more than zero Q: {T_ramp_center:.4f} vs {T_zero_center:.4f}"
+
+
 class TestEdgeCases:
     """Tests for edge cases and error handling."""
 

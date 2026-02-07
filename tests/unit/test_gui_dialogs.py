@@ -67,6 +67,38 @@ class TestSettingsValueParsing:
         with pytest.raises(ValueError):
             [float(v.strip()) for v in power_str.split(",")]
 
+    def test_power_str_with_pwl_paths(self):
+        """Test that power_str can contain PWL file paths mixed with constants."""
+        power_str = r"1.0, C:\sim\ramp.pwl, 2.0"
+        entries = [x.strip() for x in power_str.split(",")]
+        assert len(entries) == 3
+        assert entries[0] == "1.0"
+        assert entries[1] == r"C:\sim\ramp.pwl"
+        assert entries[2] == "2.0"
+
+        # Auto-detect: float vs path
+        results = []
+        for entry in entries:
+            try:
+                results.append(('const', float(entry)))
+            except ValueError:
+                results.append(('pwl', entry))
+        assert results[0] == ('const', 1.0)
+        assert results[1] == ('pwl', r"C:\sim\ramp.pwl")
+        assert results[2] == ('const', 2.0)
+
+    def test_power_str_single_pwl_for_all(self):
+        """Test that a single PWL path is valid as power_str."""
+        power_str = r"C:\sim\ramp.pwl"
+        entries = [x.strip() for x in power_str.split(",")]
+        assert len(entries) == 1
+        try:
+            float(entries[0])
+            is_path = False
+        except ValueError:
+            is_path = True
+        assert is_path
+
 
 class TestSettingsDefaults:
     """Tests for settings default values."""

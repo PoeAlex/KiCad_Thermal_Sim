@@ -281,7 +281,8 @@ def run_simulation(
     rows: int,
     cols: int,
     progress_callback: Optional[Callable[[int, int], bool]] = None,
-    snapshot_callback: Optional[Callable[[np.ndarray, float, int], str]] = None
+    snapshot_callback: Optional[Callable[[np.ndarray, float, int], str]] = None,
+    Q_func: Optional[Callable[[float], np.ndarray]] = None
 ) -> SolverResult:
     """
     Run the transient thermal simulation using BDF2 time integration.
@@ -312,6 +313,10 @@ def run_simulation(
     snapshot_callback : callable, optional
         Function(T_view, t_elapsed, snap_index) -> filename.
         Called to save snapshots at specified times.
+    Q_func : callable, optional
+        Function(t) -> np.ndarray returning heat source vector at time t.
+        When provided, Q is updated each time step for time-varying power.
+        When None, the constant Q array is used throughout.
 
     Returns
     -------
@@ -335,7 +340,8 @@ def run_simulation(
     pout_step = float(np.sum(hA * (Tn - amb)))
     prev_snap_time = 0.0
     prev_snap_energy = e0
-    pin = float(np.sum(Q))
+    Q_current = Q_func(0.0) if Q_func is not None else Q
+    pin = float(np.sum(Q_current))
 
     # Tracking variables
     step_counter = 0
@@ -473,7 +479,10 @@ def run_simulation(
         phase_steps_done = 0
 
         # First step: Backward Euler
-        rhs1 = D * Tn + Q + b
+        if Q_func is not None:
+            Q_current = Q_func(current_time + phase_dt)
+            pin = float(np.sum(Q_current))
+        rhs1 = D * Tn + Q_current + b
         solve_elapsed = advance_step(rhs1, solve_be, phase_dt)
         phase_solve_time += solve_elapsed
         phase_steps_done += 1
@@ -491,7 +500,10 @@ def run_simulation(
 
         # Remaining steps: BDF2
         while phase_steps_done < phase_step_count:
-            rhs = (2.0 * D) * Tn - (0.5 * D) * Tnm1 + Q + b
+            if Q_func is not None:
+                Q_current = Q_func(current_time + phase_dt)
+                pin = float(np.sum(Q_current))
+            rhs = (2.0 * D) * Tn - (0.5 * D) * Tnm1 + Q_current + b
             solve_elapsed = advance_step(rhs, solve_bdf2, phase_dt)
             phase_solve_time += solve_elapsed
             phase_steps_done += 1

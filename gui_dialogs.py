@@ -108,11 +108,16 @@ class SettingsDialog(wx.Dialog):
 
         lbl_pwr = wx.StaticText(
             self,
-            label="Pad Power (W): one value for all, or comma-separated per pad"
+            label="Power (W or PWL file path), comma-separated per pad"
         )
         box_main.Add(lbl_pwr, 0, wx.ALL, 5)
         self.power_input = wx.TextCtrl(self, value="1.0")
-        box_main.Add(self.power_input, 0, wx.EXPAND | wx.ALL, 5)
+        row_pwr = wx.BoxSizer(wx.HORIZONTAL)
+        row_pwr.Add(self.power_input, 1, wx.EXPAND | wx.RIGHT, 5)
+        btn_browse_pwl = wx.Button(self, label="Browse PWL...")
+        btn_browse_pwl.Bind(wx.EVT_BUTTON, self._on_browse_pwl)
+        row_pwr.Add(btn_browse_pwl, 0)
+        box_main.Add(row_pwr, 0, wx.EXPAND | wx.ALL, 5)
 
         self.time_input = self._add_field(box_main, "Duration (sec):", "20.0")
         self.amb_input = self._add_field(box_main, "Ambient Temp (C):", "25.0")
@@ -242,6 +247,25 @@ class SettingsDialog(wx.Dialog):
     def _on_snapshots_toggle(self, event):
         """Handle Snapshots checkbox toggle."""
         self.snap_count_input.Enable(self.chk_snapshots.GetValue())
+
+    def _on_browse_pwl(self, event):
+        """Handle Browse PWL button click to select a PWL file."""
+        start_dir = os.path.dirname(__file__)
+        dlg = wx.FileDialog(
+            self,
+            "Select PWL Power Profile",
+            defaultDir=start_dir,
+            wildcard="PWL files (*.pwl;*.txt;*.csv)|*.pwl;*.txt;*.csv|All files (*.*)|*.*",
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST
+        )
+        if dlg.ShowModal() == wx.ID_OK:
+            path = dlg.GetPath()
+            current = self.power_input.GetValue().strip()
+            if current:
+                self.power_input.SetValue(current + ", " + path)
+            else:
+                self.power_input.SetValue(path)
+        dlg.Destroy()
 
     def _on_browse_output(self, event):
         """Handle Browse button click for output directory."""
