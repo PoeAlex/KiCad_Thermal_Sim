@@ -6,8 +6,16 @@ feature flags that other modules can use to enable/disable functionality.
 
 Attributes
 ----------
+HAS_NUMPY : bool
+    True if numpy is available.
+HAS_SCIPY : bool
+    True if scipy is available.
+HAS_MATPLOTLIB : bool
+    True if matplotlib is available.
+HAS_WX : bool
+    True if wxPython is available.
 HAS_LIBS : bool
-    True if numpy, matplotlib, and wx are available.
+    True if all core dependencies (numpy, scipy, matplotlib, wx) are available.
 HAS_PARDISO : bool
     True if pypardiso (Intel MKL sparse solver) is available.
 HAS_NUMBA : bool
@@ -16,16 +24,40 @@ HAS_NUMBA : bool
 
 import importlib.util
 
-# Core libraries required for plugin operation
+# Granular detection of each core dependency
+HAS_NUMPY = False
+HAS_SCIPY = False
+HAS_MATPLOTLIB = False
+HAS_WX = False
+
 try:
     import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    pass
+
+try:
+    import scipy
+    HAS_SCIPY = True
+except ImportError:
+    pass
+
+try:
     import matplotlib
     matplotlib.use('Agg')  # Use non-interactive backend for file output
     import matplotlib.pyplot as plt
-    import wx
-    HAS_LIBS = True
+    HAS_MATPLOTLIB = True
 except ImportError:
-    HAS_LIBS = False
+    pass
+
+try:
+    import wx
+    HAS_WX = True
+except ImportError:
+    pass
+
+# Composite flag for backwards compatibility
+HAS_LIBS = HAS_NUMPY and HAS_SCIPY and HAS_MATPLOTLIB and HAS_WX
 
 # Optional: Intel MKL-based sparse solver (faster for large systems)
 _pardiso_spec = importlib.util.find_spec("pypardiso")
@@ -46,6 +78,32 @@ except ImportError:
     HAS_NUMBA = False
 
 
+def get_missing_packages():
+    """
+    Return a list of missing core packages as (import_name, pip_name) tuples.
+
+    Returns
+    -------
+    list of tuple
+        Each tuple contains (import_name, pip_name) for a missing package.
+        Empty list if all core packages are installed.
+
+    Examples
+    --------
+    >>> missing = get_missing_packages()
+    >>> for imp_name, pip_name in missing:
+    ...     print(f"pip install {pip_name}")
+    """
+    missing = []
+    if not HAS_NUMPY:
+        missing.append(("numpy", "numpy"))
+    if not HAS_SCIPY:
+        missing.append(("scipy", "scipy"))
+    if not HAS_MATPLOTLIB:
+        missing.append(("matplotlib", "matplotlib"))
+    return missing
+
+
 def get_capabilities_summary():
     """
     Return a human-readable summary of detected capabilities.
@@ -59,12 +117,21 @@ def get_capabilities_summary():
     --------
     >>> print(get_capabilities_summary())
     ThermalSim Capabilities:
-      Core libs (numpy, matplotlib, wx): Available
+      numpy: Available
+      scipy: Available
+      matplotlib: Available
+      wx: Available
+      Core libs (all): Available
       PyPardiso (Intel MKL solver): Not available
       Numba (JIT compilation): Not available
     """
+    _avail = lambda v: "Available" if v else "Not available"
     lines = ["ThermalSim Capabilities:"]
-    lines.append(f"  Core libs (numpy, matplotlib, wx): {'Available' if HAS_LIBS else 'Not available'}")
-    lines.append(f"  PyPardiso (Intel MKL solver): {'Available' if HAS_PARDISO else 'Not available'}")
-    lines.append(f"  Numba (JIT compilation): {'Available' if HAS_NUMBA else 'Not available'}")
+    lines.append(f"  numpy: {_avail(HAS_NUMPY)}")
+    lines.append(f"  scipy: {_avail(HAS_SCIPY)}")
+    lines.append(f"  matplotlib: {_avail(HAS_MATPLOTLIB)}")
+    lines.append(f"  wx: {_avail(HAS_WX)}")
+    lines.append(f"  Core libs (all): {_avail(HAS_LIBS)}")
+    lines.append(f"  PyPardiso (Intel MKL solver): {_avail(HAS_PARDISO)}")
+    lines.append(f"  Numba (JIT compilation): {_avail(HAS_NUMBA)}")
     return "\n".join(lines)

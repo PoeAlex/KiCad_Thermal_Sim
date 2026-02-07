@@ -106,6 +106,15 @@ class _WxMock:
         def SetToolTip(self, tip):
             pass
 
+        def SetLabel(self, label):
+            self.label = label
+
+        def GetFont(self):
+            return _WxMock.Font()
+
+        def SetFont(self, font):
+            pass
+
     class StaticLine:
         def __init__(self, parent, **kwargs):
             pass
@@ -122,6 +131,9 @@ class _WxMock:
 
         def SetValue(self, value):
             self._value = str(value)
+
+        def AppendText(self, text):
+            self._value += str(text)
 
         def Enable(self, enable=True):
             pass
@@ -198,12 +210,19 @@ class _WxMock:
     class Button:
         def __init__(self, parent, id=None, label=""):
             self.label = label
+            self._enabled = True
 
         def Bind(self, event, handler):
             pass
 
         def SetToolTip(self, tip):
             pass
+
+        def Enable(self, enable=True):
+            self._enabled = enable
+
+        def SetLabel(self, label):
+            self.label = label
 
     class DirDialog:
         def __init__(self, parent, message="", defaultPath="", style=0):
@@ -247,10 +266,32 @@ class _WxMock:
     ALIGN_CENTER_VERTICAL = 0x08
     ALIGN_RIGHT = 0x10
     LI_HORIZONTAL = 0
+    FONTWEIGHT_BOLD = 92
+    PD_CAN_ABORT = 0x01
+    PD_APP_MODAL = 0x02
+    PD_REMAINING_TIME = 0x04
+    PD_AUTO_HIDE = 0x08
 
     # Event types
     EVT_BUTTON = "EVT_BUTTON"
     EVT_CHECKBOX = "EVT_CHECKBOX"
+
+    @staticmethod
+    def CallAfter(func, *args, **kwargs):
+        """Mock wx.CallAfter — execute immediately in test context."""
+        func(*args, **kwargs)
+
+    @staticmethod
+    def MessageBox(message, caption="", style=0):
+        """Mock wx.MessageBox."""
+        pass
+
+    class Font:
+        """Mock wx.Font."""
+        def SetWeight(self, weight):
+            pass
+        def GetWeight(self):
+            return 0
 
 
 def install_wx_mock():

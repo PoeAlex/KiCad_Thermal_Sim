@@ -85,7 +85,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
     def RunSafe(self):
         """Main plugin execution logic."""
         if not HAS_LIBS:
-            wx.MessageBox("Please install numpy & matplotlib!", "Error")
+            from .capabilities import get_missing_packages
+            from .dependency_installer import DependencyInstallDialog
+            missing = get_missing_packages()
+            if missing:
+                dlg = DependencyInstallDialog(None, missing)
+                dlg.ShowModal()
+                dlg.Destroy()
+            else:
+                wx.MessageBox(
+                    "All packages appear installed. Please restart KiCad.",
+                    "ThermalSim"
+                )
             return
 
         board = pcbnew.GetBoard()
