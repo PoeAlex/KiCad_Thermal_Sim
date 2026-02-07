@@ -17,7 +17,7 @@ This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineer
 
 - **2D in-plane conduction** on each copper layer (heat spreading within a layer)
 - **Vertical coupling** between adjacent copper layers (FR4 conduction + via enhancement)
-- **Power injection** from selected pads (power distributed over raster cells)
+- **Power injection** from selected pads (constant or **time-varying PWL profiles**)
 - **Convection** to ambient on the **top and bottom** outer surfaces
 - Optional: a **Thermal Pad zone** on `User.Eco1` used as an area with stronger bottom-side heat removal
 
@@ -34,7 +34,8 @@ Typical paths:
 - **Linux**: `~/.local/share/kicad/9.0/scripting/plugins/`
 - **macOS**: `~/Library/Application Support/kicad/9.0/scripting/plugins/`
 
-3. ***Install Matplotlib and scipy!*** Open Kicad 9.0 Command Prompt and type in "pip install matplotlib" and "pip install scipy".
+3. ***Install Matplotlib and scipy!*** Open Kicad 9.0 Command Prompt and type in `pip install matplotlib scipy`.
+   - Optional for faster solves: `pip install pypardiso` (Intel MKL sparse solver)
 4. Restart KiCad.
 5. In PCB Editor, run it via **Tools → External Plugins** (or the plugin menu, depending on KiCad version).
 
@@ -45,7 +46,7 @@ Typical paths:
 1. Open your PCB in **KiCad PCB Editor**.
 2. Select one or multiple **pads** that represent your heat sources.
 3. Run the plugin.
-4. Set **Total Power**, **Duration**, **Ambient**, and **Resolution**.
+4. Set **Power** (constant value or PWL file path), **Duration**, **Ambient**, and **Resolution**.
 5. (Optional) enable geometry filters and/or the thermal pad zone.
 6. Click **Preview** (sanity check), then **Run**.
 
@@ -65,12 +66,36 @@ Informational. Shows how many copper layers were detected and that the tool will
 
 ## Parameters
 
-### Total Power (W) for N Pad(s)
-Total dissipated power assigned to the **currently selected pads**. E.g. if 1W means 1W on each selcted pad.
+### Power (W or PWL file path)
+Power assigned to each selected pad. The field accepts:
+
+| Entry | Meaning |
+|-------|---------|
+| `1.0` | 1 W constant on every selected pad |
+| `1.0, 0.5, 2.0` | Per-pad constant power (comma-separated) |
+| `C:\sim\ramp.pwl` | Same PWL profile for all pads |
+| `1.0, C:\sim\ramp.pwl` | Pad 1 = 1 W constant, Pad 2 = PWL file |
+
+Use the **Browse PWL...** button to pick a file. Clicking it multiple times appends paths for each pad.
+
+**PWL file format** (LTspice-compatible):
+```
+; Comment lines start with ; or *
+; Time(s)  Power(W)
+0.0        0.0
+0.001      1.0
+0.005      2.5
+0.010      2.5
+0.020      0.0
+```
+- Two whitespace-separated columns: time (seconds), power (watts)
+- Time values must be monotonically increasing
+- Linear interpolation between breakpoints; holds first/last value outside range
 
 **Impact**
 - Temperature rise scales approximately linearly with power.
-- If you select many pads, the same total power is spread across a larger area → lower peak temperature.
+- PWL profiles enable simulation of ramp-up, pulsed loads, and thermal cycling.
+- Constant and PWL entries can be freely mixed across pads.
 
 ---
 
@@ -222,6 +247,43 @@ This tool is most reliable for:
 - Trends: more copper, more vias, better spreading
 
 Absolute temperatures are **estimates** and depend on modeling assumptions.
+
+---
+
+## Architecture
+
+The plugin is split into focused modules:
+
+| Module | Purpose |
+|--------|---------|
+| `capabilities.py` | Runtime detection of numpy, matplotlib, pypardiso, numba |
+| `stackup_parser.py` | Parse copper/dielectric layers from .kicad_pcb S-expressions |
+| `gui_dialogs.py` | wxPython dialog for simulation parameters |
+| `geometry_mapper.py` | Convert PCB geometry to discretized conductivity arrays |
+| `thermal_solver.py` | Sparse matrix assembly, BDF2 time integration |
+| `pwl_parser.py` | Parse LTspice-style PWL power profiles |
+| `visualization.py` | Generate thermal plots and preview images |
+| `thermal_report.py` | Generate HTML summary report |
+| `thermal_plugin.py` | Orchestrate workflow, KiCad ActionPlugin interface |
+
+---
+
+## Testing
+
+211 unit tests covering physics validation, parsing, geometry mapping, visualization, and reporting.
+
+```bash
+# Run all tests
+run_tests.bat
+
+# Run specific tests
+run_tests.bat -k "test_solver"
+
+# Physics validation tests only
+run_tests.bat -m physics
+```
+
+See `CLAUDE.md` for full development documentation.
 
 ---
 
