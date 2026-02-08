@@ -7,6 +7,14 @@ If core dependencies (numpy, scipy, matplotlib) are missing, a stub plugin
 is registered that shows an auto-install dialog instead.
 """
 
+# Ensure packages installed via pip --user are discoverable
+# (KiCad's embedded Python may disable user site-packages)
+import site
+try:
+    site.addsitedir(site.getusersitepackages())
+except Exception:
+    pass
+
 try:
     from .thermal_plugin import ThermalPlugin
     ThermalPlugin().register()
