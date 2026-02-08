@@ -34,6 +34,7 @@ PLUGIN_FILES = [
     "thermal_report.py",
     "pwl_parser.py",
     "dependency_installer.py",
+    "ThermalSim_icon.png",
 ]
 
 

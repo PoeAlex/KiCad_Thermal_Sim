@@ -22,7 +22,8 @@ except ImportError:
             self.category = "Simulation"
             self.description = "Crash-safe Multilayer Sim (dependencies missing)"
             self.show_toolbar_button = True
-            self.icon_file_name = ""
+            import os as _os
+            self.icon_file_name = _os.path.join(_os.path.dirname(__file__), "ThermalSim_icon.png")
 
         def Run(self):
             import wx

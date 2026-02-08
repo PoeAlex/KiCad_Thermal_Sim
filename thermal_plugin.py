@@ -45,7 +45,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.category = "Simulation"
         self.description = "Crash-safe Multilayer Sim"
         self.show_toolbar_button = True
-        self.icon_file_name = ""
+        self.icon_file_name = os.path.join(os.path.dirname(__file__), "ThermalSim_icon.png")
 
         # Store references for preview
         self.board = None
