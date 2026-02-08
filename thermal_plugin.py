@@ -652,7 +652,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             k_norm_info=result.k_norm_info,
             out_dir=run_dir,
             snapshot_debug=snapshot_debug,
-            snapshot_files=result.snapshot_files
+            snapshot_files=result.snapshot_files,
+            T_data=result.T,
+            ambient=amb,
         )
 
         # Open outputs

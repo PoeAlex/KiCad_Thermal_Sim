@@ -4,13 +4,17 @@ Unit tests for thermal_report module.
 This module tests the HTML report generation functionality.
 """
 
+import json
 import os
+import re
 import pytest
 import tempfile
+import numpy as np
 
 from ThermalSim.thermal_report import (
     _fmt,
     _esc,
+    _build_interactive_section,
     write_html_report,
 )
 
@@ -440,3 +444,196 @@ class TestWriteHtmlReportEdgeCases:
         # Special chars should be escaped
         assert '&lt;special&gt;' in content
         assert 'R&amp;D' in content
+
+
+class TestInteractiveHeatmap:
+    """Tests for interactive heatmap section in HTML report."""
+
+    @pytest.fixture
+    def base_params(self, temp_dir):
+        """Minimal params for write_html_report."""
+        return {
+            'settings': {'power_str': '1.0', 'time': 20.0},
+            'stack_info': {},
+            'stackup_derived': {
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035, 0.035],
+                'gap_mm_used': [1.53],
+                'gap_fallback_used': False,
+            },
+            'pad_power': [('U1:1', 1.0)],
+            'layer_names': ['F.Cu', 'B.Cu'],
+            'preview_path': None,
+            'heatmap_path': None,
+            'out_dir': temp_dir,
+        }
+
+    def _read_report(self, path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    def test_no_interactive_section_when_t_data_none(self, base_params):
+        """T_data=None should not produce interactive section (backward compat)."""
+        path = write_html_report(**base_params)
+        content = self._read_report(path)
+        assert "Interactive Heatmap" not in content
+
+    def test_interactive_section_present(self, base_params):
+        """Passing T_data should produce the interactive section heading."""
+        T = np.full((2, 10, 10), 25.0)
+        T[0, 5, 5] = 80.0
+        base_params['T_data'] = T
+        base_params['ambient'] = 25.0
+
+        path = write_html_report(**base_params)
+        content = self._read_report(path)
+        assert "Interactive Heatmap" in content
+
+    def test_json_data_embedded(self, base_params):
+        """T_DATA variable should be present inside a script tag."""
+        T = np.full((2, 5, 5), 30.0)
+        base_params['T_data'] = T
+        base_params['ambient'] = 25.0
+
+        path = write_html_report(**base_params)
+        content = self._read_report(path)
+        assert "var T_DATA = " in content
+
+    def test_canvas_elements_per_layer(self, base_params):
+        """One canvas element per layer."""
+        T = np.full((2, 8, 8), 25.0)
+        base_params['T_data'] = T
+        base_params['ambient'] = 25.0
+
+        path = write_html_report(**base_params)
+        content = self._read_report(path)
+        assert 'id="layer-0"' in content
+        assert 'id="layer-1"' in content
+
+    def test_layer_names_in_js(self, base_params):
+        """LAYER_NAMES JS array should match provided layer names."""
+        T = np.full((2, 5, 5), 25.0)
+        base_params['T_data'] = T
+        base_params['ambient'] = 25.0
+
+        path = write_html_report(**base_params)
+        content = self._read_report(path)
+        assert "var LAYER_NAMES = " in content
+        assert '"F.Cu"' in content
+        assert '"B.Cu"' in content
+
+    def test_ambient_value_embedded(self, base_params):
+        """AMBIENT JS variable should match provided ambient temperature."""
+        T = np.full((2, 5, 5), 30.0)
+        base_params['T_data'] = T
+        base_params['ambient'] = 22.5
+
+        path = write_html_report(**base_params)
+        content = self._read_report(path)
+        assert "var AMBIENT = 22.5" in content
+
+    def test_four_layer_stackup(self, temp_dir):
+        """Four-layer board should produce 4 canvas elements."""
+        T = np.full((4, 10, 10), 25.0)
+        params = {
+            'settings': {},
+            'stack_info': {},
+            'stackup_derived': {
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035] * 4,
+                'gap_mm_used': [0.2, 1.0, 0.2],
+                'gap_fallback_used': False,
+            },
+            'pad_power': [],
+            'layer_names': ['F.Cu', 'In1.Cu', 'In2.Cu', 'B.Cu'],
+            'preview_path': None,
+            'heatmap_path': None,
+            'out_dir': temp_dir,
+            'T_data': T,
+            'ambient': 25.0,
+        }
+
+        path = write_html_report(**params)
+        content = self._read_report(path)
+        for i in range(4):
+            assert f'id="layer-{i}"' in content
+        assert "In1.Cu" in content
+        assert "In2.Cu" in content
+
+    def test_large_grid(self, base_params):
+        """200x200 grid should work without error."""
+        T = np.full((2, 200, 200), 25.0)
+        T[0, 100, 100] = 90.0
+        base_params['T_data'] = T
+        base_params['ambient'] = 25.0
+
+        path = write_html_report(**base_params)
+        assert path is not None
+        content = self._read_report(path)
+        assert "Interactive Heatmap" in content
+        assert 'width="200"' in content
+        assert 'height="200"' in content
+
+    def test_temperature_rounding(self, base_params):
+        """Temperature values should be rounded to 1 decimal place."""
+        T = np.full((2, 3, 3), 25.123456789)
+        base_params['T_data'] = T
+        base_params['ambient'] = 25.0
+
+        path = write_html_report(**base_params)
+        content = self._read_report(path)
+        # The exact float 25.123456789 should not appear; 25.1 should
+        assert "25.123456789" not in content
+        assert "25.1" in content
+
+    def test_special_chars_in_layer_names(self, temp_dir):
+        """Layer names with special chars should be safely embedded in JS."""
+        T = np.full((2, 5, 5), 30.0)
+        params = {
+            'settings': {},
+            'stack_info': {},
+            'stackup_derived': {
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035, 0.035],
+                'gap_mm_used': [1.53],
+                'gap_fallback_used': False,
+            },
+            'pad_power': [],
+            'layer_names': ['F.Cu<test>', 'B.Cu&"special'],
+            'preview_path': None,
+            'heatmap_path': None,
+            'out_dir': temp_dir,
+            'T_data': T,
+            'ambient': 25.0,
+        }
+
+        path = write_html_report(**params)
+        content = self._read_report(path)
+        # HTML heading should be escaped
+        assert "&lt;test&gt;" in content
+        # JS string should use JSON-safe encoding (no raw < or unescaped quotes)
+        assert "Interactive Heatmap" in content
+
+    def test_vmax_capped(self, base_params):
+        """vmax should be capped at ambient + 250."""
+        T = np.full((2, 5, 5), 25.0)
+        T[0, 0, 0] = 500.0  # way above ambient + 250 = 275
+        base_params['T_data'] = T
+        base_params['ambient'] = 25.0
+
+        path = write_html_report(**base_params)
+        content = self._read_report(path)
+        # Legend max should show 275.0, not 500.0
+        assert "275.0" in content
+
+    def test_build_interactive_section_directly(self):
+        """Test _build_interactive_section helper directly."""
+        T = np.array([[[25.0, 30.0], [35.0, 40.0]]])
+        result = _build_interactive_section(T, 25.0, ['F.Cu'])
+        assert "Interactive Heatmap" in result
+        assert "var T_DATA" in result
+        assert 'id="layer-0"' in result
+        assert "F.Cu" in result
