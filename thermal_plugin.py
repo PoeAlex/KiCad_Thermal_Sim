@@ -11,7 +11,6 @@ import re
 import time
 import math
 import json
-import shutil
 import tempfile
 import subprocess
 import traceback
@@ -578,7 +577,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 Q_func=Q_func
             )
         except Exception:
-            pd.Destroy()
             wx.MessageBox(f"Solver failed:\n{traceback.format_exc()}", "Solver Error")
             return
         finally:

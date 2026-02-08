@@ -508,7 +508,7 @@ def create_multilayer_maps(
                 if d.GetLayer() == pcbnew.Eco1_User:
                     _fill_heatsink(ctx, d.GetBoundingBox())
 
-    except Exception:
-        pass  # Silent fail for single element errors
+    except Exception as e:
+        print(f"[ThermalSim][WARN] Geometry mapping error: {e}")
 
     return K, V, H

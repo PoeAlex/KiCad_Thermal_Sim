@@ -83,7 +83,7 @@ def build_metadata(version):
         },
         "license": "MIT",
         "resources": {
-            "homepage": "https://github.com/poealex/kicad-thermal-sim"
+            "homepage": "https://github.com/PoeAlex/KiCad_Thermal_Sim"
         },
         "versions": [
             {
