@@ -9,6 +9,7 @@ __pycache__/
 # ThermalSim generated output
 Thermalsim_*/
 thermal_sim_last_settings.json
+debug_log.txt
 *.png
 *.html
 
