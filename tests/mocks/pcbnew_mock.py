@@ -295,7 +295,8 @@ class MockZone:
         net_code: int = 0,
         net_name: str = "GND",
         is_rule_area: bool = False,
-        fill_mask: Optional[Set[tuple]] = None
+        fill_mask: Optional[Set[tuple]] = None,
+        hit_test_func=None
     ):
         self._layers = layers or [F_Cu]
         self._layer_set = MockLayerSet(self._layers)
@@ -306,6 +307,7 @@ class MockZone:
         self._is_rule_area = is_rule_area
         # fill_mask: set of (x_nm, y_nm) positions that are filled
         self._fill_mask = fill_mask
+        self._hit_test_func = hit_test_func
 
     def GetLayer(self) -> int:
         return self._layers[0] if self._layers else F_Cu
@@ -353,21 +355,30 @@ class MockZone:
         return self._bbox.Contains(pos)
 
     def HitTest(self, pos: VECTOR2I) -> bool:
+        if self._hit_test_func is not None:
+            return self._hit_test_func(pos)
         return self._bbox.Contains(pos)
 
 
 class MockDrawing:
     """Mock drawing object (shapes on User.Eco1, etc.)."""
 
-    def __init__(self, layer: int = Eco1_User, bbox: Optional[EDA_RECT] = None):
+    def __init__(self, layer: int = Eco1_User, bbox: Optional[EDA_RECT] = None,
+                 hit_test_func=None):
         self._layer = layer
         self._bbox = bbox or EDA_RECT(0, 0, 5000000, 5000000)
+        self._hit_test_func = hit_test_func
 
     def GetLayer(self) -> int:
         return self._layer
 
     def GetBoundingBox(self) -> EDA_RECT:
         return self._bbox
+
+    def HitTest(self, pos: VECTOR2I) -> bool:
+        if self._hit_test_func is not None:
+            return self._hit_test_func(pos)
+        return self._bbox.Contains(pos)
 
 
 class MockFootprint:

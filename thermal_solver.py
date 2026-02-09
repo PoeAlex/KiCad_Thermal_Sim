@@ -460,12 +460,23 @@ def run_simulation(
 
         # Factor matrices
         factor_start = time.perf_counter()
-        if use_pardiso and hasattr(pypardiso, "factorized"):
-            solve_be = pypardiso.factorized(A_be.tocsc())
-            solve_bdf2 = pypardiso.factorized(A_bdf2.tocsc())
-        elif use_pardiso:
-            solve_be = lambda rhs: pypardiso.spsolve(A_be.tocsc(), rhs)
-            solve_bdf2 = lambda rhs: pypardiso.spsolve(A_bdf2.tocsc(), rhs)
+        if use_pardiso:
+            try:
+                if hasattr(pypardiso, "factorized"):
+                    solve_be = pypardiso.factorized(A_be.tocsc())
+                    solve_bdf2 = pypardiso.factorized(A_bdf2.tocsc())
+                else:
+                    solve_be = lambda rhs: pypardiso.spsolve(A_be.tocsc(), rhs)
+                    solve_bdf2 = lambda rhs: pypardiso.spsolve(A_bdf2.tocsc(), rhs)
+            except Exception as e:
+                print(f"[ThermalSim][WARN] PARDISO factorization failed: {e}")
+                print("[ThermalSim] Falling back to SciPy solver.")
+                backend = "SciPy (PARDISO fallback)"
+                use_pardiso = False
+                lu_be = spla.splu(A_be.tocsc())
+                lu_bdf2 = spla.splu(A_bdf2.tocsc())
+                solve_be = lu_be.solve
+                solve_bdf2 = lu_bdf2.solve
         else:
             lu_be = spla.splu(A_be.tocsc())
             lu_bdf2 = spla.splu(A_bdf2.tocsc())

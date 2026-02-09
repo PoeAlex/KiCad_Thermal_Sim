@@ -151,6 +151,96 @@ def _fill_heatsink(ctx, bbox):
                 H_slice[region_mask] = 1.0
 
 
+def _fill_heatsink_zone(ctx, zone):
+    """
+    Mark heatsink area using per-pixel hit-testing on a zone.
+
+    Uses zone.HitTest() for pixel-accurate fill of non-rectangular
+    shapes on User.Eco1. Falls back to bounding-box fill if HitTest
+    is not available.
+
+    Parameters
+    ----------
+    ctx : FillContext
+        Grid context.
+    zone : pcbnew.ZONE
+        The zone on User.Eco1 to fill.
+    """
+    if not hasattr(zone, "HitTest"):
+        _fill_heatsink(ctx, zone.GetBoundingBox())
+        return
+
+    bbox = zone.GetBoundingBox()
+    rs, re, cs, ce = _bbox_to_grid_indices(bbox, ctx)
+    if cs >= ce or rs >= re:
+        return
+
+    def to_iu(value_mm):
+        try:
+            return pcbnew.FromMM(value_mm)
+        except Exception:
+            return int(value_mm * 1e6)
+
+    for r in range(rs, re):
+        y = ctx.y_min + (r + 0.5) * ctx.res
+        y_iu = to_iu(y)
+        for c in range(cs, ce):
+            if ctx.area_mask is not None and not ctx.area_mask[r, c]:
+                continue
+            x = ctx.x_min + (c + 0.5) * ctx.res
+            pos = pcbnew.VECTOR2I(to_iu(x), y_iu)
+            try:
+                if zone.HitTest(pos):
+                    ctx.H[r, c] = 1.0
+            except Exception:
+                continue
+
+
+def _fill_heatsink_drawing(ctx, drawing):
+    """
+    Mark heatsink area using per-pixel hit-testing on a drawing object.
+
+    Uses drawing.HitTest() for pixel-accurate fill of non-rectangular
+    shapes on User.Eco1. Falls back to bounding-box fill if HitTest
+    is not available.
+
+    Parameters
+    ----------
+    ctx : FillContext
+        Grid context.
+    drawing : pcbnew.BOARD_ITEM
+        The drawing object on User.Eco1 to fill.
+    """
+    if not hasattr(drawing, "HitTest"):
+        _fill_heatsink(ctx, drawing.GetBoundingBox())
+        return
+
+    bbox = drawing.GetBoundingBox()
+    rs, re, cs, ce = _bbox_to_grid_indices(bbox, ctx)
+    if cs >= ce or rs >= re:
+        return
+
+    def to_iu(value_mm):
+        try:
+            return pcbnew.FromMM(value_mm)
+        except Exception:
+            return int(value_mm * 1e6)
+
+    for r in range(rs, re):
+        y = ctx.y_min + (r + 0.5) * ctx.res
+        y_iu = to_iu(y)
+        for c in range(cs, ce):
+            if ctx.area_mask is not None and not ctx.area_mask[r, c]:
+                continue
+            x = ctx.x_min + (c + 0.5) * ctx.res
+            pos = pcbnew.VECTOR2I(to_iu(x), y_iu)
+            try:
+                if drawing.HitTest(pos):
+                    ctx.H[r, c] = 1.0
+            except Exception:
+                continue
+
+
 def _fill_zone(ctx, l_idx, lid, zone, val):
     """
     Fill a copper zone using hit-testing for accurate fill detection.
@@ -500,13 +590,13 @@ def create_multilayer_maps(
             if settings['use_heatsink']:
                 z_ls = z.GetLayerSet()
                 if z_ls.Contains(pcbnew.Eco1_User):
-                    _fill_heatsink(ctx, z.GetBoundingBox())
+                    _fill_heatsink_zone(ctx, z)
 
         # Process drawings on User.Eco1 for heatsink
         if settings['use_heatsink']:
             for d in board.GetDrawings():
                 if d.GetLayer() == pcbnew.Eco1_User:
-                    _fill_heatsink(ctx, d.GetBoundingBox())
+                    _fill_heatsink_drawing(ctx, d)
 
     except Exception as e:
         print(f"[ThermalSim][WARN] Geometry mapping error: {e}")

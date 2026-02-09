@@ -915,3 +915,84 @@ class TestEdgeCases:
 
         assert result.step_counter > 0, "Should complete at least one step"
         assert not result.aborted, "Short simulation should complete normally"
+
+
+class TestSolverBackend:
+    """Tests for solver backend selection and fallback."""
+
+    @pytest.fixture
+    def backend_setup(self):
+        """Create minimal setup for backend tests."""
+        layer_count = 1
+        rows = cols = 5
+        N = layer_count * rows * cols
+        amb = 25.0
+
+        K = sp.eye(N, format='csr') * 0.1
+        C = np.ones(N) * 1e-6
+        Q = np.zeros(N)
+        Q[N // 2] = 0.01
+        b = np.zeros(N)
+        hA = np.zeros(N)
+
+        return {
+            'K': K, 'C': C, 'Q': Q, 'b': b, 'hA': hA,
+            'layer_count': layer_count,
+            'rows': rows, 'cols': cols,
+            'N': N, 'amb': amb,
+        }
+
+    def test_backend_reports_scipy(self, backend_setup):
+        """Test that backend is reported as SciPy when pardiso not requested."""
+        config = SolverConfig(
+            sim_time=0.01,
+            amb=backend_setup['amb'],
+            dt_base=0.005,
+            steps_target=2,
+            use_pardiso=False,
+            use_multi_phase=False
+        )
+
+        result = run_simulation(
+            config=config,
+            **{k: v for k, v in backend_setup.items() if k != 'N' and k != 'amb'}
+        )
+
+        assert result.k_norm_info["backend"] == "SciPy"
+
+    def test_pardiso_fallback_on_failure(self, backend_setup, monkeypatch):
+        """Test that broken pypardiso falls back to SciPy with correct backend string."""
+        import ThermalSim.thermal_solver as ts_mod
+
+        # Pretend pypardiso is available
+        monkeypatch.setattr(ts_mod, "HAS_PARDISO", True)
+
+        # Create a fake pypardiso that raises on factorized()
+        class FakePardiso:
+            @staticmethod
+            def factorized(matrix):
+                raise RuntimeError("MKL not available")
+
+        # pypardiso may not be imported if HAS_PARDISO was False at module load
+        if not hasattr(ts_mod, "pypardiso"):
+            monkeypatch.setattr(ts_mod, "pypardiso", FakePardiso(), raising=False)
+        else:
+            monkeypatch.setattr(ts_mod, "pypardiso", FakePardiso())
+
+        config = SolverConfig(
+            sim_time=0.01,
+            amb=backend_setup['amb'],
+            dt_base=0.005,
+            steps_target=2,
+            use_pardiso=True,
+            use_multi_phase=False
+        )
+
+        result = run_simulation(
+            config=config,
+            **{k: v for k, v in backend_setup.items() if k != 'N' and k != 'amb'}
+        )
+
+        assert not result.aborted
+        assert result.k_norm_info["backend"] == "SciPy (PARDISO fallback)"
+        assert result.step_counter > 0

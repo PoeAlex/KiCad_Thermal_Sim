@@ -13,6 +13,8 @@ from ThermalSim.geometry_mapper import (
     _fill_box,
     _fill_via,
     _fill_heatsink,
+    _fill_heatsink_zone,
+    _fill_heatsink_drawing,
     build_pad_distance_mask,
     get_pad_pixels,
     create_multilayer_maps,
@@ -521,3 +523,191 @@ class TestCreateMultilayerMaps:
         assert K is not None
         # Some regions should be FR4 (not filled due to mask)
         # but near pads should be processed
+
+
+class TestFillHeatsinkZone:
+    """Tests for _fill_heatsink_zone with pixel-accurate hit testing."""
+
+    @pytest.fixture
+    def context(self):
+        """Create test context with 20x20 grid at 0.5mm resolution."""
+        K = np.ones((2, 20, 20))
+        V = np.ones((20, 20))
+        H = np.zeros((20, 20))
+        return FillContext(
+            K=K, V=V, H=H,
+            area_mask=None,
+            x_min=0.0, y_min=0.0,
+            res=0.5,
+            rows=20, cols=20
+        )
+
+    def test_heatsink_zone_uses_hit_testing(self, context):
+        """Test that non-rectangular zone shape is respected via HitTest."""
+        # Create a zone whose bbox covers 4mm x 4mm (rows 4-12, cols 4-12)
+        # but HitTest only returns True for a circular region
+        bbox = EDA_RECT(2000000, 2000000, 4000000, 4000000)
+        center_x = 4000000  # 4mm center
+        center_y = 4000000
+        radius = 1500000    # 1.5mm radius in nm
+
+        def circle_hit(pos):
+            dx = pos.x - center_x
+            dy = pos.y - center_y
+            return (dx * dx + dy * dy) <= radius * radius
+
+        zone = MockZone(
+            layers=[Eco1_User],
+            bbox=bbox,
+            filled=True,
+            hit_test_func=circle_hit,
+        )
+
+        _fill_heatsink_zone(context, zone)
+
+        # Some cells should be filled (inside circle)
+        assert np.sum(context.H > 0) > 0
+
+        # Corner cells of bbox should NOT be filled (outside circle)
+        # bbox covers grid rows 4-12, cols 4-12
+        # Corner (4,4) is at position (2.25mm, 2.25mm) — far from center (4mm,4mm)
+        assert context.H[4, 4] == 0.0, "Corner of bbox should not be filled for circle"
+
+        # Center cells should be filled
+        # Grid cell (8,8) is at position (4.25mm, 4.25mm) — near center
+        assert context.H[8, 8] == 1.0, "Center of circle should be filled"
+
+    def test_heatsink_zone_fallback_without_hittest(self, context):
+        """Test that zone without HitTest falls back to bbox fill."""
+        bbox = EDA_RECT(2000000, 2000000, 2000000, 2000000)
+
+        # Create a zone-like object without HitTest
+        class NoHitTestZone:
+            def GetBoundingBox(self):
+                return bbox
+
+        zone = NoHitTestZone()
+        _fill_heatsink_zone(context, zone)
+
+        # Should still fill the region (via bbox fallback)
+        assert np.sum(context.H > 0) > 0
+
+    def test_heatsink_zone_respects_area_mask(self):
+        """Test that area_mask prevents heatsink fill in masked cells."""
+        K = np.ones((2, 20, 20))
+        V = np.ones((20, 20))
+        H = np.zeros((20, 20))
+        mask = np.zeros((20, 20), dtype=bool)
+        mask[8:12, 8:12] = True  # Only allow center 4x4 region
+
+        ctx = FillContext(
+            K=K, V=V, H=H,
+            area_mask=mask,
+            x_min=0.0, y_min=0.0,
+            res=0.5,
+            rows=20, cols=20
+        )
+
+        # Zone covers entire grid
+        bbox = EDA_RECT(0, 0, 10000000, 10000000)
+        zone = MockZone(
+            layers=[Eco1_User],
+            bbox=bbox,
+            filled=True,
+        )
+
+        _fill_heatsink_zone(ctx, zone)
+
+        # Only masked area should be filled
+        assert np.sum(ctx.H[8:12, 8:12] > 0) > 0
+        assert np.sum(ctx.H[0:8, :]) == 0.0, "Outside mask should not be filled"
+        assert np.sum(ctx.H[12:, :]) == 0.0, "Outside mask should not be filled"
+
+
+class TestFillHeatsinkDrawing:
+    """Tests for _fill_heatsink_drawing with pixel-accurate hit testing."""
+
+    @pytest.fixture
+    def context(self):
+        """Create test context with 20x20 grid at 0.5mm resolution."""
+        K = np.ones((2, 20, 20))
+        V = np.ones((20, 20))
+        H = np.zeros((20, 20))
+        return FillContext(
+            K=K, V=V, H=H,
+            area_mask=None,
+            x_min=0.0, y_min=0.0,
+            res=0.5,
+            rows=20, cols=20
+        )
+
+    def test_heatsink_drawing_uses_hit_testing(self, context):
+        """Test that non-rectangular drawing shape is respected."""
+        # Drawing bbox covers 4mm x 4mm but HitTest only fills left half
+        bbox = EDA_RECT(2000000, 2000000, 4000000, 4000000)
+
+        def left_half_hit(pos):
+            return pos.x < 4000000  # Only left half of bbox
+
+        drawing = MockDrawing(
+            layer=Eco1_User,
+            bbox=bbox,
+            hit_test_func=left_half_hit,
+        )
+
+        _fill_heatsink_drawing(context, drawing)
+
+        # Left side of bbox region should be filled
+        # bbox starts at col 4 (2mm/0.5mm), center at col 8 (4mm/0.5mm)
+        assert np.sum(context.H[:, 4:8] > 0) > 0, "Left half should be filled"
+
+        # Right side should NOT be filled (HitTest returns False)
+        # Col 8+ corresponds to x >= 4mm
+        assert np.sum(context.H[:, 9:12] > 0) == 0, "Right half should not be filled"
+
+    def test_heatsink_drawing_fallback_without_hittest(self, context):
+        """Test that drawing without HitTest falls back to bbox fill."""
+        bbox = EDA_RECT(2000000, 2000000, 2000000, 2000000)
+
+        # Create a drawing-like object without HitTest
+        class NoHitTestDrawing:
+            def GetBoundingBox(self):
+                return bbox
+
+            def GetLayer(self):
+                return Eco1_User
+
+        drawing = NoHitTestDrawing()
+        _fill_heatsink_drawing(context, drawing)
+
+        # Should still fill the region (via bbox fallback)
+        assert np.sum(context.H > 0) > 0
+
+    def test_heatsink_drawing_respects_area_mask(self):
+        """Test that area_mask prevents heatsink fill in masked cells."""
+        K = np.ones((2, 20, 20))
+        V = np.ones((20, 20))
+        H = np.zeros((20, 20))
+        mask = np.zeros((20, 20), dtype=bool)
+        mask[5:15, 5:15] = True  # Only center region
+
+        ctx = FillContext(
+            K=K, V=V, H=H,
+            area_mask=mask,
+            x_min=0.0, y_min=0.0,
+            res=0.5,
+            rows=20, cols=20
+        )
+
+        # Drawing covers entire grid
+        drawing = MockDrawing(
+            layer=Eco1_User,
+            bbox=EDA_RECT(0, 0, 10000000, 10000000),
+        )
+
+        _fill_heatsink_drawing(ctx, drawing)
+
+        # Only masked area should be filled
+        assert np.sum(ctx.H[5:15, 5:15] > 0) > 0
+        assert np.sum(ctx.H[0:5, :]) == 0.0
+        assert np.sum(ctx.H[15:, :]) == 0.0
