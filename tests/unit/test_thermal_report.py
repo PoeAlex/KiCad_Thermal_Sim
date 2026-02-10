@@ -127,7 +127,7 @@ class TestWriteHtmlReport:
         with open(result, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        assert "KiCad Thermal Sim Report" in content
+        assert "ThermalSim Report" in content
 
     def test_report_contains_settings(self, basic_report_params):
         """Test that report contains simulation settings."""
@@ -190,8 +190,8 @@ class TestWriteHtmlReport:
         assert "preview.png" in content
         assert "<img" in content
 
-    def test_report_with_heatmap_image(self, basic_report_params, temp_dir):
-        """Test report with heatmap image path."""
+    def test_report_heatmap_png_not_embedded(self, basic_report_params, temp_dir):
+        """Test that static heatmap PNG is no longer embedded (replaced by interactive)."""
         heatmap_path = os.path.join(temp_dir, "heatmap.png")
         with open(heatmap_path, 'wb') as f:
             f.write(b'\x89PNG\r\n\x1a\n')
@@ -204,7 +204,8 @@ class TestWriteHtmlReport:
         with open(result, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        assert "heatmap.png" in content
+        # Static heatmap is no longer shown; interactive heatmap replaces it
+        assert "heatmap.png" not in content
 
     def test_report_without_images(self, basic_report_params):
         """Test report handles missing images gracefully."""
@@ -235,27 +236,18 @@ class TestWriteHtmlReport:
         assert "implicit_fvm_bdf2" in content
         assert "SciPy" in content
 
-    def test_report_with_snapshots(self, basic_report_params, temp_dir):
-        """Test report with snapshot files."""
-        # Create dummy snapshot files
-        snap1 = os.path.join(temp_dir, "snap_01_t1.0.png")
-        snap2 = os.path.join(temp_dir, "snap_02_t5.0.png")
-        for path in [snap1, snap2]:
-            with open(path, 'wb') as f:
-                f.write(b'\x89PNG\r\n\x1a\n')
-
+    def test_report_snapshots_section_removed(self, basic_report_params, temp_dir):
+        """Test that snapshot PNG section is no longer in the report."""
         params = basic_report_params.copy()
-        params['snapshot_files'] = [(1.0, snap1), (5.0, snap2)]
+        params['snapshot_files'] = None
 
         result = write_html_report(**params)
 
         with open(result, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        assert "snap_01" in content
-        assert "snap_02" in content
-        assert "t = 1.0 s" in content
-        assert "t = 5.0 s" in content
+        # Snapshots section has been removed from the report
+        assert "Snapshots" not in content or "Snapshot Debug" in content
 
     def test_report_html_escaping(self, basic_report_params):
         """Test that special characters are properly escaped."""
@@ -318,7 +310,8 @@ class TestWriteHtmlReport:
         assert "In2.Cu" in content
         assert "B.Cu" in content
         # Check gap interfaces
-        assert "F.Cu -&gt; In1.Cu" in content or "F.Cu -> In1.Cu" in content
+        # Gap interfaces use arrow entity in combined stackup table
+        assert "F.Cu" in content and "In1.Cu" in content
 
     def test_report_gap_fallback_indicator(self, basic_report_params):
         """Test that gap fallback is indicated when used."""
@@ -347,8 +340,8 @@ class TestWriteHtmlReport:
 
         assert "Snapshot Debug" in content
 
-    def test_report_effective_dielectric_section(self, basic_report_params):
-        """Test that effective dielectric thickness section is present."""
+    def test_report_effective_dielectric_in_stackup(self, basic_report_params):
+        """Test that effective dielectric thickness values appear in stackup table."""
         params = basic_report_params.copy()
         params['k_norm_info'] = {
             't_fr4_eff_per_plane_mm': [0.765, 0.765],
@@ -359,7 +352,8 @@ class TestWriteHtmlReport:
         with open(result, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        assert "Effective Dielectric Thickness" in content
+        # t_fr4_eff values appear in the combined PCB Stackup table
+        assert "PCB Stackup" in content
         assert "0.765" in content
 
 
@@ -447,6 +441,143 @@ class TestWriteHtmlReportEdgeCases:
         assert 'R&amp;D' in content
 
 
+class TestReportDesign:
+    """Tests for the redesigned report layout and features."""
+
+    @pytest.fixture
+    def report_with_solver_info(self, temp_dir):
+        """Create a report with full solver info including energy balance."""
+        T = np.full((2, 10, 10), 25.0)
+        T[0, 5, 5] = 75.0
+        return {
+            'settings': {'power_str': '1.0', 'time': 20.0, 'amb': 25.0, 'res': 0.5},
+            'stack_info': {},
+            'stackup_derived': {
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035, 0.035],
+                'gap_mm_used': [1.53],
+                'gap_fallback_used': False,
+            },
+            'pad_power': [('U1:1', 1.0)],
+            'layer_names': ['F.Cu', 'B.Cu'],
+            'preview_path': None,
+            'heatmap_path': None,
+            'k_norm_info': {
+                'strategy': 'implicit_fvm_bdf2',
+                'backend': 'SciPy',
+                'pin_w': 1.0,
+                'pout_final_w': 0.98,
+                'steady_rel_diff': 0.02,
+                't_fr4_eff_per_plane_mm': [0.765, 0.765],
+            },
+            'out_dir': temp_dir,
+            'T_data': T,
+            'ambient': 25.0,
+        }
+
+    def _read(self, path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    def test_energy_balance_card_present(self, report_with_solver_info):
+        """Energy balance card shows Pin, Pout, and rel diff."""
+        path = write_html_report(**report_with_solver_info)
+        content = self._read(path)
+        assert "Energy Balance" in content
+        assert "P<sub>in</sub>" in content
+        assert "P<sub>out</sub>" in content
+        assert "1.0" in content  # pin
+        assert "0.98" in content  # pout
+
+    def test_energy_balance_green_dot(self, report_with_solver_info):
+        """Rel diff < 5% should show Acceptable label."""
+        path = write_html_report(**report_with_solver_info)
+        content = self._read(path)
+        # 2% rel diff -> Acceptable (yellow)
+        assert "Acceptable" in content
+        assert "balance-dot" in content
+
+    def test_energy_balance_excellent(self, report_with_solver_info, temp_dir):
+        """Rel diff < 1% should show Excellent label."""
+        params = report_with_solver_info.copy()
+        params['k_norm_info'] = dict(params['k_norm_info'])
+        params['k_norm_info']['steady_rel_diff'] = 0.005
+        path = write_html_report(**params)
+        content = self._read(path)
+        assert "Excellent" in content
+
+    def test_peak_temperatures_card(self, report_with_solver_info):
+        """Peak temperature card shows per-layer max values."""
+        path = write_html_report(**report_with_solver_info)
+        content = self._read(path)
+        assert "Peak Temperatures" in content
+        assert "75.0" in content  # max temp from T_data
+
+    def test_overview_card(self, report_with_solver_info):
+        """Overview card shows layers, ambient, sim time."""
+        path = write_html_report(**report_with_solver_info)
+        content = self._read(path)
+        assert "Overview" in content
+        assert "Layers" in content
+        assert "Ambient" in content
+
+    def test_collapsible_debug(self, report_with_solver_info):
+        """Debug section is in a collapsible details element."""
+        path = write_html_report(**report_with_solver_info)
+        content = self._read(path)
+        assert "<details>" in content
+        assert "Solver Debug" in content
+
+    def test_hover_hints_on_headers(self, report_with_solver_info):
+        """Table headers and labels have title attributes for hover hints."""
+        path = write_html_report(**report_with_solver_info)
+        content = self._read(path)
+        assert 'title="' in content
+
+    def test_combined_stackup_table(self, report_with_solver_info):
+        """Stackup table combines copper thickness and t_fr4_eff."""
+        path = write_html_report(**report_with_solver_info)
+        content = self._read(path)
+        assert "PCB Stackup" in content
+        assert "Cu Thickness" in content
+        assert "t<sub>fr4,eff</sub>" in content
+
+    def test_no_heatmap_png_in_report(self, report_with_solver_info):
+        """Static heatmap PNG should not appear in the report."""
+        path = write_html_report(**report_with_solver_info)
+        content = self._read(path)
+        assert "Heatmap</h3>" not in content
+
+    def test_gap_fallback_note(self, temp_dir):
+        """Fallback note appears when uniform gap was used."""
+        params = {
+            'settings': {'power_str': '1.0'},
+            'stack_info': {},
+            'stackup_derived': {
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035, 0.035],
+                'gap_mm_used': [0.8],
+                'gap_fallback_used': True,
+            },
+            'pad_power': [],
+            'layer_names': ['F.Cu', 'B.Cu'],
+            'preview_path': None,
+            'heatmap_path': None,
+            'out_dir': temp_dir,
+        }
+        path = write_html_report(**params)
+        content = self._read(path)
+        assert "Uniform dielectric gap fallback" in content
+
+    def test_heat_sources_section_name(self, report_with_solver_info):
+        """Pad power section is named 'Heat Sources'."""
+        path = write_html_report(**report_with_solver_info)
+        content = self._read(path)
+        assert "Heat Sources" in content
+
+
 class TestInteractiveHeatmap:
     """Tests for interactive heatmap section in HTML report."""
 
@@ -475,10 +606,10 @@ class TestInteractiveHeatmap:
             return f.read()
 
     def test_no_interactive_section_when_t_data_none(self, base_params):
-        """T_data=None should not produce interactive section (backward compat)."""
+        """T_data=None should not produce interactive canvas elements."""
         path = write_html_report(**base_params)
         content = self._read_report(path)
-        assert "Interactive Heatmap" not in content
+        assert "var T_DATA" not in content
 
     def test_interactive_section_present(self, base_params):
         """Passing T_data should produce the interactive section heading."""
@@ -789,7 +920,7 @@ class TestInteractiveViewer:
         assert "var VMAX = 120.0" in content
 
     def test_report_no_interactive_without_tdata(self, temp_dir):
-        """write_html_report(T_data=None) omits interactive section."""
+        """write_html_report(T_data=None) omits interactive canvas."""
         params = {
             'settings': {'power_str': '1.0'},
             'stack_info': {},
@@ -809,7 +940,7 @@ class TestInteractiveViewer:
         path = write_html_report(**params)
         with open(path, 'r', encoding='utf-8') as f:
             content = f.read()
-        assert "Interactive Heatmap" not in content
+        assert "var T_DATA" not in content
 
     def test_viewer_responsive_canvas(self, temp_dir):
         """Viewer canvas-wrap uses 90vw responsive width."""

@@ -341,67 +341,142 @@ def write_html_report(
     gap_fallback_used = stackup_derived.get("gap_fallback_used", False)
 
     preview_rel = os.path.basename(preview_path) if preview_path else ""
-    heatmap_rel = os.path.basename(heatmap_path) if heatmap_path else ""
-
-    settings_rows = "\n".join(
-        f"<tr><td>{_esc(k)}</td><td>{_esc(str(v))}</td></tr>"
-        for k, v in settings.items()
-    )
-    pad_rows = "\n".join(
-        f"<tr><td>{_esc(name)}</td><td>{_esc(_fmt(power, ' W'))}</td></tr>"
-        for name, power in pad_power
-    )
-    layer_list = ", ".join(_esc(name) for name in layer_names)
-    copper_rows = "\n".join(
-        f"<tr><td>{_esc(layer_names[i])}</td><td>{_esc(_fmt(th, ' mm'))}</td></tr>"
-        for i, th in enumerate(copper_thicknesses)
-    )
-    gap_rows = "\n".join(
-        f"<tr><td>{_esc(layer_names[i])} -> {_esc(layer_names[i + 1])}</td><td>{_esc(_fmt(g, ' mm'))}</td></tr>"
-        for i, g in enumerate(gaps_used)
-    )
-
-    t_fr4_eff_mm = []
-    if isinstance(k_norm_info, dict):
-        t_fr4_eff_mm = k_norm_info.get("t_fr4_eff_per_plane_mm") or []
-    fr4_eff_rows = "\n".join(
-        f"<tr><td>{_esc(layer_names[i])}</td><td>{_esc(_fmt(val, ' mm'))}</td></tr>"
-        for i, val in enumerate(t_fr4_eff_mm)
-    )
-
-    # Process snapshot files
-    snapshot_items = []
-    if snapshot_files is not None:
-        for item in snapshot_files:
-            if isinstance(item, (list, tuple)) and len(item) == 2:
-                t_val, fname = item
-            else:
-                fname = os.path.basename(str(item))
-                m = re.search(r"_t([0-9.]+)", fname)
-                t_val = float(m.group(1)) if m else None
-            snapshot_items.append((t_val, os.path.basename(fname)))
-    else:
-        try:
-            import glob
-            for path in glob.glob(os.path.join(out_dir, "snap_*.png")):
-                fname = os.path.basename(path)
-                m = re.search(r"_t([0-9.]+)", fname)
-                t_val = float(m.group(1)) if m else None
-                snapshot_items.append((t_val, fname))
-        except Exception:
-            snapshot_items = []
-    snapshot_items.sort(key=lambda x: (x[0] if x[0] is not None else 1e9, x[1]))
-
-    snapshots_html = ""
-    for t_val, fname in snapshot_items:
-        label = f"t = {t_val:.1f} s" if t_val is not None else fname
-        snapshots_html += f"<div><p class='small'>{_esc(label)}</p><img src='{_esc(fname)}' alt='{_esc(label)}'></div>"
 
     if k_norm_info is None:
         k_norm_info = {}
     if snapshot_debug is None:
         snapshot_debug = {}
 
+    # --- Summary card data ---
+    pin_w = k_norm_info.get("pin_w")
+    pout_w = k_norm_info.get("pout_final_w")
+    steady_rel = k_norm_info.get("steady_rel_diff")
+    total_power_w = sum(
+        p for _, p in pad_power if isinstance(p, (int, float))
+    ) if pad_power else None
+
+    # Compute max temperatures from T_data if available
+    max_temps = {}
+    if T_data is not None:
+        try:
+            import numpy as np
+            T_arr = np.asarray(T_data, dtype=float)
+            for i in range(min(len(layer_names), T_arr.shape[0])):
+                max_temps[layer_names[i]] = round(float(np.max(T_arr[i])), 1)
+        except Exception:
+            pass
+
+    # Energy balance indicator
+    if steady_rel is not None:
+        if steady_rel < 0.01:
+            balance_color = "#2ecc40"
+            balance_label = "Excellent"
+        elif steady_rel < 0.05:
+            balance_color = "#ff851b"
+            balance_label = "Acceptable"
+        else:
+            balance_color = "#ff4136"
+            balance_label = "Poor"
+        balance_dot = (
+            f'<span class="balance-dot" style="background:{balance_color};" '
+            f'title="Relative difference between input and output power"></span>'
+        )
+        balance_html = (
+            f'<div class="summary-card">'
+            f'<h3 title="Compares total injected power (Pin) against convective heat loss (Pout) at the final time step. '
+            f'A small difference indicates the simulation has reached or is near thermal equilibrium.">'
+            f'Energy Balance {balance_dot} {_esc(balance_label)}</h3>'
+            f'<table class="summary-tbl">'
+            f'<tr><td title="Total power injected into heat source pads">P<sub>in</sub></td>'
+            f'<td>{_fmt(pin_w, " W")}</td></tr>'
+            f'<tr><td title="Total convective heat loss from all surfaces at the final time step">P<sub>out</sub></td>'
+            f'<td>{_fmt(pout_w, " W")}</td></tr>'
+            f'<tr><td title="Relative difference: |Pin - Pout| / Pin">Rel. diff.</td>'
+            f'<td>{steady_rel:.2%}</td></tr>'
+            f'</table></div>'
+        )
+    else:
+        balance_html = ""
+
+    # Max temperature summary
+    max_temp_rows = ""
+    if max_temps:
+        for lname, tmax in max_temps.items():
+            max_temp_rows += f"<tr><td>{_esc(lname)}</td><td>{tmax:.1f} &deg;C</td></tr>"
+        max_temp_html = (
+            f'<div class="summary-card">'
+            f'<h3 title="Peak temperature on each copper layer at the final simulation time step">'
+            f'Peak Temperatures</h3>'
+            f'<table class="summary-tbl">'
+            f'<tr><th>Layer</th><th>T<sub>max</sub></th></tr>'
+            f'{max_temp_rows}</table></div>'
+        )
+    else:
+        max_temp_html = ""
+
+    # Overview card
+    sim_time = settings.get("time")
+    amb_val = settings.get("amb", ambient)
+    n_layers = len(layer_names)
+    overview_html = (
+        f'<div class="summary-card">'
+        f'<h3>Overview</h3>'
+        f'<table class="summary-tbl">'
+        f'<tr><td title="Number of copper layers in the simulation">Layers</td>'
+        f'<td>{n_layers} ({", ".join(_esc(n) for n in layer_names)})</td></tr>'
+        f'<tr><td title="Ambient temperature used as initial condition and convective reference">Ambient</td>'
+        f'<td>{_fmt(amb_val, " &deg;C") if amb_val is not None else "n/a"}</td></tr>'
+        f'<tr><td title="Total simulation time">Sim. time</td>'
+        f'<td>{_fmt(sim_time, " s") if sim_time is not None else "n/a"}</td></tr>'
+        f'<tr><td title="Total power injected across all heat source pads">Total power</td>'
+        f'<td>{_fmt(total_power_w, " W") if total_power_w is not None else "n/a"}</td></tr>'
+        f'<tr><td title="Board thickness from KiCad stackup definition">Board thickness</td>'
+        f'<td>{_esc(_fmt(board_thick_mm, " mm"))}</td></tr>'
+        f'</table></div>'
+    )
+
+    # --- Settings table ---
+    settings_rows = "\n".join(
+        f"<tr><td>{_esc(k)}</td><td>{_esc(str(v))}</td></tr>"
+        for k, v in settings.items()
+    )
+
+    # --- Power per pad ---
+    pad_rows = "\n".join(
+        f"<tr><td>{_esc(name)}</td><td>{_esc(_fmt(power, ' W'))}</td></tr>"
+        for name, power in pad_power
+    )
+
+    # --- Combined stackup table ---
+    t_fr4_eff_mm = []
+    if isinstance(k_norm_info, dict):
+        t_fr4_eff_mm = k_norm_info.get("t_fr4_eff_per_plane_mm") or []
+    stackup_rows = ""
+    for i, lname in enumerate(layer_names):
+        cu_th = _fmt(copper_thicknesses[i], " mm") if i < len(copper_thicknesses) else "n/a"
+        t_eff = _fmt(t_fr4_eff_mm[i], " mm") if i < len(t_fr4_eff_mm) else "n/a"
+        stackup_rows += (
+            f"<tr><td>{_esc(lname)}</td>"
+            f"<td>{_esc(cu_th)}</td>"
+            f"<td>{_esc(t_eff)}</td></tr>"
+        )
+        if i < len(gaps_used):
+            stackup_rows += (
+                f'<tr class="gap-row"><td class="gap-label">'
+                f'{_esc(lname)} &rarr; {_esc(layer_names[i + 1])}</td>'
+                f'<td colspan="2">{_esc(_fmt(gaps_used[i], " mm"))}</td></tr>'
+            )
+
+    fallback_note = ""
+    if gap_fallback_used:
+        fallback_note = (
+            '<p class="note" title="The KiCad stackup did not contain per-interface '
+            'dielectric gap data. A uniform gap was calculated by dividing the total '
+            'board thickness by the number of copper layer interfaces.">'
+            'Note: Uniform dielectric gap fallback was used (stackup gaps not available).</p>'
+        )
+
+    # --- Debug tables ---
     k_norm_rows = "\n".join(
         f"<tr><td>{_esc(str(k))}</td><td>{_esc(_fmt(v))}</td></tr>"
         for k, v in k_norm_info.items()
@@ -425,90 +500,121 @@ def write_html_report(
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>KiCad Thermal Sim Report</title>
+  <title>ThermalSim Report</title>
   <style>
-    body {{ font-family: Arial, sans-serif; margin: 20px; }}
-    h1, h2 {{ margin-bottom: 6px; }}
-    table {{ border-collapse: collapse; width: 100%; margin-bottom: 16px; }}
-    th, td {{ border: 1px solid #ccc; padding: 6px 8px; text-align: left; }}
-    pre {{ background: #f7f7f7; padding: 10px; border: 1px solid #ddd; overflow-x: auto; }}
-    .images {{ display: flex; gap: 20px; flex-wrap: wrap; }}
-    .images img {{ max-width: 100%; height: auto; border: 1px solid #ccc; }}
-    .small {{ color: #666; font-size: 0.9em; }}
+    :root {{
+      --bg: #fafbfc; --card-bg: #ffffff; --border: #e1e4e8;
+      --text: #24292e; --text-muted: #586069; --accent: #0366d6;
+      --header-bg: #f6f8fa;
+    }}
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+           background: var(--bg); color: var(--text); line-height: 1.5;
+           max-width: 1200px; margin: 0 auto; padding: 24px; }}
+    h1 {{ font-size: 1.6em; font-weight: 600; margin-bottom: 4px; color: var(--text); }}
+    h2 {{ font-size: 1.2em; font-weight: 600; margin: 28px 0 12px 0; color: var(--text);
+         padding-bottom: 6px; border-bottom: 1px solid var(--border); }}
+    h3 {{ font-size: 1em; font-weight: 600; margin-bottom: 8px; color: var(--text); }}
+    .subtitle {{ color: var(--text-muted); font-size: 0.85em; margin-bottom: 20px; }}
+    .summary-row {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }}
+    .summary-card {{ background: var(--card-bg); border: 1px solid var(--border);
+                     border-radius: 6px; padding: 16px; flex: 1; min-width: 220px; }}
+    .summary-tbl {{ width: 100%; border-collapse: collapse; }}
+    .summary-tbl td, .summary-tbl th {{
+      padding: 4px 8px; border: none; font-size: 0.9em;
+      border-bottom: 1px solid #f0f0f0;
+    }}
+    .summary-tbl th {{ text-align: left; color: var(--text-muted); font-weight: 500; font-size: 0.85em; }}
+    .summary-tbl td:first-child {{ color: var(--text-muted); white-space: nowrap; }}
+    .summary-tbl td:last-child {{ font-weight: 500; }}
+    .balance-dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+                    margin-right: 4px; vertical-align: middle; }}
+    table.data-tbl {{ border-collapse: collapse; width: 100%; margin-bottom: 16px;
+                      background: var(--card-bg); border: 1px solid var(--border);
+                      border-radius: 6px; overflow: hidden; }}
+    .data-tbl th {{ background: var(--header-bg); padding: 8px 12px; text-align: left;
+                    font-weight: 600; font-size: 0.85em; color: var(--text-muted);
+                    border-bottom: 1px solid var(--border); }}
+    .data-tbl td {{ padding: 6px 12px; border-bottom: 1px solid #f0f0f0; font-size: 0.9em; }}
+    .data-tbl tr:last-child td {{ border-bottom: none; }}
+    .gap-row td {{ background: #f8f9fa; color: var(--text-muted); font-style: italic; font-size: 0.85em; }}
+    .gap-label {{ padding-left: 24px !important; }}
+    .note {{ color: var(--text-muted); font-size: 0.85em; font-style: italic; margin: 8px 0; }}
+    .preview-section {{ margin: 16px 0; }}
+    .preview-section img {{ max-width: 100%; height: auto; border: 1px solid var(--border);
+                            border-radius: 4px; }}
+    details {{ margin-bottom: 16px; }}
+    details summary {{ cursor: pointer; font-weight: 600; font-size: 1.05em; color: var(--text);
+                       padding: 8px 0; user-select: none; }}
+    details summary:hover {{ color: var(--accent); }}
+    details .debug-tbl {{ width: 100%; border-collapse: collapse; font-size: 0.85em;
+                          background: var(--card-bg); border: 1px solid var(--border); }}
+    details .debug-tbl td {{ padding: 4px 10px; border-bottom: 1px solid #f0f0f0;
+                             font-family: 'SFMono-Regular', Consolas, monospace; }}
+    details .debug-tbl td:first-child {{ color: var(--text-muted); white-space: nowrap; }}
+    [title] {{ cursor: help; border-bottom: 1px dotted var(--text-muted); }}
+    table [title] {{ border-bottom: none; }}
+    .summary-card h3[title] {{ border-bottom: none; cursor: help; }}
   </style>
 </head>
 <body>
-  <h1>KiCad Thermal Sim Report</h1>
-  <p class="small">Generated by Thermal Sim plugin.</p>
+  <h1>ThermalSim Report</h1>
+  <p class="subtitle">2.5D transient thermal simulation &mdash; generated by ThermalSim plugin</p>
 
-  <h2>Thicknesses Used in Simulation</h2>
-  <table>
-    <tr><th>Metric</th><th>Value</th></tr>
-    <tr><td>Board thickness (stackup)</td><td>{_esc(_fmt(board_thick_mm, " mm"))}</td></tr>
-    <tr><td>Total thickness used</td><td>{_esc(_fmt(total_thick_mm, " mm"))}</td></tr>
-    <tr><td>Uniform gap fallback used</td><td>{_esc(str(bool(gap_fallback_used)))}</td></tr>
-    <tr><td>Layer names</td><td>{layer_list}</td></tr>
-  </table>
+  <!-- Summary Cards -->
+  <div class="summary-row">
+    {overview_html}
+    {max_temp_html}
+    {balance_html}
+  </div>
 
-  <h2>Copper Thickness per Layer</h2>
-  <table>
-    <tr><th>Layer</th><th>Thickness</th></tr>
-    {copper_rows}
-  </table>
+  <!-- Geometry Preview -->
+  <h2>Geometry Preview</h2>
+  <div class="preview-section">
+    {"<img src='" + _esc(preview_rel) + "' alt='Geometry preview showing copper, vias, and heat sources'>" if preview_rel else "<p class='note'>Preview image not available.</p>"}
+  </div>
 
-  <h2>Dielectric Gap per Interface</h2>
-  <table>
-    <tr><th>Interface</th><th>Gap</th></tr>
-    {gap_rows}
-  </table>
-  <h2>Effective Dielectric Thickness per Plane</h2>
-  <p class="small">t_fr4_eff is per-plane effective dielectric thickness derived by averaging adjacent interface gaps; therefore its max may be lower than the maximum single interface gap.</p>
-  <table>
-    <tr><th>Plane</th><th>t_fr4_eff</th></tr>
-    {fr4_eff_rows if fr4_eff_rows else "<tr><td colspan='2'>n/a</td></tr>"}
-  </table>
+  <!-- Interactive Heatmap -->
+  {interactive_html}
 
-  <h2>Debug</h2>
-  <table>
-    <tr><th>Key</th><th>Value</th></tr>
-    {k_norm_rows}
+  <!-- PCB Stackup -->
+  <h2 title="Physical layer stack used in the finite-volume thermal model">PCB Stackup</h2>
+  <table class="data-tbl">
+    <tr>
+      <th title="Copper layer name from KiCad board setup">Layer</th>
+      <th title="Copper foil thickness (from stackup or default 35 &micro;m)">Cu Thickness</th>
+      <th title="Effective dielectric thickness assigned to this copper plane, averaged from adjacent interface gaps">t<sub>fr4,eff</sub></th>
+    </tr>
+    {stackup_rows}
   </table>
+  {fallback_note}
 
-  <h2>Snapshot Debug</h2>
-  <table>
-    <tr><th>Key</th><th>Value</th></tr>
-    {snapshot_debug_rows}
-  </table>
-
+  <!-- Simulation Settings -->
   <h2>Simulation Settings</h2>
-  <table>
-    <tr><th>Setting</th><th>Value</th></tr>
+  <table class="data-tbl">
+    <tr><th>Parameter</th><th>Value</th></tr>
     {settings_rows}
   </table>
 
-  <h2>Power per Pad</h2>
-  <table>
-    <tr><th>Pad</th><th>Power</th></tr>
-    {pad_rows}
+  <!-- Power per Pad -->
+  <h2 title="Thermal power injected at each selected pad">Heat Sources</h2>
+  <table class="data-tbl">
+    <tr>
+      <th title="Pad reference (Footprint-PadNumber)">Pad</th>
+      <th title="Injected power in watts (constant or PWL profile)">Power</th>
+    </tr>
+    {pad_rows if pad_rows else "<tr><td colspan='2' style='color:var(--text-muted)'>No heat sources defined.</td></tr>"}
   </table>
 
-  <h2>Images</h2>
-  <div class="images">
-    <div>
-      <h3>Preview</h3>
-      {"<img src='" + _esc(preview_rel) + "' alt='Preview image'>" if preview_rel else "<p class='small'>Preview image not available.</p>"}
-    </div>
-    <div>
-      <h3>Heatmap</h3>
-      {"<img src='" + _esc(heatmap_rel) + "' alt='Heatmap image'>" if heatmap_rel else "<p class='small'>Heatmap image not available.</p>"}
-    </div>
-  </div>
-
-  <h2>Snapshots</h2>
-  <div class="images">
-    {snapshots_html if snapshots_html else "<p class='small'>No snapshots captured.</p>"}
-  </div>
-  {interactive_html}
+  <!-- Debug (collapsible) -->
+  <details>
+    <summary>Solver Debug Information</summary>
+    <p class="note" style="margin:8px 0 12px 0;">Internal solver parameters, matrix dimensions, and performance counters.</p>
+    <table class="debug-tbl">
+      {k_norm_rows}
+    </table>
+    {"<h3 style='margin:16px 0 8px 0;'>Snapshot Debug</h3><table class='debug-tbl'>" + snapshot_debug_rows + "</table>" if snapshot_debug_rows else ""}
+  </details>
 </body>
 </html>
 """
