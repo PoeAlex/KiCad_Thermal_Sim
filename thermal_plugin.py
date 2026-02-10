@@ -26,9 +26,10 @@ from .geometry_mapper import create_multilayer_maps, build_pad_distance_mask, ge
 from .thermal_solver import SolverConfig, build_stiffness_matrix, run_simulation
 from .pwl_parser import parse_pwl_file
 from .visualization import (
-    save_snapshot, show_results_top_bot, show_results_all_layers, save_preview_image
+    show_results_top_bot, show_results_all_layers, save_preview_image,
+    save_preview_from_arrays,
 )
-from .thermal_report import write_html_report
+from .thermal_report import write_html_report, write_interactive_viewer
 
 
 class ThermalPlugin(pcbnew.ActionPlugin):
@@ -554,8 +555,11 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             except Exception:
                 return False
 
+        snapshot_T_arrays = []  # list of (float, np.ndarray)
+
         def snapshot_callback(T_view, t_elapsed, snap_idx):
-            return save_snapshot(T_view, H_map, amb, layer_names, snap_idx, t_elapsed, out_dir=run_dir)
+            snapshot_T_arrays.append((t_elapsed, T_view.copy()))
+            return None
 
         # Run solver
         config = SolverConfig(
@@ -617,12 +621,11 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 open_file=False, t_elapsed=sim_time, out_dir=run_dir
             )
 
-        preview_path = save_preview_image(
-            board, copper_ids, bbox, pads_list,
-            settings, layer_names, stack_info,
-            get_pad_pixels, create_multilayer_maps,
-            self._derive_stackup_thicknesses,
-            open_file=False, out_dir=run_dir
+        preview_path = save_preview_from_arrays(
+            K, V_map, H_map, pads_list, copper_ids,
+            rows, cols, x_min, y_min, res,
+            layer_names, settings, board,
+            get_pad_pixels, out_dir=run_dir,
         )
 
         snapshot_debug = {
@@ -641,6 +644,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "phase_metrics": json.dumps(result.phase_metrics),
         }
 
+        viewer_path = write_interactive_viewer(
+            T_snapshots=snapshot_T_arrays,
+            T_final=result.T,
+            sim_time=sim_time,
+            ambient=amb,
+            layer_names=layer_names,
+            out_dir=run_dir,
+        )
+
         report_path = write_html_report(
             settings=settings,
             stack_info=stack_info,
@@ -652,7 +664,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             k_norm_info=result.k_norm_info,
             out_dir=run_dir,
             snapshot_debug=snapshot_debug,
-            snapshot_files=result.snapshot_files,
+            snapshot_files=None,
             T_data=result.T,
             ambient=amb,
         )
@@ -665,14 +677,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     webbrowser.open("file://" + os.path.abspath(report_path))
                 except Exception:
                     pass
-                if heatmap_path:
+                if viewer_path:
                     try:
-                        if sys.platform.startswith("win"):
-                            os.startfile(os.path.abspath(heatmap_path))
-                        elif sys.platform == "darwin":
-                            subprocess.Popen(["open", os.path.abspath(heatmap_path)])
-                        else:
-                            subprocess.Popen(["xdg-open", os.path.abspath(heatmap_path)])
+                        import webbrowser
+                        webbrowser.open("file://" + os.path.abspath(viewer_path))
                     except Exception:
                         pass
             wx.CallAfter(_open_outputs)

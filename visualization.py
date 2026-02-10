@@ -453,6 +453,150 @@ def save_preview_image(
         return None
 
 
+def save_preview_from_arrays(
+    K, V_map, H_map, pads_list, copper_ids,
+    rows, cols, x_min, y_min, res,
+    layer_names, settings, board,
+    get_pad_pixels_func, out_dir=None,
+):
+    """
+    Save a geometry preview image from pre-computed arrays.
+
+    This avoids redundant zone filling and geometry mapping by reusing
+    the K, V_map, and H_map arrays already computed during simulation.
+
+    Parameters
+    ----------
+    K : np.ndarray
+        Relative conductivity map, shape (layers, rows, cols).
+    V_map : np.ndarray
+        Via enhancement map, shape (rows, cols).
+    H_map : np.ndarray
+        Heatsink mask, shape (rows, cols).
+    pads_list : list
+        List of selected pad objects.
+    copper_ids : list of int
+        Copper layer IDs in stackup order.
+    rows : int
+        Number of grid rows.
+    cols : int
+        Number of grid columns.
+    x_min : float
+        Grid origin X in mm.
+    y_min : float
+        Grid origin Y in mm.
+    res : float
+        Grid resolution in mm.
+    layer_names : list of str
+        Names of copper layers.
+    settings : dict
+        Simulation settings.
+    board : pcbnew.BOARD
+        The KiCad board object.
+    get_pad_pixels_func : callable
+        Function to get pad pixel coordinates.
+    out_dir : str, optional
+        Output directory.
+
+    Returns
+    -------
+    str or None
+        Path to saved file, or None if failed.
+    """
+    try:
+        out_dir = out_dir or os.path.dirname(__file__)
+        if not os.path.isdir(out_dir):
+            out_dir = os.path.dirname(__file__)
+        output_file = os.path.join(out_dir, "thermal_preview.png")
+
+        k_fr4_rel = 1.0
+        count = len(K)
+        cols_grid = 2
+        rows_grid = math.ceil(count / 2)
+
+        fig, axes = plt.subplots(rows_grid, cols_grid, figsize=(12, 4 * rows_grid), squeeze=False)
+        axes = axes.flatten()
+
+        # Build pad masks per layer
+        pad_masks = [np.zeros((rows, cols), dtype=bool) for _ in range(count)]
+        pad_labels = []
+        label_limit = 10
+
+        for pad in pads_list or []:
+            pad_lid = pad.GetLayer()
+            target_indices = []
+            if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
+                target_indices = list(range(count))
+            elif pad_lid in copper_ids:
+                target_indices = [copper_ids.index(pad_lid)]
+            else:
+                lname = board.GetLayerName(pad_lid).upper()
+                target_indices = [count - 1 if ("B." in lname or "BOT" in lname) else 0]
+
+            pixels = get_pad_pixels_func(pad, rows, cols, x_min, y_min, res)
+            if pixels:
+                for idx in target_indices:
+                    for r, c in pixels:
+                        if r < rows and c < cols:
+                            pad_masks[idx][r, c] = True
+                if len(pad_labels) < label_limit:
+                    try:
+                        pos = pad.GetPosition()
+                        cx = int((pos.x * 1e-6 - x_min) / res)
+                        cy = int((pos.y * 1e-6 - y_min) / res)
+                    except Exception:
+                        cx, cy = None, None
+                    if cx is not None and cy is not None:
+                        label = pad.GetNumber() if hasattr(pad, "GetNumber") else ""
+                        pad_labels.append((target_indices[0], cx, cy, label))
+
+        for i in range(count):
+            ax = axes[i]
+            name = layer_names[i] if i < len(layer_names) else f"Layer {i}"
+            ax.set_title(f"Preview: {name}")
+
+            copper_mask = K[i] > k_fr4_rel
+            ax.imshow(copper_mask, cmap='Greens', origin='upper', interpolation='none', alpha=0.35)
+
+            if settings.get('use_heatsink'):
+                is_bottom = (i == count - 1) or (name == "B.Cu")
+                if is_bottom:
+                    ax.imshow(
+                        np.ma.masked_where(H_map <= 0, H_map),
+                        cmap='Blues', origin='upper', interpolation='none', alpha=0.45
+                    )
+
+            v_mask = V_map > 1.0
+            if np.any(v_mask):
+                ax.imshow(
+                    np.ma.masked_where(~v_mask, v_mask),
+                    cmap='Reds', origin='upper', alpha=0.5, interpolation='none'
+                )
+
+            pad_mask = pad_masks[i]
+            if np.any(pad_mask):
+                ax.imshow(
+                    np.ma.masked_where(~pad_mask, pad_mask),
+                    cmap='autumn', origin='upper', alpha=0.6, interpolation='none'
+                )
+                for layer_idx, cx, cy, label in pad_labels:
+                    if layer_idx == i:
+                        ax.text(cx, cy, str(label), color='black', fontsize=8, ha='center', va='center')
+
+            ax.axis('off')
+
+        for j in range(count, len(axes)):
+            axes[j].axis('off')
+
+        plt.tight_layout()
+        plt.savefig(output_file, dpi=120)
+        plt.close()
+        return output_file
+
+    except Exception:
+        return None
+
+
 def _open_file(filepath):
     """
     Open a file in the system default viewer.

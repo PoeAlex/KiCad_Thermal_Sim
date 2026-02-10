@@ -16,6 +16,7 @@ from ThermalSim.thermal_report import (
     _esc,
     _build_interactive_section,
     write_html_report,
+    write_interactive_viewer,
 )
 
 
@@ -637,3 +638,293 @@ class TestInteractiveHeatmap:
         assert "var T_DATA" in result
         assert 'id="layer-0"' in result
         assert "F.Cu" in result
+
+
+class TestInteractiveViewer:
+    """Tests for write_interactive_viewer function."""
+
+    def _read(self, path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    def test_viewer_file_created(self, temp_dir):
+        """File exists and ends with thermal_viewer.html."""
+        T = np.full((2, 10, 10), 30.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=10.0,
+            ambient=25.0, layer_names=['F.Cu', 'B.Cu'], out_dir=temp_dir,
+        )
+        assert path is not None
+        assert os.path.exists(path)
+        assert path.endswith("thermal_viewer.html")
+
+    def test_viewer_returns_none_on_bad_dir(self):
+        """Graceful failure on bad output directory."""
+        T = np.full((1, 5, 5), 25.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=5.0,
+            ambient=25.0, layer_names=['F.Cu'],
+            out_dir="/nonexistent_dir_xyz_123/sub",
+        )
+        assert path is None
+
+    def test_viewer_contains_frames_json(self, temp_dir):
+        """var FRAMES present, 'Final' label present."""
+        T = np.full((1, 5, 5), 30.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=10.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert "var FRAMES" in content
+        assert "Final" in content
+
+    def test_viewer_with_snapshots(self, temp_dir):
+        """Multiple frame labels when snapshots provided."""
+        T_final = np.full((1, 5, 5), 50.0)
+        snap1 = (2.0, np.full((1, 5, 5), 35.0))
+        snap2 = (5.0, np.full((1, 5, 5), 42.0))
+        path = write_interactive_viewer(
+            T_snapshots=[snap1, snap2], T_final=T_final, sim_time=10.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert "t = 2.0 s" in content
+        assert "t = 5.0 s" in content
+        assert "Final" in content
+
+    def test_viewer_layer_buttons(self, temp_dir):
+        """Layer names appear in LAYER_NAMES JS variable."""
+        T = np.full((4, 5, 5), 30.0)
+        names = ['F.Cu', 'In1.Cu', 'In2.Cu', 'B.Cu']
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=10.0,
+            ambient=25.0, layer_names=names, out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert "var LAYER_NAMES" in content
+        for n in names:
+            assert n in content
+
+    def test_viewer_no_snapshots_hides_frame_buttons(self, temp_dir):
+        """Single frame entry when no snapshots — frame toolbar hidden."""
+        T = np.full((1, 5, 5), 30.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=10.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        # Only one frame button (Final), and toolbar is hidden
+        assert content.count('class="btn frame-btn') == 1
+        assert 'display:none;' in content  # frame toolbar hidden
+
+    def test_viewer_canvas_dimensions(self, temp_dir):
+        """Canvas width/height match grid cols/rows."""
+        T = np.full((1, 15, 20), 30.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=5.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert 'width="20"' in content
+        assert 'height="15"' in content
+
+    def test_viewer_vmax_capped(self, temp_dir):
+        """Max capped at ambient + 250."""
+        T = np.full((1, 5, 5), 25.0)
+        T[0, 0, 0] = 500.0  # way above 25 + 250 = 275
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=5.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert "275.0" in content
+
+    def test_viewer_temperature_rounding(self, temp_dir):
+        """No raw floats, values rounded to 1dp."""
+        T = np.full((1, 3, 3), 25.123456789)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=5.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert "25.123456789" not in content
+        assert "25.1" in content
+
+    def test_viewer_valid_html(self, temp_dir):
+        """DOCTYPE, canvas, heatmap id present."""
+        T = np.full((1, 5, 5), 30.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=5.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert "<!DOCTYPE html>" in content
+        assert "<canvas" in content
+        assert 'id="heatmap"' in content
+
+    def test_viewer_hover_tooltip(self, temp_dir):
+        """Tooltip div and mousemove handler present."""
+        T = np.full((1, 5, 5), 30.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=5.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert 'id="tooltip"' in content
+        assert "mousemove" in content
+
+    def test_viewer_global_vmin_vmax(self, temp_dir):
+        """VMAX derived from hottest frame across all snapshots."""
+        T_final = np.full((1, 5, 5), 50.0)
+        # Snapshot has a hotter pixel than final
+        T_snap = np.full((1, 5, 5), 30.0)
+        T_snap[0, 0, 0] = 120.0
+        path = write_interactive_viewer(
+            T_snapshots=[(3.0, T_snap)], T_final=T_final, sim_time=10.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        # VMAX should be 120.0 (from snapshot), not 50.0 (from final)
+        assert "var VMAX = 120.0" in content
+
+    def test_report_no_interactive_without_tdata(self, temp_dir):
+        """write_html_report(T_data=None) omits interactive section."""
+        params = {
+            'settings': {'power_str': '1.0'},
+            'stack_info': {},
+            'stackup_derived': {
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035],
+                'gap_mm_used': [],
+                'gap_fallback_used': False,
+            },
+            'pad_power': [],
+            'layer_names': ['F.Cu'],
+            'preview_path': None,
+            'heatmap_path': None,
+            'out_dir': temp_dir,
+        }
+        path = write_html_report(**params)
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        assert "Interactive Heatmap" not in content
+
+    def test_viewer_responsive_canvas(self, temp_dir):
+        """Viewer canvas-wrap uses 90vw responsive width."""
+        T = np.full((1, 10, 10), 30.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=5.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert "90vw" in content
+        assert "max-width: 1400px" in content
+
+    def test_viewer_overlay_canvas(self, temp_dir):
+        """Viewer contains an overlay canvas for rectangle drawing."""
+        T = np.full((1, 10, 10), 30.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=5.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert 'id="overlay"' in content
+
+    def test_viewer_stats_panel(self, temp_dir):
+        """Viewer contains the stats panel div."""
+        T = np.full((1, 10, 10), 30.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=5.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert 'id="stats-panel"' in content
+        assert 'id="stats-list"' in content
+        assert "Selections" in content
+
+    def test_viewer_clear_all_button(self, temp_dir):
+        """Viewer contains Clear All button."""
+        T = np.full((1, 10, 10), 30.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=5.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert 'id="clear-all-btn"' in content
+        assert "Clear All" in content
+
+    def test_viewer_rectangle_js_functions(self, temp_dir):
+        """Viewer contains rectangle selection JS functions."""
+        T = np.full((1, 10, 10), 30.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=5.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert "computeStats" in content
+        assert "renderOverlay" in content
+        assert "updateStatsPanel" in content
+        assert "RECT_COLORS" in content
+
+    def test_viewer_mousedown_handler(self, temp_dir):
+        """Viewer has mousedown handler on overlay for drawing."""
+        T = np.full((1, 10, 10), 30.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=5.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert "mousedown" in content
+        assert "mouseup" in content
+
+    def test_viewer_flex_layout(self, temp_dir):
+        """Viewer uses flex layout for canvas + stats panel."""
+        T = np.full((1, 10, 10), 30.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=5.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        assert "viewer-main" in content
+        assert "display: flex" in content
+
+    def test_viewer_overlay_dimensions_match_heatmap(self, temp_dir):
+        """Overlay canvas has same dimensions as heatmap canvas."""
+        T = np.full((1, 15, 20), 30.0)
+        path = write_interactive_viewer(
+            T_snapshots=[], T_final=T, sim_time=5.0,
+            ambient=25.0, layer_names=['F.Cu'], out_dir=temp_dir,
+        )
+        content = self._read(path)
+        # Both heatmap and overlay should have width=20, height=15
+        assert content.count('width="20"') >= 2
+        assert content.count('height="15"') >= 2
+
+    def test_report_interactive_section_responsive_canvas(self, temp_dir):
+        """Interactive section in report has responsive canvas CSS."""
+        T = np.full((2, 5, 5), 30.0)
+        params = {
+            'settings': {},
+            'stack_info': {},
+            'stackup_derived': {
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035, 0.035],
+                'gap_mm_used': [1.53],
+                'gap_fallback_used': False,
+            },
+            'pad_power': [],
+            'layer_names': ['F.Cu', 'B.Cu'],
+            'preview_path': None,
+            'heatmap_path': None,
+            'out_dir': temp_dir,
+            'T_data': T,
+            'ambient': 25.0,
+        }
+        path = write_html_report(**params)
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        assert "90vw" in content
+        assert "max-width: 1200px" in content

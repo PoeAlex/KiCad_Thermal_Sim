@@ -14,6 +14,7 @@ from ThermalSim.visualization import (
     save_snapshot,
     show_results_top_bot,
     show_results_all_layers,
+    save_preview_from_arrays,
 )
 
 from tests.fixtures.temperature_arrays import (
@@ -406,3 +407,105 @@ class TestVisualizationEdgeCases:
         save_stackup_plot(T, H, amb=25.0, layer_names=[], fname=fname)
 
         assert os.path.exists(fname)
+
+
+class TestSavePreviewFromArrays:
+    """Tests for save_preview_from_arrays function."""
+
+    def _make_arrays(self, layers=2, rows=20, cols=20):
+        """Create minimal K, V_map, H_map arrays."""
+        K = np.ones((layers, rows, cols), dtype=np.float64)
+        # Mark some copper pixels
+        K[:, 5:15, 5:15] = 400.0
+        V_map = np.zeros((rows, cols), dtype=np.float64)
+        H_map = np.zeros((rows, cols), dtype=np.float64)
+        return K, V_map, H_map
+
+    def test_creates_preview_file(self, temp_dir):
+        """Test that preview file is created."""
+        K, V_map, H_map = self._make_arrays()
+        result = save_preview_from_arrays(
+            K, V_map, H_map, pads_list=[], copper_ids=[0, 31],
+            rows=20, cols=20, x_min=0.0, y_min=0.0, res=0.5,
+            layer_names=["F.Cu", "B.Cu"], settings={},
+            board=None, get_pad_pixels_func=lambda *a: [],
+            out_dir=temp_dir,
+        )
+        assert result is not None
+        assert os.path.exists(result)
+        assert "thermal_preview.png" in result
+
+    def test_valid_png_signature(self, temp_dir):
+        """Test that output file has valid PNG signature."""
+        K, V_map, H_map = self._make_arrays()
+        result = save_preview_from_arrays(
+            K, V_map, H_map, pads_list=[], copper_ids=[0, 31],
+            rows=20, cols=20, x_min=0.0, y_min=0.0, res=0.5,
+            layer_names=["F.Cu", "B.Cu"], settings={},
+            board=None, get_pad_pixels_func=lambda *a: [],
+            out_dir=temp_dir,
+        )
+        with open(result, 'rb') as f:
+            sig = f.read(4)
+        assert sig == b'\x89PNG'
+
+    def test_four_layer_stackup(self, temp_dir):
+        """Test with four-layer board."""
+        K, V_map, H_map = self._make_arrays(layers=4)
+        result = save_preview_from_arrays(
+            K, V_map, H_map, pads_list=[], copper_ids=[0, 1, 2, 31],
+            rows=20, cols=20, x_min=0.0, y_min=0.0, res=0.5,
+            layer_names=["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"],
+            settings={}, board=None, get_pad_pixels_func=lambda *a: [],
+            out_dir=temp_dir,
+        )
+        assert result is not None
+        assert os.path.exists(result)
+
+    def test_with_vias(self, temp_dir):
+        """Test that via overlay renders without error."""
+        K, V_map, H_map = self._make_arrays()
+        V_map[8:12, 8:12] = 1300.0  # via pixels
+        result = save_preview_from_arrays(
+            K, V_map, H_map, pads_list=[], copper_ids=[0, 31],
+            rows=20, cols=20, x_min=0.0, y_min=0.0, res=0.5,
+            layer_names=["F.Cu", "B.Cu"], settings={},
+            board=None, get_pad_pixels_func=lambda *a: [],
+            out_dir=temp_dir,
+        )
+        assert result is not None
+
+    def test_with_heatsink(self, temp_dir):
+        """Test with heatsink mask and use_heatsink setting."""
+        K, V_map, H_map = self._make_arrays()
+        H_map[5:15, 5:15] = 1.0
+        result = save_preview_from_arrays(
+            K, V_map, H_map, pads_list=[], copper_ids=[0, 31],
+            rows=20, cols=20, x_min=0.0, y_min=0.0, res=0.5,
+            layer_names=["F.Cu", "B.Cu"],
+            settings={'use_heatsink': True},
+            board=None, get_pad_pixels_func=lambda *a: [],
+            out_dir=temp_dir,
+        )
+        assert result is not None
+
+    def test_falls_back_on_bad_dir(self):
+        """Test falls back to module dir when output directory is invalid."""
+        K = np.ones((1, 5, 5))
+        V_map = np.zeros((5, 5))
+        H_map = np.zeros((5, 5))
+        result = save_preview_from_arrays(
+            K, V_map, H_map, pads_list=[], copper_ids=[0],
+            rows=5, cols=5, x_min=0.0, y_min=0.0, res=0.5,
+            layer_names=["F.Cu"], settings={},
+            board=None, get_pad_pixels_func=lambda *a: [],
+            out_dir="/nonexistent_dir_xyz_123/sub",
+        )
+        # Falls back to module directory, still produces a file
+        assert result is not None
+        assert os.path.exists(result)
+        # Clean up fallback file
+        try:
+            os.remove(result)
+        except Exception:
+            pass
