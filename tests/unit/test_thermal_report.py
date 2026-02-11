@@ -236,8 +236,8 @@ class TestWriteHtmlReport:
         assert "implicit_fvm_bdf2" in content
         assert "SciPy" in content
 
-    def test_report_snapshots_section_removed(self, basic_report_params, temp_dir):
-        """Test that snapshot PNG section is no longer in the report."""
+    def test_report_no_snapshot_gallery_without_files(self, basic_report_params, temp_dir):
+        """Test that snapshot gallery is not shown when no snapshot files provided."""
         params = basic_report_params.copy()
         params['snapshot_files'] = None
 
@@ -246,8 +246,8 @@ class TestWriteHtmlReport:
         with open(result, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        # Snapshots section has been removed from the report
-        assert "Snapshots" not in content or "Snapshot Debug" in content
+        # No visible snapshot gallery heading when no files
+        assert "Time-Series Snapshots</h2>" not in content
 
     def test_report_html_escaping(self, basic_report_params):
         """Test that special characters are properly escaped."""
@@ -1059,3 +1059,134 @@ class TestInteractiveViewer:
             content = f.read()
         assert "90vw" in content
         assert "max-width: 1200px" in content
+
+
+class TestSnapshotGallery:
+    """Tests for snapshot gallery in HTML report."""
+
+    def _read(self, path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    def test_snapshot_gallery_in_report(self, temp_dir):
+        """Report with snapshot_files should contain snapshot gallery."""
+        # Create dummy snapshot PNG files
+        snap_path_1 = os.path.join(temp_dir, "snap_00_t1.0.png")
+        snap_path_2 = os.path.join(temp_dir, "snap_01_t5.0.png")
+        for p in (snap_path_1, snap_path_2):
+            with open(p, 'wb') as f:
+                f.write(b'\x89PNG\r\n\x1a\n')
+
+        params = {
+            'settings': {'power_str': '1.0', 'time': 10.0},
+            'stack_info': {},
+            'stackup_derived': {
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035, 0.035],
+                'gap_mm_used': [1.53],
+                'gap_fallback_used': False,
+            },
+            'pad_power': [('U1:1', 1.0)],
+            'layer_names': ['F.Cu', 'B.Cu'],
+            'preview_path': None,
+            'heatmap_path': None,
+            'out_dir': temp_dir,
+            'snapshot_files': [
+                (1.0, snap_path_1),
+                (5.0, snap_path_2),
+            ],
+        }
+
+        path = write_html_report(**params)
+        content = self._read(path)
+
+        assert "Time-Series Snapshots" in content
+        assert "snap-gallery" in content
+        assert "snap_00_t1.0.png" in content
+        assert "snap_01_t5.0.png" in content
+        assert "t = 1.0 s" in content
+        assert "t = 5.0 s" in content
+
+    def test_no_gallery_without_snapshot_files(self, temp_dir):
+        """Report without snapshot_files should not contain gallery."""
+        params = {
+            'settings': {'power_str': '1.0'},
+            'stack_info': {},
+            'stackup_derived': {
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035],
+                'gap_mm_used': [],
+                'gap_fallback_used': False,
+            },
+            'pad_power': [],
+            'layer_names': ['F.Cu'],
+            'preview_path': None,
+            'heatmap_path': None,
+            'out_dir': temp_dir,
+            'snapshot_files': None,
+        }
+
+        path = write_html_report(**params)
+        content = self._read(path)
+
+        assert "Time-Series Snapshots</h2>" not in content
+
+    def test_gallery_skips_missing_files(self, temp_dir):
+        """Gallery should skip entries where file doesn't exist."""
+        params = {
+            'settings': {'power_str': '1.0'},
+            'stack_info': {},
+            'stackup_derived': {
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035],
+                'gap_mm_used': [],
+                'gap_fallback_used': False,
+            },
+            'pad_power': [],
+            'layer_names': ['F.Cu'],
+            'preview_path': None,
+            'heatmap_path': None,
+            'out_dir': temp_dir,
+            'snapshot_files': [
+                (1.0, os.path.join(temp_dir, "nonexistent.png")),
+            ],
+        }
+
+        path = write_html_report(**params)
+        content = self._read(path)
+
+        # Gallery heading should not appear since file doesn't exist
+        assert "Time-Series Snapshots</h2>" not in content
+
+    def test_gallery_css_present(self, temp_dir):
+        """Report with snapshots should include gallery CSS."""
+        snap_path = os.path.join(temp_dir, "snap_00_t2.0.png")
+        with open(snap_path, 'wb') as f:
+            f.write(b'\x89PNG\r\n\x1a\n')
+
+        params = {
+            'settings': {'power_str': '1.0'},
+            'stack_info': {},
+            'stackup_derived': {
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035],
+                'gap_mm_used': [],
+                'gap_fallback_used': False,
+            },
+            'pad_power': [],
+            'layer_names': ['F.Cu'],
+            'preview_path': None,
+            'heatmap_path': None,
+            'out_dir': temp_dir,
+            'snapshot_files': [(2.0, snap_path)],
+        }
+
+        path = write_html_report(**params)
+        content = self._read(path)
+
+        assert ".snap-gallery" in content
+        assert ".snap-item" in content

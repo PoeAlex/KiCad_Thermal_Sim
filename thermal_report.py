@@ -496,6 +496,24 @@ def write_html_report(
         except Exception:
             interactive_html = ""
 
+    # Build snapshot gallery section
+    snapshot_gallery_html = ""
+    if snapshot_files:
+        snap_items = ""
+        for t_val, fpath in snapshot_files:
+            if fpath and os.path.isfile(str(fpath)):
+                rel_name = os.path.basename(str(fpath))
+                snap_items += (
+                    f'<div class="snap-item">'
+                    f'<img src="{_esc(rel_name)}" loading="lazy">'
+                    f'<p>t = {t_val:.1f} s</p></div>'
+                )
+        if snap_items:
+            snapshot_gallery_html = (
+                f'<h2>Time-Series Snapshots</h2>'
+                f'<div class="snap-gallery">{snap_items}</div>'
+            )
+
     html_body = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -552,6 +570,10 @@ def write_html_report(
     details .debug-tbl td {{ padding: 4px 10px; border-bottom: 1px solid #f0f0f0;
                              font-family: 'SFMono-Regular', Consolas, monospace; }}
     details .debug-tbl td:first-child {{ color: var(--text-muted); white-space: nowrap; }}
+    .snap-gallery {{ display:flex; flex-wrap:wrap; gap:12px; margin-bottom:16px; }}
+    .snap-item {{ flex:1; min-width:280px; max-width:48%; }}
+    .snap-item img {{ max-width:100%; height:auto; border:1px solid var(--border); border-radius:4px; }}
+    .snap-item p {{ font-size:.85em; color:var(--text-muted); margin-top:4px; text-align:center; }}
     [title] {{ cursor: help; border-bottom: 1px dotted var(--text-muted); }}
     table [title] {{ border-bottom: none; }}
     .summary-card h3[title] {{ border-bottom: none; cursor: help; }}
@@ -576,6 +598,9 @@ def write_html_report(
 
   <!-- Interactive Heatmap -->
   {interactive_html}
+
+  <!-- Time-Series Snapshots -->
+  {snapshot_gallery_html}
 
   <!-- PCB Stackup -->
   <h2 title="Physical layer stack used in the finite-volume thermal model">PCB Stackup</h2>

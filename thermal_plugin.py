@@ -27,7 +27,7 @@ from .thermal_solver import SolverConfig, build_stiffness_matrix, run_simulation
 from .pwl_parser import parse_pwl_file
 from .visualization import (
     show_results_top_bot, show_results_all_layers, save_preview_image,
-    save_preview_from_arrays,
+    save_preview_from_arrays, save_snapshot,
 )
 from .thermal_report import write_html_report, write_interactive_viewer
 
@@ -556,10 +556,20 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 return False
 
         snapshot_T_arrays = []  # list of (float, np.ndarray)
+        snapshot_png_paths = []  # list of (float, str)
 
         def snapshot_callback(T_view, t_elapsed, snap_idx):
             snapshot_T_arrays.append((t_elapsed, T_view.copy()))
-            return None
+            try:
+                snap_path = save_snapshot(
+                    T_view, H_map, amb, layer_names,
+                    idx=snap_idx, t_elapsed=t_elapsed, out_dir=run_dir
+                )
+                if snap_path:
+                    snapshot_png_paths.append((t_elapsed, snap_path))
+                return snap_path
+            except Exception:
+                return None
 
         # Run solver
         config = SolverConfig(
@@ -664,7 +674,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             k_norm_info=result.k_norm_info,
             out_dir=run_dir,
             snapshot_debug=snapshot_debug,
-            snapshot_files=None,
+            snapshot_files=snapshot_png_paths or None,
             T_data=result.T,
             ambient=amb,
         )

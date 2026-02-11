@@ -15,6 +15,7 @@ from ThermalSim.geometry_mapper import (
     _fill_heatsink,
     _fill_heatsink_zone,
     _fill_heatsink_drawing,
+    _detect_heatsink_regions,
     build_pad_distance_mask,
     get_pad_pixels,
     create_multilayer_maps,
@@ -711,3 +712,164 @@ class TestFillHeatsinkDrawing:
         assert np.sum(ctx.H[5:15, 5:15] > 0) > 0
         assert np.sum(ctx.H[0:5, :]) == 0.0
         assert np.sum(ctx.H[15:, :]) == 0.0
+
+
+class TestDetectHeatsinkRegions:
+    """Tests for _detect_heatsink_regions with independent heatsink detection."""
+
+    @pytest.fixture
+    def context(self):
+        """Create test context with 20x20 grid at 0.5mm resolution."""
+        K = np.ones((2, 20, 20))
+        V = np.ones((20, 20))
+        H = np.zeros((20, 20))
+        return FillContext(
+            K=K, V=V, H=H,
+            area_mask=None,
+            x_min=0.0, y_min=0.0,
+            res=0.5,
+            rows=20, cols=20
+        )
+
+    def test_heatsink_zone_rule_area_detected(self, context):
+        """Zone on Eco1_User with is_rule_area=True should still be detected."""
+        # Rule areas on Eco1 are not filled copper, but should be heatsink
+        zone = MockZone(
+            layers=[Eco1_User],
+            bbox=EDA_RECT(2000000, 2000000, 4000000, 4000000),
+            filled=False,
+            is_rule_area=True,
+        )
+        board = MockBoard(zones=[zone])
+        settings = {'use_heatsink': True}
+
+        _detect_heatsink_regions(context, board, settings)
+
+        assert np.sum(context.H > 0) > 0, (
+            "Heatsink zone marked as rule area should still fill H_map"
+        )
+
+    def test_heatsink_zone_layer_fallback(self, context):
+        """Zone where GetLayerSet() raises but GetLayer() returns Eco1_User."""
+        class BrokenLayerSetZone:
+            def GetLayerSet(self):
+                raise RuntimeError("broken")
+
+            def IsOnLayer(self, lid):
+                return False
+
+            def GetLayer(self):
+                return Eco1_User
+
+            def GetBoundingBox(self):
+                return EDA_RECT(2000000, 2000000, 4000000, 4000000)
+
+            def HitTest(self, pos):
+                return self.GetBoundingBox().Contains(pos)
+
+        board = MockBoard(zones=[BrokenLayerSetZone()])
+        settings = {'use_heatsink': True}
+
+        _detect_heatsink_regions(context, board, settings)
+
+        assert np.sum(context.H > 0) > 0, (
+            "Should fall back to GetLayer() when GetLayerSet() fails"
+        )
+
+    def test_heatsink_drawing_survives_zone_error(self, context):
+        """Drawing on Eco1 should be detected even if a zone throws."""
+        class ExplodingZone:
+            def GetLayerSet(self):
+                raise RuntimeError("zone exploded")
+
+            def IsOnLayer(self, lid):
+                raise RuntimeError("zone exploded")
+
+            def GetLayer(self):
+                raise RuntimeError("zone exploded")
+
+        drawing = MockDrawing(
+            layer=Eco1_User,
+            bbox=EDA_RECT(2000000, 2000000, 4000000, 4000000),
+        )
+        board = MockBoard(zones=[ExplodingZone()], drawings=[drawing])
+        settings = {'use_heatsink': True}
+
+        _detect_heatsink_regions(context, board, settings)
+
+        assert np.sum(context.H > 0) > 0, (
+            "Drawing should be detected despite zone error"
+        )
+
+    def test_heatsink_warning_no_geometry(self, context, capsys):
+        """use_heatsink=True without Eco1 shapes should print warning."""
+        board = MockBoard(zones=[], drawings=[])
+        settings = {'use_heatsink': True}
+
+        _detect_heatsink_regions(context, board, settings)
+
+        captured = capsys.readouterr()
+        assert "[WARN]" in captured.out
+        assert "no heatsink" in captured.out.lower()
+
+    def test_heatsink_zone_not_on_eco1_ignored(self, context):
+        """Zone only on F.Cu should not fill H_map."""
+        zone = MockZone(
+            layers=[F_Cu],
+            bbox=EDA_RECT(0, 0, 10000000, 10000000),
+            filled=True,
+        )
+        board = MockBoard(zones=[zone])
+        settings = {'use_heatsink': True}
+
+        _detect_heatsink_regions(context, board, settings)
+
+        assert np.sum(context.H > 0) == 0
+
+
+class TestCreateMultilayerMapsHeatsink:
+    """Integration tests for heatsink detection via create_multilayer_maps."""
+
+    def test_rule_area_zone_on_eco1_fills_h_map(self, temp_dir):
+        """Rule area zone on Eco1 should fill H_map through create_multilayer_maps."""
+        import os
+        from tests.fixtures.sample_boards import SIMPLE_2_LAYER_STACKUP
+
+        filepath = os.path.join(temp_dir, "test.kicad_pcb")
+        with open(filepath, "w") as f:
+            f.write(SIMPLE_2_LAYER_STACKUP)
+
+        zone_eco1 = MockZone(
+            layers=[Eco1_User],
+            bbox=EDA_RECT(5000000, 5000000, 10000000, 10000000),
+            filled=False,
+            is_rule_area=True,
+        )
+        board = MockBoard(
+            filename=filepath,
+            zones=[zone_eco1],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+        )
+        pad = MockPad(
+            position=VECTOR2I(10000000, 10000000),
+            layer=F_Cu,
+            attribute=PAD_ATTRIB_SMD,
+            selected=True,
+        )
+
+        settings = {
+            'ignore_traces': False,
+            'ignore_polygons': False,
+            'limit_area': False,
+            'pad_dist_mm': 0,
+            'use_heatsink': True,
+        }
+
+        K, V, H = create_multilayer_maps(
+            board, [F_Cu, B_Cu], 40, 40, 0.0, 0.0, 0.5,
+            settings, 1.0, [400.0, 400.0], 1300.0, [pad],
+        )
+
+        assert np.sum(H > 0) > 0, (
+            "Rule area zone on Eco1 should be detected by create_multilayer_maps"
+        )

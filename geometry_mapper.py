@@ -241,6 +241,82 @@ def _fill_heatsink_drawing(ctx, drawing):
                 continue
 
 
+def _detect_heatsink_regions(ctx, board, settings):
+    """
+    Detect heatsink regions from User.Eco1 zones and drawings.
+
+    This function is called independently of copper processing to ensure
+    heatsink detection is not affected by errors in the zone loop or
+    skipped by the rule-area filter.
+
+    Parameters
+    ----------
+    ctx : FillContext
+        Grid context with H array to fill.
+    board : pcbnew.BOARD
+        The KiCad board object.
+    settings : dict
+        Simulation settings (must have use_heatsink=True).
+    """
+    hs_zone_count = 0
+    hs_draw_count = 0
+
+    # Check zones on Eco1_User
+    try:
+        zones = board.Zones() if hasattr(board, 'Zones') else board.GetZones()
+    except Exception:
+        zones = []
+    for z in zones:
+        try:
+            on_eco1 = False
+            try:
+                z_ls = z.GetLayerSet()
+                if z_ls is not None and z_ls.Contains(pcbnew.Eco1_User):
+                    on_eco1 = True
+            except Exception:
+                pass
+            if not on_eco1:
+                try:
+                    if hasattr(z, "IsOnLayer") and z.IsOnLayer(pcbnew.Eco1_User):
+                        on_eco1 = True
+                except Exception:
+                    pass
+            if not on_eco1:
+                try:
+                    if z.GetLayer() == pcbnew.Eco1_User:
+                        on_eco1 = True
+                except Exception:
+                    pass
+            if on_eco1:
+                _fill_heatsink_zone(ctx, z)
+                hs_zone_count += 1
+        except Exception:
+            continue
+
+    # Check drawings on Eco1_User
+    try:
+        drawings = board.GetDrawings()
+    except Exception:
+        drawings = []
+    for d in drawings:
+        try:
+            if d.GetLayer() == pcbnew.Eco1_User:
+                _fill_heatsink_drawing(ctx, d)
+                hs_draw_count += 1
+        except Exception:
+            continue
+
+    # Diagnostic logging
+    total_hs = int(np.sum(ctx.H > 0))
+    total_cells = ctx.rows * ctx.cols
+    pct = 100.0 * total_hs / total_cells if total_cells > 0 else 0.0
+    print(f"[ThermalSim] Heatsink: {hs_zone_count} zone(s), "
+          f"{hs_draw_count} drawing(s), {total_hs} pixels ({pct:.1f}%)")
+    if total_hs == 0:
+        print("[ThermalSim][WARN] use_heatsink=True but no heatsink "
+              "geometry found on User.Eco1 layer")
+
+
 def _fill_zone(ctx, l_idx, lid, zone, val):
     """
     Fill a copper zone using hit-testing for accurate fill detection.
@@ -586,19 +662,11 @@ def create_multilayer_maps(
                     idx = lid_to_idx[lid]
                     _fill_zone(ctx, idx, lid, z, k_cu_layers[idx])
 
-            # Check for heatsink on User.Eco1
-            if settings['use_heatsink']:
-                z_ls = z.GetLayerSet()
-                if z_ls.Contains(pcbnew.Eco1_User):
-                    _fill_heatsink_zone(ctx, z)
-
-        # Process drawings on User.Eco1 for heatsink
-        if settings['use_heatsink']:
-            for d in board.GetDrawings():
-                if d.GetLayer() == pcbnew.Eco1_User:
-                    _fill_heatsink_drawing(ctx, d)
-
     except Exception as e:
         print(f"[ThermalSim][WARN] Geometry mapping error: {e}")
+
+    # Heatsink detection — independent of copper processing
+    if settings.get('use_heatsink'):
+        _detect_heatsink_regions(ctx, board, settings)
 
     return K, V, H
