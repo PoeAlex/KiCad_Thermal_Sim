@@ -3,7 +3,7 @@ Tests for current path analysis module.
 
 Covers physics validation (resistance, power conservation, bottleneck
 detection) and unit tests (sigma map filtering, matrix symmetry,
-cross-section uniformity, Q merging).
+cross-section uniformity, Q merging, net-specific via masks, nodal power).
 """
 
 import pytest
@@ -21,6 +21,8 @@ from ThermalSim.current_analyzer import (
     analyze_current_path,
     analyze_all_paths,
     merge_i2r_into_q,
+    _compute_nodal_power,
+    _build_net_via_mask,
     SIGMA_CU,
     SIGMA_BG,
 )
@@ -62,10 +64,10 @@ class TestPhysicsValidation:
     @pytest.mark.physics
     def test_uniform_bar_resistance(self, bar_board):
         """
-        Verify R ≈ ρL/(w*t) for a straight copper bar.
+        Verify R ~ rho*L/(w*t) for a straight copper bar.
 
-        For 10mm x 2mm x 35µm copper at σ = 5.8e7 S/m:
-        R = L / (σ * w * t) = 0.010 / (5.8e7 * 0.002 * 35e-6) ≈ 2.46 mΩ
+        For 10mm x 2mm x 35um copper at sigma = 5.8e7 S/m:
+        R = L / (sigma * w * t) = 0.010 / (5.8e7 * 0.002 * 35e-6) ~ 2.46 mOhm
         """
         bb = bar_board
         res = 0.5  # mm
@@ -88,7 +90,6 @@ class TestPhysicsValidation:
         result = analyze_current_path(
             pair=pair,
             K=np.ones((2, rows, cols)),
-            V_map=np.ones((rows, cols)),
             board=bb["board"],
             copper_ids=bb["copper_ids"],
             rows=rows, cols=cols,
@@ -106,13 +107,13 @@ class TestPhysicsValidation:
         # (pad bounding boxes widen the conductor at the ends, lowering R)
         assert result.resistance_ohm > 0, "Resistance must be positive"
         assert abs(result.resistance_ohm - R_analytical) / R_analytical < 0.35, (
-            f"R={result.resistance_ohm*1e3:.4f} mΩ vs analytical "
-            f"R={R_analytical*1e3:.4f} mΩ (>{35}% error)"
+            f"R={result.resistance_ohm*1e3:.4f} mOhm vs analytical "
+            f"R={R_analytical*1e3:.4f} mOhm (>{35}% error)"
         )
 
     @pytest.mark.physics
     def test_power_conservation(self, bar_board):
-        """Verify ∫P_density·dV ≈ I²·R."""
+        """Verify sum(Q_i2r) ~ I^2*R (nodal power matches V*I)."""
         bb = bar_board
         res = 0.5
         length_mm = bb["length_mm"]
@@ -132,7 +133,6 @@ class TestPhysicsValidation:
         result = analyze_current_path(
             pair=pair,
             K=np.ones((2, rows, cols)),
-            V_map=np.ones((rows, cols)),
             board=bb["board"],
             copper_ids=bb["copper_ids"],
             rows=rows, cols=cols,
@@ -143,16 +143,16 @@ class TestPhysicsValidation:
             get_pad_pixels_func=get_pad_pixels,
         )
 
-        # P = I²R from V-I measurement
+        # P = I*V_drop from the solve
         P_vi = result.power_loss_w
 
-        # P from integrated Q_i2r
+        # P from integrated Q_i2r (now uses stiffness-matrix based nodal power)
         P_q = float(np.sum(result.Q_i2r))
 
-        # Both should agree within 20%
+        # With stiffness-matrix power, these should agree within 5%
         if P_vi > 1e-9:
             rel_diff = abs(P_q - P_vi) / P_vi
-            assert rel_diff < 0.20, (
+            assert rel_diff < 0.05, (
                 f"Power mismatch: P(V*I)={P_vi*1e3:.3f} mW, "
                 f"P(Q_sum)={P_q*1e3:.3f} mW, diff={rel_diff:.1%}"
             )
@@ -173,18 +173,9 @@ class TestPhysicsValidation:
             label="via path",
         )
 
-        # Build V_map with high values at via location
-        V_map = np.ones((rows, cols))
-        # Via at ~(5mm, 2mm) from origin
-        via_r = int(2.0 / res) + 2
-        via_c = int(5.0 / res) + 2
-        if via_r < rows and via_c < cols:
-            V_map[max(0, via_r-1):via_r+2, max(0, via_c-1):via_c+2] = 50.0
-
         result = analyze_current_path(
             pair=pair,
             K=np.ones((2, rows, cols)),
-            V_map=V_map,
             board=vb["board"],
             copper_ids=vb["copper_ids"],
             rows=rows, cols=cols,
@@ -263,13 +254,13 @@ class TestMatrixSymmetry:
         rows, cols = 8, 8
         layer_count = 2
         sigma = np.full((layer_count, rows, cols), SIGMA_CU)
-        V_map = np.ones((rows, cols))
+        via_mask = np.ones((rows, cols), dtype=bool)
         dx = dy = 0.5e-3
         t_cu = [35e-6, 35e-6]
         gap_m = [1.5e-3]
 
         K_elec = build_electrical_stiffness_matrix(
-            sigma, V_map, layer_count, rows, cols, t_cu, gap_m, dx, dy,
+            sigma, via_mask, layer_count, rows, cols, t_cu, gap_m, dx, dy,
         )
 
         # Check symmetry: K - K^T should have near-zero entries
@@ -283,11 +274,11 @@ class TestMatrixSymmetry:
         rows, cols = 6, 6
         layer_count = 1
         sigma = np.full((layer_count, rows, cols), SIGMA_CU)
-        V_map = np.ones((rows, cols))
+        via_mask = np.zeros((rows, cols), dtype=bool)
         dx = dy = 0.5e-3
 
         K_elec = build_electrical_stiffness_matrix(
-            sigma, V_map, layer_count, rows, cols,
+            sigma, via_mask, layer_count, rows, cols,
             [35e-6], [], dx, dy,
         )
 
@@ -335,7 +326,7 @@ class TestCrossSectionProfile:
 
 
 class TestMergeI2r:
-    """Test merging I²R power into thermal Q vector."""
+    """Test merging I^2R power into thermal Q vector."""
 
     def test_merge_additive(self):
         """Multiple paths should add to Q independently."""
@@ -394,11 +385,11 @@ class TestSolveCurrentPath:
         rows, cols = 6, 6
         layer_count = 1
         sigma = np.full((layer_count, rows, cols), SIGMA_CU)
-        V_map = np.ones((rows, cols))
+        via_mask = np.zeros((rows, cols), dtype=bool)
         dx = dy = 0.5e-3
 
         K_elec = build_electrical_stiffness_matrix(
-            sigma, V_map, layer_count, rows, cols,
+            sigma, via_mask, layer_count, rows, cols,
             [35e-6], [], dx, dy,
         )
 
@@ -425,7 +416,6 @@ class TestAnalyzeAllPaths:
         results = analyze_all_paths(
             pairs=[],
             K=np.ones((1, 5, 5)),
-            V_map=np.ones((5, 5)),
             board=MockBoard(),
             copper_ids=[F_Cu],
             rows=5, cols=5,
@@ -461,9 +451,9 @@ class TestBottleneckDetection:
         # Wide section (8 rows): cols 25-39
         sigma[0, 6:14, 25:40] = SIGMA_CU
 
-        V_map = np.ones((rows, cols))
+        via_mask = np.zeros((rows, cols), dtype=bool)
         K_elec = build_electrical_stiffness_matrix(
-            sigma, V_map, layer_count, rows, cols,
+            sigma, via_mask, layer_count, rows, cols,
             [t_cu], [], dx, dy,
         )
 
@@ -492,4 +482,220 @@ class TestBottleneckDetection:
         assert J_wide > 0, "Current density should be non-zero in wide section"
         assert J_narrow > J_wide * 1.5, (
             f"Narrow section J={J_narrow:.1f} should be > 1.5x wide J={J_wide:.1f}"
+        )
+
+
+class TestZeroCopperValidation:
+    """Test that analyze_current_path raises on empty sigma maps."""
+
+    def test_zero_copper_raises_error(self):
+        """Verify ValueError when no copper exists for the given net_code."""
+        # Board with no tracks/pads/zones on net_code=99
+        board = MockBoard(footprints=[], tracks=[], zones=[])
+
+        pad_a = MockPad(
+            position=VECTOR2I(FromMM(1.0), FromMM(1.0)),
+            layer=F_Cu, net_code=99, net_name="FAKE", number="1",
+        )
+        pad_b = MockPad(
+            position=VECTOR2I(FromMM(5.0), FromMM(1.0)),
+            layer=F_Cu, net_code=99, net_name="FAKE", number="2",
+        )
+
+        pair = CurrentPathPair(
+            pad_a=pad_a, pad_b=pad_b,
+            current_a=1.0, net_code=99,
+            label="empty net",
+        )
+
+        with pytest.raises(ValueError, match="No copper found"):
+            analyze_current_path(
+                pair=pair,
+                K=np.ones((1, 10, 10)),
+                board=board,
+                copper_ids=[F_Cu],
+                rows=10, cols=10,
+                x_min=0, y_min=0, res=1.0,
+                copper_thickness_m=[35e-6],
+                gap_m=[],
+                get_pad_pixels_func=get_pad_pixels,
+            )
+
+    def test_zero_copper_caught_by_analyze_all(self):
+        """Verify analyze_all_paths catches the ValueError and continues."""
+        board = MockBoard(footprints=[], tracks=[], zones=[])
+
+        pad_a = MockPad(
+            position=VECTOR2I(FromMM(1.0), FromMM(1.0)),
+            layer=F_Cu, net_code=99, net_name="FAKE", number="1",
+        )
+        pad_b = MockPad(
+            position=VECTOR2I(FromMM(5.0), FromMM(1.0)),
+            layer=F_Cu, net_code=99, net_name="FAKE", number="2",
+        )
+
+        pair = CurrentPathPair(
+            pad_a=pad_a, pad_b=pad_b,
+            current_a=1.0, net_code=99,
+            label="empty net",
+        )
+
+        # Should not raise -- error is caught internally
+        results = analyze_all_paths(
+            pairs=[pair],
+            K=np.ones((1, 10, 10)),
+            board=board,
+            copper_ids=[F_Cu],
+            rows=10, cols=10,
+            x_min=0, y_min=0, res=1.0,
+            copper_thickness_m=[35e-6],
+            gap_m=[],
+            get_pad_pixels_func=get_pad_pixels,
+        )
+        # The failed path should be excluded from results
+        assert len(results) == 0
+
+
+class TestNodalPower:
+    """Test _compute_nodal_power for exact energy conservation."""
+
+    def test_uniform_bar_power_matches_i2r(self):
+        """For a uniform resistor, sum(P_node) must equal I^2 * R."""
+        rows, cols = 4, 20
+        layer_count = 1
+        t_cu = 35e-6
+        dx = dy = 0.5e-3
+
+        sigma = np.full((layer_count, rows, cols), SIGMA_CU)
+        via_mask = np.zeros((rows, cols), dtype=bool)
+
+        K_elec = build_electrical_stiffness_matrix(
+            sigma, via_mask, layer_count, rows, cols,
+            [t_cu], [], dx, dy,
+        )
+
+        current = 10.0
+        pad_a_pix = [(r, 0) for r in range(rows)]
+        pad_b_pix = [(r, cols - 1) for r in range(rows)]
+
+        V_flat, V_a, V_b = solve_current_path(
+            K_elec, pad_a_pix, pad_b_pix,
+            0, 0, current, layer_count, rows, cols,
+        )
+
+        N = rows * cols * layer_count
+        P_node = _compute_nodal_power(K_elec, V_flat, N)
+        P_total = float(np.sum(P_node))
+        P_vi = current * abs(V_a - V_b)
+
+        # Stiffness-based power should match V*I within 1%
+        assert P_vi > 0
+        rel_diff = abs(P_total - P_vi) / P_vi
+        assert rel_diff < 0.01, (
+            f"Nodal power sum={P_total*1e3:.3f} mW vs V*I={P_vi*1e3:.3f} mW, "
+            f"diff={rel_diff:.2%}"
+        )
+
+    def test_nodal_power_non_negative(self):
+        """All nodal powers should be non-negative (resistive dissipation)."""
+        rows, cols = 6, 10
+        layer_count = 1
+        sigma = np.full((layer_count, rows, cols), SIGMA_CU)
+        via_mask = np.zeros((rows, cols), dtype=bool)
+        dx = dy = 0.5e-3
+
+        K_elec = build_electrical_stiffness_matrix(
+            sigma, via_mask, layer_count, rows, cols,
+            [35e-6], [], dx, dy,
+        )
+
+        pad_a_pix = [(3, 0)]
+        pad_b_pix = [(3, cols - 1)]
+
+        V_flat, _, _ = solve_current_path(
+            K_elec, pad_a_pix, pad_b_pix,
+            0, 0, 1.0, layer_count, rows, cols,
+        )
+
+        N = rows * cols
+        P_node = _compute_nodal_power(K_elec, V_flat, N)
+        assert np.all(P_node >= -1e-15), "Nodal power should be non-negative"
+
+
+class TestNetViaMask:
+    """Test _build_net_via_mask for net-specific via filtering."""
+
+    def test_only_target_net_vias(self):
+        """Vias on a different net should not appear in via mask."""
+        net_target = 1
+        net_other = 2
+
+        via_target = MockVia(
+            bbox=EDA_RECT(FromMM(2.0), FromMM(2.0), FromMM(0.6), FromMM(0.6)),
+            layers=[F_Cu, B_Cu],
+            net_code=net_target,
+            position=VECTOR2I(FromMM(2.3), FromMM(2.3)),
+        )
+        via_other = MockVia(
+            bbox=EDA_RECT(FromMM(5.0), FromMM(2.0), FromMM(0.6), FromMM(0.6)),
+            layers=[F_Cu, B_Cu],
+            net_code=net_other,
+            position=VECTOR2I(FromMM(5.3), FromMM(2.3)),
+        )
+
+        board = MockBoard(
+            footprints=[], tracks=[via_target, via_other], zones=[],
+        )
+
+        mask = _build_net_via_mask(
+            board, net_target, [F_Cu, B_Cu],
+            rows=10, cols=12, x_min=0, y_min=0, res=0.5,
+        )
+
+        # Target via region (~col 4, row 4) should be True
+        assert mask[4, 4], "Target net via cell should be True"
+
+        # Other via region (~col 10, row 4) should be False
+        assert not mask[4, 10], "Other net via cell should be False"
+
+    def test_empty_board_no_vias(self):
+        """Board with no tracks should produce empty via mask."""
+        board = MockBoard(footprints=[], tracks=[], zones=[])
+        mask = _build_net_via_mask(
+            board, 1, [F_Cu, B_Cu],
+            rows=5, cols=5, x_min=0, y_min=0, res=1.0,
+        )
+        assert not np.any(mask), "Empty board should have no via cells"
+
+    def test_via_mask_with_interlayer_coupling(self):
+        """Via mask=True cells should create strong interlayer coupling."""
+        rows, cols = 6, 6
+        layer_count = 2
+        sigma = np.full((layer_count, rows, cols), SIGMA_CU)
+        dx = dy = 0.5e-3
+
+        # With via at center
+        via_mask_true = np.zeros((rows, cols), dtype=bool)
+        via_mask_true[3, 3] = True
+        K_with = build_electrical_stiffness_matrix(
+            sigma, via_mask_true, layer_count, rows, cols,
+            [35e-6, 35e-6], [1.5e-3], dx, dy,
+        )
+
+        # Without via
+        via_mask_false = np.zeros((rows, cols), dtype=bool)
+        K_without = build_electrical_stiffness_matrix(
+            sigma, via_mask_false, layer_count, rows, cols,
+            [35e-6, 35e-6], [1.5e-3], dx, dy,
+        )
+
+        # The via cell should have much stronger interlayer coupling
+        RC = rows * cols
+        via_node_top = 0 * RC + 3 * cols + 3
+        via_node_bot = 1 * RC + 3 * cols + 3
+
+        g_with = abs(K_with[via_node_top, via_node_bot])
+        g_without = abs(K_without[via_node_top, via_node_bot])
+        assert g_with > g_without * 1e10, (
+            f"Via coupling {g_with:.2e} should be >> non-via {g_without:.2e}"
         )

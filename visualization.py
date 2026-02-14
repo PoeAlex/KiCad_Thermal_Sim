@@ -618,36 +618,56 @@ def save_current_density_plot(results, layer_names, out_dir):
     if not results:
         return None
     try:
-        n = len(results)
-        fig, axes = plt.subplots(1, n, figsize=(7 * n, 6), squeeze=False)
+        # Build list of (result_index, layer_index, panel_title) panels
+        all_panels = []
+        for i, res in enumerate(results):
+            J = res.J_magnitude
+            n_layers = J.shape[0]
+            top_idx = 0
+            bot_idx = n_layers - 1
+            layer_maxes = [float(np.max(J[l])) for l in range(n_layers)]
+            max_idx = int(np.argmax(layer_maxes))
+
+            label = res.label or f"Path {i+1}"
+
+            def _lname(idx):
+                return layer_names[idx] if idx < len(layer_names) else f"Layer {idx}"
+
+            panels = [(top_idx, _lname(top_idx))]
+            if bot_idx != top_idx:
+                panels.append((bot_idx, _lname(bot_idx)))
+            if max_idx not in (top_idx, bot_idx):
+                panels.append((max_idx, f"{_lname(max_idx)} (max J)"))
+
+            for l_idx, l_label in panels:
+                j_max = layer_maxes[l_idx]
+                title = (
+                    f"{label} – {l_label}\n"
+                    f"J_max={j_max:.0f} A/m², "
+                    f"R={res.resistance_ohm*1e3:.2f} mΩ, "
+                    f"P={res.power_loss_w*1e3:.1f} mW"
+                )
+                all_panels.append((i, l_idx, title))
+
+        n_panels = len(all_panels)
+        fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 6), squeeze=False)
         axes = axes.flatten()
 
-        for i, res in enumerate(results):
-            ax = axes[i]
-            # Show layer with highest max J
-            J = res.J_magnitude
-            layer_maxes = [float(np.max(J[l])) for l in range(J.shape[0])]
-            best_layer = int(np.argmax(layer_maxes))
-            lname = layer_names[best_layer] if best_layer < len(layer_names) else f"Layer {best_layer}"
-
-            J_show = J[best_layer]
-            # Mask near-zero values for cleaner plot
-            J_masked = np.ma.masked_where(J_show < np.max(J_show) * 0.01, J_show)
+        for p, (res_idx, l_idx, title) in enumerate(all_panels):
+            ax = axes[p]
+            J_show = results[res_idx].J_magnitude[l_idx]
+            j_peak = np.max(J_show)
+            threshold = j_peak * 0.01 if j_peak > 0 else 0
+            J_masked = np.ma.masked_where(J_show < threshold, J_show)
 
             im = ax.imshow(
                 J_masked, cmap='YlOrRd', origin='upper', interpolation='bilinear',
             )
             plt.colorbar(im, ax=ax, label='A/m²')
-
-            label = res.label or f"Path {i+1}"
-            ax.set_title(
-                f"{label} ({lname})\n"
-                f"R={res.resistance_ohm*1e3:.2f} mΩ, "
-                f"P={res.power_loss_w*1e3:.1f} mW"
-            )
+            ax.set_title(title)
             ax.axis('off')
 
-        for j in range(n, len(axes)):
+        for j in range(n_panels, len(axes)):
             axes[j].axis('off')
 
         plt.tight_layout()

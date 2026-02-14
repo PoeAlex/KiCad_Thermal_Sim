@@ -15,7 +15,9 @@ from ThermalSim.visualization import (
     show_results_top_bot,
     show_results_all_layers,
     save_preview_from_arrays,
+    save_current_density_plot,
 )
+from ThermalSim.current_analyzer import CurrentPathResult
 
 from tests.fixtures.temperature_arrays import (
     create_uniform_temperature,
@@ -509,3 +511,72 @@ class TestSavePreviewFromArrays:
             os.remove(result)
         except Exception:
             pass
+
+
+class TestSaveCurrentDensityPlot:
+    """Tests for save_current_density_plot with multi-panel output."""
+
+    def _make_result(self, layers=2, rows=20, cols=30, label="Path 1"):
+        """Create a mock CurrentPathResult with J data."""
+        J = np.zeros((layers, rows, cols), dtype=np.float64)
+        # Put current density on top and bottom layers
+        J[0, 5:15, 5:25] = 1e6  # F.Cu has some J
+        if layers > 1:
+            J[-1, 5:15, 5:25] = 5e5  # B.Cu has less J
+        return CurrentPathResult(
+            resistance_ohm=0.002,
+            voltage_drop_v=0.01,
+            power_loss_w=0.05,
+            V_field=np.zeros((layers, rows, cols)),
+            J_magnitude=J,
+            Q_i2r=np.zeros(layers * rows * cols),
+            label=label,
+        )
+
+    def test_creates_file_two_layer(self, temp_dir):
+        """Test that a PNG is created for a 2-layer result."""
+        result = self._make_result(layers=2)
+        path = save_current_density_plot(
+            [result], ["F.Cu", "B.Cu"], temp_dir,
+        )
+        assert path is not None
+        assert os.path.exists(path)
+        assert "current_density.png" in path
+
+    def test_creates_file_single_layer(self, temp_dir):
+        """Test with single layer (only 1 panel per path)."""
+        result = self._make_result(layers=1)
+        path = save_current_density_plot(
+            [result], ["F.Cu"], temp_dir,
+        )
+        assert path is not None
+        assert os.path.exists(path)
+
+    def test_six_layer_max_on_inner(self, temp_dir):
+        """When max J is on an inner layer, show 3 panels."""
+        layers = 6
+        result = self._make_result(layers=layers, label="6L path")
+        # Put max J on inner layer 2
+        result.J_magnitude[2, 8:12, 10:20] = 2e6
+        path = save_current_density_plot(
+            [result],
+            ["F.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu", "B.Cu"],
+            temp_dir,
+        )
+        assert path is not None
+        assert os.path.exists(path)
+
+    def test_empty_results(self, temp_dir):
+        """Empty results should return None."""
+        path = save_current_density_plot([], ["F.Cu"], temp_dir)
+        assert path is None
+
+    def test_multiple_paths(self, temp_dir):
+        """Multiple paths should produce panels for each."""
+        r1 = self._make_result(layers=2, label="Path A")
+        r2 = self._make_result(layers=2, label="Path B")
+        path = save_current_density_plot(
+            [r1, r2], ["F.Cu", "B.Cu"], temp_dir,
+        )
+        assert path is not None
+        assert os.path.exists(path)

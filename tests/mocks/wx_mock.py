@@ -227,6 +227,55 @@ class _WxMock:
         def SetLabel(self, label):
             self.label = label
 
+    class Choice:
+        def __init__(self, parent, choices=None, **kwargs):
+            self._items = list(choices) if choices else []
+            self._selection = -1
+            self._data = []
+
+        def SetItems(self, items):
+            self._items = list(items)
+            self._selection = -1
+            self._data = []
+
+        def Clear(self):
+            self._items = []
+            self._selection = -1
+            self._data = []
+
+        def Append(self, item, clientData=None):
+            self._items.append(item)
+            self._data.append(clientData)
+            return len(self._items) - 1
+
+        def GetSelection(self):
+            return self._selection
+
+        def SetSelection(self, n):
+            self._selection = n
+
+        def GetString(self, n):
+            if 0 <= n < len(self._items):
+                return self._items[n]
+            return ""
+
+        def GetClientData(self, n):
+            if 0 <= n < len(self._data):
+                return self._data[n]
+            return None
+
+        def GetCount(self):
+            return len(self._items)
+
+        def Bind(self, event, handler):
+            pass
+
+        def SetToolTip(self, tip):
+            pass
+
+        def Enable(self, enable=True):
+            pass
+
     class ListCtrl:
         def __init__(self, parent, style=0, **kwargs):
             self._columns = []
@@ -314,6 +363,7 @@ class _WxMock:
     # Event types
     EVT_BUTTON = "EVT_BUTTON"
     EVT_CHECKBOX = "EVT_CHECKBOX"
+    EVT_CHOICE = "EVT_CHOICE"
 
     @staticmethod
     def CallAfter(func, *args, **kwargs):

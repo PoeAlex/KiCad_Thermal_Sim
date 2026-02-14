@@ -259,9 +259,62 @@ def build_net_conductivity_map(
     return sigma
 
 
+def _build_net_via_mask(board, net_code, copper_ids, rows, cols, x_min, y_min, res):
+    """
+    Build a boolean via mask for vias belonging to a specific net.
+
+    Parameters
+    ----------
+    board : pcbnew.BOARD
+        The KiCad board object.
+    net_code : int
+        Target net code.
+    copper_ids : list of int
+        Copper layer IDs (unused, kept for API consistency).
+    rows : int
+        Grid rows.
+    cols : int
+        Grid columns.
+    x_min : float
+        Grid origin X in mm.
+    y_min : float
+        Grid origin Y in mm.
+    res : float
+        Grid resolution in mm.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean array, shape (rows, cols). True where a via of the target
+        net intersects the grid cell.
+    """
+    via_mask = np.zeros((rows, cols), dtype=bool)
+    tracks = board.Tracks() if hasattr(board, 'Tracks') else board.GetTracks()
+    for t in tracks:
+        if "VIA" not in str(type(t)).upper():
+            continue
+        try:
+            if t.GetNetCode() != net_code:
+                continue
+        except Exception:
+            continue
+        bbox = t.GetBoundingBox()
+        x0 = bbox.GetX() * 1e-6   # nm to mm
+        y0 = bbox.GetY() * 1e-6
+        w = bbox.GetWidth() * 1e-6
+        h = bbox.GetHeight() * 1e-6
+        cs = max(0, int((x0 - x_min) / res))
+        rs = max(0, int((y0 - y_min) / res))
+        ce = min(cols, int((x0 + w - x_min) / res) + 1)
+        re = min(rows, int((y0 + h - y_min) / res) + 1)
+        if cs < ce and rs < re:
+            via_mask[rs:re, cs:ce] = True
+    return via_mask
+
+
 def build_electrical_stiffness_matrix(
     sigma,
-    V_map,
+    via_mask,
     layer_count,
     rows,
     cols,
@@ -277,8 +330,9 @@ def build_electrical_stiffness_matrix(
     ----------
     sigma : np.ndarray
         Electrical conductivity, shape (layers, rows, cols).
-    V_map : np.ndarray
-        Via enhancement map, shape (rows, cols).
+    via_mask : np.ndarray
+        Boolean via mask, shape (rows, cols). True at cells that contain
+        a via belonging to the analyzed net.
     layer_count : int
         Number of copper layers.
     rows : int
@@ -347,8 +401,6 @@ def build_electrical_stiffness_matrix(
 
     # Inter-layer coupling through vias
     if layer_count > 1 and gap_m:
-        via_threshold = 1.5
-        via_mask = V_map > via_threshold
         plane_idx = np.arange(RC, dtype=np.int64)
 
         for l in range(layer_count - 1):
@@ -539,6 +591,39 @@ def compute_current_density(
     return J_mag, P_density
 
 
+def _compute_nodal_power(K_elec, V_flat, N):
+    """
+    Compute per-node power dissipation from the stiffness matrix.
+
+    Uses P_node[i] = 0.5 * sum_j G_ij * (V_i - V_j)^2 where G_ij are
+    the off-diagonal conductances (positive).  Lower-triangular extraction
+    ensures each edge is counted exactly once, with half the power assigned
+    to each endpoint.
+
+    Parameters
+    ----------
+    K_elec : scipy.sparse.csr_matrix
+        Electrical conductance matrix, shape (N, N).
+    V_flat : np.ndarray
+        Voltage vector, shape (N,).
+    N : int
+        Total number of nodes.
+
+    Returns
+    -------
+    np.ndarray
+        Per-node dissipated power in watts, shape (N,).
+    """
+    K_lower = sp.tril(K_elec, k=-1, format='coo')
+    G = -K_lower.data                          # conductances (positive)
+    dV = V_flat[K_lower.row] - V_flat[K_lower.col]
+    P_edge = G * dV**2
+    P_node = np.zeros(N, dtype=np.float64)
+    np.add.at(P_node, K_lower.row, 0.5 * P_edge)
+    np.add.at(P_node, K_lower.col, 0.5 * P_edge)
+    return P_node
+
+
 def compute_cross_section_profile(
     V_field,
     sigma,
@@ -632,7 +717,6 @@ def compute_cross_section_profile(
 def analyze_current_path(
     pair,
     K,
-    V_map,
     board,
     copper_ids,
     rows,
@@ -653,8 +737,6 @@ def analyze_current_path(
         Path definition.
     K : np.ndarray
         Thermal conductivity map (used only for geometry reference).
-    V_map : np.ndarray
-        Via enhancement map.
     board : pcbnew.BOARD
         Board object.
     copper_ids : list of int
@@ -694,9 +776,20 @@ def analyze_current_path(
         x_min, y_min, res, copper_thickness_m,
     )
 
-    # 2. Build electrical stiffness matrix
+    # Validate: ensure at least some copper was found
+    if not np.any(sigma > SIGMA_BG * 100):
+        raise ValueError(
+            f"No copper found for net_code={pair.net_code} — "
+            f"cannot analyze current path. Check that the net "
+            f"has filled copper geometry (tracks, pads, or zones)."
+        )
+
+    # 2. Build net-specific via mask and electrical stiffness matrix
+    via_mask = _build_net_via_mask(
+        board, pair.net_code, copper_ids, rows, cols, x_min, y_min, res,
+    )
     K_elec = build_electrical_stiffness_matrix(
-        sigma, V_map, layer_count, rows, cols,
+        sigma, via_mask, layer_count, rows, cols,
         copper_thickness_m, gap_m, dx, dy,
     )
 
@@ -729,14 +822,9 @@ def analyze_current_path(
     resistance = voltage_drop / pair.current_a if pair.current_a > 0 else 0.0
     power_loss = pair.current_a * voltage_drop
 
-    # 7. Build Q_i2r vector (W per node) from volumetric power density
-    # P_density is W/m³, multiply by cell volume (pixel_area * t_cu)
-    Q_i2r = np.zeros(N, dtype=np.float64)
-    t_cu = np.array(copper_thickness_m)
-    for l in range(layer_count):
-        cell_vol = pixel_area * t_cu[l]
-        Q_layer = P_density[l] * cell_vol
-        Q_i2r[l * RC:(l + 1) * RC] = Q_layer.ravel()
+    # 7. Build Q_i2r vector (W per node) from stiffness matrix
+    # Direct computation avoids gradient artefacts at copper/background boundaries
+    Q_i2r = _compute_nodal_power(K_elec, V_flat, N)
 
     # 8. Cross-section profile
     V_field = V_flat.reshape((layer_count, rows, cols))
@@ -761,7 +849,6 @@ def analyze_current_path(
 def analyze_all_paths(
     pairs,
     K,
-    V_map,
     board,
     copper_ids,
     rows,
@@ -780,7 +867,7 @@ def analyze_all_paths(
     ----------
     pairs : list of CurrentPathPair
         Path definitions.
-    K, V_map, board, copper_ids, rows, cols, x_min, y_min, res,
+    K, board, copper_ids, rows, cols, x_min, y_min, res,
     copper_thickness_m, gap_m, get_pad_pixels_func :
         See analyze_current_path.
 
@@ -793,7 +880,7 @@ def analyze_all_paths(
     for pair in pairs:
         try:
             result = analyze_current_path(
-                pair, K, V_map, board, copper_ids,
+                pair, K, board, copper_ids,
                 rows, cols, x_min, y_min, res,
                 copper_thickness_m, gap_m, get_pad_pixels_func,
             )

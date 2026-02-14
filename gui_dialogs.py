@@ -48,7 +48,9 @@ TOOLTIP_TEXTS = {
     'help': "Open the ThermalSim documentation in your web browser.",
     'preview': "Generate a geometry preview image without running the simulation.",
     'current_paths': "Enable I\u00b2R analysis: define pad pairs with current values to compute trace heating.",
-    'current_add': "Add a pad pair from selected pads (exactly 2 pads on the same net must be selected in KiCad).",
+    'current_pad_plus': "Select the source pad (current injection). Pad - will auto-filter to same net.",
+    'current_pad_minus': "Select the sink pad (current extraction). Only pads on the same net as Pad + are shown.",
+    'current_add': "Add the selected pad pair to the analysis list.",
     'current_remove': "Remove the selected pair from the list.",
     'current_input': "Current in amperes for the next pair to add.",
 }
@@ -103,13 +105,14 @@ class SettingsDialog(wx.Dialog):
         pad_names=None,
         default_output_dir="",
         defaults=None,
-        board=None
+        all_pads=None
     ):
         super().__init__(parent, title="Thermal Sim")
 
         self.layer_names = layer_names
         self.preview_callback = preview_callback
-        self.board = board
+        # all_pads: list of (ref_str, net_name, net_code) for every pad on the board
+        self._all_pads = all_pads or []
 
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
@@ -395,6 +398,36 @@ class SettingsDialog(wx.Dialog):
         self.current_list.SetMinSize((-1, 120))
         box_pairs.Add(self.current_list, 1, wx.EXPAND | wx.ALL, 3)
 
+        # --- Pad picker dropdowns ---
+        # Build unique pad labels grouped by net
+        self._pad_by_net = {}  # net_code -> [(ref_str, net_name)]
+        self._pad_labels = []  # ordered list of "REF-NUM [net]"
+        for ref_str, net_name, net_code in self._all_pads:
+            label = f"{ref_str} [{net_name}]" if net_name else ref_str
+            self._pad_labels.append(label)
+            self._pad_by_net.setdefault(net_code, []).append(
+                (ref_str, net_name, net_code, label)
+            )
+
+        # Pad + dropdown
+        row_pad_a = wx.BoxSizer(wx.HORIZONTAL)
+        lbl_pad_a = wx.StaticText(panel, label="Pad + :", size=(80, -1))
+        self.choice_pad_a = wx.Choice(panel, choices=self._pad_labels)
+        self.choice_pad_a.SetToolTip(TOOLTIP_TEXTS['current_pad_plus'])
+        self.choice_pad_a.Bind(wx.EVT_CHOICE, self._on_pad_a_changed)
+        row_pad_a.Add(lbl_pad_a, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        row_pad_a.Add(self.choice_pad_a, 1, wx.EXPAND)
+        box_pairs.Add(row_pad_a, 0, wx.EXPAND | wx.ALL, 3)
+
+        # Pad - dropdown (populated dynamically based on Pad + selection)
+        row_pad_b = wx.BoxSizer(wx.HORIZONTAL)
+        lbl_pad_b = wx.StaticText(panel, label="Pad - :", size=(80, -1))
+        self.choice_pad_b = wx.Choice(panel, choices=[])
+        self.choice_pad_b.SetToolTip(TOOLTIP_TEXTS['current_pad_minus'])
+        row_pad_b.Add(lbl_pad_b, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        row_pad_b.Add(self.choice_pad_b, 1, wx.EXPAND)
+        box_pairs.Add(row_pad_b, 0, wx.EXPAND | wx.ALL, 3)
+
         # Current input
         row_cur = wx.BoxSizer(wx.HORIZONTAL)
         lbl_cur = wx.StaticText(panel, label="Current (A):", size=(80, -1))
@@ -409,7 +442,7 @@ class SettingsDialog(wx.Dialog):
 
         # Buttons
         row_btn = wx.BoxSizer(wx.HORIZONTAL)
-        btn_add = wx.Button(panel, label="Add from Selection")
+        btn_add = wx.Button(panel, label="Add Pair")
         btn_add.Bind(wx.EVT_BUTTON, self._on_add_current_pair)
         btn_add.SetToolTip(TOOLTIP_TEXTS['current_add'])
         btn_remove = wx.Button(panel, label="Remove Selected")
@@ -424,8 +457,8 @@ class SettingsDialog(wx.Dialog):
         # Info label
         lbl_info = wx.StaticText(
             panel,
-            label="Select exactly 2 pads on the same net in KiCad,\n"
-                  "then click 'Add from Selection'. Max 10 pairs."
+            label="Select Pad + and Pad - from the dropdowns.\n"
+                  "Pad - auto-filters to pads on the same net. Max 10 pairs."
         )
         lbl_info.SetForegroundColour(wx.Colour(100, 100, 100))
         sizer.Add(lbl_info, 0, wx.ALL, 5)
@@ -435,75 +468,57 @@ class SettingsDialog(wx.Dialog):
         # Internal storage for pairs
         self._current_pairs = []  # list of dicts
 
-    def _get_board_selected_pads(self):
-        """Get currently selected pads from the board.
-
-        Returns
-        -------
-        list of (str, pad_object)
-            Pad name and pad object pairs.
-        """
-        if self.board is None:
-            return []
-        selected = []
-        try:
-            footprints = (self.board.Footprints()
-                          if hasattr(self.board, 'Footprints')
-                          else self.board.GetFootprints())
-            for fp in footprints:
-                for pad in fp.Pads():
-                    if pad.IsSelected():
-                        name = f"{fp.GetReference()}-{pad.GetNumber()}"
-                        selected.append((name, pad))
-        except Exception:
-            pass
-        return selected
+    def _on_pad_a_changed(self, event):
+        """Update Pad - dropdown to show only same-net pads when Pad + changes."""
+        sel = self.choice_pad_a.GetSelection()
+        self.choice_pad_b.Clear()
+        if sel < 0 or sel >= len(self._all_pads):
+            return
+        ref_a, net_name_a, net_code_a = self._all_pads[sel]
+        same_net = self._pad_by_net.get(net_code_a, [])
+        for ref_str, net_name, net_code, label in same_net:
+            if ref_str != ref_a:
+                self.choice_pad_b.Append(label, (ref_str, net_name, net_code))
 
     def _on_add_current_pair(self, event):
-        """Add a current path pair from the selected pads."""
+        """Add a current path pair from the dropdown selections."""
         if len(self._current_pairs) >= 10:
             wx.MessageBox("Maximum 10 pairs allowed.", "Info")
             return
 
-        selected = self._get_board_selected_pads()
-        if len(selected) != 2:
-            wx.MessageBox(
-                f"Select exactly 2 pads in KiCad.\n"
-                f"Currently {len(selected)} pad(s) selected.",
-                "Selection Error"
-            )
+        sel_a = self.choice_pad_a.GetSelection()
+        sel_b = self.choice_pad_b.GetSelection()
+        if sel_a < 0 or sel_a >= len(self._all_pads):
+            wx.MessageBox("Select a Pad + from the dropdown.", "Selection Error")
+            return
+        if sel_b < 0:
+            wx.MessageBox("Select a Pad - from the dropdown.", "Selection Error")
             return
 
-        name_a, pad_a = selected[0]
-        name_b, pad_b = selected[1]
+        ref_a, net_name_a, net_code_a = self._all_pads[sel_a]
+        # Pad B data stored as client data on the Choice item
+        pad_b_data = self.choice_pad_b.GetClientData(sel_b)
+        if pad_b_data is None:
+            # Fallback: parse from label
+            wx.MessageBox("Select a valid Pad - from the dropdown.", "Selection Error")
+            return
+        ref_b, net_name_b, net_code_b = pad_b_data
 
-        net_a = net_b = 0
-        net_name = ""
-        try:
-            net_a = pad_a.GetNetCode()
-            net_b = pad_b.GetNetCode()
-        except Exception:
-            pass
-        try:
-            net_name = pad_a.GetNetname()
-        except Exception:
-            pass
-
-        if net_a != net_b:
+        if net_code_a <= 0:
             wx.MessageBox(
-                f"Pads must be on the same net.\n"
-                f"{name_a} is on net {net_a}, {name_b} is on net {net_b}.",
-                "Net Mismatch"
+                f"Pad + ({ref_a}) is not connected to any net.\n"
+                f"Select a pad that belongs to a valid net.",
+                "Invalid Net"
             )
             return
 
         current = float(self.current_input.GetValue())
         pair_info = {
-            'pad_a_ref': name_a,
-            'pad_b_ref': name_b,
+            'pad_a_ref': ref_a,
+            'pad_b_ref': ref_b,
             'current_a': current,
-            'net_code': net_a,
-            'net_name': net_name,
+            'net_code': net_code_a,
+            'net_name': net_name_a,
         }
         self._current_pairs.append(pair_info)
         self._refresh_current_list()

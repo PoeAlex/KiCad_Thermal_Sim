@@ -494,3 +494,157 @@ class TestSettingsDialogInstantiation:
         # Applied values should be updated
         assert values['time'] == 30.0
         assert values['amb'] == 30.0
+
+    def test_dialog_with_all_pads(self):
+        """Test that SettingsDialog accepts all_pads parameter."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+        all_pads = [
+            ("U1-1", "VCC", 1),
+            ("U1-2", "GND", 2),
+            ("U2-1", "VCC", 1),
+            ("U2-2", "GND", 2),
+        ]
+        dlg = SettingsDialog(
+            None, 2, 0.5, ["F.Cu", "B.Cu"],
+            all_pads=all_pads,
+        )
+        assert dlg is not None
+        values = dlg.get_values()
+        assert 'current_paths' in values
+        assert values['current_paths'] == []
+
+
+class TestCurrentPathDropdowns:
+    """Tests for the dropdown-based current path pad picker."""
+
+    @pytest.fixture
+    def sample_pads(self):
+        """Sample pad list for dropdown testing."""
+        return [
+            ("U1-1", "VCC", 1),
+            ("U1-2", "GND", 2),
+            ("U2-1", "VCC", 1),
+            ("U2-3", "GND", 2),
+            ("J1-1", "VCC", 1),
+            ("J1-2", "", 0),  # unconnected pad
+        ]
+
+    @pytest.fixture
+    def dlg_with_pads(self, sample_pads):
+        """Create a dialog with all_pads populated."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+        return SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            all_pads=sample_pads,
+        )
+
+    def test_pad_a_dropdown_populated(self, dlg_with_pads, sample_pads):
+        """Test that Pad + dropdown contains all pads."""
+        assert dlg_with_pads.choice_pad_a.GetCount() == len(sample_pads)
+
+    def test_pad_b_initially_empty(self, dlg_with_pads):
+        """Test that Pad - dropdown starts empty."""
+        assert dlg_with_pads.choice_pad_b.GetCount() == 0
+
+    def test_pad_b_filters_by_net(self, dlg_with_pads, sample_pads):
+        """Test that selecting Pad + filters Pad - to same-net pads."""
+        # Select U1-1 (VCC, net_code=1)
+        dlg_with_pads.choice_pad_a.SetSelection(0)
+        dlg_with_pads._on_pad_a_changed(None)
+
+        # Pad - should contain U2-1 and J1-1 (also VCC, net_code=1)
+        # but NOT U1-1 itself
+        count = dlg_with_pads.choice_pad_b.GetCount()
+        assert count == 2  # U2-1, J1-1
+
+    def test_pad_b_excludes_selected_pad_a(self, dlg_with_pads):
+        """Test that Pad - does not include the selected Pad +."""
+        dlg_with_pads.choice_pad_a.SetSelection(0)  # U1-1
+        dlg_with_pads._on_pad_a_changed(None)
+
+        pad_b_labels = [
+            dlg_with_pads.choice_pad_b.GetString(i)
+            for i in range(dlg_with_pads.choice_pad_b.GetCount())
+        ]
+        assert not any("U1-1" in lbl for lbl in pad_b_labels)
+
+    def test_add_pair_from_dropdowns(self, dlg_with_pads):
+        """Test adding a pair via dropdown selections."""
+        # Select U1-1 as Pad +
+        dlg_with_pads.choice_pad_a.SetSelection(0)
+        dlg_with_pads._on_pad_a_changed(None)
+
+        # Select first item in Pad - (should be U2-1)
+        dlg_with_pads.choice_pad_b.SetSelection(0)
+
+        # Add pair
+        dlg_with_pads._on_add_current_pair(None)
+
+        values = dlg_with_pads.get_values()
+        assert len(values['current_paths']) == 1
+        pair = values['current_paths'][0]
+        assert pair['pad_a_ref'] == "U1-1"
+        assert pair['net_code'] == 1
+        assert pair['current_a'] == 1.0
+
+    def test_add_pair_rejects_unconnected_net(self, dlg_with_pads, sample_pads):
+        """Test that adding a pair with net_code=0 is rejected."""
+        # J1-2 is unconnected (net_code=0), index 5
+        dlg_with_pads.choice_pad_a.SetSelection(5)
+        dlg_with_pads._on_pad_a_changed(None)
+
+        # No same-net pads exist (net_code=0 has only J1-2)
+        assert dlg_with_pads.choice_pad_b.GetCount() == 0
+
+    def test_add_pair_no_selection_shows_error(self, dlg_with_pads):
+        """Test that adding without Pad + selection is handled."""
+        # No selection made
+        dlg_with_pads._on_add_current_pair(None)
+        # Should not crash, and no pair should be added
+        assert len(dlg_with_pads._current_pairs) == 0
+
+    def test_max_pairs_limit(self, dlg_with_pads):
+        """Test that maximum 10 pairs are enforced."""
+        dlg_with_pads.choice_pad_a.SetSelection(0)
+        dlg_with_pads._on_pad_a_changed(None)
+        dlg_with_pads.choice_pad_b.SetSelection(0)
+
+        for _ in range(12):
+            dlg_with_pads._on_add_current_pair(None)
+
+        assert len(dlg_with_pads._current_pairs) == 10
+
+    def test_remove_pair(self, dlg_with_pads):
+        """Test removing a pair from the list."""
+        # Add a pair first
+        dlg_with_pads.choice_pad_a.SetSelection(0)
+        dlg_with_pads._on_pad_a_changed(None)
+        dlg_with_pads.choice_pad_b.SetSelection(0)
+        dlg_with_pads._on_add_current_pair(None)
+        assert len(dlg_with_pads._current_pairs) == 1
+
+        # Remove it (ListCtrl mock returns -1 for GetFirstSelected,
+        # so this tests the boundary condition)
+        dlg_with_pads._on_remove_current_pair(None)
+        # Since mock returns -1, pair isn't removed (expected behavior)
+        assert len(dlg_with_pads._current_pairs) == 1
+
+    def test_saved_pairs_restored(self, sample_pads):
+        """Test that saved current_paths are restored from defaults."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+        saved = {
+            'current_path_enabled': True,
+            'current_paths': [
+                {'pad_a_ref': 'U1-1', 'pad_b_ref': 'U2-1',
+                 'current_a': 3.0, 'net_code': 1, 'net_name': 'VCC'},
+            ],
+        }
+        dlg = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            all_pads=sample_pads,
+            defaults=saved,
+        )
+        values = dlg.get_values()
+        assert values['current_path_enabled'] is True
+        assert len(values['current_paths']) == 1
+        assert values['current_paths'][0]['pad_a_ref'] == 'U1-1'

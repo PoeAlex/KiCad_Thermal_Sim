@@ -151,6 +151,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         if last_settings.get("output_dir") and os.path.isdir(last_settings.get("output_dir")):
             default_output_dir = last_settings.get("output_dir")
 
+        # Build full pad list for current-path dropdowns
+        all_pads = self._build_all_pads_list(board)
+
         dlg = SettingsDialog(
             None, len(pads_list), suggested_res, layer_names,
             preview_callback=self.generate_preview,
@@ -158,7 +161,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             pad_names=pad_names,
             default_output_dir=default_output_dir,
             defaults=last_settings,
-            board=board,
+            all_pads=all_pads,
         )
         if dlg.ShowModal() != wx.ID_OK:
             dlg.Destroy()
@@ -252,6 +255,42 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             pad_names.append(f"{nm} [{net}]" if net else nm)
         return pad_names
 
+    def _build_all_pads_list(self, board):
+        """Build a list of all pads on the board for current-path dropdowns.
+
+        Returns
+        -------
+        list of (str, str, int)
+            Each entry is (ref_str, net_name, net_code).
+        """
+        all_pads = []
+        try:
+            footprints = (board.Footprints() if hasattr(board, 'Footprints')
+                          else board.GetFootprints())
+            for fp in footprints:
+                ref = fp.GetReference()
+                for pad in fp.Pads():
+                    num = pad.GetNumber()
+                    ref_str = f"{ref}-{num}" if num else ref
+                    net_name = ""
+                    net_code = 0
+                    try:
+                        net_code = pad.GetNetCode()
+                    except Exception:
+                        pass
+                    try:
+                        net_name = pad.GetNetname()
+                    except Exception:
+                        try:
+                            net_name = pad.GetNet().GetNetname()
+                        except Exception:
+                            pass
+                    all_pads.append((ref_str, net_name, net_code))
+        except Exception:
+            pass
+        all_pads.sort(key=lambda x: x[0])
+        return all_pads
+
     def _resolve_current_pairs(self, board, path_defs):
         """Resolve pad reference strings to actual pad objects.
 
@@ -289,11 +328,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             if pad_a is None or pad_b is None:
                 print(f"[ThermalSim][WARN] Could not find pad(s): {ref_a}, {ref_b}")
                 continue
+            net_code = int(pd.get('net_code', 0))
+            if net_code <= 0:
+                print(f"[ThermalSim][WARN] Skipping pair {ref_a} → {ref_b}: "
+                      f"net_code={net_code} (unconnected)")
+                continue
             pairs.append(CurrentPathPair(
                 pad_a=pad_a,
                 pad_b=pad_b,
                 current_a=float(pd.get('current_a', 1.0)),
-                net_code=int(pd.get('net_code', 0)),
+                net_code=net_code,
                 label=f"{ref_a} → {ref_b}",
             ))
         return pairs
@@ -586,7 +630,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 if pairs:
                     current_path_results = analyze_all_paths(
                         pairs=pairs,
-                        K=K, V_map=V_map,
+                        K=K,
                         board=board,
                         copper_ids=copper_ids,
                         rows=rows, cols=cols,
