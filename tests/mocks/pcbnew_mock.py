@@ -237,17 +237,51 @@ class MockTrack:
         Track layer ID.
     bbox : EDA_RECT, optional
         Bounding box.
+    start : VECTOR2I, optional
+        Start point in internal units (nm).
+    end : VECTOR2I, optional
+        End point in internal units (nm).
+    width : int, optional
+        Track width in internal units (nm).
+    net_code : int, optional
+        Net code for connectivity.
     """
 
-    def __init__(self, layer: int = F_Cu, bbox: Optional[EDA_RECT] = None):
+    def __init__(self, layer: int = F_Cu, bbox: Optional[EDA_RECT] = None,
+                 start: Optional[VECTOR2I] = None, end: Optional[VECTOR2I] = None,
+                 width: int = 250000, net_code: int = 0):
         self._layer = layer
-        self._bbox = bbox or EDA_RECT(0, 0, 1000000, 100000)
+        self._start = start or VECTOR2I(0, 0)
+        self._end = end or VECTOR2I(1000000, 0)
+        self._width = width
+        self._net_code = net_code
+        if bbox is not None:
+            self._bbox = bbox
+        else:
+            # Auto-compute bbox from start/end/width
+            x0 = min(self._start.x, self._end.x) - width // 2
+            y0 = min(self._start.y, self._end.y) - width // 2
+            x1 = max(self._start.x, self._end.x) + width // 2
+            y1 = max(self._start.y, self._end.y) + width // 2
+            self._bbox = EDA_RECT(x0, y0, x1 - x0, y1 - y0)
 
     def GetLayer(self) -> int:
         return self._layer
 
     def GetBoundingBox(self) -> EDA_RECT:
         return self._bbox
+
+    def GetStart(self) -> VECTOR2I:
+        return self._start
+
+    def GetEnd(self) -> VECTOR2I:
+        return self._end
+
+    def GetWidth(self) -> int:
+        return self._width
+
+    def GetNetCode(self) -> int:
+        return self._net_code
 
 
 class MockVia(MockTrack):
@@ -257,8 +291,10 @@ class MockVia(MockTrack):
     Inherits from MockTrack but with type name containing 'VIA'.
     """
 
-    def __init__(self, bbox: Optional[EDA_RECT] = None, layers: Optional[List[int]] = None):
-        super().__init__(layer=F_Cu, bbox=bbox)
+    def __init__(self, bbox: Optional[EDA_RECT] = None, layers: Optional[List[int]] = None,
+                 net_code: int = 0, position: Optional[VECTOR2I] = None):
+        pos = position or VECTOR2I(0, 0)
+        super().__init__(layer=F_Cu, bbox=bbox, start=pos, end=pos, net_code=net_code)
         self._layers = layers or [F_Cu, B_Cu]
 
     def __class__(self):

@@ -597,6 +597,139 @@ def save_preview_from_arrays(
         return None
 
 
+def save_current_density_plot(results, layer_names, out_dir):
+    """
+    Save a current density heatmap for each analyzed path.
+
+    Parameters
+    ----------
+    results : list of CurrentPathResult
+        Current path analysis results.
+    layer_names : list of str
+        Names of copper layers.
+    out_dir : str
+        Output directory for the PNG file.
+
+    Returns
+    -------
+    str or None
+        Path to saved PNG, or None if failed.
+    """
+    if not results:
+        return None
+    try:
+        n = len(results)
+        fig, axes = plt.subplots(1, n, figsize=(7 * n, 6), squeeze=False)
+        axes = axes.flatten()
+
+        for i, res in enumerate(results):
+            ax = axes[i]
+            # Show layer with highest max J
+            J = res.J_magnitude
+            layer_maxes = [float(np.max(J[l])) for l in range(J.shape[0])]
+            best_layer = int(np.argmax(layer_maxes))
+            lname = layer_names[best_layer] if best_layer < len(layer_names) else f"Layer {best_layer}"
+
+            J_show = J[best_layer]
+            # Mask near-zero values for cleaner plot
+            J_masked = np.ma.masked_where(J_show < np.max(J_show) * 0.01, J_show)
+
+            im = ax.imshow(
+                J_masked, cmap='YlOrRd', origin='upper', interpolation='bilinear',
+            )
+            plt.colorbar(im, ax=ax, label='A/m²')
+
+            label = res.label or f"Path {i+1}"
+            ax.set_title(
+                f"{label} ({lname})\n"
+                f"R={res.resistance_ohm*1e3:.2f} mΩ, "
+                f"P={res.power_loss_w*1e3:.1f} mW"
+            )
+            ax.axis('off')
+
+        for j in range(n, len(axes)):
+            axes[j].axis('off')
+
+        plt.tight_layout()
+        output_file = os.path.join(out_dir, "current_density.png")
+        plt.savefig(output_file, dpi=150)
+        plt.close()
+        return output_file
+    except Exception:
+        return None
+
+
+def save_cross_section_plot(results, out_dir):
+    """
+    Save a cross-section profile plot showing copper area and current density.
+
+    Parameters
+    ----------
+    results : list of CurrentPathResult
+        Current path analysis results with cross_section_data.
+    out_dir : str
+        Output directory for the PNG file.
+
+    Returns
+    -------
+    str or None
+        Path to saved PNG, or None if failed.
+    """
+    if not results:
+        return None
+    try:
+        fig, ax1 = plt.subplots(figsize=(10, 5))
+        ax2 = ax1.twinx()
+
+        colors = plt.cm.tab10(np.linspace(0, 1, max(len(results), 1)))
+
+        for i, res in enumerate(results):
+            xs = res.cross_section_data
+            if not xs:
+                continue
+            # X-axis: fractional position (0 = pad A voltage, 1 = pad B voltage)
+            n = len(xs)
+            positions = [(k + 0.5) / n for k in range(n)]
+            areas = [s["copper_area_mm2"] for s in xs]
+            j_avg = [s["avg_j"] * 1e-6 for s in xs]  # A/m² → A/mm²
+
+            label = res.label or f"Path {i+1}"
+            color = colors[i]
+
+            ax1.plot(positions, areas, '-o', color=color, markersize=3,
+                     label=f"{label} area")
+            ax2.plot(positions, j_avg, '--s', color=color, markersize=3,
+                     alpha=0.7, label=f"{label} J")
+
+            # Highlight minimum cross-section (bottleneck)
+            if areas:
+                non_zero = [(k, a) for k, a in enumerate(areas) if a > 0]
+                if non_zero:
+                    min_k, min_a = min(non_zero, key=lambda x: x[1])
+                    ax1.annotate(
+                        f"min: {min_a:.3f} mm²",
+                        xy=(positions[min_k], min_a),
+                        fontsize=8, color=color,
+                        textcoords="offset points", xytext=(5, 5),
+                    )
+
+        ax1.set_xlabel("Position along path (0 = Pad A, 1 = Pad B)")
+        ax1.set_ylabel("Copper area (mm²)")
+        ax2.set_ylabel("Avg current density (A/mm²)")
+        ax1.legend(loc='upper left', fontsize=8)
+        ax2.legend(loc='upper right', fontsize=8)
+        ax1.set_xlim(0, 1)
+
+        plt.title("Cross-Section Profile")
+        plt.tight_layout()
+        output_file = os.path.join(out_dir, "current_cross_section.png")
+        plt.savefig(output_file, dpi=150)
+        plt.close()
+        return output_file
+    except Exception:
+        return None
+
+
 def _open_file(filepath):
     """
     Open a file in the system default viewer.

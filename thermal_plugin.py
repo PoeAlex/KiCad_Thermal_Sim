@@ -28,8 +28,12 @@ from .pwl_parser import parse_pwl_file
 from .visualization import (
     show_results_top_bot, show_results_all_layers, save_preview_image,
     save_preview_from_arrays, save_snapshot,
+    save_current_density_plot, save_cross_section_plot,
 )
 from .thermal_report import write_html_report, write_interactive_viewer
+from .current_analyzer import (
+    CurrentPathPair, analyze_all_paths, merge_i2r_into_q,
+)
 
 
 class ThermalPlugin(pcbnew.ActionPlugin):
@@ -153,7 +157,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             stackup_details=stackup_details,
             pad_names=pad_names,
             default_output_dir=default_output_dir,
-            defaults=last_settings
+            defaults=last_settings,
+            board=board,
         )
         if dlg.ShowModal() != wx.ID_OK:
             dlg.Destroy()
@@ -246,6 +251,52 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     net = ""
             pad_names.append(f"{nm} [{net}]" if net else nm)
         return pad_names
+
+    def _resolve_current_pairs(self, board, path_defs):
+        """Resolve pad reference strings to actual pad objects.
+
+        Parameters
+        ----------
+        board : pcbnew.BOARD
+            The board object.
+        path_defs : list of dict
+            Path definitions from settings, each with pad_a_ref, pad_b_ref,
+            current_a, net_code, net_name.
+
+        Returns
+        -------
+        list of CurrentPathPair
+            Resolved pairs with pad objects.
+        """
+        # Build lookup: "REF-NUM" -> pad object
+        pad_lookup = {}
+        try:
+            footprints = (board.Footprints() if hasattr(board, 'Footprints')
+                          else board.GetFootprints())
+            for fp in footprints:
+                for pad in fp.Pads():
+                    key = f"{fp.GetReference()}-{pad.GetNumber()}"
+                    pad_lookup[key] = pad
+        except Exception:
+            return []
+
+        pairs = []
+        for pd in path_defs:
+            ref_a = pd.get('pad_a_ref', '')
+            ref_b = pd.get('pad_b_ref', '')
+            pad_a = pad_lookup.get(ref_a)
+            pad_b = pad_lookup.get(ref_b)
+            if pad_a is None or pad_b is None:
+                print(f"[ThermalSim][WARN] Could not find pad(s): {ref_a}, {ref_b}")
+                continue
+            pairs.append(CurrentPathPair(
+                pad_a=pad_a,
+                pad_b=pad_b,
+                current_a=float(pd.get('current_a', 1.0)),
+                net_code=int(pd.get('net_code', 0)),
+                label=f"{ref_a} → {ref_b}",
+            ))
+        return pairs
 
     def _derive_stackup_thicknesses(self, board, copper_ids, stack_info, settings):
         """Derive thickness values from stackup or defaults."""
@@ -525,6 +576,33 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             else:
                 pad_power.append((name, None))
 
+        # Current path analysis (I²R heating)
+        current_path_results = []
+        if settings.get('current_path_enabled') and settings.get('current_paths'):
+            try:
+                pairs = self._resolve_current_pairs(
+                    board, settings['current_paths']
+                )
+                if pairs:
+                    current_path_results = analyze_all_paths(
+                        pairs=pairs,
+                        K=K, V_map=V_map,
+                        board=board,
+                        copper_ids=copper_ids,
+                        rows=rows, cols=cols,
+                        x_min=x_min, y_min=y_min, res=res,
+                        copper_thickness_m=cu_thick_m,
+                        gap_m=gap_m,
+                        get_pad_pixels_func=get_pad_pixels,
+                    )
+                    if current_path_results:
+                        Q = merge_i2r_into_q(Q, current_path_results)
+                        total_i2r = sum(r.power_loss_w for r in current_path_results)
+                        print(f"[ThermalSim] I²R: {len(current_path_results)} path(s), "
+                              f"total loss = {total_i2r*1e3:.2f} mW")
+            except Exception as e:
+                print(f"[ThermalSim][WARN] Current path analysis failed: {e}")
+
         # Build stiffness matrix
         K_matrix, b, hA, _ = build_stiffness_matrix(
             layer_count, rows, cols, copper_mask, t_cu, t_fr4_eff,
@@ -638,6 +716,14 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             get_pad_pixels, out_dir=run_dir,
         )
 
+        # Save current path plots
+        if current_path_results:
+            try:
+                save_current_density_plot(current_path_results, layer_names, run_dir)
+                save_cross_section_plot(current_path_results, run_dir)
+            except Exception as e:
+                print(f"[ThermalSim][WARN] Current path plots failed: {e}")
+
         snapshot_debug = {
             "snapshots_enabled": settings.get('snapshots'),
             "snap_count": settings.get('snap_count'),
@@ -677,6 +763,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snapshot_files=snapshot_png_paths or None,
             T_data=result.T,
             ambient=amb,
+            current_path_results=current_path_results or None,
         )
 
         # Open outputs

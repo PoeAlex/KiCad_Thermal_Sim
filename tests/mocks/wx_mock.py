@@ -115,6 +115,9 @@ class _WxMock:
         def SetFont(self, font):
             pass
 
+        def SetForegroundColour(self, colour):
+            pass
+
     class StaticLine:
         def __init__(self, parent, **kwargs):
             pass
@@ -224,6 +227,40 @@ class _WxMock:
         def SetLabel(self, label):
             self.label = label
 
+    class ListCtrl:
+        def __init__(self, parent, style=0, **kwargs):
+            self._columns = []
+            self._items = []
+
+        def InsertColumn(self, col, heading, width=80):
+            self._columns.append(heading)
+
+        def InsertItem(self, index, label):
+            while len(self._items) <= index:
+                self._items.append({})
+            self._items[index] = {0: label}
+            return index
+
+        def SetItem(self, index, col, label):
+            if index < len(self._items):
+                self._items[index][col] = label
+
+        def DeleteAllItems(self):
+            self._items = []
+
+        def GetFirstSelected(self):
+            return -1
+
+        def SetMinSize(self, size):
+            pass
+
+        def SetToolTip(self, tip):
+            pass
+
+    class Colour:
+        def __init__(self, r=0, g=0, b=0, a=255):
+            self.r, self.g, self.b, self.a = r, g, b, a
+
     class DirDialog:
         def __init__(self, parent, message="", defaultPath="", style=0):
             self.path = defaultPath
@@ -266,6 +303,8 @@ class _WxMock:
     ALIGN_CENTER_VERTICAL = 0x08
     ALIGN_RIGHT = 0x10
     LI_HORIZONTAL = 0
+    LC_REPORT = 0x01
+    LC_SINGLE_SEL = 0x02
     FONTWEIGHT_BOLD = 92
     PD_CAN_ABORT = 0x01
     PD_APP_MODAL = 0x02

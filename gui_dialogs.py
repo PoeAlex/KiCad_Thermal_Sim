@@ -47,6 +47,10 @@ TOOLTIP_TEXTS = {
     'capabilities': "Detected solver backends. PyPardiso accelerates large grids significantly.",
     'help': "Open the ThermalSim documentation in your web browser.",
     'preview': "Generate a geometry preview image without running the simulation.",
+    'current_paths': "Enable I\u00b2R analysis: define pad pairs with current values to compute trace heating.",
+    'current_add': "Add a pad pair from selected pads (exactly 2 pads on the same net must be selected in KiCad).",
+    'current_remove': "Remove the selected pair from the list.",
+    'current_input': "Current in amperes for the next pair to add.",
 }
 
 
@@ -98,12 +102,14 @@ class SettingsDialog(wx.Dialog):
         stackup_details="",
         pad_names=None,
         default_output_dir="",
-        defaults=None
+        defaults=None,
+        board=None
     ):
         super().__init__(parent, title="Thermal Sim")
 
         self.layer_names = layer_names
         self.preview_callback = preview_callback
+        self.board = board
 
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
@@ -122,6 +128,11 @@ class SettingsDialog(wx.Dialog):
         self.tab_adv = wx.Panel(self.notebook)
         self._build_advanced_tab(self.tab_adv)
         self.notebook.AddPage(self.tab_adv, "Advanced")
+
+        # Tab 3: Current Paths
+        self.tab_current = wx.Panel(self.notebook)
+        self._build_current_paths_tab(self.tab_current)
+        self.notebook.AddPage(self.tab_current, "Current Paths")
 
         main_sizer.Add(self.notebook, 1, wx.EXPAND | wx.ALL, 5)
 
@@ -361,6 +372,159 @@ class SettingsDialog(wx.Dialog):
 
         panel.SetSizer(sizer)
 
+    def _build_current_paths_tab(self, panel):
+        """Build the Current Paths tab for I²R analysis."""
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        self.chk_current_path = wx.CheckBox(panel, label="Enable Current Path Analysis")
+        self.chk_current_path.SetValue(False)
+        self.chk_current_path.SetToolTip(TOOLTIP_TEXTS['current_paths'])
+        sizer.Add(self.chk_current_path, 0, wx.ALL, 5)
+
+        # --- Pair list ---
+        box_pairs = wx.StaticBoxSizer(wx.VERTICAL, panel, "Current Path Pairs")
+
+        self.current_list = wx.ListCtrl(
+            panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL
+        )
+        self.current_list.InsertColumn(0, "#", width=30)
+        self.current_list.InsertColumn(1, "Pad +", width=100)
+        self.current_list.InsertColumn(2, "Pad -", width=100)
+        self.current_list.InsertColumn(3, "Current (A)", width=80)
+        self.current_list.InsertColumn(4, "Net", width=100)
+        self.current_list.SetMinSize((-1, 120))
+        box_pairs.Add(self.current_list, 1, wx.EXPAND | wx.ALL, 3)
+
+        # Current input
+        row_cur = wx.BoxSizer(wx.HORIZONTAL)
+        lbl_cur = wx.StaticText(panel, label="Current (A):", size=(80, -1))
+        self.current_input = wx.SpinCtrlDouble(
+            panel, value="1.0", min=0.001, max=1000.0, inc=0.5
+        )
+        self.current_input.SetDigits(3)
+        self.current_input.SetToolTip(TOOLTIP_TEXTS['current_input'])
+        row_cur.Add(lbl_cur, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        row_cur.Add(self.current_input, 1, wx.EXPAND)
+        box_pairs.Add(row_cur, 0, wx.EXPAND | wx.ALL, 3)
+
+        # Buttons
+        row_btn = wx.BoxSizer(wx.HORIZONTAL)
+        btn_add = wx.Button(panel, label="Add from Selection")
+        btn_add.Bind(wx.EVT_BUTTON, self._on_add_current_pair)
+        btn_add.SetToolTip(TOOLTIP_TEXTS['current_add'])
+        btn_remove = wx.Button(panel, label="Remove Selected")
+        btn_remove.Bind(wx.EVT_BUTTON, self._on_remove_current_pair)
+        btn_remove.SetToolTip(TOOLTIP_TEXTS['current_remove'])
+        row_btn.Add(btn_add, 0, wx.RIGHT, 5)
+        row_btn.Add(btn_remove, 0)
+        box_pairs.Add(row_btn, 0, wx.ALL, 3)
+
+        sizer.Add(box_pairs, 1, wx.EXPAND | wx.ALL, 5)
+
+        # Info label
+        lbl_info = wx.StaticText(
+            panel,
+            label="Select exactly 2 pads on the same net in KiCad,\n"
+                  "then click 'Add from Selection'. Max 10 pairs."
+        )
+        lbl_info.SetForegroundColour(wx.Colour(100, 100, 100))
+        sizer.Add(lbl_info, 0, wx.ALL, 5)
+
+        panel.SetSizer(sizer)
+
+        # Internal storage for pairs
+        self._current_pairs = []  # list of dicts
+
+    def _get_board_selected_pads(self):
+        """Get currently selected pads from the board.
+
+        Returns
+        -------
+        list of (str, pad_object)
+            Pad name and pad object pairs.
+        """
+        if self.board is None:
+            return []
+        selected = []
+        try:
+            footprints = (self.board.Footprints()
+                          if hasattr(self.board, 'Footprints')
+                          else self.board.GetFootprints())
+            for fp in footprints:
+                for pad in fp.Pads():
+                    if pad.IsSelected():
+                        name = f"{fp.GetReference()}-{pad.GetNumber()}"
+                        selected.append((name, pad))
+        except Exception:
+            pass
+        return selected
+
+    def _on_add_current_pair(self, event):
+        """Add a current path pair from the selected pads."""
+        if len(self._current_pairs) >= 10:
+            wx.MessageBox("Maximum 10 pairs allowed.", "Info")
+            return
+
+        selected = self._get_board_selected_pads()
+        if len(selected) != 2:
+            wx.MessageBox(
+                f"Select exactly 2 pads in KiCad.\n"
+                f"Currently {len(selected)} pad(s) selected.",
+                "Selection Error"
+            )
+            return
+
+        name_a, pad_a = selected[0]
+        name_b, pad_b = selected[1]
+
+        net_a = net_b = 0
+        net_name = ""
+        try:
+            net_a = pad_a.GetNetCode()
+            net_b = pad_b.GetNetCode()
+        except Exception:
+            pass
+        try:
+            net_name = pad_a.GetNetname()
+        except Exception:
+            pass
+
+        if net_a != net_b:
+            wx.MessageBox(
+                f"Pads must be on the same net.\n"
+                f"{name_a} is on net {net_a}, {name_b} is on net {net_b}.",
+                "Net Mismatch"
+            )
+            return
+
+        current = float(self.current_input.GetValue())
+        pair_info = {
+            'pad_a_ref': name_a,
+            'pad_b_ref': name_b,
+            'current_a': current,
+            'net_code': net_a,
+            'net_name': net_name,
+        }
+        self._current_pairs.append(pair_info)
+        self._refresh_current_list()
+
+    def _on_remove_current_pair(self, event):
+        """Remove the selected current pair from the list."""
+        sel = self.current_list.GetFirstSelected()
+        if sel >= 0 and sel < len(self._current_pairs):
+            self._current_pairs.pop(sel)
+            self._refresh_current_list()
+
+    def _refresh_current_list(self):
+        """Refresh the ListCtrl from internal pairs data."""
+        self.current_list.DeleteAllItems()
+        for i, p in enumerate(self._current_pairs):
+            idx = self.current_list.InsertItem(i, str(i + 1))
+            self.current_list.SetItem(idx, 1, p['pad_a_ref'])
+            self.current_list.SetItem(idx, 2, p['pad_b_ref'])
+            self.current_list.SetItem(idx, 3, f"{p['current_a']:.3f}")
+            self.current_list.SetItem(idx, 4, p.get('net_name', ''))
+
     # ------------------------------------------------------------------
     # Helper: add spinner fields
     # ------------------------------------------------------------------
@@ -565,6 +729,8 @@ class SettingsDialog(wx.Dialog):
                 'pad_k': float(self.pad_k.GetValue()),
                 'pad_cap_areal': float(self.pad_cap.GetValue()),
                 'h_conv': float(self.h_conv_input.GetValue()),
+                'current_path_enabled': self.chk_current_path.GetValue(),
+                'current_paths': list(self._current_pairs),
             }
         except ValueError:
             return None
@@ -628,5 +794,17 @@ class SettingsDialog(wx.Dialog):
 
             if 'h_conv' in defaults:
                 self.h_conv_input.SetValue(float(defaults['h_conv']))
+
+            # Current Paths tab
+            self.chk_current_path.SetValue(
+                bool(defaults.get('current_path_enabled', False))
+            )
+            saved_paths = defaults.get('current_paths', [])
+            if isinstance(saved_paths, list):
+                self._current_pairs = [
+                    p for p in saved_paths
+                    if isinstance(p, dict) and 'pad_a_ref' in p
+                ]
+                self._refresh_current_list()
         except Exception:
             pass

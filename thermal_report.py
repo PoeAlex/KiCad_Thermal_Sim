@@ -276,6 +276,7 @@ def write_html_report(
     snapshot_files=None,
     T_data=None,
     ambient=None,
+    current_path_results=None,
 ):
     """
     Generate an HTML report for the thermal simulation.
@@ -315,6 +316,9 @@ def write_html_report(
     ambient : float, optional
         Ambient temperature in degrees Celsius. Required when T_data is
         provided.
+    current_path_results : list, optional
+        List of CurrentPathResult objects from current path analysis.
+        If provided, generates a current path summary section.
 
     Returns
     -------
@@ -486,6 +490,69 @@ def write_html_report(
         for k, v in snapshot_debug.items()
     )
 
+    # Build current path analysis section
+    current_path_html = ""
+    if current_path_results:
+        cp_rows = ""
+        total_i2r_power = 0.0
+        for r in current_path_results:
+            label = _esc(r.label) if r.label else "—"
+            net_name = _esc(str(r.net_code))
+            try:
+                if hasattr(r, 'net_code'):
+                    net_name = _esc(str(r.net_code))
+            except Exception:
+                pass
+            r_mohm = r.resistance_ohm * 1e3
+            v_mv = r.voltage_drop_v * 1e3
+            p_mw = r.power_loss_w * 1e3
+            total_i2r_power += r.power_loss_w
+            cp_rows += (
+                f"<tr><td>{label}</td>"
+                f"<td>{net_name}</td>"
+                f"<td>{r.current_a:.2f}</td>"
+                f"<td>{r_mohm:.3f}</td>"
+                f"<td>{v_mv:.3f}</td>"
+                f"<td>{p_mw:.2f}</td></tr>\n"
+            )
+
+        # Density plot image
+        density_img_html = ""
+        density_path = os.path.join(out_dir, "current_density.png")
+        if os.path.isfile(density_path):
+            density_img_html = (
+                '<div class="preview-section">'
+                '<img src="current_density.png" alt="Current density heatmap">'
+                '</div>'
+            )
+
+        # Cross-section plot image
+        xsection_img_html = ""
+        xsection_path = os.path.join(out_dir, "current_cross_section.png")
+        if os.path.isfile(xsection_path):
+            xsection_img_html = (
+                '<div class="preview-section">'
+                '<img src="current_cross_section.png" alt="Cross-section profile">'
+                '</div>'
+            )
+
+        current_path_html = f"""
+  <h2 title="I&sup2;R heating from current-carrying traces">Current Path Analysis</h2>
+  <table class="data-tbl">
+    <tr>
+      <th>Path</th><th>Net</th><th>Current (A)</th>
+      <th>R (m&Omega;)</th><th>V<sub>drop</sub> (mV)</th><th>P<sub>loss</sub> (mW)</th>
+    </tr>
+    {cp_rows}
+    <tr style="font-weight:600; border-top:2px solid var(--border);">
+      <td colspan="5" style="text-align:right;">Total I&sup2;R loss</td>
+      <td>{total_i2r_power*1e3:.2f} mW</td>
+    </tr>
+  </table>
+  {density_img_html}
+  {xsection_img_html}
+"""
+
     # Build interactive heatmap section if T_data provided
     interactive_html = ""
     if T_data is not None and ambient is not None:
@@ -630,6 +697,9 @@ def write_html_report(
     </tr>
     {pad_rows if pad_rows else "<tr><td colspan='2' style='color:var(--text-muted)'>No heat sources defined.</td></tr>"}
   </table>
+
+  <!-- Current Path Analysis -->
+  {current_path_html}
 
   <!-- Debug (collapsible) -->
   <details>
