@@ -643,7 +643,7 @@ class TestFillHeatsinkDrawing:
         )
 
     def test_heatsink_drawing_uses_hit_testing(self, context):
-        """Test that non-rectangular drawing shape is respected."""
+        """Test that non-rectangular filled drawing shape is respected."""
         # Drawing bbox covers 4mm x 4mm but HitTest only fills left half
         bbox = EDA_RECT(2000000, 2000000, 4000000, 4000000)
 
@@ -654,6 +654,7 @@ class TestFillHeatsinkDrawing:
             layer=Eco1_User,
             bbox=bbox,
             hit_test_func=left_half_hit,
+            filled=True,  # Filled shape uses HitTest
         )
 
         _fill_heatsink_drawing(context, drawing)
@@ -873,3 +874,222 @@ class TestCreateMultilayerMapsHeatsink:
         assert np.sum(H > 0) > 0, (
             "Rule area zone on Eco1 should be detected by create_multilayer_maps"
         )
+
+
+class TestUnfilledDrawingBboxFallback:
+    """Tests for unfilled drawing bounding-box fallback."""
+
+    @pytest.fixture
+    def context(self):
+        """Create test context with 20x20 grid at 0.5mm resolution."""
+        K = np.ones((2, 20, 20))
+        V = np.ones((20, 20))
+        H = np.zeros((20, 20))
+        return FillContext(
+            K=K, V=V, H=H,
+            area_mask=None,
+            x_min=0.0, y_min=0.0,
+            res=0.5,
+            rows=20, cols=20
+        )
+
+    def test_unfilled_drawing_uses_bbox_fallback(self, context):
+        """Unfilled drawing on User.Eco1 should fill entire bounding box."""
+        # HitTest on unfilled shapes only detects outline pixels,
+        # so the fix should skip HitTest and use bbox fill instead
+        outline_only_count = 0
+
+        def outline_hit(pos):
+            """Simulate unfilled shape: only outline pixels match."""
+            nonlocal outline_only_count
+            bbox = drawing.GetBoundingBox()
+            x0, y0 = bbox.GetX(), bbox.GetY()
+            x1 = x0 + bbox.GetWidth()
+            y1 = y0 + bbox.GetHeight()
+            margin = 50000  # 0.05mm
+            on_edge = (abs(pos.x - x0) < margin or abs(pos.x - x1) < margin or
+                       abs(pos.y - y0) < margin or abs(pos.y - y1) < margin)
+            if on_edge:
+                outline_only_count += 1
+            return on_edge
+
+        drawing = MockDrawing(
+            layer=Eco1_User,
+            bbox=EDA_RECT(2000000, 2000000, 4000000, 4000000),
+            hit_test_func=outline_hit,
+            filled=False,  # Unfilled shape — should trigger bbox fallback
+        )
+
+        _fill_heatsink_drawing(context, drawing)
+
+        # Bbox covers rows 4-12, cols 4-12 => 64 pixels
+        filled_pixels = int(np.sum(context.H > 0))
+        assert filled_pixels >= 50, (
+            f"Unfilled drawing should fill bbox area, got only {filled_pixels} pixels"
+        )
+
+    def test_filled_drawing_uses_hittest(self, context):
+        """Filled drawing should use HitTest for pixel-accurate fill."""
+        bbox = EDA_RECT(2000000, 2000000, 4000000, 4000000)
+
+        def left_half_hit(pos):
+            return pos.x < 4000000  # Only left half
+
+        drawing = MockDrawing(
+            layer=Eco1_User,
+            bbox=bbox,
+            hit_test_func=left_half_hit,
+            filled=True,  # Filled shape — should use HitTest
+        )
+
+        _fill_heatsink_drawing(context, drawing)
+
+        # Left side should be filled
+        assert np.sum(context.H[:, 4:8] > 0) > 0, "Left half should be filled"
+        # Right side should NOT be filled
+        assert np.sum(context.H[:, 9:12] > 0) == 0, "Right half should not be filled"
+
+    def test_filled_drawing_with_zero_hits_falls_back(self, context):
+        """Filled drawing where HitTest returns all False should fall back to bbox."""
+        drawing = MockDrawing(
+            layer=Eco1_User,
+            bbox=EDA_RECT(2000000, 2000000, 4000000, 4000000),
+            hit_test_func=lambda pos: False,  # HitTest always fails
+            filled=True,
+        )
+
+        _fill_heatsink_drawing(context, drawing)
+
+        # Should still fill via bbox fallback
+        filled_pixels = int(np.sum(context.H > 0))
+        assert filled_pixels > 0, "Should fall back to bbox when HitTest finds nothing"
+
+
+class TestHeatsinkZoneBboxFallback:
+    """Tests for zone HitTest fallback to bounding-box fill."""
+
+    @pytest.fixture
+    def context(self):
+        """Create test context."""
+        K = np.ones((2, 20, 20))
+        V = np.ones((20, 20))
+        H = np.zeros((20, 20))
+        return FillContext(
+            K=K, V=V, H=H,
+            area_mask=None,
+            x_min=0.0, y_min=0.0,
+            res=0.5,
+            rows=20, cols=20
+        )
+
+    def test_zone_hittest_zero_hits_falls_back(self, context):
+        """Zone where HitTest returns all False should fall back to bbox fill."""
+        zone = MockZone(
+            layers=[Eco1_User],
+            bbox=EDA_RECT(2000000, 2000000, 4000000, 4000000),
+            filled=True,
+            hit_test_func=lambda pos: False,  # Always returns False
+        )
+
+        _fill_heatsink_zone(context, zone)
+
+        filled_pixels = int(np.sum(context.H > 0))
+        assert filled_pixels > 0, (
+            "Zone with zero HitTest hits should fall back to bbox fill"
+        )
+
+
+class TestFootprintGraphicsDetection:
+    """Tests for footprint-embedded User.Eco1 graphics detection."""
+
+    @pytest.fixture
+    def context(self):
+        """Create test context."""
+        K = np.ones((2, 20, 20))
+        V = np.ones((20, 20))
+        H = np.zeros((20, 20))
+        return FillContext(
+            K=K, V=V, H=H,
+            area_mask=None,
+            x_min=0.0, y_min=0.0,
+            res=0.5,
+            rows=20, cols=20
+        )
+
+    def test_footprint_eco1_graphic_detected(self, context):
+        """Footprint graphic on User.Eco1 should be detected as heatsink."""
+        eco1_drawing = MockDrawing(
+            layer=Eco1_User,
+            bbox=EDA_RECT(2000000, 2000000, 4000000, 4000000),
+        )
+        fp = MockFootprint(reference="U1", graphical_items=[eco1_drawing])
+        board = MockBoard(footprints=[fp], zones=[], drawings=[])
+        settings = {'use_heatsink': True}
+
+        _detect_heatsink_regions(context, board, settings)
+
+        assert np.sum(context.H > 0) > 0, (
+            "Footprint graphic on Eco1 should fill H_map"
+        )
+
+    def test_footprint_non_eco1_graphic_ignored(self, context):
+        """Footprint graphic on F.Cu should NOT be detected as heatsink."""
+        fcu_drawing = MockDrawing(
+            layer=F_Cu,
+            bbox=EDA_RECT(2000000, 2000000, 4000000, 4000000),
+        )
+        fp = MockFootprint(reference="U1", graphical_items=[fcu_drawing])
+        board = MockBoard(footprints=[fp], zones=[], drawings=[])
+        settings = {'use_heatsink': True}
+
+        _detect_heatsink_regions(context, board, settings)
+
+        assert np.sum(context.H > 0) == 0, (
+            "Footprint graphic on F.Cu should NOT fill H_map"
+        )
+
+    def test_footprint_and_board_drawings_combined(self, context):
+        """Both board drawings and footprint graphics on Eco1 should be detected."""
+        board_drawing = MockDrawing(
+            layer=Eco1_User,
+            bbox=EDA_RECT(0, 0, 2000000, 2000000),
+        )
+        fp_drawing = MockDrawing(
+            layer=Eco1_User,
+            bbox=EDA_RECT(5000000, 5000000, 3000000, 3000000),
+        )
+        fp = MockFootprint(reference="U1", graphical_items=[fp_drawing])
+        board = MockBoard(
+            footprints=[fp],
+            zones=[],
+            drawings=[board_drawing],
+        )
+        settings = {'use_heatsink': True}
+
+        _detect_heatsink_regions(context, board, settings)
+
+        # Both regions should be filled
+        # Board drawing: rows 0-4, cols 0-4
+        assert np.sum(context.H[0:4, 0:4] > 0) > 0, (
+            "Board drawing region should be filled"
+        )
+        # FP drawing: rows 10-16, cols 10-16
+        assert np.sum(context.H[10:16, 10:16] > 0) > 0, (
+            "Footprint drawing region should be filled"
+        )
+
+    def test_diagnostic_logging_includes_fp_count(self, context, capsys):
+        """Diagnostic log should include footprint graphic count."""
+        eco1_drawing = MockDrawing(
+            layer=Eco1_User,
+            bbox=EDA_RECT(2000000, 2000000, 4000000, 4000000),
+        )
+        fp = MockFootprint(reference="U1", graphical_items=[eco1_drawing])
+        board = MockBoard(footprints=[fp], zones=[], drawings=[])
+        settings = {'use_heatsink': True}
+
+        _detect_heatsink_regions(context, board, settings)
+
+        captured = capsys.readouterr()
+        assert "fp-graphic(s)" in captured.out
+        assert "1 fp-graphic(s)" in captured.out

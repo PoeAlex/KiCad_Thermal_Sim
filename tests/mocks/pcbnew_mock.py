@@ -351,6 +351,9 @@ class MockZone:
                 if abs(pos.x - fx) <= margin + 100000 and abs(pos.y - fy) <= margin + 100000:
                     return True
             return False
+        # Use custom hit test function if provided
+        if self._hit_test_func is not None:
+            return self._hit_test_func(pos)
         # Default: check bounding box
         return self._bbox.Contains(pos)
 
@@ -364,16 +367,20 @@ class MockDrawing:
     """Mock drawing object (shapes on User.Eco1, etc.)."""
 
     def __init__(self, layer: int = Eco1_User, bbox: Optional[EDA_RECT] = None,
-                 hit_test_func=None):
+                 hit_test_func=None, filled: bool = False):
         self._layer = layer
         self._bbox = bbox or EDA_RECT(0, 0, 5000000, 5000000)
         self._hit_test_func = hit_test_func
+        self._filled = filled
 
     def GetLayer(self) -> int:
         return self._layer
 
     def GetBoundingBox(self) -> EDA_RECT:
         return self._bbox
+
+    def IsFilled(self) -> bool:
+        return self._filled
 
     def HitTest(self, pos: VECTOR2I) -> bool:
         if self._hit_test_func is not None:
@@ -391,17 +398,24 @@ class MockFootprint:
         Reference designator (e.g., "U1").
     pads : list of MockPad, optional
         Pads belonging to this footprint.
+    graphical_items : list, optional
+        Graphical items (drawings) embedded in this footprint.
     """
 
-    def __init__(self, reference: str = "U1", pads: Optional[List[MockPad]] = None):
+    def __init__(self, reference: str = "U1", pads: Optional[List[MockPad]] = None,
+                 graphical_items: Optional[List] = None):
         self._reference = reference
         self._pads = pads or []
+        self._graphical_items = graphical_items or []
 
     def GetReference(self) -> str:
         return self._reference
 
     def Pads(self) -> List[MockPad]:
         return self._pads
+
+    def GraphicalItems(self) -> List:
+        return self._graphical_items
 
 
 class MockBoard:

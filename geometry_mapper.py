@@ -153,11 +153,11 @@ def _fill_heatsink(ctx, bbox):
 
 def _fill_heatsink_zone(ctx, zone):
     """
-    Mark heatsink area using per-pixel hit-testing on a zone.
+    Mark heatsink area using filled-area hit-testing on a zone.
 
-    Uses zone.HitTest() for pixel-accurate fill of non-rectangular
-    shapes on User.Eco1. Falls back to bounding-box fill if HitTest
-    is not available.
+    Uses zone.HitTestFilledArea() for pixel-accurate fill (same method
+    used for copper zones). Falls back to Outline().Contains(), then
+    HitTest(), then bounding-box fill.
 
     Parameters
     ----------
@@ -166,13 +166,26 @@ def _fill_heatsink_zone(ctx, zone):
     zone : pcbnew.ZONE
         The zone on User.Eco1 to fill.
     """
-    if not hasattr(zone, "HitTest"):
-        _fill_heatsink(ctx, zone.GetBoundingBox())
-        return
-
     bbox = zone.GetBoundingBox()
     rs, re, cs, ce = _bbox_to_grid_indices(bbox, ctx)
     if cs >= ce or rs >= re:
+        return
+
+    # Determine best hit-test method for interior detection
+    # ZONE::HitTest() only checks edges/corners, NOT interior!
+    # We need HitTestFilledArea() or Outline().Contains() for interior.
+    has_filled_hit = hasattr(zone, "HitTestFilledArea")
+    outline = None
+    try:
+        ol = zone.Outline()
+        if ol is not None and hasattr(ol, "Contains"):
+            outline = ol
+    except Exception:
+        pass
+
+    if not has_filled_hit and outline is None:
+        # No interior test available — use bounding-box fill
+        _fill_heatsink(ctx, bbox)
         return
 
     def to_iu(value_mm):
@@ -181,6 +194,16 @@ def _fill_heatsink_zone(ctx, zone):
         except Exception:
             return int(value_mm * 1e6)
 
+    # Get Eco1 layer ID for HitTestFilledArea
+    eco1_lid = None
+    if has_filled_hit:
+        try:
+            eco1_lid = pcbnew.Eco1_User
+        except Exception:
+            pass
+
+    margin_iu = 1
+    hit_count = 0
     for r in range(rs, re):
         y = ctx.y_min + (r + 0.5) * ctx.res
         y_iu = to_iu(y)
@@ -190,19 +213,37 @@ def _fill_heatsink_zone(ctx, zone):
             x = ctx.x_min + (c + 0.5) * ctx.res
             pos = pcbnew.VECTOR2I(to_iu(x), y_iu)
             try:
-                if zone.HitTest(pos):
+                hit = False
+                # Prefer HitTestFilledArea (same as copper zone detection)
+                if eco1_lid is not None:
+                    try:
+                        hit = zone.HitTestFilledArea(eco1_lid, pos, margin_iu)
+                    except Exception:
+                        pass
+                # Fallback: outline polygon containment test
+                if not hit and outline is not None:
+                    try:
+                        hit = outline.Contains(pos)
+                    except Exception:
+                        pass
+                if hit:
                     ctx.H[r, c] = 1.0
+                    hit_count += 1
             except Exception:
                 continue
+
+    # Final fallback: bounding-box fill if nothing worked
+    if hit_count == 0:
+        _fill_heatsink(ctx, bbox)
 
 
 def _fill_heatsink_drawing(ctx, drawing):
     """
-    Mark heatsink area using per-pixel hit-testing on a drawing object.
+    Mark heatsink area for a drawing object on User.Eco1.
 
-    Uses drawing.HitTest() for pixel-accurate fill of non-rectangular
-    shapes on User.Eco1. Falls back to bounding-box fill if HitTest
-    is not available.
+    For filled shapes, uses HitTest() for pixel-accurate fill.
+    For unfilled shapes (the KiCad default), HitTest only detects
+    the outline, so we fall back to bounding-box fill.
 
     Parameters
     ----------
@@ -211,34 +252,46 @@ def _fill_heatsink_drawing(ctx, drawing):
     drawing : pcbnew.BOARD_ITEM
         The drawing object on User.Eco1 to fill.
     """
-    if not hasattr(drawing, "HitTest"):
-        _fill_heatsink(ctx, drawing.GetBoundingBox())
-        return
-
     bbox = drawing.GetBoundingBox()
     rs, re, cs, ce = _bbox_to_grid_indices(bbox, ctx)
     if cs >= ce or rs >= re:
         return
 
-    def to_iu(value_mm):
-        try:
-            return pcbnew.FromMM(value_mm)
-        except Exception:
-            return int(value_mm * 1e6)
+    # Check if shape is filled — filled shapes work correctly with HitTest
+    is_filled = False
+    try:
+        is_filled = drawing.IsFilled()
+    except Exception:
+        pass
 
-    for r in range(rs, re):
-        y = ctx.y_min + (r + 0.5) * ctx.res
-        y_iu = to_iu(y)
-        for c in range(cs, ce):
-            if ctx.area_mask is not None and not ctx.area_mask[r, c]:
-                continue
-            x = ctx.x_min + (c + 0.5) * ctx.res
-            pos = pcbnew.VECTOR2I(to_iu(x), y_iu)
+    # For filled shapes with HitTest: use pixel-accurate fill
+    if is_filled and hasattr(drawing, "HitTest"):
+        def to_iu(value_mm):
             try:
-                if drawing.HitTest(pos):
-                    ctx.H[r, c] = 1.0
+                return pcbnew.FromMM(value_mm)
             except Exception:
-                continue
+                return int(value_mm * 1e6)
+
+        hit_count = 0
+        for r in range(rs, re):
+            y = ctx.y_min + (r + 0.5) * ctx.res
+            y_iu = to_iu(y)
+            for c in range(cs, ce):
+                if ctx.area_mask is not None and not ctx.area_mask[r, c]:
+                    continue
+                x = ctx.x_min + (c + 0.5) * ctx.res
+                pos = pcbnew.VECTOR2I(to_iu(x), y_iu)
+                try:
+                    if drawing.HitTest(pos):
+                        ctx.H[r, c] = 1.0
+                        hit_count += 1
+                except Exception:
+                    continue
+        if hit_count > 0:
+            return  # HitTest worked, done
+
+    # Fallback: bounding-box fill (for unfilled shapes or failed HitTest)
+    _fill_heatsink(ctx, bbox)
 
 
 def _detect_heatsink_regions(ctx, board, settings):
@@ -306,12 +359,32 @@ def _detect_heatsink_regions(ctx, board, settings):
         except Exception:
             continue
 
+    # Check footprint graphics on Eco1_User
+    hs_fp_count = 0
+    try:
+        footprints = board.Footprints() if hasattr(board, 'Footprints') else board.GetFootprints()
+    except Exception:
+        footprints = []
+    for fp in footprints:
+        try:
+            items = fp.GraphicalItems() if hasattr(fp, 'GraphicalItems') else []
+        except Exception:
+            continue
+        for item in items:
+            try:
+                if item.GetLayer() == pcbnew.Eco1_User:
+                    _fill_heatsink_drawing(ctx, item)
+                    hs_fp_count += 1
+            except Exception:
+                continue
+
     # Diagnostic logging
     total_hs = int(np.sum(ctx.H > 0))
     total_cells = ctx.rows * ctx.cols
     pct = 100.0 * total_hs / total_cells if total_cells > 0 else 0.0
     print(f"[ThermalSim] Heatsink: {hs_zone_count} zone(s), "
-          f"{hs_draw_count} drawing(s), {total_hs} pixels ({pct:.1f}%)")
+          f"{hs_draw_count} drawing(s), {hs_fp_count} fp-graphic(s), "
+          f"{total_hs} pixels ({pct:.1f}%)")
     if total_hs == 0:
         print("[ThermalSim][WARN] use_heatsink=True but no heatsink "
               "geometry found on User.Eco1 layer")
