@@ -19,6 +19,108 @@ import matplotlib.pyplot as plt
 import pcbnew
 
 
+def build_interactive_heatmap_payload(
+    T,
+    amb,
+    layer_names,
+    res_mm,
+    x_min_mm=0.0,
+    y_min_mm=0.0,
+    show_all=True,
+    max_delta_c=250.0
+):
+    """
+    Build a JSON-safe payload for the interactive HTML heatmap viewer.
+
+    Parameters
+    ----------
+    T : np.ndarray
+        Temperature array, shape (layers, rows, cols).
+    amb : float
+        Ambient temperature in degrees Celsius.
+    layer_names : list of str
+        Names for each layer.
+    res_mm : float
+        Grid resolution in millimeters.
+    x_min_mm : float, optional
+        Minimum x coordinate of the simulated area in millimeters.
+    y_min_mm : float, optional
+        Minimum y coordinate of the simulated area in millimeters.
+    show_all : bool, optional
+        Whether all layers are visible in the interactive viewer.
+    max_delta_c : float, optional
+        Maximum color scale range above ambient.
+
+    Returns
+    -------
+    dict
+        JSON-safe payload for the HTML report viewer.
+    """
+    T = np.asarray(T)
+    if T.ndim != 3:
+        raise ValueError("Temperature array T must have shape (layers, rows, cols)")
+
+    layer_count, rows, cols = T.shape
+    if show_all or layer_count <= 1:
+        visible_indices = list(range(layer_count))
+    else:
+        visible_indices = sorted({0, layer_count - 1})
+
+    finite_mask = np.isfinite(T)
+    if np.any(finite_mask):
+        vmax = float(np.max(T[finite_mask]))
+    else:
+        vmax = float(amb)
+    vmax = min(vmax, float(amb) + float(max_delta_c))
+    vmax = max(vmax, float(amb))
+
+    def _layer_name(index):
+        if index < len(layer_names):
+            return str(layer_names[index])
+        if index == 0:
+            return "Top (F.Cu)"
+        if index == layer_count - 1:
+            return "Bottom (B.Cu)"
+        return f"Inner {index}"
+
+    def _json_value(value):
+        if value is None or not np.isfinite(value):
+            return None
+        return round(float(value), 3)
+
+    layers = []
+    for index in visible_indices:
+        layer = np.asarray(T[index])
+        finite_layer = np.isfinite(layer)
+        if np.any(finite_layer):
+            layer_min = float(np.min(layer[finite_layer]))
+            layer_max = float(np.max(layer[finite_layer]))
+        else:
+            layer_min = float(amb)
+            layer_max = float(amb)
+        flat_data = [_json_value(val) for val in layer.ravel(order='C')]
+        layers.append({
+            "index": int(index),
+            "name": _layer_name(index),
+            "rows": int(rows),
+            "cols": int(cols),
+            "min_c": round(layer_min, 3),
+            "max_c": round(layer_max, 3),
+            "data": flat_data,
+        })
+
+    return {
+        "ambient_c": round(float(amb), 3),
+        "vmin_c": round(float(amb), 3),
+        "vmax_c": round(vmax, 3),
+        "res_mm": round(float(res_mm), 6),
+        "x_min_mm": round(float(x_min_mm), 6),
+        "y_min_mm": round(float(y_min_mm), 6),
+        "visible_layer_indices": visible_indices,
+        "layers": layers,
+    }
+
+
 def save_stackup_plot(T, H, amb, layer_names, fname, t_elapsed=None):
     """
     Save a multi-layer temperature plot to file.

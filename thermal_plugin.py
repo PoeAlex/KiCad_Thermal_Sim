@@ -26,7 +26,8 @@ from .geometry_mapper import create_multilayer_maps, build_pad_distance_mask, ge
 from .thermal_solver import SolverConfig, build_stiffness_matrix, run_simulation
 from .pwl_parser import parse_pwl_file
 from .visualization import (
-    save_snapshot, show_results_top_bot, show_results_all_layers, save_preview_image
+    save_snapshot, show_results_top_bot, show_results_all_layers, save_preview_image,
+    build_interactive_heatmap_payload
 )
 from .thermal_report import write_html_report
 
@@ -625,6 +626,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             open_file=False, out_dir=run_dir
         )
 
+        interactive_heatmap = build_interactive_heatmap_payload(
+            result.T,
+            amb=amb,
+            layer_names=layer_names,
+            res_mm=res,
+            x_min_mm=x_min,
+            y_min_mm=y_min,
+            show_all=bool(settings.get('show_all', True))
+        )
+
         snapshot_debug = {
             "snapshots_enabled": settings.get('snapshots'),
             "snap_count": settings.get('snap_count'),
@@ -652,7 +663,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             k_norm_info=result.k_norm_info,
             out_dir=run_dir,
             snapshot_debug=snapshot_debug,
-            snapshot_files=result.snapshot_files
+            snapshot_files=result.snapshot_files,
+            interactive_heatmap=interactive_heatmap
         )
 
         # Open outputs

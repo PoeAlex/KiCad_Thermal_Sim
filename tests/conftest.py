@@ -13,6 +13,7 @@ module imports, as several modules import pcbnew at module level.
 import os
 import sys
 import tempfile
+import importlib.util
 
 # ============================================================================
 # CRITICAL: Install pcbnew mock BEFORE any imports that might trigger
@@ -34,6 +35,18 @@ install_wx_mock()
 
 # Now add the plugin directory to path for ThermalSim imports
 sys.path.insert(0, _plugin_dir)
+
+# Support local checkouts whose folder name is not "ThermalSim".
+if 'ThermalSim' not in sys.modules:
+    _spec = importlib.util.spec_from_file_location(
+        'ThermalSim',
+        os.path.join(_plugin_dir, '__init__.py'),
+        submodule_search_locations=[_plugin_dir]
+    )
+    _module = importlib.util.module_from_spec(_spec)
+    sys.modules['ThermalSim'] = _module
+    if _spec.loader is not None:
+        _spec.loader.exec_module(_module)
 
 # Remove tests directory from path (no longer needed)
 sys.path.remove(_tests_dir)

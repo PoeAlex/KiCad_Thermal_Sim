@@ -4,7 +4,9 @@ Unit tests for thermal_report module.
 This module tests the HTML report generation functionality.
 """
 
+import json
 import os
+import re
 import pytest
 import tempfile
 
@@ -13,6 +15,19 @@ from ThermalSim.thermal_report import (
     _esc,
     write_html_report,
 )
+from ThermalSim.visualization import build_interactive_heatmap_payload
+from tests.fixtures.temperature_arrays import create_uniform_temperature
+
+
+def _extract_embedded_heatmap_json(html_text):
+    """Extract and parse the embedded interactive heatmap JSON payload."""
+    match = re.search(
+        r"<script id='interactive-heatmap-data' type='application/json'>(.*?)</script>",
+        html_text,
+        re.DOTALL,
+    )
+    assert match is not None
+    return json.loads(match.group(1))
 
 
 class TestFmtHelper:
@@ -73,6 +88,15 @@ class TestWriteHtmlReport:
     @pytest.fixture
     def basic_report_params(self, temp_dir):
         """Create basic parameters for report generation."""
+        interactive_heatmap = build_interactive_heatmap_payload(
+            create_uniform_temperature(2, 6, 8, temperature=55.0),
+            amb=25.0,
+            layer_names=['F.Cu', 'B.Cu'],
+            res_mm=0.5,
+            x_min_mm=1.0,
+            y_min_mm=2.0,
+            show_all=True
+        )
         return {
             'settings': {
                 'power_str': '1.0',
@@ -105,6 +129,7 @@ class TestWriteHtmlReport:
             'preview_path': None,
             'heatmap_path': None,
             'out_dir': temp_dir,
+            'interactive_heatmap': interactive_heatmap,
         }
 
     def test_report_file_created(self, basic_report_params):
@@ -123,6 +148,7 @@ class TestWriteHtmlReport:
             content = f.read()
 
         assert "KiCad Thermal Sim Report" in content
+        assert "Summary" in content
 
     def test_report_contains_settings(self, basic_report_params):
         """Test that report contains simulation settings."""
@@ -209,6 +235,8 @@ class TestWriteHtmlReport:
             content = f.read()
 
         assert "not available" in content.lower()
+        assert "Geometry Preview" in content
+        assert "Final Heatmap" in content
 
     def test_report_with_k_norm_info(self, basic_report_params):
         """Test report with k_norm_info debug information."""
@@ -283,6 +311,80 @@ class TestWriteHtmlReport:
         assert "</head>" in content
         assert "<body>" in content
         assert "</body>" in content
+
+    def test_report_contains_interactive_viewer_markup(self, basic_report_params):
+        """Interactive heatmap viewer should be embedded in report HTML."""
+        result = write_html_report(**basic_report_params)
+
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        assert "interactive-heatmap-data" in content
+        assert "heatmap-canvas" in content
+        assert "ROI Statistics" in content
+        assert "Clear all" in content
+
+    def test_report_embeds_parseable_heatmap_payload_for_interactivity(self, basic_report_params):
+        """Interactive viewer payload should remain valid JSON in the report HTML."""
+        result = write_html_report(**basic_report_params)
+
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        payload = _extract_embedded_heatmap_json(content)
+
+        assert payload["visible_layer_indices"] == [0, 1]
+        assert [layer["name"] for layer in payload["layers"]] == ["F.Cu", "B.Cu"]
+        assert payload["layers"][0]["rows"] == 6
+        assert payload["layers"][0]["cols"] == 8
+        assert "&quot;" not in content
+        assert "buildOptions()" in content
+        assert "sel.addEventListener('change'" in content
+
+    def test_report_contains_collapsible_debug_sections(self, basic_report_params):
+        """Debug information should remain available in collapsed detail blocks."""
+        params = basic_report_params.copy()
+        params['k_norm_info'] = {'backend': 'SciPy', 'steps_total': 42}
+        params['snapshot_debug'] = {'snapshots_enabled': True}
+
+        result = write_html_report(**params)
+
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        assert "Diagnostics" in content
+        assert "<details>" in content
+        assert "<details open>" not in content
+        assert "Solver Normalization and Debug" in content
+        assert "Snapshot Debug" in content
+
+    def test_report_contains_print_styles(self, basic_report_params):
+        """Printable report CSS should be embedded."""
+        result = write_html_report(**basic_report_params)
+
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        assert "@media print" in content
+        assert "viewer-controls" in content
+
+    def test_report_snapshots_section_is_collapsible(self, basic_report_params, temp_dir):
+        """Snapshots should be present behind a collapsible section."""
+        snap1 = os.path.join(temp_dir, "snap_01_t1.0.png")
+        with open(snap1, 'wb') as f:
+            f.write(b'\x89PNG\r\n\x1a\n')
+
+        params = basic_report_params.copy()
+        params['snapshot_files'] = [(1.0, snap1)]
+
+        result = write_html_report(**params)
+
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        assert "Snapshots" in content
+        assert "snapshot-card" in content
+        assert "snap_01_t1.0.png" in content
 
     def test_report_4_layer_stackup(self, temp_dir):
         """Test report generation for 4-layer stackup."""

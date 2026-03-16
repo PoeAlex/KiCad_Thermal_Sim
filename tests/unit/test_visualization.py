@@ -14,6 +14,7 @@ from ThermalSim.visualization import (
     save_snapshot,
     show_results_top_bot,
     show_results_all_layers,
+    build_interactive_heatmap_payload,
 )
 
 from tests.fixtures.temperature_arrays import (
@@ -406,3 +407,75 @@ class TestVisualizationEdgeCases:
         save_stackup_plot(T, H, amb=25.0, layer_names=[], fname=fname)
 
         assert os.path.exists(fname)
+
+
+class TestBuildInteractiveHeatmapPayload:
+    """Tests for interactive heatmap payload generation."""
+
+    def test_payload_contains_geometry_metadata(self):
+        """Payload should include grid geometry and color scale metadata."""
+        T = create_uniform_temperature(2, 8, 10, temperature=42.0)
+
+        payload = build_interactive_heatmap_payload(
+            T,
+            amb=25.0,
+            layer_names=["F.Cu", "B.Cu"],
+            res_mm=0.25,
+            x_min_mm=12.5,
+            y_min_mm=4.0,
+            show_all=True
+        )
+
+        assert payload["ambient_c"] == 25.0
+        assert payload["vmin_c"] == 25.0
+        assert payload["vmax_c"] == 42.0
+        assert payload["res_mm"] == 0.25
+        assert payload["x_min_mm"] == 12.5
+        assert payload["y_min_mm"] == 4.0
+        assert payload["visible_layer_indices"] == [0, 1]
+        assert payload["layers"][0]["rows"] == 8
+        assert payload["layers"][0]["cols"] == 10
+
+    def test_payload_filters_layers_when_show_all_disabled(self):
+        """Only top and bottom should remain when show_all is false."""
+        T = create_gradient_temperature(4, 6, 6, t_min=25.0, t_max=100.0, direction="layer")
+
+        payload = build_interactive_heatmap_payload(
+            T,
+            amb=25.0,
+            layer_names=["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"],
+            res_mm=0.5,
+            show_all=False
+        )
+
+        assert payload["visible_layer_indices"] == [0, 3]
+        assert [layer["index"] for layer in payload["layers"]] == [0, 3]
+        assert [layer["name"] for layer in payload["layers"]] == ["F.Cu", "B.Cu"]
+
+    def test_payload_clamps_vmax_above_ambient_window(self):
+        """Viewer color scale should clamp extremely high temperatures."""
+        T = create_uniform_temperature(2, 4, 4, temperature=500.0)
+
+        payload = build_interactive_heatmap_payload(
+            T,
+            amb=25.0,
+            layer_names=["F.Cu", "B.Cu"],
+            res_mm=1.0,
+            show_all=True
+        )
+
+        assert payload["vmax_c"] == 275.0
+
+    def test_payload_serializes_row_major_data(self):
+        """Flattened data should preserve row-major ordering."""
+        T = np.array([[[25.0, 30.0], [35.0, 40.0]]], dtype=float)
+
+        payload = build_interactive_heatmap_payload(
+            T,
+            amb=25.0,
+            layer_names=["F.Cu"],
+            res_mm=0.1,
+            show_all=True
+        )
+
+        assert payload["layers"][0]["data"] == [25.0, 30.0, 35.0, 40.0]
