@@ -210,6 +210,8 @@ class TestWriteHtmlReport:
 
         assert "preview.png" in content
         assert "<img" in content
+        assert "Open full-size image" in content
+        assert "target='_blank'" in content
 
     def test_report_with_heatmap_image(self, basic_report_params, temp_dir):
         """Test report with heatmap image path."""
@@ -226,6 +228,7 @@ class TestWriteHtmlReport:
             content = f.read()
 
         assert "heatmap.png" in content
+        assert "rel='noopener'" in content
 
     def test_report_without_images(self, basic_report_params):
         """Test report handles missing images gracefully."""
@@ -323,6 +326,9 @@ class TestWriteHtmlReport:
         assert "heatmap-canvas" in content
         assert "ROI Statistics" in content
         assert "Clear all" in content
+        assert "roi-apply-all-layers" in content
+        assert "Apply ROI to all layers" in content
+        assert "type='checkbox' checked" in content
 
     def test_report_embeds_parseable_heatmap_payload_for_interactivity(self, basic_report_params):
         """Interactive viewer payload should remain valid JSON in the report HTML."""
@@ -340,6 +346,8 @@ class TestWriteHtmlReport:
         assert "&quot;" not in content
         assert "buildOptions()" in content
         assert "sel.addEventListener('change'" in content
+        assert "applyToAllLayers:roiToggle?roiToggle.checked:true" in content
+        assert "roi.mode==='all_layers'" in content
 
     def test_report_contains_collapsible_debug_sections(self, basic_report_params):
         """Debug information should remain available in collapsed detail blocks."""
@@ -367,6 +375,9 @@ class TestWriteHtmlReport:
 
         assert "@media print" in content
         assert "viewer-controls" in content
+        assert "interactive-heatmap-panel" in content
+        assert "diagnostics-section" in content
+        assert "print-hide-col" in content
 
     def test_report_snapshots_section_is_collapsible(self, basic_report_params, temp_dir):
         """Snapshots should be present behind a collapsible section."""
@@ -385,6 +396,7 @@ class TestWriteHtmlReport:
         assert "Snapshots" in content
         assert "snapshot-card" in content
         assert "snap_01_t1.0.png" in content
+        assert "Open snapshot" in content
 
     def test_report_4_layer_stackup(self, temp_dir):
         """Test report generation for 4-layer stackup."""
