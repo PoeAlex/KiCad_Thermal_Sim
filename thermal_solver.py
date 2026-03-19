@@ -171,14 +171,21 @@ def build_stiffness_matrix(
     RC = rows * cols
     N = RC * layer_count
 
-    rows_list = []
-    cols_list = []
-    data_list = []
-
     col_right = np.arange(cols - 1)[None, :]
     row_all = np.arange(rows)[:, None]
     col_all = np.arange(cols)[None, :]
     row_down = np.arange(rows - 1)[:, None]
+    plane_idx = np.arange(RC, dtype=np.int64)
+
+    x_edges = layer_count * rows * max(cols - 1, 0)
+    y_edges = layer_count * max(rows - 1, 0) * cols
+    z_edges = ((layer_count - 1) * RC) if (layer_count > 1 and gap_m) else 0
+    pair_count = x_edges + y_edges + z_edges
+
+    row_idx = np.empty(pair_count * 4, dtype=np.int64)
+    col_idx = np.empty(pair_count * 4, dtype=np.int64)
+    data = np.empty(pair_count * 4, dtype=np.float64)
+    offset = 0
 
     # Build in-plane conduction terms
     for l in range(layer_count):
@@ -198,9 +205,23 @@ def build_stiffness_matrix(
         g = Gx.ravel()
         i_idx = idx_left.ravel()
         j_idx = idx_right.ravel()
-        rows_list.extend([i_idx, j_idx, i_idx, j_idx])
-        cols_list.extend([i_idx, j_idx, j_idx, i_idx])
-        data_list.extend([g, g, -g, -g])
+        n = g.size
+        row_idx[offset:offset + n] = i_idx
+        col_idx[offset:offset + n] = i_idx
+        data[offset:offset + n] = g
+        offset += n
+        row_idx[offset:offset + n] = j_idx
+        col_idx[offset:offset + n] = j_idx
+        data[offset:offset + n] = g
+        offset += n
+        row_idx[offset:offset + n] = i_idx
+        col_idx[offset:offset + n] = j_idx
+        data[offset:offset + n] = -g
+        offset += n
+        row_idx[offset:offset + n] = j_idx
+        col_idx[offset:offset + n] = i_idx
+        data[offset:offset + n] = -g
+        offset += n
 
         # Y-direction coupling
         k_h = 2.0 * k_layer[:-1, :] * k_layer[1:, :] / (k_layer[:-1, :] + k_layer[1:, :] + eps)
@@ -213,26 +234,58 @@ def build_stiffness_matrix(
         g = Gy.ravel()
         i_idx = idx_up.ravel()
         j_idx = idx_down.ravel()
-        rows_list.extend([i_idx, j_idx, i_idx, j_idx])
-        cols_list.extend([i_idx, j_idx, j_idx, i_idx])
-        data_list.extend([g, g, -g, -g])
+        n = g.size
+        row_idx[offset:offset + n] = i_idx
+        col_idx[offset:offset + n] = i_idx
+        data[offset:offset + n] = g
+        offset += n
+        row_idx[offset:offset + n] = j_idx
+        col_idx[offset:offset + n] = j_idx
+        data[offset:offset + n] = g
+        offset += n
+        row_idx[offset:offset + n] = i_idx
+        col_idx[offset:offset + n] = j_idx
+        data[offset:offset + n] = -g
+        offset += n
+        row_idx[offset:offset + n] = j_idx
+        col_idx[offset:offset + n] = i_idx
+        data[offset:offset + n] = -g
+        offset += n
 
     # Inter-layer coupling through vias
     if layer_count > 1 and gap_m:
         V_enh = np.clip(V_map, 1.0, 50.0)
-        plane_idx = np.arange(RC, dtype=np.int64)
         for l in range(layer_count - 1):
             gap_val = max(gap_m[l], 1e-6)
             Gz_base = k_fr4 * pixel_area / gap_val
             Gz = (Gz_base * V_enh).ravel()
             i_idx = l * RC + plane_idx
             j_idx = (l + 1) * RC + plane_idx
-            rows_list.extend([i_idx, j_idx, i_idx, j_idx])
-            cols_list.extend([i_idx, j_idx, j_idx, i_idx])
-            data_list.extend([Gz, Gz, -Gz, -Gz])
+            n = Gz.size
+            row_idx[offset:offset + n] = i_idx
+            col_idx[offset:offset + n] = i_idx
+            data[offset:offset + n] = Gz
+            offset += n
+            row_idx[offset:offset + n] = j_idx
+            col_idx[offset:offset + n] = j_idx
+            data[offset:offset + n] = Gz
+            offset += n
+            row_idx[offset:offset + n] = i_idx
+            col_idx[offset:offset + n] = j_idx
+            data[offset:offset + n] = -Gz
+            offset += n
+            row_idx[offset:offset + n] = j_idx
+            col_idx[offset:offset + n] = i_idx
+            data[offset:offset + n] = -Gz
+            offset += n
+
+    if offset != data.size:
+        row_idx = row_idx[:offset]
+        col_idx = col_idx[:offset]
+        data = data[:offset]
 
     K_base = sp.coo_matrix(
-        (np.concatenate(data_list), (np.concatenate(rows_list), np.concatenate(cols_list))),
+        (data, (row_idx, col_idx)),
         shape=(N, N),
         dtype=np.float64
     ).tocsr()

@@ -14,6 +14,7 @@ import json
 import tempfile
 import subprocess
 import traceback
+from dataclasses import dataclass
 
 import pcbnew
 import numpy as np
@@ -22,7 +23,7 @@ import wx
 from .capabilities import HAS_LIBS, HAS_PARDISO
 from .stackup_parser import parse_stackup_from_board_file, format_stackup_report_um
 from .gui_dialogs import SettingsDialog
-from .geometry_mapper import create_multilayer_maps, build_pad_distance_mask, get_pad_pixels
+from .geometry_mapper import build_geometry_state, create_multilayer_maps, get_pad_pixels
 from .thermal_solver import SolverConfig, build_stiffness_matrix, run_simulation
 from .pwl_parser import parse_pwl_file
 from .visualization import (
@@ -30,6 +31,213 @@ from .visualization import (
     build_interactive_heatmap_payload
 )
 from .thermal_report import write_html_report
+
+
+@dataclass
+class SparsePadContribution:
+    """Sparse per-pad power distribution on the simulation grid."""
+
+    indices: np.ndarray
+    weights: np.ndarray
+
+
+def _bbox_to_power_indices(bbox, target_idx, rows, cols, x_min, y_min, res, rc):
+    """
+    Convert a pad bounding box to flattened node indices on one copper layer.
+
+    Parameters
+    ----------
+    bbox : pcbnew.EDA_RECT
+        Pad bounding box in KiCad internal units.
+    target_idx : int
+        Target copper layer index.
+    rows : int
+        Number of grid rows.
+    cols : int
+        Number of grid columns.
+    x_min : float
+        Grid origin x coordinate in millimeters.
+    y_min : float
+        Grid origin y coordinate in millimeters.
+    res : float
+        Grid resolution in millimeters.
+    rc : int
+        Number of nodes per layer.
+
+    Returns
+    -------
+    np.ndarray
+        Flattened node indices for the rectangular pad extent.
+    """
+    x0 = bbox.GetX() * 1e-6
+    y0 = bbox.GetY() * 1e-6
+    w = bbox.GetWidth() * 1e-6
+    h = bbox.GetHeight() * 1e-6
+    cs = max(0, int((x0 - x_min) / res))
+    rs = max(0, int((y0 - y_min) / res))
+    ce = min(cols, int((x0 + w - x_min) / res) + 1)
+    re = min(rows, int((y0 + h - y_min) / res) + 1)
+    if cs >= ce or rs >= re:
+        return np.empty(0, dtype=np.int64)
+
+    row_offsets = np.arange(rs, re, dtype=np.int64) * cols
+    col_offsets = np.arange(cs, ce, dtype=np.int64)
+    return target_idx * rc + (row_offsets[:, None] + col_offsets[None, :]).ravel(order="C")
+
+
+def _pad_target_layer_index(board, copper_ids, pad, lid_to_idx):
+    """
+    Resolve the solver layer index for a pad.
+
+    Parameters
+    ----------
+    board : pcbnew.BOARD
+        The active board object.
+    copper_ids : list of int
+        Copper layer IDs in stackup order.
+    pad : pcbnew.PAD
+        Pad to place on the thermal grid.
+    lid_to_idx : dict
+        Mapping from KiCad layer IDs to solver indices.
+
+    Returns
+    -------
+    int
+        Target copper layer index for the pad.
+    """
+    pad_lid = pad.GetLayer()
+    target_idx = lid_to_idx.get(pad_lid)
+    if target_idx is not None:
+        return target_idx
+
+    try:
+        lname = board.GetLayerName(pad_lid).upper()
+    except Exception:
+        lname = ""
+    return len(copper_ids) - 1 if ("B." in lname or "BOT" in lname) else 0
+
+
+def _build_sparse_pad_contributions(board, copper_ids, pads_list, rows, cols, x_min, y_min, res):
+    """
+    Build sparse per-pad unit power distributions.
+
+    Parameters
+    ----------
+    board : pcbnew.BOARD
+        The active board object.
+    copper_ids : list of int
+        Copper layer IDs in stackup order.
+    pads_list : list
+        Selected pads used as heat sources.
+    rows : int
+        Number of grid rows.
+    cols : int
+        Number of grid columns.
+    x_min : float
+        Grid origin x coordinate in millimeters.
+    y_min : float
+        Grid origin y coordinate in millimeters.
+    res : float
+        Grid resolution in millimeters.
+
+    Returns
+    -------
+    list of SparsePadContribution
+        Sparse power distributions normalized to 1 W per pad.
+    """
+    rc = rows * cols
+    lid_to_idx = {lid: idx for idx, lid in enumerate(copper_ids)}
+    contributions = []
+
+    for pad in pads_list:
+        target_idx = _pad_target_layer_index(board, copper_ids, pad, lid_to_idx)
+        indices = _bbox_to_power_indices(
+            pad.GetBoundingBox(),
+            target_idx=target_idx,
+            rows=rows,
+            cols=cols,
+            x_min=x_min,
+            y_min=y_min,
+            res=res,
+            rc=rc,
+        )
+        if indices.size:
+            weights = np.full(indices.shape, 1.0 / float(indices.size), dtype=np.float64)
+        else:
+            weights = np.empty(0, dtype=np.float64)
+        contributions.append(SparsePadContribution(indices=indices, weights=weights))
+
+    return contributions
+
+
+def _build_power_vector(pad_sources, pad_contributions, total_nodes):
+    """
+    Build the constant power vector and optional time-varying callback.
+
+    Parameters
+    ----------
+    pad_sources : list
+        Parsed pad source descriptors: ('const', value) or ('pwl', (times, powers)).
+    pad_contributions : list of SparsePadContribution
+        Sparse per-pad unit distributions.
+    total_nodes : int
+        Total number of thermal nodes.
+
+    Returns
+    -------
+    tuple
+        (Q, Q_func) where Q is the initial dense power vector and Q_func is an
+        optional callback for time-varying inputs.
+    """
+    q_const = np.zeros(total_nodes, dtype=np.float64)
+    pwl_terms = []
+
+    for idx, (source_type, source_value) in enumerate(pad_sources):
+        if idx >= len(pad_contributions):
+            break
+        contribution = pad_contributions[idx]
+        if contribution.indices.size == 0:
+            continue
+        if source_type == 'const':
+            q_const[contribution.indices] += float(source_value) * contribution.weights
+        else:
+            times, powers = source_value
+            pwl_terms.append((
+                np.asarray(times, dtype=np.float64),
+                np.asarray(powers, dtype=np.float64),
+                contribution.indices,
+                contribution.weights,
+            ))
+
+    if not pwl_terms:
+        return q_const, None
+
+    q_initial = q_const.copy()
+    for times, powers, indices, weights in pwl_terms:
+        q_initial[indices] += float(np.interp(0.0, times, powers)) * weights
+
+    def q_func(t, _q_const=q_const, _pwl_terms=tuple(pwl_terms)):
+        q_t = _q_const.copy()
+        for times, powers, indices, weights in _pwl_terms:
+            q_t[indices] += float(np.interp(t, times, powers)) * weights
+        return q_t
+
+    return q_initial, q_func
+
+
+def _format_timing_summary(timings):
+    """Format initialization timings for console output."""
+    parts = []
+    for key in (
+        "zone_refill_s",
+        "geometry_maps_s",
+        "capacity_build_s",
+        "power_vector_build_s",
+        "stiffness_matrix_s",
+    ):
+        if key in timings:
+            parts.append(f"{key}={float(timings[key]):.4f}s")
+    return ", ".join(parts)
 
 
 class ThermalPlugin(pcbnew.ActionPlugin):
@@ -53,6 +261,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.copper_ids = []
         self.bbox = None
         self.pads_list = []
+        self.stack_info = None
+        self.last_zone_refill_s = 0.0
 
     def _settings_path(self):
         """Return path to settings persistence file."""
@@ -102,10 +312,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         board = pcbnew.GetBoard()
 
         # Keep zone fills up-to-date
+        zone_refill_start = time.perf_counter()
         try:
             pcbnew.ZONE_FILLER(board).Fill(board.Zones())
         except Exception:
             pass
+        zone_refill_s = time.perf_counter() - zone_refill_start
 
         # --- 1. Layer Detection ---
         copper_ids, layer_names = self._detect_copper_layers(board)
@@ -138,6 +350,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.copper_ids = copper_ids
         self.bbox = bbox
         self.pads_list = pads_list
+        self.stack_info = stack_info
+        self.last_zone_refill_s = zone_refill_s
 
         # --- 4. Show Dialog ---
         stackup_details = format_stackup_report_um(stack_info) if stack_info else ""
@@ -168,7 +382,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # --- 5. Run Simulation ---
         self._run_simulation(
             board, copper_ids, layer_names, bbox, pads_list,
-            settings, stack_info, pad_names
+            settings, stack_info, pad_names, zone_refill_s=zone_refill_s
         )
 
     def _detect_copper_layers(self, board):
@@ -307,7 +521,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         output_file = save_preview_image(
             self.board, self.copper_ids, self.bbox, self.pads_list,
             settings, layer_names,
-            parse_stackup_from_board_file(self.board),
+            self.stack_info if self.stack_info is not None else parse_stackup_from_board_file(self.board),
             get_pad_pixels,
             create_multilayer_maps,
             self._derive_stackup_thicknesses,
@@ -317,11 +531,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             wx.MessageBox("Board data missing for preview", "Error")
 
     def _run_simulation(self, board, copper_ids, layer_names, bbox, pads_list,
-                        settings, stack_info, pad_names):
+                        settings, stack_info, pad_names, zone_refill_s=0.0):
         """Execute the thermal simulation."""
         # Derive thicknesses
         stackup_derived = self._derive_stackup_thicknesses(board, copper_ids, stack_info, settings)
         total_thick_mm = stackup_derived["total_thick_mm_used"]
+        init_timings = {"zone_refill_s": float(zone_refill_s)}
 
         # Output folder setup
         base_output_dir = settings.get('output_dir') or os.path.dirname(__file__)
@@ -366,9 +581,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # Physical parameters
         k_fr4_rel = 1.0
-        k_cu_rel = 400.0
         via_factor = 390.0 / 0.3
-        ref_cu_thick_m = 35e-6
         k_cu = 390.0
         k_fr4 = 0.3
         rho_cu, cp_cu = 8960.0, 385.0
@@ -378,17 +591,29 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         gap_mm_used = stackup_derived["gap_mm_used"]
         cu_thick_m = [max(1e-9, th * 1e-3) for th in cu_thick_mm_used]
         gap_m = [max(1e-9, g * 1e-3) for g in gap_mm_used]
-        k_cu_layers = [k_cu_rel * (th / ref_cu_thick_m) for th in cu_thick_m]
 
-        # Create geometry maps
+        # Build internal geometry state
+        geometry_start = time.perf_counter()
         try:
-            K, V_map, H_map = create_multilayer_maps(
-                board, copper_ids, rows, cols, x_min, y_min, res,
-                settings, k_fr4_rel, k_cu_layers, via_factor, pads_list
+            geometry_state = build_geometry_state(
+                board=board,
+                copper_ids=copper_ids,
+                rows=rows,
+                cols=cols,
+                x_min=x_min,
+                y_min=y_min,
+                res=res,
+                settings=settings,
+                via_factor=via_factor,
+                pads_list=pads_list,
             )
         except Exception as e:
             wx.MessageBox(f"Error mapping geometry: {e}", "Error")
             return
+        init_timings["geometry_maps_s"] = time.perf_counter() - geometry_start
+        copper_mask = geometry_state.copper_mask
+        V_map = geometry_state.via_map
+        H_map = geometry_state.heatsink_mask.astype(np.float64, copy=False)
 
         # Time step calculation
         dx = res * 1e-3
@@ -401,7 +626,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         amb = settings['amb']
         pixel_area = dx * dy
         copper_threshold_rel = k_fr4_rel * 1.5
-        copper_mask = K > copper_threshold_rel
         t_cu = np.array(cu_thick_m)
 
         # Effective FR4 thickness per layer
@@ -421,6 +645,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         t_fr4_eff_mm = (t_fr4_eff * 1e3).tolist()
 
         # Heat capacity
+        capacity_start = time.perf_counter()
         C_layers = np.empty((layer_count, rows, cols), dtype=np.float64)
         for l in range(layer_count):
             V_cu = pixel_area * t_cu[l]
@@ -434,10 +659,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             pad_cap_per_cell = pad_cap_areal * pixel_area
             C_layers[-1] += pad_cap_per_cell * H_map
         C = C_layers.reshape(-1)
+        init_timings["capacity_build_s"] = time.perf_counter() - capacity_start
 
         # Power injection (supports constant values and PWL file paths)
         RC = rows * cols
         N = RC * layer_count
+        power_start = time.perf_counter()
 
         entries = [x.strip() for x in settings['power_str'].split(',')]
         if len(entries) == 1:
@@ -466,52 +693,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 "Warning"
             )
 
-        # Build per-pad unit Q vectors (spatial distribution at 1W)
-        Q_units = []
-        for idx, pad in enumerate(pads_list):
-            Q_pad = np.zeros(N, dtype=np.float64)
-            pad_lid = pad.GetLayer()
-            target_idx = 0
-            if pad_lid in copper_ids:
-                target_idx = copper_ids.index(pad_lid)
-            else:
-                lname = board.GetLayerName(pad_lid).upper()
-                target_idx = layer_count - 1 if ("B." in lname or "BOT" in lname) else 0
-            pixels = get_pad_pixels(pad, rows, cols, x_min, y_min, res)
-            if pixels:
-                pix = np.array(pixels, dtype=np.int64)
-                r, c = pix[:, 0], pix[:, 1]
-                valid = (r < rows) & (c < cols) & (r >= 0) & (c >= 0)
-                r, c = r[valid], c[valid]
-                if r.size > 0:
-                    idxs = target_idx * RC + r * cols + c
-                    np.add.at(Q_pad, idxs, 1.0 / float(r.size))
-            Q_units.append(Q_pad)
-
-        # Build constant Q and detect PWL usage
-        has_pwl = any(s[0] == 'pwl' for s in pad_sources)
-
-        Q = np.zeros(N, dtype=np.float64)
-        for i, (stype, sval) in enumerate(pad_sources):
-            if i >= len(Q_units):
-                break
-            if stype == 'const':
-                Q += sval * Q_units[i]
-            else:
-                Q += float(np.interp(0.0, sval[0], sval[1])) * Q_units[i]
-
-        Q_func = None
-        if has_pwl:
-            def Q_func(t, _sources=pad_sources, _units=Q_units, _N=N):
-                Q_t = np.zeros(_N, dtype=np.float64)
-                for i, (stype, sval) in enumerate(_sources):
-                    if i >= len(_units):
-                        break
-                    if stype == 'const':
-                        Q_t += sval * _units[i]
-                    else:
-                        Q_t += float(np.interp(t, sval[0], sval[1])) * _units[i]
-                return Q_t
+        pad_contributions = _build_sparse_pad_contributions(
+            board=board,
+            copper_ids=copper_ids,
+            pads_list=pads_list,
+            rows=rows,
+            cols=cols,
+            x_min=x_min,
+            y_min=y_min,
+            res=res,
+        )
+        Q, Q_func = _build_power_vector(pad_sources, pad_contributions, N)
+        init_timings["power_vector_build_s"] = time.perf_counter() - power_start
 
         # Build pad_power for reporting
         pad_power = []
@@ -526,10 +719,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 pad_power.append((name, None))
 
         # Build stiffness matrix
+        stiffness_start = time.perf_counter()
         K_matrix, b, hA, _ = build_stiffness_matrix(
             layer_count, rows, cols, copper_mask, t_cu, t_fr4_eff,
             k_cu, k_fr4, dx, dy, V_map, gap_m, H_map, settings, amb
         )
+        init_timings["stiffness_matrix_s"] = time.perf_counter() - stiffness_start
+        print(f"[ThermalSim] init timings: {_format_timing_summary(init_timings)}")
 
         # Snapshot configuration
         snap_times = []
@@ -604,6 +800,11 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "pad_cap_input_areal": pad_cap_areal,
             "h_top": float(settings.get('h_conv', 10.0)),
             "h_air_bottom": float(settings.get('h_conv', 10.0)),
+            "init_zone_refill_s": init_timings.get("zone_refill_s"),
+            "init_geometry_maps_s": init_timings.get("geometry_maps_s"),
+            "init_capacity_build_s": init_timings.get("capacity_build_s"),
+            "init_power_vector_build_s": init_timings.get("power_vector_build_s"),
+            "init_stiffness_matrix_s": init_timings.get("stiffness_matrix_s"),
         })
 
         # Save results
@@ -650,6 +851,11 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "factorizations": result.factor_count,
             "factorization_s": result.total_factor_time,
             "phase_metrics": json.dumps(result.phase_metrics),
+            "init_zone_refill_s": init_timings.get("zone_refill_s"),
+            "init_geometry_maps_s": init_timings.get("geometry_maps_s"),
+            "init_capacity_build_s": init_timings.get("capacity_build_s"),
+            "init_power_vector_build_s": init_timings.get("power_vector_build_s"),
+            "init_stiffness_matrix_s": init_timings.get("stiffness_matrix_s"),
         }
 
         report_path = write_html_report(

@@ -23,6 +23,115 @@ from ThermalSim.thermal_solver import (
 )
 
 
+def _build_stiffness_matrix_reference(
+    layer_count,
+    rows,
+    cols,
+    copper_mask,
+    t_cu,
+    t_fr4_eff,
+    k_cu,
+    k_fr4,
+    dx,
+    dy,
+    V_map,
+    gap_m,
+    H_map,
+    settings,
+    amb
+):
+    """Reference implementation matching the preallocation refactor mathematically."""
+    eps = 1e-12
+    pixel_area = dx * dy
+    rc = rows * cols
+    n = rc * layer_count
+
+    rows_list = []
+    cols_list = []
+    data_list = []
+
+    col_right = np.arange(cols - 1)[None, :]
+    row_all = np.arange(rows)[:, None]
+    col_all = np.arange(cols)[None, :]
+    row_down = np.arange(rows - 1)[:, None]
+
+    for layer in range(layer_count):
+        base = layer * rc
+        mask = copper_mask[layer]
+        k_layer = np.where(mask, k_cu, k_fr4)
+        t_layer = np.where(mask, t_cu[layer], t_fr4_eff[layer])
+
+        k_h = 2.0 * k_layer[:, :-1] * k_layer[:, 1:] / (k_layer[:, :-1] + k_layer[:, 1:] + eps)
+        t_edge = 0.5 * (t_layer[:, :-1] + t_layer[:, 1:])
+        gx = k_h * (t_edge * dy) / dx
+        idx_left = base + row_all * cols + col_right
+        idx_right = idx_left + 1
+
+        g = gx.ravel()
+        i_idx = idx_left.ravel()
+        j_idx = idx_right.ravel()
+        rows_list.extend([i_idx, j_idx, i_idx, j_idx])
+        cols_list.extend([i_idx, j_idx, j_idx, i_idx])
+        data_list.extend([g, g, -g, -g])
+
+        k_h = 2.0 * k_layer[:-1, :] * k_layer[1:, :] / (k_layer[:-1, :] + k_layer[1:, :] + eps)
+        t_edge = 0.5 * (t_layer[:-1, :] + t_layer[1:, :])
+        gy = k_h * (t_edge * dx) / dy
+        idx_up = base + row_down * cols + col_all
+        idx_down = idx_up + cols
+
+        g = gy.ravel()
+        i_idx = idx_up.ravel()
+        j_idx = idx_down.ravel()
+        rows_list.extend([i_idx, j_idx, i_idx, j_idx])
+        cols_list.extend([i_idx, j_idx, j_idx, i_idx])
+        data_list.extend([g, g, -g, -g])
+
+    if layer_count > 1 and gap_m:
+        v_enh = np.clip(V_map, 1.0, 50.0)
+        plane_idx = np.arange(rc, dtype=np.int64)
+        for layer in range(layer_count - 1):
+            gap_val = max(gap_m[layer], 1e-6)
+            gz_base = k_fr4 * pixel_area / gap_val
+            gz = (gz_base * v_enh).ravel()
+            i_idx = layer * rc + plane_idx
+            j_idx = (layer + 1) * rc + plane_idx
+            rows_list.extend([i_idx, j_idx, i_idx, j_idx])
+            cols_list.extend([i_idx, j_idx, j_idx, i_idx])
+            data_list.extend([gz, gz, -gz, -gz])
+
+    k_base = sp.coo_matrix(
+        (np.concatenate(data_list), (np.concatenate(rows_list), np.concatenate(cols_list))),
+        shape=(n, n),
+        dtype=np.float64,
+    ).tocsr()
+
+    diag_extra = np.zeros(n, dtype=np.float64)
+    b = np.zeros(n, dtype=np.float64)
+
+    h_top = float(settings.get('h_conv', 10.0))
+    diag_add_top = h_top * pixel_area
+    top_idx = np.arange(rc, dtype=np.int64)
+    diag_extra[top_idx] += diag_add_top
+    b[top_idx] += diag_add_top * amb
+
+    h_air_bot = float(settings.get('h_conv', 10.0))
+    pad_thick_m = max(0.0001, settings['pad_th'] * 1e-3)
+    pad_k = settings['pad_k']
+    h_sink = (pad_k / pad_thick_m) * 0.2
+    h_bot_eff = (1.0 - H_map) * h_air_bot + H_map * h_sink
+    diag_add_bot = (h_bot_eff * pixel_area).ravel()
+    bot_idx = (layer_count - 1) * rc + top_idx
+    diag_extra[bot_idx] += diag_add_bot
+    b[bot_idx] += diag_add_bot * amb
+
+    hA = np.zeros(n, dtype=np.float64)
+    hA[top_idx] += diag_add_top
+    hA[bot_idx] += diag_add_bot
+
+    return k_base + sp.diags(diag_extra, format="csr"), b, hA, diag_extra
+
+
 class TestSolverConfig:
     """Tests for SolverConfig dataclass."""
 
@@ -186,6 +295,16 @@ class TestBuildStiffnessMatrix:
         norm_cu = sp.linalg.norm(K_cu)
 
         assert norm_cu > norm_fr4, "Copper should increase matrix norm"
+
+    def test_matches_reference_assembly(self, simple_setup):
+        """Preallocated COO assembly should match the legacy reference implementation."""
+        K_ref, b_ref, hA_ref, diag_ref = _build_stiffness_matrix_reference(**simple_setup)
+        K_new, b_new, hA_new, diag_new = build_stiffness_matrix(**simple_setup)
+
+        np.testing.assert_allclose((K_new - K_ref).toarray(), 0.0, atol=1e-12)
+        np.testing.assert_allclose(b_new, b_ref, atol=1e-12)
+        np.testing.assert_allclose(hA_new, hA_ref, atol=1e-12)
+        np.testing.assert_allclose(diag_new, diag_ref, atol=1e-12)
 
 
 class TestRunSimulation:

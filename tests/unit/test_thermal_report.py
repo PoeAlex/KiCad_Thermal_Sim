@@ -456,6 +456,26 @@ class TestWriteHtmlReport:
 
         assert "Snapshot Debug" in content
 
+    def test_report_contains_initialization_timing_debug(self, basic_report_params):
+        """Initialization timing metrics should appear in diagnostics output."""
+        params = basic_report_params.copy()
+        params['snapshot_debug'] = {
+            'init_zone_refill_s': 0.12,
+            'init_geometry_maps_s': 0.34,
+            'init_capacity_build_s': 0.05,
+            'init_power_vector_build_s': 0.02,
+            'init_stiffness_matrix_s': 0.17,
+        }
+
+        result = write_html_report(**params)
+
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        assert "init_zone_refill_s" in content
+        assert "init_geometry_maps_s" in content
+        assert "init_stiffness_matrix_s" in content
+
     def test_report_effective_dielectric_section(self, basic_report_params):
         """Test that effective dielectric thickness section is present."""
         params = basic_report_params.copy()

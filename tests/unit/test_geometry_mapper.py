@@ -9,6 +9,7 @@ import numpy as np
 
 from ThermalSim.geometry_mapper import (
     FillContext,
+    build_geometry_state,
     _bbox_to_grid_indices,
     _fill_box,
     _fill_via,
@@ -521,3 +522,68 @@ class TestCreateMultilayerMaps:
         assert K is not None
         # Some regions should be FR4 (not filled due to mask)
         # but near pads should be processed
+
+    def test_wrapper_matches_internal_geometry_state(self, basic_setup):
+        """Materialized maps should match the internal GeometryState."""
+        state = build_geometry_state(
+            board=basic_setup['board'],
+            copper_ids=basic_setup['copper_ids'],
+            rows=basic_setup['rows'],
+            cols=basic_setup['cols'],
+            x_min=basic_setup['x_min'],
+            y_min=basic_setup['y_min'],
+            res=basic_setup['res'],
+            settings=basic_setup['settings'],
+            via_factor=basic_setup['via_factor'],
+            pads_list=basic_setup['pads_list'],
+        )
+        K, V, H = create_multilayer_maps(**basic_setup)
+
+        expected_K = np.full(K.shape, basic_setup['k_fr4'], dtype=np.float64)
+        for layer_idx, layer_value in enumerate(basic_setup['k_cu_layers']):
+            expected_K[layer_idx, state.copper_mask[layer_idx]] = layer_value
+
+        np.testing.assert_array_equal(K, expected_K)
+        np.testing.assert_array_equal(V, state.via_map)
+        np.testing.assert_array_equal(H, state.heatsink_mask.astype(np.float64))
+
+    def test_zone_fill_mask_respects_hit_test_filled_area(self):
+        """Zone fill should follow HitTestFilledArea cell selection."""
+        fill_mask = {
+            (1500000, 1500000),
+            (2500000, 1500000),
+        }
+        zone = MockZone(
+            layers=[F_Cu],
+            bbox=EDA_RECT(1000000, 1000000, 2000000, 1000000),
+            filled=True,
+            fill_mask=fill_mask,
+        )
+        board = MockBoard(
+            zones=[zone],
+            layer_names={F_Cu: "F.Cu"},
+        )
+        settings = {
+            'ignore_traces': False,
+            'ignore_polygons': False,
+            'limit_area': False,
+            'pad_dist_mm': 0.0,
+            'use_heatsink': False,
+        }
+
+        state = build_geometry_state(
+            board=board,
+            copper_ids=[F_Cu],
+            rows=6,
+            cols=6,
+            x_min=0.0,
+            y_min=0.0,
+            res=1.0,
+            settings=settings,
+            via_factor=1300.0,
+            pads_list=[],
+        )
+
+        assert state.copper_mask[0, 1, 1]
+        assert state.copper_mask[0, 1, 2]
+        assert np.count_nonzero(state.copper_mask[0]) == 2

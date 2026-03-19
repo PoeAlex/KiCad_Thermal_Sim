@@ -7,7 +7,7 @@ discretized conductivity arrays for thermal simulation.
 
 import math
 from dataclasses import dataclass
-from typing import Optional, List, Set
+from typing import Optional, Set
 
 import numpy as np
 import pcbnew
@@ -53,6 +53,49 @@ class FillContext:
     cols: int
 
 
+@dataclass
+class GeometryState:
+    """
+    Internal geometry representation for fast map construction.
+
+    Attributes
+    ----------
+    copper_mask : np.ndarray
+        Boolean copper occupancy mask, shape (layers, rows, cols).
+    via_map : np.ndarray
+        Via enhancement map, shape (rows, cols).
+    heatsink_mask : np.ndarray
+        Boolean heatsink/thermal-pad mask, shape (rows, cols).
+    area_mask : np.ndarray or None
+        Boolean mask limiting the simulation area.
+    x_min : float
+        X coordinate of grid origin in mm.
+    y_min : float
+        Y coordinate of grid origin in mm.
+    res : float
+        Grid resolution in mm.
+    rows : int
+        Number of grid rows.
+    cols : int
+        Number of grid columns.
+    x_centers_iu : np.ndarray
+        Precomputed x cell centers in KiCad internal units.
+    y_centers_iu : np.ndarray
+        Precomputed y cell centers in KiCad internal units.
+    """
+    copper_mask: np.ndarray
+    via_map: np.ndarray
+    heatsink_mask: np.ndarray
+    area_mask: Optional[np.ndarray]
+    x_min: float
+    y_min: float
+    res: float
+    rows: int
+    cols: int
+    x_centers_iu: np.ndarray
+    y_centers_iu: np.ndarray
+
+
 def _bbox_to_grid_indices(bbox, ctx):
     """
     Convert a KiCad bounding box to grid indices.
@@ -77,6 +120,28 @@ def _bbox_to_grid_indices(bbox, ctx):
     ce = min(ctx.cols, int((x0 + w - ctx.x_min) / ctx.res) + 1)
     re = min(ctx.rows, int((y0 + h - ctx.y_min) / ctx.res) + 1)
     return rs, re, cs, ce
+
+
+def _grid_centers_to_iu(count, origin_mm, res_mm):
+    """
+    Convert grid cell centers to KiCad internal units.
+
+    Parameters
+    ----------
+    count : int
+        Number of cells along one axis.
+    origin_mm : float
+        Grid origin in millimeters.
+    res_mm : float
+        Grid spacing in millimeters.
+
+    Returns
+    -------
+    np.ndarray
+        Cell centers in KiCad internal units.
+    """
+    centers_mm = origin_mm + (np.arange(count, dtype=np.float64) + 0.5) * res_mm
+    return np.asarray(centers_mm * 1e6, dtype=np.int64)
 
 
 def _fill_box(ctx, l_idx, bbox, val):
@@ -205,6 +270,362 @@ def _fill_zone(ctx, l_idx, lid, zone, val):
                     ctx.K[l_idx, r, c] = max(ctx.K[l_idx, r, c], val)
             except Exception:
                 continue
+
+
+def _state_fill_box(state, l_idx, bbox):
+    """Mark copper occupancy in a rectangular region."""
+    rs, re, cs, ce = _bbox_to_grid_indices(bbox, state)
+    if cs >= ce or rs >= re or rs >= state.rows or cs >= state.cols:
+        return
+
+    target = state.copper_mask[l_idx, rs:re, cs:ce]
+    if state.area_mask is None:
+        target[...] = True
+        return
+
+    region_mask = state.area_mask[rs:re, cs:ce]
+    if np.any(region_mask):
+        target |= region_mask
+
+
+def _state_fill_box_all_layers(state, bbox):
+    """Mark copper occupancy for all layers in a rectangular region."""
+    rs, re, cs, ce = _bbox_to_grid_indices(bbox, state)
+    if cs >= ce or rs >= re or rs >= state.rows or cs >= state.cols:
+        return
+
+    target = state.copper_mask[:, rs:re, cs:ce]
+    if state.area_mask is None:
+        target[...] = True
+        return
+
+    region_mask = state.area_mask[rs:re, cs:ce]
+    if np.any(region_mask):
+        target |= region_mask[None, :, :]
+
+
+def _state_fill_via(state, bbox, val):
+    """Apply via enhancement in a rectangular region."""
+    rs, re, cs, ce = _bbox_to_grid_indices(bbox, state)
+    if cs >= ce or rs >= re or rs >= state.rows or cs >= state.cols:
+        return
+
+    target = state.via_map[rs:re, cs:ce]
+    if state.area_mask is None:
+        np.maximum(target, val, out=target)
+        return
+
+    region_mask = state.area_mask[rs:re, cs:ce]
+    if np.any(region_mask):
+        np.maximum(target, val, out=target, where=region_mask)
+
+
+def _state_fill_heatsink(state, bbox):
+    """Mark heatsink occupancy in a rectangular region."""
+    rs, re, cs, ce = _bbox_to_grid_indices(bbox, state)
+    if cs >= ce or rs >= re or rs >= state.rows or cs >= state.cols:
+        return
+
+    target = state.heatsink_mask[rs:re, cs:ce]
+    if state.area_mask is None:
+        target[...] = True
+        return
+
+    region_mask = state.area_mask[rs:re, cs:ce]
+    if np.any(region_mask):
+        target |= region_mask
+
+
+def _fill_zone_mask_hit_test_filled(mask, area_mask, x_vals, y_vals, lid, zone):
+    """Populate a boolean mask using HitTestFilledArea."""
+    hit_test = zone.HitTestFilledArea
+    vector_ctor = pcbnew.VECTOR2I
+    margin_iu = 1
+
+    try:
+        if area_mask is None:
+            for r_idx, y_iu in enumerate(y_vals):
+                row_mask = mask[r_idx]
+                for c_idx, x_iu in enumerate(x_vals):
+                    row_mask[c_idx] = bool(hit_test(lid, vector_ctor(int(x_iu), int(y_iu)), margin_iu))
+        else:
+            for r_idx, y_iu in enumerate(y_vals):
+                allowed = area_mask[r_idx]
+                if not np.any(allowed):
+                    continue
+                row_mask = mask[r_idx]
+                for c_idx, x_iu in enumerate(x_vals):
+                    if allowed[c_idx]:
+                        row_mask[c_idx] = bool(hit_test(lid, vector_ctor(int(x_iu), int(y_iu)), margin_iu))
+    except Exception:
+        for r_idx, y_iu in enumerate(y_vals):
+            try:
+                row_mask = mask[r_idx]
+                if area_mask is None:
+                    for c_idx, x_iu in enumerate(x_vals):
+                        row_mask[c_idx] = bool(hit_test(lid, vector_ctor(int(x_iu), int(y_iu)), margin_iu))
+                else:
+                    allowed = area_mask[r_idx]
+                    if not np.any(allowed):
+                        continue
+                    for c_idx, x_iu in enumerate(x_vals):
+                        if allowed[c_idx]:
+                            row_mask[c_idx] = bool(hit_test(lid, vector_ctor(int(x_iu), int(y_iu)), margin_iu))
+            except Exception:
+                continue
+
+
+def _fill_zone_mask_hit_test(mask, area_mask, x_vals, y_vals, zone):
+    """Populate a boolean mask using generic HitTest."""
+    hit_test = zone.HitTest
+    vector_ctor = pcbnew.VECTOR2I
+
+    try:
+        if area_mask is None:
+            for r_idx, y_iu in enumerate(y_vals):
+                row_mask = mask[r_idx]
+                for c_idx, x_iu in enumerate(x_vals):
+                    row_mask[c_idx] = bool(hit_test(vector_ctor(int(x_iu), int(y_iu))))
+        else:
+            for r_idx, y_iu in enumerate(y_vals):
+                allowed = area_mask[r_idx]
+                if not np.any(allowed):
+                    continue
+                row_mask = mask[r_idx]
+                for c_idx, x_iu in enumerate(x_vals):
+                    if allowed[c_idx]:
+                        row_mask[c_idx] = bool(hit_test(vector_ctor(int(x_iu), int(y_iu))))
+    except Exception:
+        for r_idx, y_iu in enumerate(y_vals):
+            try:
+                row_mask = mask[r_idx]
+                if area_mask is None:
+                    for c_idx, x_iu in enumerate(x_vals):
+                        row_mask[c_idx] = bool(hit_test(vector_ctor(int(x_iu), int(y_iu))))
+                else:
+                    allowed = area_mask[r_idx]
+                    if not np.any(allowed):
+                        continue
+                    for c_idx, x_iu in enumerate(x_vals):
+                        if allowed[c_idx]:
+                            row_mask[c_idx] = bool(hit_test(vector_ctor(int(x_iu), int(y_iu))))
+            except Exception:
+                continue
+
+
+def _state_fill_zone(state, l_idx, lid, zone):
+    """
+    Mark copper occupancy for a zone using KiCad hit testing.
+
+    This keeps the current authoritative geometry path while reducing
+    Python overhead in the inner loops.
+    """
+    bbox = zone.GetBoundingBox()
+    rs, re, cs, ce = _bbox_to_grid_indices(bbox, state)
+    if cs >= ce or rs >= re:
+        return
+
+    zone_mask = np.zeros((re - rs, ce - cs), dtype=bool)
+    area_mask = state.area_mask[rs:re, cs:ce] if state.area_mask is not None else None
+    x_vals = state.x_centers_iu[cs:ce]
+    y_vals = state.y_centers_iu[rs:re]
+
+    if hasattr(zone, "HitTestFilledArea"):
+        _fill_zone_mask_hit_test_filled(zone_mask, area_mask, x_vals, y_vals, lid, zone)
+    elif hasattr(zone, "HitTest"):
+        _fill_zone_mask_hit_test(zone_mask, area_mask, x_vals, y_vals, zone)
+    else:
+        return
+
+    if np.any(zone_mask):
+        state.copper_mask[l_idx, rs:re, cs:ce] |= zone_mask
+
+
+def build_geometry_state(
+    board,
+    copper_ids,
+    rows,
+    cols,
+    x_min,
+    y_min,
+    res,
+    settings,
+    via_factor,
+    pads_list
+):
+    """
+    Build the internal geometry representation used by the solver.
+
+    Parameters
+    ----------
+    board : pcbnew.BOARD
+        The KiCad board object.
+    copper_ids : list of int
+        Layer IDs of copper layers in stackup order.
+    rows : int
+        Number of grid rows.
+    cols : int
+        Number of grid columns.
+    x_min : float
+        X coordinate of grid origin in mm.
+    y_min : float
+        Y coordinate of grid origin in mm.
+    res : float
+        Grid resolution in mm.
+    settings : dict
+        Simulation settings from the dialog.
+    via_factor : float
+        Enhancement factor for via thermal conductivity.
+    pads_list : list
+        List of selected pad objects (heat sources).
+
+    Returns
+    -------
+    GeometryState
+        Internal geometry state with boolean copper occupancy and masks.
+    """
+    num_layers = len(copper_ids)
+    limit_area = settings.get('limit_area', False)
+    radius_mm = settings.get('pad_dist_mm', 0.0) if limit_area else 0.0
+    area_mask = build_pad_distance_mask(pads_list, rows, cols, x_min, y_min, res, radius_mm)
+
+    state = GeometryState(
+        copper_mask=np.zeros((num_layers, rows, cols), dtype=bool),
+        via_map=np.ones((rows, cols), dtype=np.float64),
+        heatsink_mask=np.zeros((rows, cols), dtype=bool),
+        area_mask=area_mask,
+        x_min=x_min,
+        y_min=y_min,
+        res=res,
+        rows=rows,
+        cols=cols,
+        x_centers_iu=_grid_centers_to_iu(cols, x_min, res),
+        y_centers_iu=_grid_centers_to_iu(rows, y_min, res),
+    )
+
+    pad_net_codes: Set[int] = set()
+    pad_net_names: Set[str] = set()
+    if settings.get('ignore_polygons'):
+        for pad in pads_list:
+            try:
+                pad_net_codes.add(pad.GetNetCode())
+            except Exception:
+                continue
+            try:
+                pad_net_names.add(pad.GetNetname())
+            except Exception:
+                try:
+                    pad_net_names.add(pad.GetNet().GetNetname())
+                except Exception:
+                    pass
+        pad_net_codes = {code for code in pad_net_codes if code is not None}
+        pad_net_names = {name for name in pad_net_names if name}
+
+    lid_to_idx = {lid: i for i, lid in enumerate(copper_ids)}
+    ignore_traces = settings.get('ignore_traces')
+    ignore_polygons = settings.get('ignore_polygons')
+    use_heatsink = settings.get('use_heatsink')
+
+    try:
+        tracks = list(board.Tracks() if hasattr(board, 'Tracks') else board.GetTracks())
+        footprints = list(board.Footprints() if hasattr(board, 'Footprints') else board.GetFootprints())
+        zones = list(board.Zones() if hasattr(board, 'Zones') else board.GetZones())
+        drawings = list(board.GetDrawings()) if use_heatsink and hasattr(board, 'GetDrawings') else []
+
+        for track in tracks:
+            is_via = "VIA" in str(type(track)).upper()
+            if ignore_traces and not is_via:
+                continue
+
+            lid = track.GetLayer()
+            layer_idx = lid_to_idx.get(lid)
+            bbox = track.GetBoundingBox()
+            if layer_idx is not None:
+                _state_fill_box(state, layer_idx, bbox)
+            if is_via:
+                _state_fill_via(state, bbox, via_factor)
+
+        for fp in footprints:
+            for pad in fp.Pads():
+                bbox = pad.GetBoundingBox()
+                if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
+                    _state_fill_box_all_layers(state, bbox)
+                    _state_fill_via(state, bbox, via_factor)
+                else:
+                    layer_idx = lid_to_idx.get(pad.GetLayer())
+                    if layer_idx is not None:
+                        _state_fill_box(state, layer_idx, bbox)
+
+        for zone in zones:
+            if hasattr(zone, "IsFilled") and not zone.IsFilled():
+                is_rule_area = getattr(zone, "GetIsRuleArea", lambda: False)()
+                is_keepout = getattr(zone, "GetIsKeepout", lambda: False)()
+                if is_rule_area or is_keepout:
+                    continue
+
+            if ignore_polygons:
+                zone_net_name = None
+                zone_net_code = None
+                try:
+                    zone_net_name = zone.GetNetname()
+                except Exception:
+                    try:
+                        zone_net_name = zone.GetNet().GetNetname()
+                    except Exception:
+                        zone_net_name = None
+                try:
+                    zone_net_code = zone.GetNetCode()
+                except Exception:
+                    zone_net_code = None
+                if pad_net_names:
+                    if zone_net_name not in pad_net_names:
+                        continue
+                elif pad_net_codes and zone_net_code not in pad_net_codes:
+                    continue
+
+            zone_layers = []
+            if hasattr(zone, "IsOnLayer"):
+                for lid in copper_ids:
+                    try:
+                        if zone.IsOnLayer(lid):
+                            zone_layers.append(lid)
+                    except Exception:
+                        continue
+            if not zone_layers:
+                try:
+                    zone_layers = list(zone.GetLayerSet().IntSeq())
+                except Exception:
+                    zone_layers = []
+            if not zone_layers:
+                try:
+                    zone_layers = [zone.GetLayer()]
+                except Exception:
+                    zone_layers = []
+
+            for lid in zone_layers:
+                layer_idx = lid_to_idx.get(lid)
+                if layer_idx is not None:
+                    _state_fill_zone(state, layer_idx, lid, zone)
+
+            if use_heatsink:
+                try:
+                    if zone.GetLayerSet().Contains(pcbnew.Eco1_User):
+                        _state_fill_heatsink(state, zone.GetBoundingBox())
+                except Exception:
+                    pass
+
+        if use_heatsink:
+            for drawing in drawings:
+                try:
+                    if drawing.GetLayer() == pcbnew.Eco1_User:
+                        _state_fill_heatsink(state, drawing.GetBoundingBox())
+                except Exception:
+                    continue
+
+    except Exception as exc:
+        print(f"[ThermalSim][WARN] Geometry mapping error: {exc}")
+
+    return state
 
 
 def build_pad_distance_mask(pads_list, rows, cols, x_min, y_min, res, radius_mm):
@@ -370,145 +791,26 @@ def create_multilayer_maps(
     - Copper zones with filled area hit-testing
     - User.Eco1 layer for thermal pad definition
     """
-    num_layers = len(copper_ids)
-    K = np.ones((num_layers, rows, cols)) * k_fr4
-    V = np.ones((rows, cols))
-    H = np.zeros((rows, cols))
-
-    limit_area = settings.get('limit_area', False)
-    radius_mm = settings.get('pad_dist_mm', 0.0) if limit_area else 0.0
-    area_mask = build_pad_distance_mask(pads_list, rows, cols, x_min, y_min, res, radius_mm)
-
-    ctx = FillContext(
-        K=K, V=V, H=H,
-        area_mask=area_mask,
-        x_min=x_min, y_min=y_min,
-        res=res, rows=rows, cols=cols
+    state = build_geometry_state(
+        board=board,
+        copper_ids=copper_ids,
+        rows=rows,
+        cols=cols,
+        x_min=x_min,
+        y_min=y_min,
+        res=res,
+        settings=settings,
+        via_factor=via_factor,
+        pads_list=pads_list,
     )
 
-    # Collect pad nets if filtering polygons
-    pad_net_codes: Set[int] = set()
-    pad_net_names: Set[str] = set()
-    if settings.get('ignore_polygons'):
-        for pad in pads_list:
-            try:
-                pad_net_codes.add(pad.GetNetCode())
-            except Exception:
-                continue
-            try:
-                pad_net_names.add(pad.GetNetname())
-            except Exception:
-                try:
-                    net = pad.GetNet()
-                    pad_net_names.add(net.GetNetname())
-                except Exception:
-                    pass
-        pad_net_codes = {code for code in pad_net_codes if code is not None}
-        pad_net_names = {name for name in pad_net_names if name}
+    num_layers = len(copper_ids)
+    K = np.full((num_layers, rows, cols), k_fr4, dtype=np.float64)
+    for layer_idx, layer_value in enumerate(k_cu_layers):
+        mask = state.copper_mask[layer_idx]
+        if np.any(mask):
+            K[layer_idx, mask] = float(layer_value)
 
-    # Map layer IDs to indices for fast lookup
-    lid_to_idx = {lid: i for i, lid in enumerate(copper_ids)}
-
-    def safe_fill(lid, bbox):
-        if lid in lid_to_idx:
-            idx = lid_to_idx[lid]
-            _fill_box(ctx, idx, bbox, k_cu_layers[idx])
-
-    try:
-        # Process tracks and vias
-        tracks = board.Tracks() if hasattr(board, 'Tracks') else board.GetTracks()
-        for t in tracks:
-            is_via = "VIA" in str(type(t)).upper()
-            if settings.get('ignore_traces') and not is_via:
-                continue
-            lid = t.GetLayer()
-            safe_fill(lid, t.GetBoundingBox())
-
-            if is_via:
-                _fill_via(ctx, t.GetBoundingBox(), via_factor)
-
-        # Process footprint pads
-        footprints = board.Footprints() if hasattr(board, 'Footprints') else board.GetFootprints()
-        for fp in footprints:
-            for pad in fp.Pads():
-                bb = pad.GetBoundingBox()
-                if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
-                    # PTH pads exist on all copper layers
-                    for i in range(num_layers):
-                        _fill_box(ctx, i, bb, k_cu_layers[i])
-                    _fill_via(ctx, bb, via_factor)
-                else:
-                    # SMD pads
-                    safe_fill(pad.GetLayer(), bb)
-
-        # Process zones
-        zones = board.Zones() if hasattr(board, 'Zones') else board.GetZones()
-        for z in zones:
-            if hasattr(z, "IsFilled") and not z.IsFilled():
-                is_rule_area = getattr(z, "GetIsRuleArea", lambda: False)()
-                is_keepout = getattr(z, "GetIsKeepout", lambda: False)()
-                if is_rule_area or is_keepout:
-                    continue
-
-            if settings.get('ignore_polygons'):
-                zone_net_name = None
-                zone_net_code = None
-                try:
-                    zone_net_name = z.GetNetname()
-                except Exception:
-                    try:
-                        zone_net_name = z.GetNet().GetNetname()
-                    except Exception:
-                        zone_net_name = None
-                try:
-                    zone_net_code = z.GetNetCode()
-                except Exception:
-                    zone_net_code = None
-                if pad_net_names:
-                    if zone_net_name not in pad_net_names:
-                        continue
-                elif pad_net_codes:
-                    if zone_net_code not in pad_net_codes:
-                        continue
-
-            # Check all layers the zone might be on
-            z_lids = []
-            if hasattr(z, "IsOnLayer"):
-                for lid in copper_ids:
-                    try:
-                        if z.IsOnLayer(lid):
-                            z_lids.append(lid)
-                    except Exception:
-                        continue
-            if not z_lids:
-                try:
-                    z_lids = list(z.GetLayerSet().IntSeq())
-                except Exception:
-                    z_lids = []
-            if not z_lids:
-                try:
-                    z_lids = [z.GetLayer()]
-                except Exception:
-                    z_lids = []
-
-            for lid in z_lids:
-                if lid in lid_to_idx:
-                    idx = lid_to_idx[lid]
-                    _fill_zone(ctx, idx, lid, z, k_cu_layers[idx])
-
-            # Check for heatsink on User.Eco1
-            if settings['use_heatsink']:
-                z_ls = z.GetLayerSet()
-                if z_ls.Contains(pcbnew.Eco1_User):
-                    _fill_heatsink(ctx, z.GetBoundingBox())
-
-        # Process drawings on User.Eco1 for heatsink
-        if settings['use_heatsink']:
-            for d in board.GetDrawings():
-                if d.GetLayer() == pcbnew.Eco1_User:
-                    _fill_heatsink(ctx, d.GetBoundingBox())
-
-    except Exception as e:
-        print(f"[ThermalSim][WARN] Geometry mapping error: {e}")
-
+    V = np.asarray(state.via_map, dtype=np.float64)
+    H = state.heatsink_mask.astype(np.float64, copy=False)
     return K, V, H
