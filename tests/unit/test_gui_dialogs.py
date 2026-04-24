@@ -395,6 +395,163 @@ class TestNewSettingsKeys:
             assert key in settings, f"Missing key: {key}"
 
 
+class TestCurrentGroupSettings:
+    """Tests for current-path group serialization helpers."""
+
+    def test_total_current_is_split_across_pads(self):
+        from ThermalSim.gui_dialogs import prepare_current_groups
+
+        groups = [{
+            'name': 'Return',
+            'mode': 'total',
+            'total_current_a': -9.0,
+            'pads': [
+                {'pad_key': 'a', 'name': 'J1-1', 'net_name': 'PWR'},
+                {'pad_key': 'b', 'name': 'J2-1', 'net_name': 'PWR'},
+                {'pad_key': 'c', 'name': 'J3-1', 'net_name': 'PWR'},
+            ],
+        }]
+
+        prepared = prepare_current_groups(groups)
+
+        currents = [pad['current_a'] for pad in prepared[0]['pads']]
+        assert currents == [-3.0, -3.0, -3.0]
+
+    def test_per_pad_current_preserves_values_and_total(self):
+        from ThermalSim.gui_dialogs import prepare_current_groups
+
+        groups = [{
+            'name': 'Sources',
+            'mode': 'per_pad',
+            'total_current_a': 0.0,
+            'pads': [
+                {'pad_key': 'a', 'name': 'J1-1', 'net_name': 'PWR', 'current_a': 9.0},
+                {'pad_key': 'b', 'name': 'J2-1', 'net_name': 'PWR', 'current_a': -3.0},
+                {'pad_key': 'c', 'name': 'J3-1', 'net_name': 'PWR', 'current_a': -6.0},
+            ],
+        }]
+
+        prepared = prepare_current_groups(groups)
+
+        assert prepared[0]['total_current_a'] == 0.0
+        assert [pad['current_a'] for pad in prepared[0]['pads']] == [9.0, -3.0, -6.0]
+
+    def test_summarize_current_groups_reports_net_balance(self):
+        from ThermalSim.gui_dialogs import summarize_current_groups
+
+        groups = [{
+            'name': 'Balanced',
+            'mode': 'per_pad',
+            'pads': [
+                {'pad_key': 'a', 'name': 'J1-1', 'net_name': 'PWR', 'current_a': 9.0},
+                {'pad_key': 'b', 'name': 'J2-1', 'net_name': 'PWR', 'current_a': -9.0},
+            ],
+        }]
+
+        _, balance_rows = summarize_current_groups(groups)
+
+        assert balance_rows == [('PWR', '0 A', 'OK')]
+
+    def test_default_mode_is_per_pad_for_new_groups(self):
+        from ThermalSim.gui_dialogs import prepare_current_groups
+
+        prepared = prepare_current_groups([{
+            'name': 'New Group',
+            'pads': [
+                {'pad_key': 'a', 'name': 'J1-1', 'net_name': 'PWR', 'current_a': 6.0},
+                {'pad_key': 'b', 'name': 'J1-2', 'net_name': 'PWR', 'current_a': -4.0},
+                {'pad_key': 'c', 'name': 'J1-3', 'net_name': 'PWR', 'current_a': -2.0},
+            ],
+        }])
+
+        assert prepared[0]['mode'] == 'per_pad'
+        assert [pad['current_a'] for pad in prepared[0]['pads']] == [6.0, -4.0, -2.0]
+
+    def test_legacy_german_modes_are_loaded(self):
+        from ThermalSim.gui_dialogs import prepare_current_groups
+
+        per_pad = prepare_current_groups([{'mode': 'Strom pro Pad', 'pads': []}])
+        total = prepare_current_groups([{'mode': 'Gesamtstrom verteilen', 'pads': []}])
+
+        assert per_pad[0]['mode'] == 'per_pad'
+        assert total[0]['mode'] == 'total'
+
+    def test_unbalanced_group_reports_needs_balance(self):
+        from ThermalSim.gui_dialogs import summarize_current_groups
+
+        groups = [{
+            'name': 'Unbalanced',
+            'mode': 'per_pad',
+            'pads': [
+                {'pad_key': 'a', 'name': 'J1-1', 'net_name': 'PWR', 'current_a': 6.0},
+                {'pad_key': 'b', 'name': 'J1-2', 'net_name': 'PWR', 'current_a': -3.0},
+            ],
+        }]
+
+        _, balance_rows = summarize_current_groups(groups)
+
+        assert balance_rows == [('PWR', '3 A', 'Needs balance')]
+
+    def test_mixed_nets_are_visible_in_group_summary(self):
+        from ThermalSim.gui_dialogs import summarize_current_groups
+
+        groups = [{
+            'name': 'Mixed',
+            'mode': 'per_pad',
+            'pads': [
+                {'pad_key': 'a', 'name': 'J1-1', 'net_name': 'PWR', 'current_a': 1.0},
+                {'pad_key': 'b', 'name': 'J1-2', 'net_name': 'GND', 'current_a': -1.0},
+            ],
+        }]
+
+        group_rows, _ = summarize_current_groups(groups)
+
+        assert group_rows[0][1] == 'Mixed nets: GND, PWR'
+
+    def test_dialog_new_group_defaults_to_per_pad_and_applies_current_list(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        selected_pads = [
+            {'pad_key': 'a', 'name': 'Pad1', 'net_name': 'PWR', 'layer': 'F.Cu'},
+            {'pad_key': 'b', 'name': 'Pad2', 'net_name': 'PWR', 'layer': 'F.Cu'},
+            {'pad_key': 'c', 'name': 'Pad3', 'net_name': 'PWR', 'layer': 'F.Cu'},
+        ]
+        dlg = SettingsDialog(
+            None, 0, 0.5, ["F.Cu", "B.Cu"],
+            selection_provider=lambda: selected_pads
+        )
+
+        dlg._on_current_new_group(None)
+        dlg.current_pad_list_input.SetValue("+6, -4, -2")
+        dlg._on_current_apply_pad_current_list(None)
+        values = dlg.get_values()
+
+        group = values['current_groups'][0]
+        assert values['current_enabled'] is True
+        assert group['mode'] == 'per_pad'
+        assert [pad['current_a'] for pad in group['pads']] == [6.0, -4.0, -2.0]
+        assert dlg.current_balance_text.GetValue() == "PWR: 0 A - OK"
+
+    def test_current_paths_tab_labels_are_english(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(None, 0, 0.5, ["F.Cu", "B.Cu"])
+
+        page_labels = [caption for _, caption in dlg.notebook._pages]
+        assert "Current Paths" in page_labels
+        labels = " ".join(
+            list(dlg.current_group_list._columns)
+            + list(dlg.current_pad_list._columns)
+            + [dlg.chk_current_enabled.label]
+        )
+        forbidden = [
+            "Strom", "Padgruppen", "Auswahl", "Gesamtstrom",
+            "Netzbilanz", "Loeschen", "Uebernehmen", "Modus"
+        ]
+        for word in forbidden:
+            assert word not in labels
+
+
 class TestTooltipTexts:
     """Tests for tooltip text coverage."""
 

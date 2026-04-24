@@ -272,7 +272,8 @@ def write_html_report(
     out_dir=None,
     snapshot_debug=None,
     snapshot_files=None,
-    interactive_heatmap=None
+    interactive_heatmap=None,
+    electrical_summary=None
 ):
     """Generate an HTML report for the thermal simulation."""
     out_dir = out_dir or os.path.dirname(__file__)
@@ -283,6 +284,7 @@ def write_html_report(
     k_norm_info = k_norm_info or {}
     snapshot_debug = snapshot_debug or {}
     interactive_heatmap = interactive_heatmap or {}
+    electrical_summary = electrical_summary or {}
 
     total_thick_mm = stackup_derived.get("total_thick_mm_used")
     board_thick_mm = stackup_derived.get("stack_board_thick_mm")
@@ -307,6 +309,16 @@ def write_html_report(
 
     settings_rows = [(str(key), str(value)) for key, value in settings.items()]
     pad_rows = [(str(name), _fmt(power, " W")) for name, power in pad_power]
+    current_rows = []
+    for net_item in electrical_summary.get("nets", []) or []:
+        current_rows.append((
+            str(net_item.get("net", "")),
+            str(net_item.get("terminal_count", "")),
+            _fmt(net_item.get("total_abs_current_a"), " A"),
+            _fmt(net_item.get("total_loss_w"), " W"),
+            _fmt(net_item.get("max_node_power_w"), " W"),
+        ))
+    current_warning_rows = [(str(idx + 1), str(msg)) for idx, msg in enumerate(electrical_summary.get("warnings", []) or [])]
     thickness_summary_rows = [
         ("Board thickness (stackup)", _fmt(board_thick_mm, " mm")),
         ("Total thickness used", _fmt(total_thick_mm, " mm")),
@@ -365,6 +377,9 @@ def write_html_report(
         f"{_table_html(['Setting', 'Value'], settings_rows, empty_text='No settings recorded.')}<div class='spacer-sm'></div>"
         "<h3 class='section-title'>Power per Pad</h3>"
         f"{_table_html(['Pad', 'Power'], pad_rows, empty_text='No pad power recorded.')}"
+        "<div class='spacer-sm'></div><h3 class='section-title'>Current Heating</h3>"
+        f"{_table_html(['Net', 'Pads', 'Abs Current', 'Copper Loss', 'Max Cell Loss'], current_rows, empty_text='No current heating recorded.')}"
+        f"{_table_html(['#', 'Warning'], current_warning_rows, empty_text='No current heating warnings.')}"
         "</div></div>"
         f"{_details_block('Snapshots', _build_snapshot_gallery(snapshot_items), open_by_default=False)}"
         "</section>"

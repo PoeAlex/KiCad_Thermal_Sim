@@ -18,6 +18,7 @@ This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineer
 - **2D in-plane conduction** on each copper layer (heat spreading within a layer)
 - **Vertical coupling** between adjacent copper layers (FR4 conduction + via enhancement)
 - **Power injection** from selected pads (constant or **time-varying PWL profiles**)
+- Optional **DC current-flow heating** from source/sink pads on the same KiCad net
 - **Convection** to ambient on the **top and bottom** outer surfaces
 - Optional: a **Thermal Pad zone** on `User.Eco1` used as an area with stronger bottom-side heat removal
 
@@ -63,8 +64,9 @@ If required packages are missing, the plugin automatically shows an install dial
 2. Select one or multiple **pads** that represent your heat sources.
 3. Run the plugin via **Tools → External Plugins → 2.5D Thermal Sim**.
 4. Set **Power** (constant value or PWL file path), **Duration**, **Ambient**, and **Resolution**.
-5. (Optional) Switch to the **Advanced** tab for geometry filters, thermal pad, and solver settings.
-6. Click **Preview** (sanity check), then **Run**.
+5. (Optional) Use **Current Paths** to add source/sink pads and per-pad currents for copper I2R heating.
+6. (Optional) Switch to the **Advanced** tab for geometry filters, thermal pad, and solver settings.
+7. Click **Preview** (sanity check), then **Run**.
 
 ![GUI main tab](docs/images/gui_main.png "Simulation tab")
 
@@ -106,6 +108,11 @@ Use the **Browse PWL...** button to pick a file. Clicking it multiple times appe
 - Two whitespace-separated columns: time (seconds), power (watts)
 - Time values must be monotonically increasing
 - Linear interpolation between breakpoints; holds first/last value outside range
+
+### Current Paths tab
+Enable current heating to calculate copper losses from DC current flow. Add the currently selected KiCad pads to a group, then enter positive current for source pads and negative current for sink pads. Each active KiCad net must balance to 0 A before the solver runs.
+
+Current heating is additive with the **Power** field above: manual pad power still applies, and the computed I2R copper loss is added as a distributed heat source. When current heating is enabled, area limiting is disabled for the run so the electrical path is not clipped.
 
 #### Duration (sec)
 Total simulated time. Shorter durations emphasize transient peaks; longer durations approach quasi steady-state.
@@ -174,6 +181,7 @@ The plugin is split into focused modules:
 | `stackup_parser.py` | Parse copper/dielectric layers from .kicad_pcb S-expressions |
 | `gui_dialogs.py` | wxPython dialog for simulation parameters (tabbed UI) |
 | `geometry_mapper.py` | Convert PCB geometry to discretized conductivity arrays |
+| `electrical_solver.py` | Solve DC current flow and convert copper losses to heat sources |
 | `thermal_solver.py` | Sparse matrix assembly, BDF2 time integration |
 | `pwl_parser.py` | Parse LTspice-style PWL power profiles |
 | `visualization.py` | Generate thermal plots and preview images |
@@ -189,6 +197,7 @@ The plugin is split into focused modules:
 - No component/package thermal model (junction → case → pad is not explicitly modeled)
 - Convection is simplified (uniform top/bottom ambient coupling; no airflow field)
 - Radiation is not modeled
+- Current-flow heating is DC only; AC effects, skin effect, and temperature-dependent copper resistance are not modeled
 - Via coupling is an approximation (via density enhancement heuristic)
 - Results depend strongly on **Resolution (mm)** and (if used) **Limit Area/Distance**
 - Thermal Pad (User.Eco1) is a simplification of real mechanical contact pressure, interface quality, and sink temperature

@@ -239,15 +239,50 @@ class MockTrack:
         Bounding box.
     """
 
-    def __init__(self, layer: int = F_Cu, bbox: Optional[EDA_RECT] = None):
+    def __init__(
+        self,
+        layer: int = F_Cu,
+        bbox: Optional[EDA_RECT] = None,
+        start: Optional[VECTOR2I] = None,
+        end: Optional[VECTOR2I] = None,
+        width: int = 100000,
+        net_code: int = 0,
+        net_name: str = "",
+    ):
         self._layer = layer
         self._bbox = bbox or EDA_RECT(0, 0, 1000000, 100000)
+        self._start = start
+        self._end = end
+        self._width = width
+        self._net_code = net_code
+        self._net_name = net_name
 
     def GetLayer(self) -> int:
         return self._layer
 
     def GetBoundingBox(self) -> EDA_RECT:
         return self._bbox
+
+    def GetStart(self) -> VECTOR2I:
+        return self._start or VECTOR2I(self._bbox.GetX(), self._bbox.GetY() + self._bbox.GetHeight() // 2)
+
+    def GetEnd(self) -> VECTOR2I:
+        return self._end or VECTOR2I(
+            self._bbox.GetX() + self._bbox.GetWidth(),
+            self._bbox.GetY() + self._bbox.GetHeight() // 2,
+        )
+
+    def GetWidth(self) -> int:
+        return self._width
+
+    def GetNetCode(self) -> int:
+        return self._net_code
+
+    def GetNetname(self) -> str:
+        return self._net_name
+
+    def GetNet(self) -> MockNet:
+        return MockNet(self._net_name, self._net_code)
 
 
 class MockVia(MockTrack):
@@ -257,9 +292,18 @@ class MockVia(MockTrack):
     Inherits from MockTrack but with type name containing 'VIA'.
     """
 
-    def __init__(self, bbox: Optional[EDA_RECT] = None, layers: Optional[List[int]] = None):
-        super().__init__(layer=F_Cu, bbox=bbox)
+    def __init__(
+        self,
+        bbox: Optional[EDA_RECT] = None,
+        layers: Optional[List[int]] = None,
+        net_code: int = 0,
+        net_name: str = "",
+    ):
+        super().__init__(layer=F_Cu, bbox=bbox, net_code=net_code, net_name=net_name)
         self._layers = layers or [F_Cu, B_Cu]
+
+    def GetLayerSet(self) -> MockLayerSet:
+        return MockLayerSet(self._layers)
 
     def __class__(self):
         class _VIA:

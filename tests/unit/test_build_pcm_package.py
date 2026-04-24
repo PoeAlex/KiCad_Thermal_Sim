@@ -52,6 +52,7 @@ class TestBuildPcmPackage:
             assert "plugins/__init__.py" in names
             assert "plugins/thermal_plugin.py" in names
             assert "plugins/capabilities.py" in names
+            assert "plugins/electrical_solver.py" in names
             assert "plugins/thermal_solver.py" in names
             assert "plugins/dependency_installer.py" in names
 

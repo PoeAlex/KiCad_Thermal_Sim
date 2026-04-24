@@ -29,6 +29,7 @@ PLUGIN_FILES = [
     "stackup_parser.py",
     "gui_dialogs.py",
     "geometry_mapper.py",
+    "electrical_solver.py",
     "thermal_solver.py",
     "visualization.py",
     "thermal_report.py",
@@ -68,6 +69,7 @@ def build_metadata(version):
             "Features:\n"
             "- Automatic stackup detection from board file\n"
             "- Multi-layer heat spreading with via coupling\n"
+            "- DC current-flow Joule heating in traces, vias, and zones\n"
             "- BDF2 implicit time integration\n"
             "- Piecewise-linear (PWL) time-varying power profiles\n"
             "- Heatsink/thermal-pad support (User.Eco1 layer)\n"
