@@ -75,6 +75,47 @@ class TestCapabilityFlags:
             assert isinstance(HAS_LIBS, bool)
 
 
+class TestPyPardisoPlatformSupport:
+    """Tests for PyPardiso platform compatibility detection."""
+
+    def test_windows_amd64_supported(self):
+        """Test that Windows x86_64/amd64 supports PyPardiso."""
+        from ThermalSim.capabilities import is_pypardiso_supported_platform
+        assert is_pypardiso_supported_platform("win32", "AMD64") is True
+
+    def test_linux_x86_64_supported(self):
+        """Test that Linux x86_64 supports PyPardiso."""
+        from ThermalSim.capabilities import is_pypardiso_supported_platform
+        assert is_pypardiso_supported_platform("linux", "x86_64") is True
+
+    def test_macos_unsupported(self):
+        """Test that macOS is not offered PyPardiso automatically."""
+        from ThermalSim.capabilities import is_pypardiso_supported_platform
+        assert is_pypardiso_supported_platform("darwin", "x86_64") is False
+        assert is_pypardiso_supported_platform("darwin", "arm64") is False
+
+    def test_linux_arm_unsupported(self):
+        """Test that Linux ARM/aarch64 is not offered PyPardiso automatically."""
+        from ThermalSim.capabilities import is_pypardiso_supported_platform
+        assert is_pypardiso_supported_platform("linux", "aarch64") is False
+
+    def test_optional_dependency_descriptor_defaults_when_supported(self):
+        """Test that supported missing PyPardiso is selected by default."""
+        from ThermalSim import capabilities
+        original = capabilities.HAS_PARDISO
+        original_func = capabilities.is_pypardiso_supported_platform
+        try:
+            capabilities.HAS_PARDISO = False
+            capabilities.is_pypardiso_supported_platform = lambda: True
+            result = capabilities.get_pypardiso_optional_dependency()
+            assert result["pip_name"] == "pypardiso"
+            assert result["enabled"] is True
+            assert result["default_selected"] is True
+        finally:
+            capabilities.HAS_PARDISO = original
+            capabilities.is_pypardiso_supported_platform = original_func
+
+
 class TestGranularFlags:
     """Tests for granular dependency flags."""
 

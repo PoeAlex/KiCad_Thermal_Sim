@@ -46,6 +46,38 @@ class TestDependencyInstallDialogCreation:
         dlg = DependencyInstallDialog(None, [("numpy", "numpy")])
         assert dlg._installing is False
 
+    def test_compatible_pypardiso_checkbox_checked(self):
+        """Test that compatible PyPardiso option is enabled and checked."""
+        from ThermalSim.dependency_installer import DependencyInstallDialog
+        optional = [{
+            "import_name": "pypardiso",
+            "pip_name": "pypardiso",
+            "label": "Install PyPardiso accelerator",
+            "enabled": True,
+            "default_selected": True,
+            "status": "Recommended accelerator for large simulations.",
+        }]
+        dlg = DependencyInstallDialog(None, [("numpy", "numpy")], optional)
+        chk = dlg._optional_checkboxes[0]
+        assert chk.IsEnabled() is True
+        assert chk.GetValue() is True
+
+    def test_unsupported_pypardiso_checkbox_disabled(self):
+        """Test that unsupported PyPardiso option is disabled and unchecked."""
+        from ThermalSim.dependency_installer import DependencyInstallDialog
+        optional = [{
+            "import_name": "pypardiso",
+            "pip_name": "pypardiso",
+            "label": "Install PyPardiso accelerator",
+            "enabled": False,
+            "default_selected": False,
+            "status": "Unavailable on this platform; using SciPy solver fallback.",
+        }]
+        dlg = DependencyInstallDialog(None, [("numpy", "numpy")], optional)
+        chk = dlg._optional_checkboxes[0]
+        assert chk.IsEnabled() is False
+        assert chk.GetValue() is False
+
 
 class TestInstallLogic:
     """Tests for the pip install subprocess logic."""
@@ -72,6 +104,16 @@ class TestInstallLogic:
         dlg._installing = True
 
         # Should return early without starting a thread
+        import threading
+        with patch.object(threading, 'Thread') as mock_thread:
+            dlg._on_install(None)
+            mock_thread.assert_not_called()
+
+    def test_on_install_without_selected_packages_does_not_start_thread(self):
+        """Test that an empty selection does not run pip."""
+        from ThermalSim.dependency_installer import DependencyInstallDialog
+        dlg = DependencyInstallDialog(None, [])
+
         import threading
         with patch.object(threading, 'Thread') as mock_thread:
             dlg._on_install(None)
@@ -209,6 +251,63 @@ class TestPipCommand:
         assert "numpy" in captured_cmd
         assert "scipy" in captured_cmd
         assert "matplotlib" in captured_cmd
+
+    def test_unchecked_pypardiso_excluded_from_install(self):
+        """Test that unchecked PyPardiso is excluded from the pip command."""
+        from ThermalSim.dependency_installer import DependencyInstallDialog
+        optional = [{
+            "import_name": "pypardiso",
+            "pip_name": "pypardiso",
+            "label": "Install PyPardiso accelerator",
+            "enabled": True,
+            "default_selected": True,
+            "status": "Recommended accelerator for large simulations.",
+        }]
+        dlg = DependencyInstallDialog(None, [("numpy", "numpy")], optional)
+        dlg._optional_checkboxes[0].SetValue(False)
+
+        captured_cmd = []
+
+        def capture_thread(*args, **kwargs):
+            if 'args' in kwargs:
+                captured_cmd.extend(kwargs['args'][0])
+            mock_t = MagicMock()
+            return mock_t
+
+        import threading
+        with patch.object(threading, 'Thread', side_effect=capture_thread):
+            dlg._on_install(None)
+
+        assert "numpy" in captured_cmd
+        assert "pypardiso" not in captured_cmd
+
+    def test_checked_pypardiso_included_with_required_packages(self):
+        """Test that checked PyPardiso is included alongside required packages."""
+        from ThermalSim.dependency_installer import DependencyInstallDialog
+        optional = [{
+            "import_name": "pypardiso",
+            "pip_name": "pypardiso",
+            "label": "Install PyPardiso accelerator",
+            "enabled": True,
+            "default_selected": True,
+            "status": "Recommended accelerator for large simulations.",
+        }]
+        dlg = DependencyInstallDialog(None, [("numpy", "numpy")], optional)
+
+        captured_cmd = []
+
+        def capture_thread(*args, **kwargs):
+            if 'args' in kwargs:
+                captured_cmd.extend(kwargs['args'][0])
+            mock_t = MagicMock()
+            return mock_t
+
+        import threading
+        with patch.object(threading, 'Thread', side_effect=capture_thread):
+            dlg._on_install(None)
+
+        assert "numpy" in captured_cmd
+        assert "pypardiso" in captured_cmd
 
 
 class TestFindPython:

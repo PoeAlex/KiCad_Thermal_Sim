@@ -194,12 +194,20 @@ class _WxMock:
     class CheckBox:
         def __init__(self, parent, label=""):
             self._value = False
+            self._enabled = True
+            self.label = label
 
         def GetValue(self):
             return self._value
 
         def SetValue(self, value):
             self._value = bool(value)
+
+        def Enable(self, enable=True):
+            self._enabled = enable
+
+        def IsEnabled(self):
+            return self._enabled
 
         def Bind(self, event, handler):
             pass

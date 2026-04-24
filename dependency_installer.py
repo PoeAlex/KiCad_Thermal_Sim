@@ -58,12 +58,17 @@ class DependencyInstallDialog(wx.Dialog):
         Parent window.
     missing_packages : list of tuple
         List of (import_name, pip_name) tuples for missing packages.
+    optional_packages : list of dict, optional
+        Optional package metadata for user-selectable accelerators.
     """
 
-    def __init__(self, parent, missing_packages):
+    def __init__(self, parent, missing_packages, optional_packages=None):
         super().__init__(parent, title="ThermalSim - Missing Dependencies",
                          size=(520, 400))
         self._missing = list(missing_packages)
+        self._optional = list(optional_packages or [])
+        self._optional_checkboxes = []
+        self._last_pip_names = []
         self._process = None
         self._installing = False
 
@@ -83,13 +88,26 @@ class DependencyInstallDialog(wx.Dialog):
         vbox.Add(header, flag=wx.ALL, border=10)
 
         # Missing packages list
-        pkg_names = ", ".join(pip for _, pip in self._missing)
+        pkg_names = ", ".join(pip for _, pip in self._missing) or "None"
         info = wx.StaticText(
             panel,
-            label=f"Missing: {pkg_names}\n\n"
-                  f"Click 'Install Now' to install into KiCad's Python environment."
+            label=f"Required missing: {pkg_names}\n\n"
+                  f"Click 'Install Now' to install selected packages into KiCad's Python environment."
         )
         vbox.Add(info, flag=wx.LEFT | wx.RIGHT, border=10)
+
+        if self._optional:
+            opt_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Optional accelerators")
+            for opt in self._optional:
+                chk = wx.CheckBox(panel, label=opt.get("label", opt.get("pip_name", "")))
+                chk.SetValue(bool(opt.get("default_selected", False)))
+                chk.Enable(bool(opt.get("enabled", True)))
+                chk.Bind(wx.EVT_CHECKBOX, self._on_optional_toggle)
+                status = wx.StaticText(panel, label=opt.get("status", ""))
+                opt_box.Add(chk, flag=wx.ALL, border=3)
+                opt_box.Add(status, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=18)
+                self._optional_checkboxes.append(chk)
+            vbox.Add(opt_box, flag=wx.LEFT | wx.RIGHT | wx.TOP | wx.EXPAND, border=10)
 
         # Output log
         self._log = wx.TextCtrl(
@@ -113,17 +131,43 @@ class DependencyInstallDialog(wx.Dialog):
         vbox.Add(self._manual_text, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
 
         panel.SetSizer(vbox)
+        self._refresh_install_button()
+
+    def _on_optional_toggle(self, event):
+        """Update install button state when optional packages are toggled."""
+        self._refresh_install_button()
+
+    def _get_selected_pip_names(self):
+        """Return pip package names selected for installation."""
+        pip_names = [pip for _, pip in self._missing]
+        for opt, chk in zip(self._optional, self._optional_checkboxes):
+            if bool(opt.get("enabled", True)) and chk.GetValue():
+                pip_names.append(opt.get("pip_name", opt.get("import_name", "")))
+        return [name for name in pip_names if name]
+
+    def _refresh_install_button(self):
+        """Enable the install button only when at least one package is selected."""
+        if not hasattr(self, "_btn_install"):
+            return
+        has_selection = bool(self._get_selected_pip_names())
+        self._btn_install.Enable(has_selection)
+        self._btn_install.SetLabel("Install Now" if has_selection else "Nothing to Install")
 
     def _on_install(self, event):
         """Start pip install in a background thread."""
         if self._installing:
+            return
+        pip_names = self._get_selected_pip_names()
+        if not pip_names:
+            self._append_log("No packages selected for installation.\n")
+            self._refresh_install_button()
             return
         self._installing = True
         self._btn_install.Enable(False)
         self._log.SetValue("")
         self._append_log("Starting installation...\n")
 
-        pip_names = [pip for _, pip in self._missing]
+        self._last_pip_names = list(pip_names)
         cmd = [_find_python(), "-m", "pip", "install"] + pip_names
 
         self._append_log(f"> {' '.join(cmd)}\n\n")
@@ -183,7 +227,7 @@ class DependencyInstallDialog(wx.Dialog):
         if error_msg:
             self._append_log(f"Error: {error_msg}\n")
 
-        pip_names = " ".join(pip for _, pip in self._missing)
+        pip_names = " ".join(self._last_pip_names or [pip for _, pip in self._missing])
         manual = (
             f"Manual install: Open 'KiCad 9.0 Command Prompt' and run:\n"
             f"  pip install {pip_names}"

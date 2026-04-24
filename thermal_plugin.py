@@ -20,7 +20,7 @@ import pcbnew
 import numpy as np
 import wx
 
-from .capabilities import HAS_LIBS, HAS_PARDISO
+from .capabilities import HAS_LIBS, HAS_PARDISO, get_pypardiso_optional_dependency
 from .stackup_parser import parse_stackup_from_board_file, format_stackup_report_um
 from .gui_dialogs import SettingsDialog
 from .geometry_mapper import build_geometry_state, create_multilayer_maps, get_pad_pixels
@@ -299,7 +299,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             from .dependency_installer import DependencyInstallDialog
             missing = get_missing_packages()
             if missing:
-                dlg = DependencyInstallDialog(None, missing)
+                dlg = DependencyInstallDialog(None, missing, [get_pypardiso_optional_dependency()])
                 dlg.ShowModal()
                 dlg.Destroy()
             else:

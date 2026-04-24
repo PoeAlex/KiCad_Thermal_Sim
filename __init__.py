@@ -35,7 +35,7 @@ except ImportError:
 
         def Run(self):
             import wx
-            from .capabilities import get_missing_packages
+            from .capabilities import get_missing_packages, get_pypardiso_optional_dependency
             missing = get_missing_packages()
             if not missing:
                 wx.MessageBox(
@@ -44,7 +44,7 @@ except ImportError:
                 )
                 return
             from .dependency_installer import DependencyInstallDialog
-            dlg = DependencyInstallDialog(None, missing)
+            dlg = DependencyInstallDialog(None, missing, [get_pypardiso_optional_dependency()])
             dlg.ShowModal()
             dlg.Destroy()
 

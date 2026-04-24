@@ -43,11 +43,11 @@ This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineer
    - **macOS**: `~/Library/Application Support/kicad/9.0/scripting/plugins/`
 
 3. Restart KiCad.
-4. On first run, the plugin will offer to install missing packages (`numpy`, `scipy`, `matplotlib`) automatically. Alternatively, install them manually in the **KiCad 9.0 Command Prompt**:
+4. On first run, the plugin will offer to install missing packages (`numpy`, `scipy`, `matplotlib`) automatically. On supported Windows/Linux x86_64 systems, the installer also offers optional PyPardiso acceleration via a checked-by-default checkbox. Alternatively, install packages manually in the **KiCad 9.0 Command Prompt**:
    ```
    pip install numpy scipy matplotlib
    ```
-   Optional for faster solves: `pip install pypardiso` (Intel MKL sparse solver)
+   Optional for faster solves on supported Windows/Linux x86_64 systems: `pip install pypardiso` (Intel MKL sparse solver)
 
 5. In PCB Editor, run via **Tools → External Plugins → 2.5D Thermal Sim**.
 

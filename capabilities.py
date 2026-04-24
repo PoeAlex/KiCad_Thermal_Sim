@@ -23,6 +23,8 @@ HAS_NUMBA : bool
 """
 
 import importlib.util
+import platform
+import sys
 
 # Granular detection of each core dependency
 HAS_NUMPY = False
@@ -76,6 +78,60 @@ try:
     HAS_NUMBA = True
 except ImportError:
     HAS_NUMBA = False
+
+
+def is_pypardiso_supported_platform(platform_name=None, machine=None):
+    """
+    Return whether PyPardiso is supported on the current platform.
+
+    Parameters
+    ----------
+    platform_name : str, optional
+        Platform identifier. Defaults to ``sys.platform``.
+    machine : str, optional
+        CPU architecture. Defaults to ``platform.machine()``.
+
+    Returns
+    -------
+    bool
+        True for Windows/Linux on x86_64/amd64 architectures.
+    """
+    platform_id = (platform_name or sys.platform).lower()
+    arch = (machine or platform.machine()).lower()
+    return (
+        (platform_id == "win32" or platform_id.startswith("linux"))
+        and arch in ("x86_64", "amd64")
+    )
+
+
+def get_pypardiso_optional_dependency():
+    """
+    Return installer metadata for the optional PyPardiso accelerator.
+
+    Returns
+    -------
+    dict
+        Metadata used by the dependency installer to render the optional
+        PyPardiso checkbox and decide whether it should be selected.
+    """
+    supported = is_pypardiso_supported_platform()
+    enabled = supported and not HAS_PARDISO
+    if HAS_PARDISO:
+        status = "Already installed."
+    elif supported:
+        status = "Recommended accelerator for large simulations."
+    else:
+        status = "Unavailable on this platform; using SciPy solver fallback."
+    return {
+        "import_name": "pypardiso",
+        "pip_name": "pypardiso",
+        "label": "Install PyPardiso accelerator",
+        "supported": supported,
+        "installed": HAS_PARDISO,
+        "enabled": enabled,
+        "default_selected": enabled,
+        "status": status,
+    }
 
 
 def get_missing_packages():
