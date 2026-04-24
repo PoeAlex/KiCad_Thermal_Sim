@@ -22,7 +22,8 @@ import wx
 
 from .capabilities import HAS_LIBS, HAS_PARDISO, get_pypardiso_optional_dependency
 from .stackup_parser import parse_stackup_from_board_file, format_stackup_report_um
-from .gui_dialogs import SettingsDialog
+from .gui_dialogs import SettingsDialog, prepare_current_groups
+from .electrical_solver import CurrentTerminal, ElectricalConfig, solve_electrical_heating
 from .geometry_mapper import build_geometry_state, create_multilayer_maps, get_pad_pixels
 from .thermal_solver import SolverConfig, build_stiffness_matrix, run_simulation
 from .pwl_parser import parse_pwl_file
@@ -233,6 +234,7 @@ def _format_timing_summary(timings):
         "geometry_maps_s",
         "capacity_build_s",
         "power_vector_build_s",
+        "electrical_solve_s",
         "stiffness_matrix_s",
     ):
         if key in timings:
@@ -263,6 +265,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.pads_list = []
         self.stack_info = None
         self.last_zone_refill_s = 0.0
+        self.settings_dialog = None
 
     def _settings_path(self):
         """Return path to settings persistence file."""
@@ -338,11 +341,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         h_mm = bbox.GetHeight() * 1e-6
         suggested_res = self._calculate_suggested_resolution(w_mm, h_mm, len(copper_ids))
 
-        # --- 3. Pad Selection ---
+        # --- 3. Initial Pad Selection ---
         selected_pads = self._get_selected_pads(board)
-        if not selected_pads:
-            wx.MessageBox("Select pads first!", "Info")
-            return
         pads_list = [p[1] for p in selected_pads]
 
         # Store for preview
@@ -361,29 +361,58 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         if last_settings.get("output_dir") and os.path.isdir(last_settings.get("output_dir")):
             default_output_dir = last_settings.get("output_dir")
 
+        if self.settings_dialog is not None:
+            try:
+                self.settings_dialog.Raise()
+                return
+            except Exception:
+                self.settings_dialog = None
+
+        def selection_provider():
+            return self._get_selected_pad_descriptors(board)
+
+        def run_callback(settings):
+            self.settings_dialog = None
+            self._save_settings(settings)
+            current_pads = self._resolve_current_pad_objects(board, settings)
+            focus_pads = self._unique_pads(pads_list + current_pads)
+            self._run_simulation(
+                board, copper_ids, layer_names, bbox, pads_list,
+                settings, stack_info, pad_names, zone_refill_s=zone_refill_s,
+                focus_pads=focus_pads
+            )
+
+        def close_callback():
+            self.settings_dialog = None
+
         dlg = SettingsDialog(
             None, len(pads_list), suggested_res, layer_names,
             preview_callback=self.generate_preview,
+            selection_provider=selection_provider,
+            run_callback=run_callback,
+            close_callback=close_callback,
             stackup_details=stackup_details,
             pad_names=pad_names,
             default_output_dir=default_output_dir,
             defaults=last_settings
         )
-        if dlg.ShowModal() != wx.ID_OK:
-            dlg.Destroy()
-            return
-        settings = dlg.get_values()
-        dlg.Destroy()
-        if not settings:
-            return
-
-        self._save_settings(settings)
-
-        # --- 5. Run Simulation ---
-        self._run_simulation(
-            board, copper_ids, layer_names, bbox, pads_list,
-            settings, stack_info, pad_names, zone_refill_s=zone_refill_s
-        )
+        self.settings_dialog = dlg
+        try:
+            dlg.Show()
+        except Exception:
+            if dlg.ShowModal() == wx.ID_OK:
+                settings = dlg.get_values()
+                self.settings_dialog = None
+                dlg.Destroy()
+                if settings:
+                    self._save_settings(settings)
+                    current_pads = self._resolve_current_pad_objects(board, settings)
+                    focus_pads = self._unique_pads(pads_list + current_pads)
+                    self._run_simulation(
+                        board, copper_ids, layer_names, bbox, pads_list,
+                        settings, stack_info, pad_names, zone_refill_s=zone_refill_s,
+                        focus_pads=focus_pads
+                    )
 
     def _detect_copper_layers(self, board):
         """Detect enabled copper layers in stackup order."""
@@ -445,6 +474,155 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             return []
         selected_pads.sort(key=lambda x: x[0])
         return selected_pads
+
+    def _pad_key(self, fp_ref, pad):
+        """Build a stable key for a pad in settings."""
+        try:
+            pos = pad.GetPosition()
+            px, py = int(pos.x), int(pos.y)
+        except Exception:
+            px, py = 0, 0
+        try:
+            net_code = int(pad.GetNetCode())
+        except Exception:
+            net_code = 0
+        try:
+            number = pad.GetNumber()
+        except Exception:
+            number = ""
+        return f"{fp_ref}:{number}:{net_code}:{px}:{py}"
+
+    def _pad_net_name(self, pad):
+        """Return the display net name for a pad."""
+        try:
+            net = pad.GetNetname()
+        except Exception:
+            try:
+                net = pad.GetNet().GetNetname()
+            except Exception:
+                net = ""
+        return net or ""
+
+    def _pad_net_code(self, pad):
+        """Return the KiCad net code for a pad."""
+        try:
+            return int(pad.GetNetCode())
+        except Exception:
+            try:
+                return int(pad.GetNet().GetNetCode())
+            except Exception:
+                return 0
+
+    def _pad_layer_name(self, board, pad):
+        """Return the KiCad layer name for a pad."""
+        try:
+            return board.GetLayerName(pad.GetLayer())
+        except Exception:
+            return str(pad.GetLayer())
+
+    def _pad_descriptor(self, board, fp_ref, pad):
+        """Return a serializable pad descriptor for current groups."""
+        try:
+            number = pad.GetNumber()
+        except Exception:
+            number = ""
+        name = f"{fp_ref}-{number}"
+        net_name = self._pad_net_name(pad)
+        return {
+            "pad_key": self._pad_key(fp_ref, pad),
+            "name": f"{name} [{net_name}]" if net_name else name,
+            "net_name": net_name,
+            "net_code": self._pad_net_code(pad),
+            "layer": self._pad_layer_name(board, pad),
+            "current_a": 0.0,
+        }
+
+    def _get_selected_pad_descriptors(self, board):
+        """Return serializable descriptors for currently selected KiCad pads."""
+        descriptors = []
+        try:
+            footprints = board.Footprints() if hasattr(board, 'Footprints') else board.GetFootprints()
+            for fp in footprints:
+                fp_ref = fp.GetReference()
+                for pad in fp.Pads():
+                    if pad.IsSelected():
+                        descriptors.append(self._pad_descriptor(board, fp_ref, pad))
+        except Exception:
+            return []
+        descriptors.sort(key=lambda item: item.get("name", ""))
+        return descriptors
+
+    def _build_pad_lookup(self, board):
+        """Build lookup maps from persisted pad descriptors to live pad objects."""
+        by_key = {}
+        by_name = {}
+        try:
+            footprints = board.Footprints() if hasattr(board, 'Footprints') else board.GetFootprints()
+        except Exception:
+            footprints = []
+        for fp in footprints:
+            fp_ref = fp.GetReference()
+            for pad in fp.Pads():
+                descriptor = self._pad_descriptor(board, fp_ref, pad)
+                by_key[descriptor["pad_key"]] = (descriptor, pad)
+                by_name[descriptor["name"]] = (descriptor, pad)
+        return by_key, by_name
+
+    def _resolve_current_pad_objects(self, board, settings):
+        """Resolve current-group pad descriptors to live pad objects."""
+        if not settings.get("current_enabled"):
+            return []
+        by_key, by_name = self._build_pad_lookup(board)
+        pads = []
+        seen = set()
+        for group in prepare_current_groups(settings.get("current_groups", [])):
+            for pad_info in group.get("pads", []):
+                match = by_key.get(pad_info.get("pad_key")) or by_name.get(pad_info.get("name"))
+                if not match:
+                    continue
+                _, pad = match
+                if id(pad) not in seen:
+                    pads.append(pad)
+                    seen.add(id(pad))
+        return pads
+
+    def _resolve_current_terminals(self, board, settings):
+        """Resolve current-group settings into CurrentTerminal objects."""
+        terminals = []
+        missing = []
+        if not settings.get("current_enabled"):
+            return terminals, missing
+        by_key, by_name = self._build_pad_lookup(board)
+        for group in prepare_current_groups(settings.get("current_groups", [])):
+            for pad_info in group.get("pads", []):
+                current = float(pad_info.get("current_a", 0.0) or 0.0)
+                if abs(current) <= 0.0:
+                    continue
+                match = by_key.get(pad_info.get("pad_key")) or by_name.get(pad_info.get("name"))
+                if not match:
+                    missing.append(pad_info.get("name", pad_info.get("pad_key", "<unknown>")))
+                    continue
+                descriptor, pad = match
+                terminals.append(CurrentTerminal(
+                    pad=pad,
+                    name=descriptor.get("name", pad_info.get("name", "")),
+                    net_name=descriptor.get("net_name", pad_info.get("net_name", "")),
+                    net_code=int(descriptor.get("net_code", pad_info.get("net_code", 0)) or 0),
+                    current_a=current,
+                ))
+        return terminals, missing
+
+    def _unique_pads(self, pads):
+        """Return pads without duplicate object identities."""
+        result = []
+        seen = set()
+        for pad in pads or []:
+            ident = id(pad)
+            if ident in seen:
+                continue
+            result.append(pad)
+            seen.add(ident)
+        return result
 
     def _format_pad_names(self, selected_pads):
         """Format pad names with net info for display."""
@@ -518,8 +696,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
     def generate_preview(self, settings, layer_names):
         """Generate geometry preview image."""
+        current_pads = self._resolve_current_pad_objects(self.board, settings)
+        preview_pads = self._unique_pads(self.pads_list + current_pads)
         output_file = save_preview_image(
-            self.board, self.copper_ids, self.bbox, self.pads_list,
+            self.board, self.copper_ids, self.bbox, preview_pads,
             settings, layer_names,
             self.stack_info if self.stack_info is not None else parse_stackup_from_board_file(self.board),
             get_pad_pixels,
@@ -531,8 +711,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             wx.MessageBox("Board data missing for preview", "Error")
 
     def _run_simulation(self, board, copper_ids, layer_names, bbox, pads_list,
-                        settings, stack_info, pad_names, zone_refill_s=0.0):
+                        settings, stack_info, pad_names, zone_refill_s=0.0,
+                        focus_pads=None):
         """Execute the thermal simulation."""
+        focus_pads = focus_pads if focus_pads is not None else pads_list
+        if settings.get("current_enabled") and settings.get("limit_area"):
+            settings = dict(settings)
+            settings["limit_area"] = False
+            wx.MessageBox(
+                "Limit Area was disabled for current-flow simulation so copper paths are not cut off.",
+                "ThermalSim"
+            )
         # Derive thicknesses
         stackup_derived = self._derive_stackup_thicknesses(board, copper_ids, stack_info, settings)
         total_thick_mm = stackup_derived["total_thick_mm_used"]
@@ -565,8 +754,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # Apply area limiting if enabled
         if settings.get('limit_area') and settings.get('pad_dist_mm', 0.0) > 0:
             radius_mm = settings['pad_dist_mm']
-            pad_xs = [pad.GetPosition().x * 1e-6 for pad in pads_list]
-            pad_ys = [pad.GetPosition().y * 1e-6 for pad in pads_list]
+            pad_xs = [pad.GetPosition().x * 1e-6 for pad in focus_pads]
+            pad_ys = [pad.GetPosition().y * 1e-6 for pad in focus_pads]
             if pad_xs and pad_ys:
                 x_min = max(x_min, min(pad_xs) - radius_mm)
                 y_min = max(y_min, min(pad_ys) - radius_mm)
@@ -605,7 +794,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 res=res,
                 settings=settings,
                 via_factor=via_factor,
-                pads_list=pads_list,
+                pads_list=focus_pads,
             )
         except Exception as e:
             wx.MessageBox(f"Error mapping geometry: {e}", "Error")
@@ -706,6 +895,68 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         Q, Q_func = _build_power_vector(pad_sources, pad_contributions, N)
         init_timings["power_vector_build_s"] = time.perf_counter() - power_start
 
+        electrical_summary = None
+        if settings.get("current_enabled"):
+            electrical_start = time.perf_counter()
+            terminals, missing_pads = self._resolve_current_terminals(board, settings)
+            if missing_pads:
+                wx.MessageBox(
+                    "Current simulation references pads that were not found on the board:\n"
+                    + "\n".join(str(name) for name in missing_pads),
+                    "Current Path Error"
+                )
+                return
+            if terminals:
+                electrical_config = ElectricalConfig(
+                    copper_ids=list(copper_ids),
+                    rows=rows,
+                    cols=cols,
+                    x_min=x_min,
+                    y_min=y_min,
+                    res=res,
+                    t_cu=np.asarray(t_cu, dtype=np.float64),
+                )
+                electrical_result = solve_electrical_heating(board, terminals, electrical_config)
+                if not electrical_result.valid:
+                    wx.MessageBox(
+                        "Current simulation validation failed:\n\n"
+                        + "\n".join(electrical_result.errors),
+                        "Current Path Error"
+                    )
+                    return
+                q_joule = electrical_result.q_joule
+                if np.any(q_joule):
+                    Q = Q + q_joule
+                    if Q_func is not None:
+                        base_q_func = Q_func
+
+                        def q_func_with_joule(t, _base=base_q_func, _q_joule=q_joule):
+                            return _base(t) + _q_joule
+
+                        Q_func = q_func_with_joule
+                electrical_summary = {
+                    "total_loss_w": electrical_result.total_loss_w,
+                    "warnings": electrical_result.warnings,
+                    "nets": [
+                        {
+                            "net": item.net_name,
+                            "terminal_count": item.terminal_count,
+                            "total_abs_current_a": item.total_abs_current_a,
+                            "total_loss_w": item.total_loss_w,
+                            "max_node_power_w": item.max_node_power_w,
+                            "connected_component_count": item.connected_component_count,
+                        }
+                        for item in electrical_result.net_summaries
+                    ],
+                }
+            else:
+                electrical_summary = {
+                    "total_loss_w": 0.0,
+                    "warnings": ["Current simulation enabled but no non-zero pad currents were configured."],
+                    "nets": [],
+                }
+            init_timings["electrical_solve_s"] = time.perf_counter() - electrical_start
+
         # Build pad_power for reporting
         pad_power = []
         for i, name in enumerate(pad_names):
@@ -804,7 +1055,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "init_geometry_maps_s": init_timings.get("geometry_maps_s"),
             "init_capacity_build_s": init_timings.get("capacity_build_s"),
             "init_power_vector_build_s": init_timings.get("power_vector_build_s"),
+            "init_electrical_solve_s": init_timings.get("electrical_solve_s"),
             "init_stiffness_matrix_s": init_timings.get("stiffness_matrix_s"),
+            "electrical_summary": electrical_summary,
         })
 
         # Save results
@@ -820,7 +1073,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             )
 
         preview_path = save_preview_image(
-            board, copper_ids, bbox, pads_list,
+            board, copper_ids, bbox, focus_pads,
             settings, layer_names, stack_info,
             get_pad_pixels, create_multilayer_maps,
             self._derive_stackup_thicknesses,
@@ -855,6 +1108,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "init_geometry_maps_s": init_timings.get("geometry_maps_s"),
             "init_capacity_build_s": init_timings.get("capacity_build_s"),
             "init_power_vector_build_s": init_timings.get("power_vector_build_s"),
+            "init_electrical_solve_s": init_timings.get("electrical_solve_s"),
             "init_stiffness_matrix_s": init_timings.get("stiffness_matrix_s"),
         }
 
@@ -870,7 +1124,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             out_dir=run_dir,
             snapshot_debug=snapshot_debug,
             snapshot_files=result.snapshot_files,
-            interactive_heatmap=interactive_heatmap
+            interactive_heatmap=interactive_heatmap,
+            electrical_summary=electrical_summary
         )
 
         # Open outputs

@@ -6,6 +6,7 @@ simulation parameters, organized into two notebook tabs:
 Simulation (everyday settings) and Advanced (rarely changed).
 """
 
+import copy
 import os
 import wx
 
@@ -47,7 +48,151 @@ TOOLTIP_TEXTS = {
     'capabilities': "Detected solver backends. PyPardiso accelerates large grids significantly.",
     'help': "Open the ThermalSim documentation in your web browser.",
     'preview': "Generate a geometry preview image without running the simulation.",
+    'current_enable': "Enable DC current-flow simulation for Joule heating in traces and copper pours.",
+    'current_groups': "Pad groups used as current sources or sinks. Positive current enters the PCB; negative current leaves it.",
+    'current_total': "Total current for the selected group. In distribution mode it is split evenly across all pads.",
+    'current_per_pad': "Current value applied to selected pad rows in per-pad mode. If no row is selected, it is applied to all pads in the group.",
+    'current_pad_list': "Comma-separated per-pad currents in the same order as the pad table, for example: +6, -4, -2.",
 }
+
+
+CURRENT_GROUP_COLORS = [
+    "#d62728", "#1f77b4", "#2ca02c", "#ff7f0e",
+    "#9467bd", "#17becf", "#8c564b", "#e377c2",
+]
+
+
+def _safe_float(value, default=0.0):
+    """Parse a float and fall back to a default for UI data."""
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def normalize_current_mode(mode):
+    """
+    Normalize saved and UI current-entry modes to stable internal values.
+
+    Parameters
+    ----------
+    mode : str
+        Saved mode value or display label.
+
+    Returns
+    -------
+    str
+        Either ``per_pad`` or ``total``.
+    """
+    value = str(mode or "").strip().lower()
+    if value in ("per_pad", "per-pad currents", "strom pro pad", "pad current", "pad currents"):
+        return "per_pad"
+    if value in ("total", "distribute total current", "gesamtstrom verteilen", "distributed"):
+        return "total"
+    return "per_pad"
+
+
+def normalize_pad_descriptor(pad):
+    """
+    Return a serializable pad descriptor with stable keys.
+
+    Parameters
+    ----------
+    pad : dict
+        Partially populated pad descriptor.
+
+    Returns
+    -------
+    dict
+        Normalized descriptor suitable for settings persistence.
+    """
+    pad = dict(pad or {})
+    current = _safe_float(pad.get('current_a', pad.get('current', 0.0)))
+    return {
+        'pad_key': str(pad.get('pad_key', pad.get('key', ''))),
+        'name': str(pad.get('name', '')),
+        'net_name': str(pad.get('net_name', pad.get('net', ''))),
+        'net_code': int(_safe_float(pad.get('net_code', 0), 0)),
+        'layer': str(pad.get('layer', '')),
+        'current_a': current,
+    }
+
+
+def prepare_current_groups(groups):
+    """
+    Normalize groups and apply their current distribution mode.
+
+    Parameters
+    ----------
+    groups : list of dict
+        Raw group dictionaries from UI or saved settings.
+
+    Returns
+    -------
+    list of dict
+        Serializable groups with pad currents resolved.
+    """
+    prepared = []
+    for idx, raw in enumerate(groups or []):
+        pads = [normalize_pad_descriptor(p) for p in raw.get('pads', [])]
+        mode = normalize_current_mode(raw.get('mode', 'per_pad'))
+        total_current = _safe_float(raw.get('total_current_a', raw.get('total_current', 0.0)))
+        if mode == 'total' and pads:
+            per_pad = total_current / float(len(pads))
+            for pad in pads:
+                pad['current_a'] = per_pad
+        elif mode == 'per_pad':
+            total_current = float(sum(_safe_float(p.get('current_a')) for p in pads))
+        prepared.append({
+            'name': str(raw.get('name') or f"Group {idx + 1}"),
+            'color': str(raw.get('color') or CURRENT_GROUP_COLORS[idx % len(CURRENT_GROUP_COLORS)]),
+            'mode': mode,
+            'total_current_a': total_current,
+            'pads': pads,
+        })
+    return prepared
+
+
+def summarize_current_groups(groups):
+    """
+    Build user-readable group and net balance summaries.
+
+    Parameters
+    ----------
+    groups : list of dict
+        Current groups.
+
+    Returns
+    -------
+    tuple
+        (group_rows, balance_rows) where each row is a tuple of strings.
+    """
+    prepared = prepare_current_groups(groups)
+    group_rows = []
+    net_totals = {}
+    for group in prepared:
+        nets = sorted({p.get('net_name') or "(no net)" for p in group.get('pads', [])})
+        if not nets:
+            net_label = "-"
+        elif len(nets) == 1:
+            net_label = nets[0]
+        else:
+            net_label = "Mixed nets: " + ", ".join(nets)
+        total_current = float(sum(p.get('current_a', 0.0) for p in group.get('pads', [])))
+        group_rows.append((
+            group.get('name', ''),
+            net_label,
+            str(len(group.get('pads', []))),
+            f"{total_current:.6g} A",
+        ))
+        for pad in group.get('pads', []):
+            net = pad.get('net_name') or "(no net)"
+            net_totals[net] = net_totals.get(net, 0.0) + float(pad.get('current_a', 0.0))
+    balance_rows = []
+    for net, total in sorted(net_totals.items()):
+        status = "OK" if abs(total) <= max(1e-9, 1e-6 * abs(total)) else "Needs balance"
+        balance_rows.append((net, f"{total:.9g} A", status))
+    return group_rows, balance_rows
 
 
 class SettingsDialog(wx.Dialog):
@@ -95,6 +240,9 @@ class SettingsDialog(wx.Dialog):
         suggested_res,
         layer_names,
         preview_callback=None,
+        selection_provider=None,
+        run_callback=None,
+        close_callback=None,
         stackup_details="",
         pad_names=None,
         default_output_dir="",
@@ -104,6 +252,11 @@ class SettingsDialog(wx.Dialog):
 
         self.layer_names = layer_names
         self.preview_callback = preview_callback
+        self.selection_provider = selection_provider
+        self.run_callback = run_callback
+        self.close_callback = close_callback
+        self.current_groups = []
+        self.current_group_index = -1
 
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
@@ -122,6 +275,11 @@ class SettingsDialog(wx.Dialog):
         self.tab_adv = wx.Panel(self.notebook)
         self._build_advanced_tab(self.tab_adv)
         self.notebook.AddPage(self.tab_adv, "Advanced")
+
+        # Tab 3: Current paths
+        self.tab_current = wx.Panel(self.notebook)
+        self._build_current_tab(self.tab_current)
+        self.notebook.AddPage(self.tab_current, "Current Paths")
 
         main_sizer.Add(self.notebook, 1, wx.EXPAND | wx.ALL, 5)
 
@@ -149,19 +307,28 @@ class SettingsDialog(wx.Dialog):
 
         btn_sizer.AddStretchSpacer()
 
-        btn_run = wx.Button(self, wx.ID_OK, "Run")
-        btn_cancel = wx.Button(self, wx.ID_CANCEL, "Cancel")
+        btn_run = wx.Button(self, label="Run")
+        btn_run.Bind(wx.EVT_BUTTON, self._on_run)
+        btn_cancel = wx.Button(self, label="Cancel")
+        btn_cancel.Bind(wx.EVT_BUTTON, self._on_cancel)
         btn_sizer.Add(btn_run, 0, wx.ALL, 5)
         btn_sizer.Add(btn_cancel, 0, wx.ALL, 5)
+
+        try:
+            self.Bind(wx.EVT_CLOSE, self._on_cancel)
+        except Exception:
+            pass
 
         main_sizer.Add(btn_sizer, 0, wx.EXPAND | wx.ALL, 5)
 
         self.SetSizer(main_sizer)
-        self.SetSize((520, 680))
+        self.SetSize((680, 760))
         self.Center()
 
         if defaults:
             self._apply_defaults(defaults)
+        else:
+            self._render_current_groups()
 
     # ------------------------------------------------------------------
     # Tab builders
@@ -361,6 +528,125 @@ class SettingsDialog(wx.Dialog):
 
         panel.SetSizer(sizer)
 
+    def _build_current_tab(self, panel):
+        """Build the current-path/Joule-heating tab."""
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        self.chk_current_enabled = wx.CheckBox(panel, label="Enable current heating")
+        self.chk_current_enabled.SetValue(False)
+        self.chk_current_enabled.SetToolTip(TOOLTIP_TEXTS['current_enable'])
+        self.chk_current_enabled.Bind(wx.EVT_CHECKBOX, self._on_current_enabled_toggle)
+        sizer.Add(self.chk_current_enabled, 0, wx.ALL, 5)
+
+        help_text = wx.StaticText(
+            panel,
+            label="Positive currents enter the PCB; negative currents leave it."
+        )
+        sizer.Add(help_text, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        group_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Current Groups")
+        self.current_group_list = wx.ListCtrl(
+            panel,
+            style=getattr(wx, "LC_REPORT", 0) | getattr(wx, "LC_SINGLE_SEL", 0)
+        )
+        for idx, (title, width) in enumerate([
+            ("Name", 130), ("Net", 190), ("Pads", 55), ("Current", 90),
+        ]):
+            self.current_group_list.InsertColumn(idx, title, width=width)
+        self.current_group_list.SetToolTip(TOOLTIP_TEXTS['current_groups'])
+        self.current_group_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self._on_current_group_selected)
+        group_box.Add(self.current_group_list, 1, wx.EXPAND | wx.ALL, 3)
+
+        group_buttons = wx.BoxSizer(wx.HORIZONTAL)
+        btn_new = wx.Button(panel, label="New")
+        btn_new.Bind(wx.EVT_BUTTON, self._on_current_new_group)
+        group_buttons.Add(btn_new, 0, wx.ALL, 2)
+        btn_add = wx.Button(panel, label="Add Pads")
+        btn_add.Bind(wx.EVT_BUTTON, self._on_current_add_selection)
+        group_buttons.Add(btn_add, 0, wx.ALL, 2)
+        btn_remove = wx.Button(panel, label="Remove Pads")
+        btn_remove.Bind(wx.EVT_BUTTON, self._on_current_remove_pads)
+        group_buttons.Add(btn_remove, 0, wx.ALL, 2)
+        btn_duplicate = wx.Button(panel, label="Duplizieren")
+        btn_duplicate.Bind(wx.EVT_BUTTON, self._on_current_duplicate_group)
+        group_buttons.Add(btn_duplicate, 0, wx.ALL, 2)
+        btn_delete = wx.Button(panel, label="Delete")
+        btn_delete.Bind(wx.EVT_BUTTON, self._on_current_delete_group)
+        group_buttons.Add(btn_delete, 0, wx.ALL, 2)
+        group_box.Add(group_buttons, 0, wx.EXPAND | wx.ALL, 3)
+        sizer.Add(group_box, 1, wx.EXPAND | wx.ALL, 5)
+
+        edit_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Selected Group")
+        row_name = wx.BoxSizer(wx.HORIZONTAL)
+        row_name.Add(wx.StaticText(panel, label="Name:", size=(105, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.current_name_input = wx.TextCtrl(panel, value="")
+        row_name.Add(self.current_name_input, 1, wx.EXPAND | wx.RIGHT, 5)
+        btn_apply_name = wx.Button(panel, label="Apply")
+        btn_apply_name.Bind(wx.EVT_BUTTON, self._on_current_apply_group_fields)
+        row_name.Add(btn_apply_name, 0)
+        edit_box.Add(row_name, 0, wx.EXPAND | wx.ALL, 2)
+
+        row_mode = wx.BoxSizer(wx.HORIZONTAL)
+        row_mode.Add(wx.StaticText(panel, label="Mode:", size=(105, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.current_mode_choice = wx.Choice(
+            panel,
+            choices=["Per-Pad Currents", "Distribute Total Current"]
+        )
+        self.current_mode_choice.SetSelection(0)
+        row_mode.Add(self.current_mode_choice, 1, wx.EXPAND)
+        edit_box.Add(row_mode, 0, wx.EXPAND | wx.ALL, 2)
+
+        self.current_total_input = self._add_spin_field(
+            edit_box, panel, "Group Current (A):", 0.0,
+            min_val=-10000.0, max_val=10000.0, inc=0.1, digits=3,
+            tooltip_key='current_total'
+        )
+
+        row_pad_current = wx.BoxSizer(wx.HORIZONTAL)
+        row_pad_current.Add(wx.StaticText(panel, label="Selected Pad A:", size=(105, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.current_pad_value_input = wx.SpinCtrlDouble(
+            panel, value="0.0", min=-10000.0, max=10000.0, inc=0.1
+        )
+        self.current_pad_value_input.SetDigits(3)
+        self.current_pad_value_input.SetToolTip(TOOLTIP_TEXTS['current_per_pad'])
+        row_pad_current.Add(self.current_pad_value_input, 1, wx.EXPAND | wx.RIGHT, 5)
+        btn_set_pad_current = wx.Button(panel, label="Apply to Selected")
+        btn_set_pad_current.Bind(wx.EVT_BUTTON, self._on_current_apply_pad_current)
+        row_pad_current.Add(btn_set_pad_current, 0)
+        edit_box.Add(row_pad_current, 0, wx.EXPAND | wx.ALL, 2)
+
+        row_pad_list = wx.BoxSizer(wx.HORIZONTAL)
+        row_pad_list.Add(wx.StaticText(panel, label="Pad Currents:", size=(105, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.current_pad_list_input = wx.TextCtrl(panel, value="")
+        self.current_pad_list_input.SetToolTip(TOOLTIP_TEXTS['current_pad_list'])
+        row_pad_list.Add(self.current_pad_list_input, 1, wx.EXPAND | wx.RIGHT, 5)
+        btn_apply_list = wx.Button(panel, label="Apply List")
+        btn_apply_list.Bind(wx.EVT_BUTTON, self._on_current_apply_pad_current_list)
+        row_pad_list.Add(btn_apply_list, 0)
+        edit_box.Add(row_pad_list, 0, wx.EXPAND | wx.ALL, 2)
+
+        self.current_pad_list = wx.ListCtrl(
+            panel,
+            style=getattr(wx, "LC_REPORT", 0) | getattr(wx, "LC_SINGLE_SEL", 0)
+        )
+        for idx, (title, width) in enumerate([
+            ("Pad", 190), ("Net", 140), ("Layer", 80), ("Current A", 90), ("Status", 100),
+        ]):
+            self.current_pad_list.InsertColumn(idx, title, width=width)
+        self.current_pad_list.SetMinSize((-1, 130))
+        edit_box.Add(self.current_pad_list, 1, wx.EXPAND | wx.ALL, 3)
+        sizer.Add(edit_box, 1, wx.EXPAND | wx.ALL, 5)
+
+        balance_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Net Balance")
+        self.current_balance_text = wx.TextCtrl(
+            panel, value="", style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP
+        )
+        self.current_balance_text.SetMinSize((-1, 70))
+        balance_box.Add(self.current_balance_text, 0, wx.EXPAND | wx.ALL, 3)
+        sizer.Add(balance_box, 0, wx.EXPAND | wx.ALL, 5)
+
+        panel.SetSizer(sizer)
+
     # ------------------------------------------------------------------
     # Helper: add spinner fields
     # ------------------------------------------------------------------
@@ -462,6 +748,36 @@ class SettingsDialog(wx.Dialog):
             if settings:
                 self.preview_callback(settings, self.layer_names)
 
+    def _on_run(self, event):
+        """Handle Run button click for modal and modeless workflows."""
+        settings = self.get_values()
+        if not settings:
+            wx.MessageBox("Invalid simulation settings.", "ThermalSim")
+            return
+        if self.run_callback:
+            self.run_callback(settings)
+            try:
+                self.Destroy()
+            except Exception:
+                pass
+        else:
+            try:
+                self.EndModal(wx.ID_OK)
+            except Exception:
+                pass
+
+    def _on_cancel(self, event):
+        """Handle Cancel button click."""
+        if self.close_callback:
+            self.close_callback()
+        try:
+            self.Destroy()
+        except Exception:
+            try:
+                self.EndModal(wx.ID_CANCEL)
+            except Exception:
+                pass
+
     def _on_limit_area_toggle(self, event):
         """Handle Limit Area checkbox toggle."""
         self.pad_dist_input.Enable(self.chk_limit_area.GetValue())
@@ -469,6 +785,146 @@ class SettingsDialog(wx.Dialog):
     def _on_snapshots_toggle(self, event):
         """Handle Snapshots checkbox toggle."""
         self.snap_count_input.Enable(self.chk_snapshots.GetValue())
+
+    def _on_current_enabled_toggle(self, event):
+        """Refresh summaries when current simulation is toggled."""
+        self._render_current_groups()
+
+    def _on_current_new_group(self, event):
+        """Create a current group from the live KiCad pad selection."""
+        pads = self._selection_descriptors()
+        if not pads:
+            wx.MessageBox("Select one or more pads in KiCad first.", "ThermalSim")
+            return
+        group_idx = len(self.current_groups)
+        self.current_groups.append({
+            'name': f"Group {group_idx + 1}",
+            'color': CURRENT_GROUP_COLORS[group_idx % len(CURRENT_GROUP_COLORS)],
+            'mode': 'per_pad',
+            'total_current_a': 0.0,
+            'pads': [normalize_pad_descriptor(p) for p in pads],
+        })
+        self.current_group_index = group_idx
+        self.chk_current_enabled.SetValue(True)
+        self._render_current_groups()
+
+    def _on_current_add_selection(self, event):
+        """Add the live KiCad pad selection to the selected current group."""
+        self._sync_current_group_from_fields()
+        group = self._selected_current_group()
+        if group is None:
+            self._on_current_new_group(event)
+            return
+        pads = self._selection_descriptors()
+        if not pads:
+            wx.MessageBox("Select one or more pads in KiCad first.", "ThermalSim")
+            return
+        existing = {p.get('pad_key') for p in group.get('pads', [])}
+        for pad in pads:
+            descriptor = normalize_pad_descriptor(pad)
+            if descriptor['pad_key'] not in existing:
+                group.setdefault('pads', []).append(descriptor)
+                existing.add(descriptor['pad_key'])
+        self._render_current_groups()
+
+    def _on_current_remove_pads(self, event):
+        """Remove selected pad rows from the selected group."""
+        self._sync_current_group_from_fields()
+        group = self._selected_current_group()
+        if group is None:
+            return
+        indices = self._selected_current_pad_indices()
+        if not indices:
+            return
+        group['pads'] = [
+            pad for idx, pad in enumerate(group.get('pads', []))
+            if idx not in set(indices)
+        ]
+        self._render_current_groups()
+
+    def _on_current_duplicate_group(self, event):
+        """Duplicate the selected group."""
+        self._sync_current_group_from_fields()
+        group = self._selected_current_group()
+        if group is None:
+            return
+        duplicate = copy.deepcopy(group)
+        duplicate['name'] = f"{group.get('name', 'Group')} Copy"
+        duplicate['color'] = CURRENT_GROUP_COLORS[len(self.current_groups) % len(CURRENT_GROUP_COLORS)]
+        self.current_groups.append(duplicate)
+        self.current_group_index = len(self.current_groups) - 1
+        self._render_current_groups()
+
+    def _on_current_delete_group(self, event):
+        """Delete the selected group."""
+        self._sync_current_group_from_fields()
+        if 0 <= self.current_group_index < len(self.current_groups):
+            del self.current_groups[self.current_group_index]
+        self.current_group_index = min(self.current_group_index, len(self.current_groups) - 1)
+        self._render_current_groups()
+
+    def _on_current_group_selected(self, event):
+        """Handle current group list selection changes."""
+        self._sync_current_group_from_fields()
+        try:
+            self.current_group_index = event.GetIndex()
+        except Exception:
+            try:
+                self.current_group_index = self.current_group_list.GetFirstSelected()
+            except Exception:
+                self.current_group_index = -1
+        self._render_current_group_editor()
+
+    def _on_current_apply_group_fields(self, event):
+        """Apply name, mode, and total current edits to the selected group."""
+        self._sync_current_group_from_fields()
+        self._render_current_groups()
+
+    def _on_current_apply_pad_current(self, event):
+        """Apply a per-pad current to selected pad rows or all pads."""
+        group = self._selected_current_group()
+        if group is None:
+            return
+        group['mode'] = 'per_pad'
+        current = float(self.current_pad_value_input.GetValue())
+        indices = self._selected_current_pad_indices()
+        if not indices:
+            indices = list(range(len(group.get('pads', []))))
+        for idx in indices:
+            if 0 <= idx < len(group.get('pads', [])):
+                group['pads'][idx]['current_a'] = current
+        self.current_mode_choice.SetSelection(0)
+        self._render_current_groups()
+
+    def _on_current_apply_pad_current_list(self, event):
+        """Apply a comma-separated list of pad currents to the selected group."""
+        group = self._selected_current_group()
+        if group is None:
+            return
+        text = self.current_pad_list_input.GetValue().strip()
+        if not text:
+            return
+        try:
+            values = [
+                float(part.strip())
+                for part in text.replace(";", ",").split(",")
+                if part.strip()
+            ]
+        except ValueError:
+            wx.MessageBox("Enter comma-separated numeric currents, e.g. +6, -4, -2.", "ThermalSim")
+            return
+        pads = group.get('pads', [])
+        if len(values) != len(pads):
+            wx.MessageBox(
+                f"Current list has {len(values)} values, but the group has {len(pads)} pads.",
+                "ThermalSim"
+            )
+            return
+        group['mode'] = 'per_pad'
+        for idx, value in enumerate(values):
+            pads[idx]['current_a'] = value
+        self.current_mode_choice.SetSelection(0)
+        self._render_current_groups()
 
     def _on_browse_pwl(self, event):
         """Handle Browse PWL button click to select a PWL file."""
@@ -510,6 +966,116 @@ class SettingsDialog(wx.Dialog):
         webbrowser.open("https://github.com/PoeAlex/KiCad_Thermal_Sim#readme")
 
     # ------------------------------------------------------------------
+    # Current-path tab helpers
+    # ------------------------------------------------------------------
+
+    def _selection_descriptors(self):
+        """Return live pad descriptors from the host plugin."""
+        if not self.selection_provider:
+            return []
+        try:
+            pads = self.selection_provider()
+        except Exception:
+            pads = []
+        return [normalize_pad_descriptor(pad) for pad in (pads or [])]
+
+    def _selected_current_group(self):
+        """Return the selected current group or None."""
+        if 0 <= self.current_group_index < len(self.current_groups):
+            return self.current_groups[self.current_group_index]
+        return None
+
+    def _selected_current_pad_indices(self):
+        """Return selected pad row indices in the pad table."""
+        indices = []
+        try:
+            idx = self.current_pad_list.GetFirstSelected()
+            while idx != -1:
+                indices.append(idx)
+                idx = self.current_pad_list.GetNextItem(idx, getattr(wx, "LIST_NEXT_ALL", 0), getattr(wx, "LIST_STATE_SELECTED", 0))
+        except Exception:
+            pass
+        return indices
+
+    def _sync_current_group_from_fields(self):
+        """Copy editor fields into the selected group."""
+        group = self._selected_current_group()
+        if group is None:
+            return
+        group['name'] = self.current_name_input.GetValue().strip() or group.get('name', 'Group')
+        group['mode'] = 'total' if self.current_mode_choice.GetSelection() == 1 else 'per_pad'
+        group['total_current_a'] = float(self.current_total_input.GetValue())
+
+    def _render_current_groups(self):
+        """Refresh group list, pad table, and net-balance text."""
+        self.current_groups = prepare_current_groups(self.current_groups)
+        if self.current_groups and not (0 <= self.current_group_index < len(self.current_groups)):
+            self.current_group_index = 0
+        try:
+            self.current_group_list.DeleteAllItems()
+            rows, balance_rows = summarize_current_groups(self.current_groups)
+            for row_idx, row in enumerate(rows):
+                self.current_group_list.InsertItem(row_idx, row[0])
+                for col_idx, value in enumerate(row[1:], start=1):
+                    self.current_group_list.SetItem(row_idx, col_idx, value)
+            if 0 <= self.current_group_index < len(self.current_groups):
+                self.current_group_list.Select(self.current_group_index)
+        except Exception:
+            _, balance_rows = summarize_current_groups(self.current_groups)
+
+        lines = []
+        for net, total, status in balance_rows:
+            lines.append(f"{net}: {total} - {status}")
+        if not lines:
+            lines.append("No current groups configured.")
+        self.current_balance_text.SetValue("\n".join(lines))
+        self._render_current_group_editor()
+
+    def _render_current_group_editor(self):
+        """Refresh editor fields for the selected group."""
+        group = self._selected_current_group()
+        if group is None:
+            self.current_name_input.SetValue("")
+            self.current_total_input.SetValue(0.0)
+            self.current_mode_choice.SetSelection(0)
+            self.current_pad_list_input.SetValue("")
+            try:
+                self.current_pad_list.DeleteAllItems()
+            except Exception:
+                pass
+            return
+        self.current_name_input.SetValue(str(group.get('name', '')))
+        self.current_mode_choice.SetSelection(1 if group.get('mode') == 'total' else 0)
+        self.current_total_input.SetValue(float(group.get('total_current_a', 0.0)))
+        self.current_pad_list_input.SetValue(
+            ", ".join(f"{float(pad.get('current_a', 0.0)):.6g}" for pad in group.get('pads', []))
+        )
+
+        try:
+            self.current_pad_list.DeleteAllItems()
+            group_nets = {pad.get('net_name') or "(no net)" for pad in group.get('pads', [])}
+            for row_idx, pad in enumerate(group.get('pads', [])):
+                net = pad.get('net_name') or "(no net)"
+                if net == "(no net)":
+                    status = "No net"
+                elif len(group_nets) > 1:
+                    status = "Mixed nets"
+                else:
+                    status = "OK"
+                values = [
+                    pad.get('name', ''),
+                    net,
+                    pad.get('layer', ''),
+                    f"{float(pad.get('current_a', 0.0)):.6g}",
+                    status,
+                ]
+                self.current_pad_list.InsertItem(row_idx, values[0])
+                for col_idx, value in enumerate(values[1:], start=1):
+                    self.current_pad_list.SetItem(row_idx, col_idx, value)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # Settings I/O
     # ------------------------------------------------------------------
 
@@ -546,6 +1112,8 @@ class SettingsDialog(wx.Dialog):
         - h_conv : float
         """
         try:
+            self._sync_current_group_from_fields()
+            current_groups = prepare_current_groups(self.current_groups)
             return {
                 'power_str': self.power_input.GetValue(),
                 'time': float(self.time_input.GetValue()),
@@ -565,6 +1133,8 @@ class SettingsDialog(wx.Dialog):
                 'pad_k': float(self.pad_k.GetValue()),
                 'pad_cap_areal': float(self.pad_cap.GetValue()),
                 'h_conv': float(self.h_conv_input.GetValue()),
+                'current_enabled': self.chk_current_enabled.GetValue(),
+                'current_groups': current_groups,
             }
         except ValueError:
             return None
@@ -628,5 +1198,12 @@ class SettingsDialog(wx.Dialog):
 
             if 'h_conv' in defaults:
                 self.h_conv_input.SetValue(float(defaults['h_conv']))
+
+            self.chk_current_enabled.SetValue(
+                bool(defaults.get('current_enabled', self.chk_current_enabled.GetValue()))
+            )
+            self.current_groups = prepare_current_groups(defaults.get('current_groups', []))
+            self.current_group_index = 0 if self.current_groups else -1
+            self._render_current_groups()
         except Exception:
             pass
