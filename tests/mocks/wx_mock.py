@@ -229,6 +229,9 @@ class _WxMock:
         def Enable(self, enable=True):
             self._enabled = enable
 
+        def IsEnabled(self):
+            return self._enabled
+
         def SetLabel(self, label):
             self.label = label
 

@@ -16,6 +16,12 @@ import threading
 import wx
 
 
+STATUS_READY = "Ready to install selected packages."
+STATUS_INSTALLING = "Installing packages... this can take a few minutes. Please keep this window open."
+STATUS_SUCCESS = "Installation successful. Restart KiCad to use the installed packages."
+STATUS_FAILURE = "Installation failed. See details below."
+
+
 def _find_python():
     """Find the Python interpreter for pip commands.
 
@@ -109,6 +115,9 @@ class DependencyInstallDialog(wx.Dialog):
                 self._optional_checkboxes.append(chk)
             vbox.Add(opt_box, flag=wx.LEFT | wx.RIGHT | wx.TOP | wx.EXPAND, border=10)
 
+        self._status_text = wx.StaticText(panel, label=STATUS_READY)
+        vbox.Add(self._status_text, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+
         # Output log
         self._log = wx.TextCtrl(
             panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP
@@ -132,6 +141,15 @@ class DependencyInstallDialog(wx.Dialog):
 
         panel.SetSizer(vbox)
         self._refresh_install_button()
+
+    def _set_status(self, text):
+        """Set the visible installer status message."""
+        self._status_text.SetLabel(text)
+
+    def _set_optional_controls_enabled(self, enable):
+        """Enable or disable selectable optional package controls."""
+        for opt, chk in zip(self._optional, self._optional_checkboxes):
+            chk.Enable(bool(opt.get("enabled", True)) and enable)
 
     def _on_optional_toggle(self, event):
         """Update install button state when optional packages are toggled."""
@@ -164,6 +182,11 @@ class DependencyInstallDialog(wx.Dialog):
             return
         self._installing = True
         self._btn_install.Enable(False)
+        self._btn_install.SetLabel("Installing...")
+        self._btn_close.SetLabel("Please wait...")
+        self._btn_close.Enable(False)
+        self._set_optional_controls_enabled(False)
+        self._set_status(STATUS_INSTALLING)
         self._log.SetValue("")
         self._append_log("Starting installation...\n")
 
@@ -215,14 +238,18 @@ class DependencyInstallDialog(wx.Dialog):
     def _on_success(self):
         """Handle successful installation."""
         self._installing = False
+        self._set_status(STATUS_SUCCESS)
         self._append_log("\nInstallation successful!\n")
         self._append_log("Please restart KiCad for changes to take effect.\n")
         self._btn_install.SetLabel("Done")
         self._btn_install.Enable(False)
+        self._btn_close.SetLabel("Close")
+        self._btn_close.Enable(True)
 
     def _on_failure(self, returncode, error_msg=None):
         """Handle failed installation."""
         self._installing = False
+        self._set_status(STATUS_FAILURE)
         self._append_log(f"\nInstallation failed (exit code {returncode}).\n")
         if error_msg:
             self._append_log(f"Error: {error_msg}\n")
@@ -237,3 +264,6 @@ class DependencyInstallDialog(wx.Dialog):
 
         self._btn_install.SetLabel("Retry")
         self._btn_install.Enable(True)
+        self._btn_close.SetLabel("Close")
+        self._btn_close.Enable(True)
+        self._set_optional_controls_enabled(True)

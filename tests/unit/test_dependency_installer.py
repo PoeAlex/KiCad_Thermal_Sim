@@ -46,6 +46,12 @@ class TestDependencyInstallDialogCreation:
         dlg = DependencyInstallDialog(None, [("numpy", "numpy")])
         assert dlg._installing is False
 
+    def test_dialog_shows_ready_status_initially(self):
+        """Test that dialog shows an initial ready status."""
+        from ThermalSim.dependency_installer import DependencyInstallDialog, STATUS_READY
+        dlg = DependencyInstallDialog(None, [("numpy", "numpy")])
+        assert dlg._status_text.label == STATUS_READY
+
     def test_compatible_pypardiso_checkbox_checked(self):
         """Test that compatible PyPardiso option is enabled and checked."""
         from ThermalSim.dependency_installer import DependencyInstallDialog
@@ -84,7 +90,10 @@ class TestInstallLogic:
 
     def test_on_install_sets_installing_flag(self):
         """Test that clicking install sets the installing flag."""
-        from ThermalSim.dependency_installer import DependencyInstallDialog
+        from ThermalSim.dependency_installer import (
+            DependencyInstallDialog,
+            STATUS_INSTALLING,
+        )
         missing = [("numpy", "numpy")]
         dlg = DependencyInstallDialog(None, missing)
 
@@ -95,6 +104,10 @@ class TestInstallLogic:
                 mock_thread.return_value = mock_thread_instance
                 dlg._on_install(None)
                 assert dlg._installing is True
+                assert dlg._status_text.label == STATUS_INSTALLING
+                assert dlg._btn_install.label == "Installing..."
+                assert dlg._btn_close.label == "Please wait..."
+                assert dlg._btn_close.IsEnabled() is False
 
     def test_on_install_prevents_double_install(self):
         """Test that a second install click is ignored while installing."""
@@ -118,6 +131,27 @@ class TestInstallLogic:
         with patch.object(threading, 'Thread') as mock_thread:
             dlg._on_install(None)
             mock_thread.assert_not_called()
+
+    def test_on_install_disables_optional_checkboxes(self):
+        """Test that optional package controls are locked while installing."""
+        from ThermalSim.dependency_installer import DependencyInstallDialog
+        optional = [{
+            "import_name": "pypardiso",
+            "pip_name": "pypardiso",
+            "label": "Install PyPardiso accelerator",
+            "enabled": True,
+            "default_selected": True,
+            "status": "Recommended accelerator for large simulations.",
+        }]
+        dlg = DependencyInstallDialog(None, [("numpy", "numpy")], optional)
+
+        with patch.object(dlg, '_run_pip'):
+            import threading
+            with patch.object(threading, 'Thread') as mock_thread:
+                mock_thread.return_value = MagicMock()
+                dlg._on_install(None)
+
+        assert dlg._optional_checkboxes[0].IsEnabled() is False
 
     def test_run_pip_success(self):
         """Test successful pip run."""
@@ -171,19 +205,25 @@ class TestCallbackHandlers:
 
     def test_on_success_resets_installing_flag(self):
         """Test that success handler resets the installing flag."""
-        from ThermalSim.dependency_installer import DependencyInstallDialog
+        from ThermalSim.dependency_installer import DependencyInstallDialog, STATUS_SUCCESS
         dlg = DependencyInstallDialog(None, [("numpy", "numpy")])
         dlg._installing = True
         dlg._on_success()
         assert dlg._installing is False
+        assert dlg._status_text.label == STATUS_SUCCESS
+        assert dlg._btn_close.label == "Close"
+        assert dlg._btn_close.IsEnabled() is True
 
     def test_on_failure_resets_installing_flag(self):
         """Test that failure handler resets the installing flag."""
-        from ThermalSim.dependency_installer import DependencyInstallDialog
+        from ThermalSim.dependency_installer import DependencyInstallDialog, STATUS_FAILURE
         dlg = DependencyInstallDialog(None, [("numpy", "numpy")])
         dlg._installing = True
         dlg._on_failure(1)
         assert dlg._installing is False
+        assert dlg._status_text.label == STATUS_FAILURE
+        assert dlg._btn_close.label == "Close"
+        assert dlg._btn_close.IsEnabled() is True
 
     def test_on_failure_with_error_message(self):
         """Test failure handler with error message."""
@@ -192,6 +232,22 @@ class TestCallbackHandlers:
         dlg._installing = True
         dlg._on_failure(-1, "Permission denied")
         assert dlg._installing is False
+
+    def test_on_failure_reenables_supported_optional_checkboxes(self):
+        """Test that retry restores enabled optional controls."""
+        from ThermalSim.dependency_installer import DependencyInstallDialog
+        optional = [{
+            "import_name": "pypardiso",
+            "pip_name": "pypardiso",
+            "label": "Install PyPardiso accelerator",
+            "enabled": True,
+            "default_selected": True,
+            "status": "Recommended accelerator for large simulations.",
+        }]
+        dlg = DependencyInstallDialog(None, [("numpy", "numpy")], optional)
+        dlg._set_optional_controls_enabled(False)
+        dlg._on_failure(1)
+        assert dlg._optional_checkboxes[0].IsEnabled() is True
 
     def test_append_log(self):
         """Test that append_log adds text to the log control."""
