@@ -491,6 +491,89 @@ class TestWriteHtmlReport:
         assert "Effective Dielectric Thickness" in content
         assert "0.765" in content
 
+    def test_report_contains_current_path_diagnostics(self, basic_report_params, temp_dir):
+        """Current-path diagnostics should render rich electrical metrics."""
+        joule_map = os.path.join(temp_dir, "joule_loss_map.png")
+        with open(joule_map, 'wb') as f:
+            f.write(b'\x89PNG\r\n\x1a\n')
+        params = basic_report_params.copy()
+        params['k_norm_info'] = {
+            'grid_requested_res_mm': 0.1,
+            'grid_res_mm': 0.184475,
+            'grid_auto_coarsened': True,
+            'grid_rows': 259,
+            'grid_cols': 394,
+        }
+        params['electrical_summary'] = {
+            'total_loss_w': 0.233886,
+            'warnings': [],
+            'nets': [
+                {
+                    'net': 'PWR<main>',
+                    'net_name': 'PWR<main>',
+                    'terminal_count': 2,
+                    'source_current_a': 5.0,
+                    'sink_current_a': 5.0,
+                    'current_balance_a': 0.0,
+                    'total_abs_current_a': 10.0,
+                    'total_loss_w': 0.233886,
+                    'max_node_power_w': 0.000524,
+                    'effective_resistance_ohm': 0.009355,
+                    'equivalent_voltage_drop_v': 0.046777,
+                    'pad_resistance_ohm': 0.009350,
+                    'copper_cell_count': 450,
+                    'edge_count': 820,
+                    'via_edge_count': 0,
+                    'connected_component_count': 3,
+                    'terminal_diagnostics': [
+                        {
+                            'name': 'U1<1>',
+                            'net_name': 'PWR<main>',
+                            'current_a': 5.0,
+                            'layer': 'F.Cu',
+                            'x_mm': 10.0,
+                            'y_mm': 20.0,
+                            'bbox_mm': [9.5, 19.5, 1.0, 1.0],
+                            'cell_count': 12,
+                            'component_ids': [0],
+                            'mean_potential_v': 0.046,
+                        }
+                    ],
+                    'primitive_diagnostics': [
+                        {
+                            'net_name': 'PWR<main>',
+                            'primitive_type': 'Track',
+                            'layer': 'F.Cu',
+                            'count': 1,
+                            'track_length_mm': 20.0,
+                            'track_width_min_mm': 2.079,
+                            'track_width_avg_mm': 2.079,
+                            'track_width_max_mm': 2.079,
+                            'bbox_area_mm2': 41.584,
+                            'mapped_cell_count': 450,
+                        }
+                    ],
+                }
+            ],
+        }
+        params['joule_map_path'] = joule_map
+
+        result = write_html_report(**params)
+
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        assert "Current Path Diagnostics" in content
+        assert "R_eff" in content
+        assert "V_eq" in content
+        assert "0.184 mm" in content
+        assert "requested: 0.100 mm" in content
+        assert "Grid resolution was auto-coarsened" in content
+        assert "Mapped KiCad Primitives" in content
+        assert "joule_loss_map.png" in content
+        assert "PWR&lt;main&gt;" in content
+        assert "U1&lt;1&gt;" in content
+
 
 class TestWriteHtmlReportEdgeCases:
     """Edge case tests for write_html_report."""

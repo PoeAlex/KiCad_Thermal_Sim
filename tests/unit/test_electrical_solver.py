@@ -116,6 +116,117 @@ def test_track_loss_matches_i_squared_r_order():
     np.testing.assert_allclose(result.total_loss_w, expected_r, rtol=0.25)
 
 
+def test_ideal_20mm_strip_reports_kicad_calculator_order():
+    """A 20 mm x 2.0792 mm top trace at 5 A should report KiCad-order diagnostics."""
+    width_mm = 2.0792
+    length_mm = 20.0
+    current_a = 5.0
+    pad_size_mm = 0.05
+    y_mid_mm = 1.5
+    pad_a = MockPad(
+        position=VECTOR2I(int(0.025e6), int(y_mid_mm * 1e6)),
+        layer=F_Cu,
+        bbox=EDA_RECT(0, int((y_mid_mm - pad_size_mm / 2) * 1e6), int(pad_size_mm * 1e6), int(pad_size_mm * 1e6)),
+        net_code=1,
+        net_name="PWR",
+        number="1",
+    )
+    pad_b = MockPad(
+        position=VECTOR2I(int((length_mm - 0.025) * 1e6), int(y_mid_mm * 1e6)),
+        layer=F_Cu,
+        bbox=EDA_RECT(
+            int((length_mm - pad_size_mm) * 1e6),
+            int((y_mid_mm - pad_size_mm / 2) * 1e6),
+            int(pad_size_mm * 1e6),
+            int(pad_size_mm * 1e6),
+        ),
+        net_code=1,
+        net_name="PWR",
+        number="2",
+    )
+    track = MockTrack(
+        layer=F_Cu,
+        bbox=EDA_RECT(0, int((y_mid_mm - width_mm / 2) * 1e6), int(length_mm * 1e6), int(width_mm * 1e6)),
+        start=VECTOR2I(0, int(y_mid_mm * 1e6)),
+        end=VECTOR2I(int(length_mm * 1e6), int(y_mid_mm * 1e6)),
+        width=int(width_mm * 1e6),
+        net_code=1,
+        net_name="PWR",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_a, pad_b])],
+        tracks=[track],
+        layer_names={F_Cu: "F.Cu"},
+    )
+    config = ElectricalConfig(
+        copper_ids=[F_Cu],
+        rows=70,
+        cols=410,
+        x_min=0.0,
+        y_min=0.0,
+        res=0.05,
+        t_cu=np.array([35e-6], dtype=np.float64),
+        layer_names={F_Cu: "F.Cu"},
+    )
+
+    result = solve_electrical_heating(
+        board,
+        [
+            CurrentTerminal(pad_a, "J1-1", "PWR", 1, current_a),
+            CurrentTerminal(pad_b, "J2-1", "PWR", 1, -current_a),
+        ],
+        config,
+    )
+
+    expected_r = 1.724e-8 * (length_mm * 1e-3) / ((width_mm * 1e-3) * 35e-6)
+    expected_p = current_a * current_a * expected_r
+    summary = result.net_summaries[0]
+    assert result.valid, result.errors
+    np.testing.assert_allclose(result.total_loss_w, expected_p, rtol=0.20)
+    np.testing.assert_allclose(summary.effective_resistance_ohm, expected_r, rtol=0.20)
+    np.testing.assert_allclose(summary.equivalent_voltage_drop_v, expected_p / current_a, rtol=0.20)
+    assert summary.terminal_diagnostics[0].cell_count > 0
+    assert summary.primitive_diagnostics
+
+
+def test_multi_terminal_summary_uses_effective_values_without_pad_resistance():
+    """Multi-terminal nets should avoid pretending there is one pad-to-pad resistance."""
+    a1 = _pad(0.25, 1.25, "1")
+    a2 = _pad(0.25, 2.25, "2")
+    b1 = _pad(9.25, 1.25, "3")
+    b2 = _pad(9.25, 2.25, "4")
+    track = MockTrack(
+        layer=F_Cu,
+        bbox=EDA_RECT(250000, 1250000, 9100000, 1100000),
+        start=VECTOR2I(500000, 1750000),
+        end=VECTOR2I(9500000, 1750000),
+        width=2000000,
+        net_code=1,
+        net_name="PWR",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[a1, a2, b1, b2])],
+        tracks=[track],
+    )
+
+    result = solve_electrical_heating(
+        board,
+        [
+            CurrentTerminal(a1, "A1", "PWR", 1, 1.0),
+            CurrentTerminal(a2, "A2", "PWR", 1, 1.0),
+            CurrentTerminal(b1, "B1", "PWR", 1, -1.0),
+            CurrentTerminal(b2, "B2", "PWR", 1, -1.0),
+        ],
+        _config(rows=5, cols=12),
+    )
+
+    summary = result.net_summaries[0]
+    assert result.valid, result.errors
+    assert summary.effective_resistance_ohm is not None
+    assert summary.equivalent_voltage_drop_v is not None
+    assert summary.pad_resistance_ohm is None
+
+
 def test_via_connects_current_between_layers():
     """A via should create a valid vertical path between copper layers."""
     top_pad = _pad(2.25, 1.25, "1", layer=F_Cu)

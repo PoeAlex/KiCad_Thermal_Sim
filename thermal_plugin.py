@@ -14,7 +14,7 @@ import json
 import tempfile
 import subprocess
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 import pcbnew
 import numpy as np
@@ -29,7 +29,7 @@ from .thermal_solver import SolverConfig, build_stiffness_matrix, run_simulation
 from .pwl_parser import parse_pwl_file
 from .visualization import (
     save_snapshot, show_results_top_bot, show_results_all_layers, save_preview_image,
-    build_interactive_heatmap_payload
+    build_interactive_heatmap_payload, save_joule_loss_map
 )
 from .thermal_report import write_html_report
 
@@ -40,6 +40,13 @@ class SparsePadContribution:
 
     indices: np.ndarray
     weights: np.ndarray
+
+
+def _electrical_net_summary_dict(summary):
+    """Convert electrical net diagnostics to report-friendly dictionaries."""
+    data = asdict(summary)
+    data["net"] = data.get("net_name", "")
+    return data
 
 
 def _bbox_to_power_indices(bbox, target_idx, rows, cols, x_min, y_min, res, rc):
@@ -748,10 +755,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         h_mm = bbox.GetHeight() * 1e-6
         x_min = bbox.GetX() * 1e-6
         y_min = bbox.GetY() * 1e-6
-        res = settings['res']
+        requested_res = float(settings['res'])
+        res = requested_res
         area = w_mm * h_mm
+        auto_coarsened = False
         if (w_mm / res) * (h_mm / res) > 200000:
             res = math.sqrt(area / 100000)
+            auto_coarsened = True
 
         # Apply area limiting if enabled
         if settings.get('limit_area') and settings.get('pad_dist_mm', 0.0) > 0:
@@ -769,6 +779,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         cols = int(w_mm / res) + 4
         rows = int(h_mm / res) + 4
         layer_count = len(copper_ids)
+        grid_info = {
+            "grid_requested_res_mm": requested_res,
+            "grid_res_mm": float(res),
+            "grid_auto_coarsened": bool(auto_coarsened),
+            "grid_rows": int(rows),
+            "grid_cols": int(cols),
+            "grid_x_min_mm": float(x_min),
+            "grid_y_min_mm": float(y_min),
+            "grid_width_mm": float(cols * res),
+            "grid_height_mm": float(rows * res),
+            "grid_cell_area_mm2": float(res * res),
+        }
 
         # Physical parameters
         k_fr4_rel = 1.0
@@ -898,6 +920,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         init_timings["power_vector_build_s"] = time.perf_counter() - power_start
 
         electrical_summary = None
+        q_joule = None
         if settings.get("current_enabled"):
             electrical_start = time.perf_counter()
             terminals, missing_pads = self._resolve_current_terminals(board, settings)
@@ -917,6 +940,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     y_min=y_min,
                     res=res,
                     t_cu=np.asarray(t_cu, dtype=np.float64),
+                    layer_names={lid: layer_names[idx] for idx, lid in enumerate(copper_ids) if idx < len(layer_names)},
                 )
                 electrical_result = solve_electrical_heating(board, terminals, electrical_config)
                 if not electrical_result.valid:
@@ -939,17 +963,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 electrical_summary = {
                     "total_loss_w": electrical_result.total_loss_w,
                     "warnings": electrical_result.warnings,
-                    "nets": [
-                        {
-                            "net": item.net_name,
-                            "terminal_count": item.terminal_count,
-                            "total_abs_current_a": item.total_abs_current_a,
-                            "total_loss_w": item.total_loss_w,
-                            "max_node_power_w": item.max_node_power_w,
-                            "connected_component_count": item.connected_component_count,
-                        }
-                        for item in electrical_result.net_summaries
-                    ],
+                    "nets": [_electrical_net_summary_dict(item) for item in electrical_result.net_summaries],
                 }
             else:
                 electrical_summary = {
@@ -1046,6 +1060,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # Add extra info to k_norm_info
         result.k_norm_info.update({
+            **grid_info,
             "copper_threshold_rel": copper_threshold_rel,
             "t_fr4_eff_min": float(np.min(t_fr4_eff)),
             "t_fr4_eff_max": float(np.max(t_fr4_eff)),
@@ -1072,6 +1087,21 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             heatmap_path = show_results_top_bot(
                 result.T, H_map, amb,
                 open_file=False, t_elapsed=sim_time, out_dir=run_dir
+            )
+
+        joule_map_path = None
+        if q_joule is not None and np.any(q_joule):
+            joule_map_path = save_joule_loss_map(
+                q_joule,
+                layer_count=layer_count,
+                rows=rows,
+                cols=cols,
+                layer_names=layer_names,
+                x_min_mm=x_min,
+                y_min_mm=y_min,
+                res_mm=res,
+                electrical_summary=electrical_summary,
+                out_dir=run_dir,
             )
 
         preview_path = save_preview_image(
@@ -1127,7 +1157,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snapshot_debug=snapshot_debug,
             snapshot_files=result.snapshot_files,
             interactive_heatmap=interactive_heatmap,
-            electrical_summary=electrical_summary
+            electrical_summary=electrical_summary,
+            joule_map_path=joule_map_path
         )
 
         # Open outputs

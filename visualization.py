@@ -234,6 +234,115 @@ def save_snapshot(T, H, amb, layer_names, idx, t_elapsed, out_dir=None):
         return fname
 
 
+def save_joule_loss_map(
+    q_joule,
+    layer_count,
+    rows,
+    cols,
+    layer_names,
+    x_min_mm=0.0,
+    y_min_mm=0.0,
+    res_mm=1.0,
+    electrical_summary=None,
+    out_dir=None,
+):
+    """
+    Save a per-layer Joule-loss map for current-path diagnostics.
+
+    Parameters
+    ----------
+    q_joule : np.ndarray
+        Flattened Joule heat source vector in watts per thermal node.
+    layer_count : int
+        Number of copper layers.
+    rows, cols : int
+        Grid dimensions.
+    layer_names : list of str
+        Names for each layer.
+    x_min_mm, y_min_mm : float, optional
+        Grid origin in millimeters.
+    res_mm : float, optional
+        Grid resolution in millimeters.
+    electrical_summary : dict, optional
+        Current-path diagnostics containing terminal positions.
+    out_dir : str, optional
+        Output directory.
+
+    Returns
+    -------
+    str or None
+        Path to saved image, or None when no Joule data is available.
+    """
+    q_arr = np.asarray(q_joule, dtype=np.float64)
+    expected = int(layer_count) * int(rows) * int(cols)
+    if q_arr.size != expected or expected <= 0:
+        return None
+    q_layers = q_arr.reshape((layer_count, rows, cols))
+    if not np.any(np.isfinite(q_layers)) or float(np.nanmax(q_layers)) <= 0.0:
+        return None
+
+    out_dir = out_dir or os.path.dirname(__file__)
+    output_file = os.path.join(out_dir, "joule_loss_map.png")
+    vmax = float(np.nanmax(q_layers))
+    vmax = max(vmax, 1e-18)
+
+    count = int(layer_count)
+    if count == 1:
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+        axes = [ax]
+    elif count == 2:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        axes = axes.flatten()
+    else:
+        cols_grid = 2
+        rows_grid = math.ceil(count / 2)
+        fig, axes = plt.subplots(rows_grid, cols_grid, figsize=(12, 4 * rows_grid))
+        axes = axes.flatten()
+
+    terminals = []
+    for net in (electrical_summary or {}).get("nets", []) or []:
+        terminals.extend(net.get("terminal_diagnostics", []) or [])
+
+    for i in range(count):
+        ax = axes[i]
+        name = layer_names[i] if i < len(layer_names) else f"Layer {i}"
+        layer = q_layers[i]
+        im = ax.imshow(
+            layer,
+            cmap="magma",
+            origin="upper",
+            vmin=0.0,
+            vmax=vmax,
+            interpolation="nearest",
+        )
+        max_mw = float(np.nanmax(layer)) * 1e3 if np.any(np.isfinite(layer)) else 0.0
+        ax.set_title(f"{name} Joule Loss - Max: {max_mw:.3f} mW/cell")
+        for term in terminals:
+            term_layer = str(term.get("layer", ""))
+            if term_layer not in (name, "All copper (PTH)", "All copper"):
+                continue
+            try:
+                col = (float(term["x_mm"]) - float(x_min_mm)) / float(res_mm)
+                row = (float(term["y_mm"]) - float(y_min_mm)) / float(res_mm)
+            except Exception:
+                continue
+            current = float(term.get("current_a", 0.0) or 0.0)
+            marker = "^" if current >= 0.0 else "v"
+            color = "#e31a1c" if current >= 0.0 else "#1f78b4"
+            ax.scatter([col], [row], marker=marker, s=52, c=color, edgecolors="white", linewidths=0.8)
+            ax.text(col + 1.5, row + 1.5, str(term.get("name", "")), color="white", fontsize=7)
+        plt.colorbar(im, ax=ax, label="Cell loss (W)")
+        ax.axis("off")
+
+    for j in range(count, len(axes)):
+        axes[j].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=150)
+    plt.close()
+    return output_file
+
+
 def show_results_top_bot(T, H, amb, open_file=True, t_elapsed=None, out_dir=None):
     """
     Save and optionally display top/bottom layer temperature results.

@@ -21,6 +21,7 @@ REPORT_STYLE = """
   .summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:12px}.metric-card{border:1px solid var(--line);border-radius:12px;background:linear-gradient(180deg,#fff 0%,var(--alt) 100%);padding:12px 14px;min-height:88px}.metric-card.metric-card--featured{border-color:#adc7da;background:linear-gradient(180deg,#f8fcff 0%,#edf6fc 100%)}.metric-label{margin:0 0 6px;font-size:.8rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}.metric-value{margin:0;font-size:1.2rem;font-weight:700}.metric-card--featured .metric-value{font-size:1.35rem}.metric-detail{margin:6px 0 0;font-size:.85rem;color:var(--muted)}
   .details-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.image-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.image-card{border:1px solid var(--line);border-radius:12px;padding:12px;background:#fff}.image-card h3{margin:0 0 6px;font-size:1rem}.image-caption{margin:0 0 10px;color:var(--muted);font-size:.9rem}.image-link{display:block}.image-link img{width:100%;height:auto;border:1px solid var(--line);border-radius:10px;background:#fff;display:block}.image-actions{margin-top:8px}.image-actions a,.snapshot-link,.inline-link{color:var(--accent);font-size:.9rem;text-decoration:none}.image-actions a:hover,.snapshot-link:hover,.inline-link:hover{text-decoration:underline}
   .table-wrap{overflow-x:auto} table{width:100%;border-collapse:collapse;margin:0;font-size:.95rem} th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top} th{background:#eef3f7;font-weight:700} tbody tr:nth-child(even) td{background:#fbfcfd}.mono{font-family:var(--mono);font-size:.88rem}
+  .warning-list{border:1px solid #e2b4b4;background:#fff7f7;color:var(--danger);border-radius:12px;padding:12px 14px;margin:0 0 12px}.warning-list ul{margin:6px 0 0 18px;padding:0}.warning-list li{margin:3px 0}
   details{border:1px solid var(--line);border-radius:12px;background:#fff;margin-top:12px;overflow:hidden} details summary{cursor:pointer;list-style:none;padding:12px 14px;font-weight:700;background:#f5f8fb;border-bottom:1px solid transparent} details[open] summary{border-bottom-color:var(--line)} details summary::-webkit-details-marker{display:none}.details-body{padding:14px}
   pre{margin:0;padding:12px;background:#0f1720;color:#dde7ef;border-radius:10px;overflow-x:auto;font-size:.83rem;white-space:pre-wrap;word-break:break-word}.spacer{height:16px}.spacer-sm{height:12px}
   .viewer-shell{display:grid;grid-template-columns:1fr;gap:16px}.viewer-panel{border:1px solid var(--line);border-radius:12px;padding:14px;background:linear-gradient(180deg,#fff 0%,#f9fbfd 100%)}.viewer-controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px}.viewer-controls label{font-size:.92rem;color:var(--muted)}.viewer-controls select,.viewer-controls button{font:inherit;border:1px solid var(--strong);border-radius:9px;background:#fff;color:var(--ink);padding:7px 10px}.viewer-controls button{cursor:pointer}.viewer-controls button:hover{background:var(--accent-soft);border-color:var(--accent)}.viewer-toggle{display:inline-flex;align-items:center;gap:8px;padding:7px 10px;border:1px solid var(--line);border-radius:10px;background:#fff;color:var(--ink)}.viewer-toggle input{margin:0}
@@ -145,10 +146,21 @@ def _build_summary_metrics(settings, interactive_heatmap, k_norm_info, snapshot_
     grid_label = "n/a"
     if layers:
         grid_label = f"{layers[0].get('rows', 0)} x {layers[0].get('cols', 0)}"
+    actual_res = (k_norm_info or {}).get("grid_res_mm")
+    if actual_res is None:
+        actual_res = (interactive_heatmap or {}).get("res_mm")
+    requested_res = (k_norm_info or {}).get("grid_requested_res_mm", settings.get("res"))
+    res_detail = grid_label
+    if actual_res is not None and requested_res is not None:
+        try:
+            if abs(float(actual_res) - float(requested_res)) > 1e-9:
+                res_detail = f"requested: {float(requested_res):.3f} mm; grid: {grid_label}"
+        except Exception:
+            pass
     metrics = [
         ("Duration", f"{float(settings.get('time', 0.0)):.2f} s" if "time" in settings else "n/a", None),
         ("Ambient", f"{float(settings.get('amb', 0.0)):.2f} C" if "amb" in settings else "n/a", None),
-        ("Resolution", f"{float(settings.get('res', 0.0)):.3f} mm" if "res" in settings else "n/a", grid_label),
+        ("Resolution", f"{float(actual_res):.3f} mm" if actual_res is not None else "n/a", res_detail),
         ("Visible Layers", str(len(layers)), ", ".join(layer.get("name", "") for layer in layers) if layers else None),
         ("Top Peak", f"{float(top_layer.get('max_c')):.2f} C" if top_layer and top_layer.get("max_c") is not None else "n/a", top_layer.get("name") if top_layer else None),
         ("Bottom Peak", f"{float(bottom_layer.get('max_c')):.2f} C" if bottom_layer and bottom_layer.get("max_c") is not None else "n/a", bottom_layer.get("name") if bottom_layer else None),
@@ -188,11 +200,12 @@ def _build_image_card(title, path, empty_message):
         )
     else:
         content = f"<div class='empty-state'>{_esc(empty_message)}</div>"
-    caption = (
-        "Inspect the mapped board geometry used for the simulation."
-        if title == "Geometry Preview"
-        else "Static export of the final multilayer temperature field."
-    )
+    if title == "Geometry Preview":
+        caption = "Inspect the mapped board geometry used for the simulation."
+    elif title == "Joule Loss Map":
+        caption = "Static per-layer map of current-induced copper losses."
+    else:
+        caption = "Static export of the final multilayer temperature field."
     return (
         "<article class='image-card'>"
         f"<h3>{_esc(title)}</h3>"
@@ -260,6 +273,190 @@ def _build_snapshot_gallery(snapshot_items):
     return "<div class='snapshot-grid'>" + "".join(cards) + "</div>"
 
 
+def _fmt_num(value, digits=4, suffix=""):
+    """Format a numeric value with explicit precision."""
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.{digits}f}{suffix}"
+    except Exception:
+        return _fmt(value, suffix)
+
+
+def _fmt_compact(value, suffix=""):
+    """Format very small and very large numbers compactly."""
+    if value is None:
+        return "n/a"
+    try:
+        val = float(value)
+    except Exception:
+        return _fmt(value, suffix)
+    if val == 0.0:
+        return f"0{suffix}"
+    if abs(val) < 1e-3 or abs(val) >= 1e4:
+        return f"{val:.4e}{suffix}"
+    return f"{val:.4f}{suffix}"
+
+
+def _build_cards(rows):
+    """Render compact metric cards."""
+    cards = []
+    for label, value, detail in rows:
+        detail_html = f"<p class='metric-detail'>{_esc(detail)}</p>" if detail else ""
+        cards.append(
+            "<article class='metric-card metric-card--featured'>"
+            f"<p class='metric-label'>{_esc(label)}</p>"
+            f"<p class='metric-value'>{_esc(value)}</p>"
+            f"{detail_html}</article>"
+        )
+    return "<div class='summary-grid'>" + "".join(cards) + "</div>"
+
+
+def _current_path_warnings(electrical_summary, k_norm_info):
+    """Collect prominent current-path report warnings."""
+    warnings = list((electrical_summary or {}).get("warnings", []) or [])
+    if (k_norm_info or {}).get("grid_auto_coarsened"):
+        warnings.append(
+            "Grid resolution was auto-coarsened from "
+            f"{_fmt_num((k_norm_info or {}).get('grid_requested_res_mm'), 3, ' mm')} to "
+            f"{_fmt_num((k_norm_info or {}).get('grid_res_mm'), 3, ' mm')}."
+        )
+    for net in (electrical_summary or {}).get("nets", []) or []:
+        net_name = net.get("net", net.get("net_name", "n/a"))
+        try:
+            if int(net.get("connected_component_count", 0)) > 1:
+                warnings.append(f"Net {net_name} has {net.get('connected_component_count')} mapped copper islands.")
+        except Exception:
+            pass
+        terminals = net.get("terminal_diagnostics", []) or []
+        sources = [t for t in terminals if float(t.get("current_a", 0.0) or 0.0) > 0.0]
+        sinks = [t for t in terminals if float(t.get("current_a", 0.0) or 0.0) < 0.0]
+        if terminals and (len(sources) != 1 or len(sinks) != 1):
+            warnings.append(f"Net {net_name}: multiple terminals configured; single pad-to-pad resistance is not shown.")
+        for term in terminals:
+            if int(term.get("cell_count", 0) or 0) <= 0:
+                warnings.append(f"{term.get('name', 'Terminal')}: no mapped copper cells under terminal.")
+    unique = []
+    seen = set()
+    for item in warnings:
+        text = str(item)
+        if text not in seen:
+            unique.append(text)
+            seen.add(text)
+    return unique
+
+
+def _build_warning_block(warnings):
+    """Render a warning block."""
+    if not warnings:
+        return "<div class='empty-state'>No current path diagnostics warnings.</div>"
+    items = "".join(f"<li>{_esc(str(item))}</li>" for item in warnings)
+    return f"<div class='warning-list'><strong>Warnings</strong><ul>{items}</ul></div>"
+
+
+def _build_current_path_diagnostics(electrical_summary, k_norm_info, joule_map_path):
+    """Render current-path diagnostics for the report."""
+    if not electrical_summary or not electrical_summary.get("nets"):
+        return "<div class='empty-state'>No current path diagnostics recorded.</div>"
+
+    nets = electrical_summary.get("nets", []) or []
+    total_loss = electrical_summary.get("total_loss_w")
+    total_source = sum(float(net.get("source_current_a", 0.0) or 0.0) for net in nets)
+    total_sink = sum(float(net.get("sink_current_a", 0.0) or 0.0) for net in nets)
+    max_cell = max((float(net.get("max_node_power_w", 0.0) or 0.0) for net in nets), default=0.0)
+    first_net = nets[0] if len(nets) == 1 else {}
+    actual_res = (k_norm_info or {}).get("grid_res_mm")
+
+    cards = _build_cards([
+        ("Copper Loss", _fmt_compact(total_loss, " W"), "all active nets"),
+        ("R_eff", _fmt_compact(first_net.get("effective_resistance_ohm"), " ohm") if first_net else "see table", "P / I_source^2"),
+        ("V_eq", _fmt_compact(first_net.get("equivalent_voltage_drop_v"), " V") if first_net else "see table", "P / I_source"),
+        ("Source/Sink Current", f"{_fmt_num(total_source, 4, ' A')} / {_fmt_num(total_sink, 4, ' A')}", "sum over active nets"),
+        ("Max Cell Loss", _fmt_compact(max_cell, " W"), None),
+        ("Actual Resolution", _fmt_num(actual_res, 3, " mm"), "used by electrical grid"),
+    ])
+
+    net_rows = []
+    for net in nets:
+        net_rows.append((
+            net.get("net", net.get("net_name", "")),
+            net.get("terminal_count", ""),
+            f"{_fmt_num(net.get('source_current_a'), 4, ' A')} / {_fmt_num(net.get('sink_current_a'), 4, ' A')}",
+            _fmt_compact(net.get("current_balance_a"), " A"),
+            _fmt_compact(net.get("total_loss_w"), " W"),
+            _fmt_compact(net.get("effective_resistance_ohm"), " ohm"),
+            _fmt_compact(net.get("equivalent_voltage_drop_v"), " V"),
+            _fmt_compact(net.get("pad_resistance_ohm"), " ohm"),
+            net.get("copper_cell_count", ""),
+            net.get("edge_count", ""),
+            net.get("via_edge_count", ""),
+            net.get("connected_component_count", ""),
+        ))
+
+    terminal_rows = []
+    for net in nets:
+        for term in net.get("terminal_diagnostics", []) or []:
+            bbox = term.get("bbox_mm") or []
+            bbox_label = "n/a"
+            if len(bbox) == 4:
+                bbox_label = (
+                    f"{_fmt_num(bbox[0], 3)}, {_fmt_num(bbox[1], 3)}, "
+                    f"{_fmt_num(bbox[2], 3)} x {_fmt_num(bbox[3], 3)} mm"
+                )
+            comps = term.get("component_ids", [])
+            terminal_rows.append((
+                term.get("name", ""),
+                net.get("net", net.get("net_name", "")),
+                _fmt_num(term.get("current_a"), 4, " A"),
+                term.get("layer", ""),
+                f"{_fmt_num(term.get('x_mm'), 3)}, {_fmt_num(term.get('y_mm'), 3)} mm",
+                bbox_label,
+                term.get("cell_count", ""),
+                ", ".join(str(comp) for comp in comps) if comps else "n/a",
+                _fmt_compact(term.get("mean_potential_v"), " V"),
+            ))
+
+    primitive_rows = []
+    for net in nets:
+        for prim in net.get("primitive_diagnostics", []) or []:
+            width_label = "n/a"
+            if prim.get("track_width_avg_mm") is not None:
+                width_label = (
+                    f"{_fmt_num(prim.get('track_width_min_mm'), 3)} / "
+                    f"{_fmt_num(prim.get('track_width_avg_mm'), 3)} / "
+                    f"{_fmt_num(prim.get('track_width_max_mm'), 3)} mm"
+                )
+            primitive_rows.append((
+                net.get("net", net.get("net_name", "")),
+                prim.get("primitive_type", ""),
+                prim.get("layer", ""),
+                prim.get("count", ""),
+                _fmt_num(prim.get("track_length_mm"), 3, " mm") if prim.get("track_length_mm") else "n/a",
+                width_label,
+                _fmt_num(prim.get("bbox_area_mm2"), 3, " mm^2"),
+                prim.get("mapped_cell_count", ""),
+            ))
+
+    image_html = ""
+    if joule_map_path:
+        image_html = (
+            "<div class='spacer-sm'></div>"
+            f"{_build_image_card('Joule Loss Map', os.path.basename(joule_map_path), 'Joule loss map not available.')}"
+        )
+
+    return (
+        f"{cards}<div class='spacer-sm'></div>"
+        f"{_build_warning_block(_current_path_warnings(electrical_summary, k_norm_info))}"
+        "<h3 class='section-title'>Net Path Metrics</h3>"
+        f"{_table_html(['Net', 'Terminals', 'Source/Sink', 'Balance', 'Loss', 'R_eff', 'V_eq', 'Pad R', 'Cells', 'Edges', 'Via Edges', 'Islands'], net_rows, empty_text='No net path metrics recorded.')}"
+        "<div class='spacer-sm'></div><h3 class='section-title'>Current Terminals</h3>"
+        f"{_table_html(['Pad', 'Net', 'Current', 'Layer', 'Position', 'BBox', 'Cells', 'Island', 'Potential'], terminal_rows, empty_text='No terminal diagnostics recorded.')}"
+        "<div class='spacer-sm'></div><h3 class='section-title'>Mapped KiCad Primitives</h3>"
+        f"{_table_html(['Net', 'Type', 'Layer', 'Count', 'Track Length', 'Width min/avg/max', 'BBox Area', 'Mapped Cells'], primitive_rows, empty_text='No primitive diagnostics recorded.')}"
+        f"{image_html}"
+    )
+
+
 def write_html_report(
     settings,
     stack_info,
@@ -273,7 +470,8 @@ def write_html_report(
     snapshot_debug=None,
     snapshot_files=None,
     interactive_heatmap=None,
-    electrical_summary=None
+    electrical_summary=None,
+    joule_map_path=None
 ):
     """Generate an HTML report for the thermal simulation."""
     out_dir = out_dir or os.path.dirname(__file__)
@@ -380,6 +578,8 @@ def write_html_report(
         "<div class='spacer-sm'></div><h3 class='section-title'>Current Heating</h3>"
         f"{_table_html(['Net', 'Pads', 'Abs Current', 'Copper Loss', 'Max Cell Loss'], current_rows, empty_text='No current heating recorded.')}"
         f"{_table_html(['#', 'Warning'], current_warning_rows, empty_text='No current heating warnings.')}"
+        "<div class='spacer-sm'></div><h3 class='section-title'>Current Path Diagnostics</h3>"
+        f"{_build_current_path_diagnostics(electrical_summary, k_norm_info, joule_map_path)}"
         "</div></div>"
         f"{_details_block('Snapshots', _build_snapshot_gallery(snapshot_items), open_by_default=False)}"
         "</section>"
@@ -392,6 +592,7 @@ def write_html_report(
         f"{_details_block('Solver Summary', _mapping_table_html(solver_summary), open_by_default=False)}"
         f"{_details_block('Solver Normalization and Debug', _mapping_table_html(k_norm_info), open_by_default=False)}"
         f"{_details_block('Snapshot Debug', _mapping_table_html(snapshot_debug), open_by_default=False)}"
+        f"{_details_block('Raw Electrical JSON', '<pre>' + _esc(json.dumps(electrical_summary, indent=2, sort_keys=True)) + '</pre>', open_by_default=False)}"
         f"{_details_block('Raw Solver JSON', '<pre>' + _esc(json.dumps(k_norm_info, indent=2, sort_keys=True)) + '</pre>', open_by_default=False)}"
         f"{_details_block('Raw Snapshot JSON', '<pre>' + _esc(json.dumps(snapshot_debug, indent=2, sort_keys=True)) + '</pre>', open_by_default=False)}"
         "</section>"
