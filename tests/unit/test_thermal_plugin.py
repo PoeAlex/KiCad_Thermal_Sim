@@ -5,6 +5,8 @@ These tests focus on initialization-time helper logic that was refactored
 for performance, while keeping numerical behavior unchanged.
 """
 
+import json
+
 import numpy as np
 
 from ThermalSim.geometry_mapper import get_pad_pixels
@@ -196,3 +198,69 @@ class TestPowerVectorHelpers:
 
         assert plugin._resolve_power_pad_objects(board, settings) == [power_pad]
         assert plugin._resolve_current_pad_objects(board, settings) == [current_pad]
+
+
+class TestSettingsPersistence:
+    """Tests for JSON settings file persistence helpers."""
+
+    def test_save_and_load_settings_from_custom_path(self, tmp_path):
+        """Settings should round-trip through a caller-selected JSON file."""
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        settings_path = tmp_path / "my_thermal_settings.json"
+        settings = {
+            "power_str": "2.5",
+            "time": 60.0,
+            "amb": 25.0,
+            "res": 0.2,
+            "power_pads": [{
+                "pad_key": "U1:1:1:100:200",
+                "name": "U1-1 [VIN]",
+                "net_name": "VIN",
+                "net_code": 1,
+                "layer": "F.Cu",
+                "power": "2.5",
+            }],
+            "current_enabled": True,
+            "current_groups": [{
+                "name": "Load",
+                "color": "#d62728",
+                "mode": "per_pad",
+                "total_current_a": 0.0,
+                "pads": [{
+                    "pad_key": "J1:1:1:300:400",
+                    "name": "J1-1 [VIN]",
+                    "net_name": "VIN",
+                    "net_code": 1,
+                    "layer": "F.Cu",
+                    "current_a": 5.0,
+                }],
+            }],
+        }
+
+        assert plugin._save_settings(settings, str(settings_path)) is True
+        assert plugin._load_settings(str(settings_path)) == settings
+
+    def test_load_settings_rejects_non_dict_json(self, tmp_path):
+        """Only object-shaped JSON files are valid settings files."""
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        settings_path = tmp_path / "not_settings.json"
+        settings_path.write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
+
+        assert plugin._load_settings(str(settings_path)) == {}
+
+    def test_load_settings_rejects_invalid_json(self, tmp_path):
+        """Malformed JSON should not raise during settings load."""
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        settings_path = tmp_path / "broken_settings.json"
+        settings_path.write_text("{broken json", encoding="utf-8")
+
+        assert plugin._load_settings(str(settings_path)) == {}

@@ -7,6 +7,7 @@ Simulation (everyday settings) and Advanced (rarely changed).
 """
 
 import copy
+import json
 import os
 import wx
 
@@ -51,6 +52,8 @@ TOOLTIP_TEXTS = {
     'capabilities': "Detected solver backends. PyPardiso accelerates large grids significantly.",
     'help': "Open the ThermalSim documentation in your web browser.",
     'preview': "Generate a geometry preview image without running the simulation.",
+    'load_settings': "Load simulation settings from a JSON file.",
+    'save_settings': "Save the current simulation settings to a JSON file.",
     'current_enable': "Enable DC current-flow simulation for Joule heating in traces and copper pours.",
     'current_groups': "Pad groups used as current sources or sinks. Positive current enters the PCB; negative current leaves it.",
     'current_total': "Total current for the selected group. In distribution mode it is split evenly across all pads.",
@@ -337,6 +340,8 @@ class SettingsDialog(wx.Dialog):
         selection_provider=None,
         run_callback=None,
         close_callback=None,
+        load_settings_callback=None,
+        save_settings_callback=None,
         stackup_details="",
         pad_names=None,
         initial_power_pads=None,
@@ -350,6 +355,8 @@ class SettingsDialog(wx.Dialog):
         self.selection_provider = selection_provider
         self.run_callback = run_callback
         self.close_callback = close_callback
+        self.load_settings_callback = load_settings_callback
+        self.save_settings_callback = save_settings_callback
         self.current_groups = []
         self.current_group_index = -1
         self.power_pads = []
@@ -409,6 +416,16 @@ class SettingsDialog(wx.Dialog):
         self.btn_preview.Bind(wx.EVT_BUTTON, self._on_preview)
         self.btn_preview.SetToolTip(TOOLTIP_TEXTS['preview'])
         btn_sizer.Add(self.btn_preview, 0, wx.ALL, 5)
+
+        btn_load_settings = wx.Button(self, label="Load Settings...")
+        btn_load_settings.Bind(wx.EVT_BUTTON, self._on_load_settings)
+        btn_load_settings.SetToolTip(TOOLTIP_TEXTS['load_settings'])
+        btn_sizer.Add(btn_load_settings, 0, wx.ALL, 5)
+
+        btn_save_settings = wx.Button(self, label="Save Settings...")
+        btn_save_settings.Bind(wx.EVT_BUTTON, self._on_save_settings)
+        btn_save_settings.SetToolTip(TOOLTIP_TEXTS['save_settings'])
+        btn_sizer.Add(btn_save_settings, 0, wx.ALL, 5)
 
         btn_sizer.AddStretchSpacer()
 
@@ -889,6 +906,91 @@ class SettingsDialog(wx.Dialog):
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
+
+    def _settings_file_start_dir(self):
+        """Return the preferred directory for settings file dialogs."""
+        try:
+            output_dir = self.output_dir_input.GetValue().strip()
+            if output_dir and os.path.isdir(output_dir):
+                return output_dir
+        except Exception:
+            pass
+        return os.path.dirname(__file__)
+
+    def _load_settings_file(self, path):
+        """Load settings from a JSON file when no external callback is configured."""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_settings_file(self, settings, path):
+        """Save settings to a JSON file when no external callback is configured."""
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2, sort_keys=True)
+            return True
+        except Exception:
+            return False
+
+    def _on_load_settings(self, event):
+        """Handle manual settings import from a JSON file."""
+        dlg = wx.FileDialog(
+            self,
+            message="Load ThermalSim settings",
+            defaultDir=self._settings_file_start_dir(),
+            wildcard="JSON files (*.json)|*.json|All files (*.*)|*.*",
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
+        )
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            path = dlg.GetPath()
+        finally:
+            dlg.Destroy()
+
+        loader = self.load_settings_callback or self._load_settings_file
+        settings = loader(path)
+        if not isinstance(settings, dict) or not settings:
+            wx.MessageBox("No valid ThermalSim settings found in this file.", "ThermalSim")
+            return
+
+        self._apply_defaults(settings)
+        wx.MessageBox("Settings loaded.", "ThermalSim")
+
+    def _on_save_settings(self, event):
+        """Handle manual settings export to a JSON file."""
+        settings = self.get_values()
+        if not settings:
+            wx.MessageBox("Invalid simulation settings. Settings were not saved.", "ThermalSim")
+            return
+
+        save_style = getattr(wx, "FD_SAVE", 0) | getattr(wx, "FD_OVERWRITE_PROMPT", 0)
+        dlg = wx.FileDialog(
+            self,
+            message="Save ThermalSim settings",
+            defaultDir=self._settings_file_start_dir(),
+            defaultFile="thermal_sim_settings.json",
+            wildcard="JSON files (*.json)|*.json|All files (*.*)|*.*",
+            style=save_style,
+        )
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            path = dlg.GetPath()
+        finally:
+            dlg.Destroy()
+
+        if path and not os.path.splitext(path)[1]:
+            path += ".json"
+
+        saver = self.save_settings_callback or self._save_settings_file
+        if saver(settings, path):
+            wx.MessageBox("Settings saved.", "ThermalSim")
+        else:
+            wx.MessageBox("Settings could not be saved.", "ThermalSim")
 
     def _on_preview(self, event):
         """Handle Preview button click."""

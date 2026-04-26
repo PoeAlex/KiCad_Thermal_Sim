@@ -278,22 +278,25 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         """Return path to settings persistence file."""
         return os.path.join(os.path.dirname(__file__), "thermal_sim_last_settings.json")
 
-    def _load_settings(self):
-        """Load settings from JSON file."""
+    def _load_settings(self, path=None):
+        """Load settings from a JSON file."""
+        settings_path = path or self._settings_path()
         try:
-            with open(self._settings_path(), "r", encoding="utf-8") as f:
+            with open(settings_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else {}
         except Exception:
             return {}
 
-    def _save_settings(self, settings):
-        """Save settings to JSON file."""
+    def _save_settings(self, settings, path=None):
+        """Save settings to a JSON file."""
+        settings_path = path or self._settings_path()
         try:
-            with open(self._settings_path(), "w", encoding="utf-8") as f:
+            with open(settings_path, "w", encoding="utf-8") as f:
                 json.dump(settings, f, indent=2, sort_keys=True)
+            return True
         except Exception:
-            pass
+            return False
 
     def Run(self):
         """Plugin entry point with error handling."""
@@ -400,6 +403,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             selection_provider=selection_provider,
             run_callback=run_callback,
             close_callback=close_callback,
+            load_settings_callback=self._load_settings,
+            save_settings_callback=self._save_settings,
             stackup_details=stackup_details,
             pad_names=pad_names,
             initial_power_pads=initial_power_pads,
