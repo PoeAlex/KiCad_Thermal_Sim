@@ -564,6 +564,9 @@ class TestWriteHtmlReport:
             content = f.read()
 
         assert "Current Path Diagnostics" in content
+        assert "Path Current" in content
+        assert "Abs Current" not in content
+        assert "5.0000 A" in content
         assert "R_eff" in content
         assert "V_eq" in content
         assert "0.184 mm" in content

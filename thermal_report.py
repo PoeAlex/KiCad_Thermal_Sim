@@ -509,10 +509,19 @@ def write_html_report(
     pad_rows = [(str(name), _fmt(power, " W")) for name, power in pad_power]
     current_rows = []
     for net_item in electrical_summary.get("nets", []) or []:
+        source_current = net_item.get("source_current_a")
+        sink_current = net_item.get("sink_current_a")
+        try:
+            src = float(source_current or 0.0)
+            snk = float(sink_current or 0.0)
+            path_current = min(src, snk) if src > 0.0 and snk > 0.0 else max(src, snk)
+        except Exception:
+            path_current = None
         current_rows.append((
             str(net_item.get("net", "")),
             str(net_item.get("terminal_count", "")),
-            _fmt(net_item.get("total_abs_current_a"), " A"),
+            _fmt(path_current, " A"),
+            f"{_fmt(source_current, ' A')} / {_fmt(sink_current, ' A')}",
             _fmt(net_item.get("total_loss_w"), " W"),
             _fmt(net_item.get("max_node_power_w"), " W"),
         ))
@@ -576,7 +585,7 @@ def write_html_report(
         "<h3 class='section-title'>Power per Pad</h3>"
         f"{_table_html(['Pad', 'Power'], pad_rows, empty_text='No pad power recorded.')}"
         "<div class='spacer-sm'></div><h3 class='section-title'>Current Heating</h3>"
-        f"{_table_html(['Net', 'Pads', 'Abs Current', 'Copper Loss', 'Max Cell Loss'], current_rows, empty_text='No current heating recorded.')}"
+        f"{_table_html(['Net', 'Terminals', 'Path Current', 'Source/Sink Current', 'Copper Loss', 'Max Cell Loss'], current_rows, empty_text='No current heating recorded.')}"
         f"{_table_html(['#', 'Warning'], current_warning_rows, empty_text='No current heating warnings.')}"
         "<div class='spacer-sm'></div><h3 class='section-title'>Current Path Diagnostics</h3>"
         f"{_build_current_path_diagnostics(electrical_summary, k_norm_info, joule_map_path)}"

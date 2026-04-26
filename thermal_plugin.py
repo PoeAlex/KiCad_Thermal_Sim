@@ -22,7 +22,7 @@ import wx
 
 from .capabilities import HAS_LIBS, HAS_PARDISO, get_pypardiso_optional_dependency
 from .stackup_parser import parse_stackup_from_board_file, format_stackup_report_um
-from .gui_dialogs import SettingsDialog, prepare_current_groups
+from .gui_dialogs import SettingsDialog, prepare_current_groups, prepare_power_pads
 from .electrical_solver import CurrentTerminal, ElectricalConfig, solve_electrical_heating
 from .geometry_mapper import build_geometry_state, create_multilayer_maps, get_pad_pixels
 from .thermal_solver import SolverConfig, build_stiffness_matrix, run_simulation
@@ -363,6 +363,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # --- 4. Show Dialog ---
         stackup_details = format_stackup_report_um(stack_info) if stack_info else ""
         pad_names = self._format_pad_names(selected_pads)
+        initial_power_pads = self._get_selected_pad_descriptors(board)
         default_output_dir = os.path.dirname(__file__)
         last_settings = self._load_settings()
         if last_settings.get("output_dir") and os.path.isdir(last_settings.get("output_dir")):
@@ -381,8 +382,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         def run_callback(settings):
             self.settings_dialog = None
             self._save_settings(settings)
+            power_pads = self._resolve_power_pad_objects(board, settings, legacy_pads=pads_list)
             current_pads = self._resolve_current_pad_objects(board, settings)
-            focus_pads = self._unique_pads(pads_list + current_pads)
+            focus_pads = self._unique_pads(power_pads + current_pads)
             self._run_simulation(
                 board, copper_ids, layer_names, bbox, pads_list,
                 settings, stack_info, pad_names, zone_refill_s=zone_refill_s,
@@ -400,6 +402,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             close_callback=close_callback,
             stackup_details=stackup_details,
             pad_names=pad_names,
+            initial_power_pads=initial_power_pads,
             default_output_dir=default_output_dir,
             defaults=last_settings
         )
@@ -412,8 +415,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     settings = dlg.get_values()
                     if settings:
                         self._save_settings(settings)
+                        power_pads = self._resolve_power_pad_objects(board, settings, legacy_pads=pads_list)
                         current_pads = self._resolve_current_pad_objects(board, settings)
-                        focus_pads = self._unique_pads(pads_list + current_pads)
+                        focus_pads = self._unique_pads(power_pads + current_pads)
                         self._run_simulation(
                             board, copper_ids, layer_names, bbox, pads_list,
                             settings, stack_info, pad_names, zone_refill_s=zone_refill_s,
@@ -577,6 +581,35 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 by_name[descriptor["name"]] = (descriptor, pad)
         return by_key, by_name
 
+    def _resolve_power_pad_entries(self, board, settings):
+        """Resolve manual power-pad settings to live pad objects and power strings."""
+        raw_power_pads = prepare_power_pads(
+            settings.get("power_pads", []),
+            settings.get("power_str", "1.0"),
+        )
+        if not raw_power_pads:
+            return [], []
+        by_key, by_name = self._build_pad_lookup(board)
+        entries = []
+        missing = []
+        for pad_info in raw_power_pads:
+            match = by_key.get(pad_info.get("pad_key")) or by_name.get(pad_info.get("name"))
+            if not match:
+                missing.append(pad_info.get("name", pad_info.get("pad_key", "<unknown>")))
+                continue
+            descriptor, pad = match
+            merged = dict(descriptor)
+            merged["power"] = str(pad_info.get("power", "0.0")).strip()
+            entries.append((merged, pad, merged["power"]))
+        return entries, missing
+
+    def _resolve_power_pad_objects(self, board, settings, legacy_pads=None):
+        """Resolve manual power pads to live pad objects for preview/focus area."""
+        if "power_pads" not in (settings or {}):
+            return list(legacy_pads or [])
+        entries, _ = self._resolve_power_pad_entries(board, settings)
+        return self._unique_pads([pad for _, pad, _ in entries])
+
     def _resolve_current_pad_objects(self, board, settings):
         """Resolve current-group pad descriptors to live pad objects."""
         if not settings.get("current_enabled"):
@@ -705,8 +738,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
     def generate_preview(self, settings, layer_names):
         """Generate geometry preview image."""
+        power_pads = self._resolve_power_pad_objects(self.board, settings, legacy_pads=self.pads_list)
         current_pads = self._resolve_current_pad_objects(self.board, settings)
-        preview_pads = self._unique_pads(self.pads_list + current_pads)
+        preview_pads = self._unique_pads(power_pads + current_pads)
         output_file = save_preview_image(
             self.board, self.copper_ids, self.bbox, preview_pads,
             settings, layer_names,
@@ -879,9 +913,27 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         N = RC * layer_count
         power_start = time.perf_counter()
 
-        entries = [x.strip() for x in settings['power_str'].split(',')]
-        if len(entries) == 1:
-            entries = entries * len(pads_list)
+        has_power_pad_settings = "power_pads" in settings
+        missing_power_pads = []
+        if has_power_pad_settings:
+            power_pad_entries, missing_power_pads = self._resolve_power_pad_entries(board, settings)
+            power_pads = [pad for _, pad, _ in power_pad_entries]
+            power_pad_names = [descriptor.get("name", "") for descriptor, _, _ in power_pad_entries]
+            entries = [power for _, _, power in power_pad_entries if str(power).strip()]
+        else:
+            power_pads = list(pads_list or [])
+            power_pad_names = list(pad_names or [])
+            entries = [x.strip() for x in settings.get('power_str', '').split(',') if x.strip()]
+            if len(entries) == 1:
+                entries = entries * len(power_pads)
+
+        if missing_power_pads:
+            wx.MessageBox(
+                "Manual power references pads that were not found on the board:\n"
+                + "\n".join(str(name) for name in missing_power_pads),
+                "Power Pad Error"
+            )
+            return
 
         # Parse each entry as constant float or PWL file path
         pad_sources = []  # ('const', float) or ('pwl', (times, powers))
@@ -899,17 +951,21 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     )
                     return
 
-        if len(pad_sources) != len(pads_list) and len(pad_sources) != 1:
+        if len(pad_sources) == 1 and len(power_pads) > 1:
+            pad_sources = pad_sources * len(power_pads)
+            entries = entries * len(power_pads)
+
+        if len(pad_sources) != len(power_pads):
             wx.MessageBox(
                 f"Number of power entries ({len(pad_sources)}) does not match "
-                f"number of pads ({len(pads_list)}).",
+                f"number of power pads ({len(power_pads)}).",
                 "Warning"
             )
 
         pad_contributions = _build_sparse_pad_contributions(
             board=board,
             copper_ids=copper_ids,
-            pads_list=pads_list,
+            pads_list=power_pads,
             rows=rows,
             cols=cols,
             x_min=x_min,
@@ -975,13 +1031,14 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # Build pad_power for reporting
         pad_power = []
-        for i, name in enumerate(pad_names):
+        for i, name in enumerate(power_pad_names):
             if i < len(pad_sources):
                 stype, sval = pad_sources[i]
                 if stype == 'const':
                     pad_power.append((name, sval))
                 else:
-                    pad_power.append((name, f"PWL:{entries[i]}"))
+                    entry_label = entries[i] if i < len(entries) else ""
+                    pad_power.append((name, f"PWL:{entry_label}"))
             else:
                 pad_power.append((name, None))
 

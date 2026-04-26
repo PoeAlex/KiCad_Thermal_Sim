@@ -25,8 +25,11 @@ except ImportError:
 # Tooltip text for every control, keyed by internal name
 TOOLTIP_TEXTS = {
     'stackup': "Read-only stackup parsed from your .kicad_pcb file.",
-    'pads': "Selected pads that will be used as heat sources.",
-    'power': "Heat dissipation per pad in Watts. Single value, comma-separated, or PWL file path.",
+    'pads': "Pads selected when the dialog opened. Use Power Pads and Current Paths to choose simulation roles.",
+    'power': "Heat dissipation for power pads in Watts. Single value, comma-separated values, or PWL file path.",
+    'power_pads': "Pads used for manual heat dissipation. This list is independent from current-path terminals.",
+    'power_apply': "Apply the Power field to selected power-pad rows. If no row is selected, it is applied to all rows.",
+    'power_list': "Apply comma-separated power values in the same order as the power-pad table.",
     'browse_pwl': "Select a Piecewise-Linear (.pwl/.csv/.txt) file for time-varying power.",
     'duration': "Total simulation time in seconds. Longer durations approach steady-state.",
     'ambient': "Surrounding air temperature in \u00b0C. Typical lab conditions: 25 \u00b0C.",
@@ -116,6 +119,97 @@ def normalize_pad_descriptor(pad):
         'layer': str(pad.get('layer', '')),
         'current_a': current,
     }
+
+
+def normalize_power_pad_descriptor(pad, default_power="1.0"):
+    """
+    Return a serializable manual-power pad descriptor.
+
+    Parameters
+    ----------
+    pad : dict
+        Pad descriptor from saved settings or live KiCad selection.
+    default_power : str, optional
+        Power value to use when the descriptor has no explicit power value.
+
+    Returns
+    -------
+    dict
+        Normalized power-pad descriptor suitable for settings persistence.
+    """
+    pad = dict(pad or {})
+    power = pad.get('power', pad.get('power_str', pad.get('power_w', default_power)))
+    if power is None:
+        power = default_power
+    return {
+        'pad_key': str(pad.get('pad_key', pad.get('key', ''))),
+        'name': str(pad.get('name', '')),
+        'net_name': str(pad.get('net_name', pad.get('net', ''))),
+        'net_code': int(_safe_float(pad.get('net_code', 0), 0)),
+        'layer': str(pad.get('layer', '')),
+        'power': str(power).strip(),
+    }
+
+
+def prepare_power_pads(pads, power_str="1.0"):
+    """
+    Normalize manual-power pads and apply legacy power strings when needed.
+
+    Parameters
+    ----------
+    pads : list of dict
+        Raw power pad descriptors.
+    power_str : str, optional
+        Legacy single/comma-separated power input.
+
+    Returns
+    -------
+    list of dict
+        Serializable power-pad descriptors.
+    """
+    raw_pads = list(pads or [])
+    entries = [part.strip() for part in str(power_str or "").split(",") if part.strip()]
+    if not entries:
+        entries = ["0.0"]
+
+    prepared = []
+    for idx, raw in enumerate(raw_pads):
+        has_power = any(key in raw for key in ("power", "power_str", "power_w"))
+        if has_power:
+            default_power = entries[0]
+        elif len(entries) == 1:
+            default_power = entries[0]
+        elif idx < len(entries):
+            default_power = entries[idx]
+        else:
+            default_power = "0.0"
+        prepared.append(normalize_power_pad_descriptor(raw, default_power=default_power))
+    return prepared
+
+
+def power_pads_to_power_str(power_pads, fallback=""):
+    """
+    Serialize power-pad values to the legacy ``power_str`` setting.
+
+    Parameters
+    ----------
+    power_pads : list of dict
+        Normalized power-pad descriptors.
+    fallback : str
+        Value used when no power pads are configured.
+
+    Returns
+    -------
+    str
+        Single value if all pads share the same power, otherwise comma-separated.
+    """
+    values = [str(pad.get('power', '')).strip() for pad in (power_pads or [])]
+    values = [value for value in values if value]
+    if not values:
+        return str(fallback)
+    if all(value == values[0] for value in values):
+        return values[0]
+    return ", ".join(values)
 
 
 def prepare_current_groups(groups):
@@ -245,6 +339,7 @@ class SettingsDialog(wx.Dialog):
         close_callback=None,
         stackup_details="",
         pad_names=None,
+        initial_power_pads=None,
         default_output_dir="",
         defaults=None
     ):
@@ -257,6 +352,11 @@ class SettingsDialog(wx.Dialog):
         self.close_callback = close_callback
         self.current_groups = []
         self.current_group_index = -1
+        self.power_pads = []
+        self.initial_power_pads = [
+            normalize_power_pad_descriptor(pad) for pad in (initial_power_pads or [])
+        ]
+        self._power_pads_edited = False
 
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
@@ -271,12 +371,17 @@ class SettingsDialog(wx.Dialog):
         )
         self.notebook.AddPage(self.tab_sim, "Simulation")
 
-        # Tab 2: Advanced
+        # Tab 2: Power pads
+        self.tab_power = wx.Panel(self.notebook)
+        self._build_power_tab(self.tab_power)
+        self.notebook.AddPage(self.tab_power, "Power Pads")
+
+        # Tab 3: Advanced
         self.tab_adv = wx.Panel(self.notebook)
         self._build_advanced_tab(self.tab_adv)
         self.notebook.AddPage(self.tab_adv, "Advanced")
 
-        # Tab 3: Current paths
+        # Tab 4: Current paths
         self.tab_current = wx.Panel(self.notebook)
         self._build_current_tab(self.tab_current)
         self.notebook.AddPage(self.tab_current, "Current Paths")
@@ -328,6 +433,8 @@ class SettingsDialog(wx.Dialog):
         if defaults:
             self._apply_defaults(defaults)
         else:
+            self.power_pads = prepare_power_pads(self.initial_power_pads, self.power_input.GetValue())
+            self._render_power_pads()
             self._render_current_groups()
 
     # ------------------------------------------------------------------
@@ -369,21 +476,6 @@ class SettingsDialog(wx.Dialog):
 
         # --- Parameters ---
         box_params = wx.StaticBoxSizer(wx.VERTICAL, panel, "Parameters")
-
-        # Power (TextCtrl + Browse)
-        lbl_pwr = wx.StaticText(
-            panel, label="Power (W or PWL file), comma-sep per pad"
-        )
-        box_params.Add(lbl_pwr, 0, wx.ALL, 3)
-        row_pwr = wx.BoxSizer(wx.HORIZONTAL)
-        self.power_input = wx.TextCtrl(panel, value="1.0")
-        self.power_input.SetToolTip(TOOLTIP_TEXTS['power'])
-        row_pwr.Add(self.power_input, 1, wx.EXPAND | wx.RIGHT, 5)
-        btn_browse_pwl = wx.Button(panel, label="Browse PWL...")
-        btn_browse_pwl.Bind(wx.EVT_BUTTON, self._on_browse_pwl)
-        btn_browse_pwl.SetToolTip(TOOLTIP_TEXTS['browse_pwl'])
-        row_pwr.Add(btn_browse_pwl, 0)
-        box_params.Add(row_pwr, 0, wx.EXPAND | wx.ALL, 3)
 
         # Duration
         self.time_input = self._add_spin_field(
@@ -443,6 +535,63 @@ class SettingsDialog(wx.Dialog):
         box_out.Add(row_path, 0, wx.EXPAND | wx.ALL, 3)
 
         sizer.Add(box_out, 0, wx.EXPAND | wx.ALL, 5)
+
+        panel.SetSizer(sizer)
+
+    def _build_power_tab(self, panel):
+        """Build the manual power-pad tab."""
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        help_text = wx.StaticText(
+            panel,
+            label="Manual heat sources are configured here. Current-path terminals are selected separately."
+        )
+        sizer.Add(help_text, 0, wx.EXPAND | wx.ALL, 5)
+
+        edit_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Power Pad Editor")
+        row_pwr = wx.BoxSizer(wx.HORIZONTAL)
+        row_pwr.Add(wx.StaticText(panel, label="Power W/PWL:", size=(105, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.power_input = wx.TextCtrl(panel, value="1.0")
+        self.power_input.SetToolTip(TOOLTIP_TEXTS['power'])
+        row_pwr.Add(self.power_input, 1, wx.EXPAND | wx.RIGHT, 5)
+        btn_browse_pwl = wx.Button(panel, label="Browse PWL...")
+        btn_browse_pwl.Bind(wx.EVT_BUTTON, self._on_browse_pwl)
+        btn_browse_pwl.SetToolTip(TOOLTIP_TEXTS['browse_pwl'])
+        row_pwr.Add(btn_browse_pwl, 0)
+        edit_box.Add(row_pwr, 0, wx.EXPAND | wx.ALL, 3)
+
+        edit_buttons = wx.BoxSizer(wx.HORIZONTAL)
+        btn_add = wx.Button(panel, label="Add Selected Pads")
+        btn_add.Bind(wx.EVT_BUTTON, self._on_power_add_selection)
+        edit_buttons.Add(btn_add, 0, wx.ALL, 2)
+        btn_apply = wx.Button(panel, label="Apply to Selected")
+        btn_apply.Bind(wx.EVT_BUTTON, self._on_power_apply_value)
+        btn_apply.SetToolTip(TOOLTIP_TEXTS['power_apply'])
+        edit_buttons.Add(btn_apply, 0, wx.ALL, 2)
+        btn_apply_list = wx.Button(panel, label="Apply List")
+        btn_apply_list.Bind(wx.EVT_BUTTON, self._on_power_apply_list)
+        btn_apply_list.SetToolTip(TOOLTIP_TEXTS['power_list'])
+        edit_buttons.Add(btn_apply_list, 0, wx.ALL, 2)
+        btn_remove = wx.Button(panel, label="Remove")
+        btn_remove.Bind(wx.EVT_BUTTON, self._on_power_remove_pads)
+        edit_buttons.Add(btn_remove, 0, wx.ALL, 2)
+        btn_clear = wx.Button(panel, label="Clear")
+        btn_clear.Bind(wx.EVT_BUTTON, self._on_power_clear_pads)
+        edit_buttons.Add(btn_clear, 0, wx.ALL, 2)
+        edit_box.Add(edit_buttons, 0, wx.EXPAND | wx.ALL, 3)
+
+        self.power_pad_list = wx.ListCtrl(
+            panel,
+            style=getattr(wx, "LC_REPORT", 0) | getattr(wx, "LC_SINGLE_SEL", 0)
+        )
+        for idx, (title, width) in enumerate([
+            ("Pad", 210), ("Net", 150), ("Layer", 80), ("Power W/PWL", 180),
+        ]):
+            self.power_pad_list.InsertColumn(idx, title, width=width)
+        self.power_pad_list.SetMinSize((-1, 300))
+        self.power_pad_list.SetToolTip(TOOLTIP_TEXTS['power_pads'])
+        edit_box.Add(self.power_pad_list, 1, wx.EXPAND | wx.ALL, 3)
+        sizer.Add(edit_box, 1, wx.EXPAND | wx.ALL, 5)
 
         panel.SetSizer(sizer)
 
@@ -966,6 +1115,113 @@ class SettingsDialog(wx.Dialog):
         webbrowser.open("https://github.com/PoeAlex/KiCad_Thermal_Sim#readme")
 
     # ------------------------------------------------------------------
+    # Power-pad tab helpers
+    # ------------------------------------------------------------------
+
+    def _selected_power_pad_indices(self):
+        """Return selected row indices in the manual power-pad table."""
+        indices = []
+        try:
+            idx = self.power_pad_list.GetFirstSelected()
+            while idx != -1:
+                indices.append(idx)
+                idx = self.power_pad_list.GetNextItem(idx, getattr(wx, "LIST_NEXT_ALL", 0), getattr(wx, "LIST_STATE_SELECTED", 0))
+        except Exception:
+            pass
+        return indices
+
+    def _on_power_add_selection(self, event):
+        """Add the live KiCad pad selection to the manual power-pad list."""
+        pads = self._selection_descriptors()
+        if not pads:
+            wx.MessageBox("Select one or more pads in KiCad first.", "ThermalSim")
+            return
+        power_value = self.power_input.GetValue().strip() or "0.0"
+        existing = {pad.get('pad_key') for pad in self.power_pads}
+        for pad in pads:
+            descriptor = normalize_power_pad_descriptor(pad, default_power=power_value)
+            if descriptor['pad_key'] not in existing:
+                self.power_pads.append(descriptor)
+                existing.add(descriptor['pad_key'])
+        self._power_pads_edited = True
+        self._render_power_pads()
+
+    def _on_power_remove_pads(self, event):
+        """Remove selected rows from the manual power-pad list."""
+        indices = set(self._selected_power_pad_indices())
+        if not indices:
+            return
+        self.power_pads = [
+            pad for idx, pad in enumerate(self.power_pads)
+            if idx not in indices
+        ]
+        self._power_pads_edited = True
+        self._render_power_pads()
+
+    def _on_power_clear_pads(self, event):
+        """Clear all manual power pads."""
+        self.power_pads = []
+        self._power_pads_edited = True
+        self._render_power_pads()
+
+    def _on_power_apply_value(self, event):
+        """Apply the Power W/PWL field to selected rows or all power pads."""
+        value = self.power_input.GetValue().strip()
+        if not value:
+            return
+        indices = self._selected_power_pad_indices()
+        if not indices:
+            indices = list(range(len(self.power_pads)))
+        for idx in indices:
+            if 0 <= idx < len(self.power_pads):
+                self.power_pads[idx]['power'] = value
+        self._power_pads_edited = True
+        self._render_power_pads()
+
+    def _on_power_apply_list(self, event):
+        """Apply comma-separated power values to all power pads in table order."""
+        text = self.power_input.GetValue().strip()
+        if not text:
+            return
+        values = [part.strip() for part in text.split(",") if part.strip()]
+        if not values:
+            return
+        if not self.power_pads:
+            return
+        if len(values) == 1:
+            for pad in self.power_pads:
+                pad['power'] = values[0]
+        elif len(values) == len(self.power_pads):
+            for idx, value in enumerate(values):
+                self.power_pads[idx]['power'] = value
+        else:
+            wx.MessageBox(
+                f"Power list has {len(values)} values, but the table has {len(self.power_pads)} pads.",
+                "ThermalSim"
+            )
+            return
+        self._power_pads_edited = True
+        self._render_power_pads()
+
+    def _render_power_pads(self):
+        """Refresh the manual power-pad table."""
+        self.power_pads = prepare_power_pads(self.power_pads, self.power_input.GetValue())
+        try:
+            self.power_pad_list.DeleteAllItems()
+            for row_idx, pad in enumerate(self.power_pads):
+                values = [
+                    pad.get('name', ''),
+                    pad.get('net_name') or "(no net)",
+                    pad.get('layer', ''),
+                    pad.get('power', ''),
+                ]
+                self.power_pad_list.InsertItem(row_idx, values[0])
+                for col_idx, value in enumerate(values[1:], start=1):
+                    self.power_pad_list.SetItem(row_idx, col_idx, value)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # Current-path tab helpers
     # ------------------------------------------------------------------
 
@@ -1093,6 +1349,7 @@ class SettingsDialog(wx.Dialog):
         -----
         The returned dictionary contains:
         - power_str : str
+        - power_pads : list
         - time : float
         - amb : float
         - thick : float
@@ -1113,9 +1370,21 @@ class SettingsDialog(wx.Dialog):
         """
         try:
             self._sync_current_group_from_fields()
+            if not self._power_pads_edited:
+                legacy_pads = []
+                for pad in (self.power_pads or self.initial_power_pads):
+                    item = dict(pad)
+                    item.pop('power', None)
+                    item.pop('power_str', None)
+                    item.pop('power_w', None)
+                    legacy_pads.append(item)
+                self.power_pads = prepare_power_pads(legacy_pads, self.power_input.GetValue())
+            power_pads = prepare_power_pads(self.power_pads, self.power_input.GetValue())
             current_groups = prepare_current_groups(self.current_groups)
+            power_str = power_pads_to_power_str(power_pads, self.power_input.GetValue())
             return {
-                'power_str': self.power_input.GetValue(),
+                'power_str': power_str,
+                'power_pads': power_pads,
                 'time': float(self.time_input.GetValue()),
                 'amb': float(self.amb_input.GetValue()),
                 'thick': float(self.thick_input.GetValue()),
@@ -1198,6 +1467,14 @@ class SettingsDialog(wx.Dialog):
 
             if 'h_conv' in defaults:
                 self.h_conv_input.SetValue(float(defaults['h_conv']))
+
+            if 'power_pads' in defaults:
+                self.power_pads = prepare_power_pads(defaults.get('power_pads', []), self.power_input.GetValue())
+                self._power_pads_edited = True
+            else:
+                self.power_pads = prepare_power_pads(self.initial_power_pads, self.power_input.GetValue())
+                self._power_pads_edited = False
+            self._render_power_pads()
 
             self.chk_current_enabled.SetValue(
                 bool(defaults.get('current_enabled', self.chk_current_enabled.GetValue()))

@@ -14,6 +14,7 @@ from ThermalSim.thermal_plugin import (
 )
 from tests.mocks.pcbnew_mock import (
     MockBoard,
+    MockFootprint,
     MockPad,
     VECTOR2I,
     EDA_RECT,
@@ -155,3 +156,43 @@ class TestPowerVectorHelpers:
         np.testing.assert_allclose(q_new, q_ref, atol=1e-12)
         np.testing.assert_allclose(q_func_new(1.0), q_func_ref(1.0), atol=1e-12)
         np.testing.assert_allclose(q_func_new(3.0), q_func_ref(3.0), atol=1e-12)
+
+    def test_power_and_current_pad_resolution_are_separate(self):
+        """Manual power pads and current terminals should resolve independently."""
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        power_pad = MockPad(
+            position=VECTOR2I(5000000, 5000000),
+            layer=F_Cu,
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        current_pad = MockPad(
+            position=VECTOR2I(7000000, 5000000),
+            layer=F_Cu,
+            net_code=1,
+            net_name="VIN",
+            number="2",
+        )
+        board = MockBoard(
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+            footprints=[MockFootprint("J1", [power_pad, current_pad])],
+        )
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        power_descriptor = plugin._pad_descriptor(board, "J1", power_pad)
+        current_descriptor = plugin._pad_descriptor(board, "J1", current_pad)
+
+        settings = {
+            "power_pads": [{**power_descriptor, "power": "2.0"}],
+            "current_enabled": True,
+            "current_groups": [{
+                "name": "Load",
+                "mode": "per_pad",
+                "pads": [{**current_descriptor, "current_a": 5.0}],
+            }],
+        }
+
+        assert plugin._resolve_power_pad_objects(board, settings) == [power_pad]
+        assert plugin._resolve_current_pad_objects(board, settings) == [current_pad]

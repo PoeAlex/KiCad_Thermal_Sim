@@ -532,12 +532,67 @@ class TestCurrentGroupSettings:
         assert [pad['current_a'] for pad in group['pads']] == [6.0, -4.0, -2.0]
         assert dlg.current_balance_text.GetValue() == "PWR: 0 A - OK"
 
+    def test_power_pads_tab_uses_live_selection_independently(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        selected_pads = [
+            {'pad_key': 'p', 'name': 'U1-1 [VIN]', 'net_name': 'VIN', 'layer': 'F.Cu'},
+        ]
+        dlg = SettingsDialog(
+            None, 0, 0.5, ["F.Cu", "B.Cu"],
+            selection_provider=lambda: selected_pads
+        )
+
+        dlg.power_input.SetValue("2.5")
+        dlg._on_power_add_selection(None)
+        values = dlg.get_values()
+
+        assert values['power_str'] == "2.5"
+        assert values['power_pads'][0]['name'] == "U1-1 [VIN]"
+        assert values['power_pads'][0]['power'] == "2.5"
+        assert values['current_groups'] == []
+
+    def test_legacy_initial_selection_becomes_power_pads(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        initial_pads = [
+            {'pad_key': 'a', 'name': 'U1-1 [VIN]', 'net_name': 'VIN', 'layer': 'F.Cu'},
+            {'pad_key': 'b', 'name': 'U1-2 [VIN]', 'net_name': 'VIN', 'layer': 'F.Cu'},
+        ]
+        dlg = SettingsDialog(
+            None, 2, 0.5, ["F.Cu", "B.Cu"],
+            initial_power_pads=initial_pads
+        )
+
+        dlg.power_input.SetValue("1.0, 0.5")
+        values = dlg.get_values()
+
+        assert values['power_str'] == "1.0, 0.5"
+        assert [pad['power'] for pad in values['power_pads']] == ["1.0", "0.5"]
+
+    def test_saved_empty_power_pads_stays_empty(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        initial_pads = [
+            {'pad_key': 'a', 'name': 'U1-1 [VIN]', 'net_name': 'VIN', 'layer': 'F.Cu'},
+        ]
+        dlg = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            initial_power_pads=initial_pads,
+            defaults={'power_str': '1.0', 'power_pads': []}
+        )
+
+        values = dlg.get_values()
+
+        assert values['power_pads'] == []
+
     def test_current_paths_tab_labels_are_english(self):
         from ThermalSim.gui_dialogs import SettingsDialog
 
         dlg = SettingsDialog(None, 0, 0.5, ["F.Cu", "B.Cu"])
 
         page_labels = [caption for _, caption in dlg.notebook._pages]
+        assert "Power Pads" in page_labels
         assert "Current Paths" in page_labels
         labels = " ".join(
             list(dlg.current_group_list._columns)
