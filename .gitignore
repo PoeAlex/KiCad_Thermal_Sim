@@ -12,6 +12,7 @@ thermal_sim_last_settings.json
 debug_log.txt
 *.png
 !ThermalSim_icon.png
+!docs/images/*.png
 *.html
 
 # Distribution / packaging

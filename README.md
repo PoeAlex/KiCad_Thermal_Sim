@@ -76,7 +76,11 @@ Run the plugin in PCB Editor via **Tools -> External Plugins -> 2.5D Thermal Sim
 7. Optionally use **Advanced** for geometry filters, thermal pad, convection, and solver settings.
 8. Click **Preview** to check the mapped geometry, then **Run**.
 
-![GUI main tab](docs/images/gui_main.png "Simulation tab")
+![GUI simulation tab](docs/images/gui_sim.png "Simulation tab")
+
+![GUI power pads tab](docs/images/gui_powerpads.png "Power Pads tab")
+
+![GUI current paths tab](docs/images/gui_current-paths.png "Current Paths tab")
 
 ![GUI advanced tab](docs/images/gui_adv.png "Advanced tab")
 
