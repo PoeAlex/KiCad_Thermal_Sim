@@ -238,6 +238,7 @@ class _WxMock:
             self._value = float(value) if value else min
             self._min = min
             self._max = max
+            self._enabled = True
 
         def GetValue(self):
             return self._value
@@ -249,7 +250,10 @@ class _WxMock:
             pass
 
         def Enable(self, enable=True):
-            pass
+            self._enabled = enable
+
+        def IsEnabled(self):
+            return self._enabled
 
         def SetToolTip(self, tip):
             pass
@@ -263,6 +267,7 @@ class _WxMock:
             self._value = int(value) if value else min
             self._min = min
             self._max = max
+            self._enabled = True
 
         def GetValue(self):
             return self._value
@@ -271,7 +276,10 @@ class _WxMock:
             self._value = int(value)
 
         def Enable(self, enable=True):
-            pass
+            self._enabled = enable
+
+        def IsEnabled(self):
+            return self._enabled
 
         def SetToolTip(self, tip):
             pass

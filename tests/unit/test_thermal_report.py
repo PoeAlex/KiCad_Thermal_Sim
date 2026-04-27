@@ -501,6 +501,9 @@ class TestWriteHtmlReport:
             'grid_requested_res_mm': 0.1,
             'grid_res_mm': 0.184475,
             'grid_auto_coarsened': True,
+            'grid_expert_limits': False,
+            'grid_max_cells': 200000,
+            'grid_target_cells': 100000,
             'grid_rows': 259,
             'grid_cols': 394,
         }
@@ -571,6 +574,9 @@ class TestWriteHtmlReport:
         assert "V_eq" in content
         assert "0.184 mm" in content
         assert "requested: 0.100 mm" in content
+        assert "auto-coarsened to 0.184 mm" in content
+        assert "limit: 200000 -&gt; 100000 cells" in content
+        assert "default grid limits" in content
         assert "Grid resolution was auto-coarsened" in content
         assert "Mapped KiCad Primitives" in content
         assert "joule_loss_map.png" in content

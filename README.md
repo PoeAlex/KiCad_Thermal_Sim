@@ -11,6 +11,7 @@ This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineer
 - Which layout variant is **better** in an A/B comparison?
 - How does heat distribute through the **stackup**?
 - How much extra heat is created by **DC current flow** in copper?
+- Which grid settings were actually used when automatic coarsening protects runtime?
 
 ---
 
@@ -73,7 +74,7 @@ Run the plugin in PCB Editor via **Tools -> External Plugins -> 2.5D Thermal Sim
 4. Use **Power Pads** to add pads that dissipate manual power, then enter constant W values or PWL file paths.
 5. Set **Duration**, **Ambient**, and **Resolution** on the **Simulation** tab.
 6. Optionally use **Current Paths** to add source/sink pads and per-pad currents for copper `I^2R` heating.
-7. Optionally use **Advanced** for geometry filters, thermal pad, convection, and solver settings.
+7. Optionally use **Advanced** for geometry filters, thermal pad, convection, solver settings, and expert grid limits.
 8. Click **Preview** to check the mapped geometry, then **Run**.
 
 ![GUI simulation tab](docs/images/gui_sim.png "Simulation tab")
@@ -107,12 +108,21 @@ Shows detected copper layers with thicknesses and dielectric gaps parsed from th
 - **Ambient Temp (C)** - reference temperature. Results are relative to ambient.
 - **Resolution (mm)** - spatial grid cell size. Smaller values improve hotspot and trace localization but increase runtime.
 
+For large boards, ThermalSim may automatically coarsen the requested resolution to keep the grid size practical. The report always records both the requested and actual solver resolution.
+
 #### Output
 
 - **Show All Layers** - display results for all copper layers.
 - **Save Snapshots** - store intermediate temperature images.
 - **Snapshot Count** - number of intermediate snapshots.
 - **Output Folder** - where the timestamped result folder is created.
+
+#### Settings Files
+
+- **Load Settings...** - load a JSON settings file from any folder and apply it to the open dialog.
+- **Save Settings...** - save the current dialog values as a JSON settings file.
+
+ThermalSim also keeps using `thermal_sim_last_settings.json` in the plugin folder for automatic last-used settings. Manual load/save files use the same JSON structure and can be stored per project or per experiment.
 
 ### Power Pads Tab
 
@@ -201,7 +211,12 @@ The report shows **Path Current** as the useful current value. For a `+5 A` sour
 
 - **Convection h (W/m2K)** - convection coefficient for top/bottom surfaces. Default is 10.
 - **PCB Thickness (mm)** - overall board thickness. Stackup thickness is used when available.
+- **Expert Grid Limits** - enable expert control over automatic grid coarsening.
+- **Coarsen Above Cells** - estimated cell count above which ThermalSim coarsens the grid. Default is `200000`.
+- **Target Cells** - target cell count after coarsening. Default is `100000`.
 - **Capabilities** - detected solver backend, for example SciPy or PyPardiso.
+
+When **Expert Grid Limits** is disabled, the default limits always apply and any custom expert values are reset. There is no full "disable coarsening" switch; raising **Coarsen Above Cells** is the expert way to allow finer grids intentionally.
 
 ---
 
@@ -239,7 +254,7 @@ When current heating is enabled, the HTML report includes **Current Path Diagnos
 - **Mapped KiCad Primitives** - pads, tracks, vias/PTHs, zones, track length, and width summary.
 - **Joule Loss Map** - per-layer static image of current-induced copper loss.
 
-The report records both requested and actual grid resolution. If the solver auto-coarsens the grid, the report shows the actual resolution used for the simulation.
+The report records both requested and actual grid resolution. If the solver auto-coarsens the grid, the report shows the requested resolution, actual resolution, grid size, active cell limits, and whether default or expert grid limits were used.
 
 ---
 
@@ -283,6 +298,7 @@ The plugin is split into focused modules:
 - Radiation is not modeled.
 - Current-flow heating is static DC only; AC effects, skin effect, and temperature-dependent copper resistance are not modeled.
 - Current-path accuracy depends on grid resolution; narrow traces and small pads may need a finer grid to match hand calculations closely.
+- Very fine requested resolutions may be auto-coarsened on large boards unless expert grid limits are raised.
 - Via coupling is an approximation.
 - Results depend strongly on **Resolution (mm)** and, for pure thermal runs, **Limit Area/Distance**.
 - Thermal Pad (`User.Eco1`) is a simplification of real contact pressure, interface quality, and sink temperature.
@@ -296,8 +312,10 @@ The plugin is split into focused modules:
 3. Start pure thermal pad-power runs with **Limit Area to Pads** enabled and a moderate **Limit Distance**, for example 30 mm.
 4. For current-flow runs, let ThermalSim disable area limiting so electrical paths are not clipped.
 5. Tune **Resolution** until hotspots and current-path metrics are stable. Try 0.5 mm, then 0.3 mm.
-6. Compare layout variants using the same settings.
-7. Validate important designs with measurement or a full 3D thermal workflow.
+6. For deliberately fine full-board runs, enable **Expert Grid Limits** and raise the cell thresholds while watching runtime and memory use.
+7. Save JSON settings for repeatable project comparisons.
+8. Compare layout variants using the same settings.
+9. Validate important designs with measurement or a full 3D thermal workflow.
 
 ---
 

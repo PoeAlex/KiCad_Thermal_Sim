@@ -207,7 +207,10 @@ def default_settings():
         'pad_th': 1.0,
         'pad_k': 3.0,
         'pad_cap_areal': 0.0,
-        'h_conv': 10.0
+        'h_conv': 10.0,
+        'grid_expert_limits': False,
+        'grid_max_cells': 200000,
+        'grid_target_cells': 100000
     }
 
 

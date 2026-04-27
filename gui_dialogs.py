@@ -49,6 +49,9 @@ TOOLTIP_TEXTS = {
     'pad_cap': "Areal heat capacity in J/(m\u00b2\u00b7K). Set 0 for negligible thermal mass.",
     'h_conv': "Convection coefficient in W/(m\u00b2\u00b7K). Still air ~5-10, light fan ~25, forced ~50-100.",
     'pcb_thick': "PCB thickness override in mm. Usually auto-detected from stackup.",
+    'grid_expert_limits': "Enable expert control over automatic grid coarsening limits.",
+    'grid_max_cells': "Estimated cell count above which the grid is automatically coarsened.",
+    'grid_target_cells': "Target cell count used when automatic grid coarsening is applied.",
     'capabilities': "Detected solver backends. PyPardiso accelerates large grids significantly.",
     'help': "Open the ThermalSim documentation in your web browser.",
     'preview': "Generate a geometry preview image without running the simulation.",
@@ -68,12 +71,24 @@ CURRENT_GROUP_COLORS = [
 ]
 
 
+DEFAULT_GRID_MAX_CELLS = 200000
+DEFAULT_GRID_TARGET_CELLS = 100000
+
+
 def _safe_float(value, default=0.0):
     """Parse a float and fall back to a default for UI data."""
     try:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _safe_int(value, default=0):
+    """Parse an int and fall back to a default for UI data."""
+    try:
+        return int(float(value))
+    except Exception:
+        return int(default)
 
 
 def normalize_current_mode(mode):
@@ -682,6 +697,24 @@ class SettingsDialog(wx.Dialog):
             tooltip_key='pcb_thick'
         )
 
+        self.chk_grid_expert_limits = wx.CheckBox(panel, label="Expert Grid Limits")
+        self.chk_grid_expert_limits.SetValue(False)
+        self.chk_grid_expert_limits.SetToolTip(TOOLTIP_TEXTS['grid_expert_limits'])
+        self.chk_grid_expert_limits.Bind(wx.EVT_CHECKBOX, self._on_grid_expert_limits_toggle)
+        box_solver.Add(self.chk_grid_expert_limits, 0, wx.ALL, 3)
+
+        self.grid_max_cells_input = self._add_int_spin_field(
+            box_solver, panel, "Coarsen Above Cells:", DEFAULT_GRID_MAX_CELLS,
+            min_val=1000, max_val=10000000,
+            tooltip_key='grid_max_cells'
+        )
+        self.grid_target_cells_input = self._add_int_spin_field(
+            box_solver, panel, "Target Cells:", DEFAULT_GRID_TARGET_CELLS,
+            min_val=1000, max_val=10000000,
+            tooltip_key='grid_target_cells'
+        )
+        self._apply_grid_expert_state(reset_to_defaults=True)
+
         sizer.Add(box_solver, 0, wx.EXPAND | wx.ALL, 5)
 
         # --- Capabilities (read-only) ---
@@ -1036,6 +1069,19 @@ class SettingsDialog(wx.Dialog):
     def _on_snapshots_toggle(self, event):
         """Handle Snapshots checkbox toggle."""
         self.snap_count_input.Enable(self.chk_snapshots.GetValue())
+
+    def _apply_grid_expert_state(self, reset_to_defaults=False):
+        """Enable expert grid limit controls and optionally restore defaults."""
+        expert_enabled = self.chk_grid_expert_limits.GetValue()
+        if reset_to_defaults or not expert_enabled:
+            self.grid_max_cells_input.SetValue(DEFAULT_GRID_MAX_CELLS)
+            self.grid_target_cells_input.SetValue(DEFAULT_GRID_TARGET_CELLS)
+        self.grid_max_cells_input.Enable(expert_enabled)
+        self.grid_target_cells_input.Enable(expert_enabled)
+
+    def _on_grid_expert_limits_toggle(self, event):
+        """Handle Expert Grid Limits checkbox toggle."""
+        self._apply_grid_expert_state(reset_to_defaults=not self.chk_grid_expert_limits.GetValue())
 
     def _on_current_enabled_toggle(self, event):
         """Refresh summaries when current simulation is toggled."""
@@ -1469,6 +1515,9 @@ class SettingsDialog(wx.Dialog):
         - pad_k : float
         - pad_cap_areal : float
         - h_conv : float
+        - grid_expert_limits : bool
+        - grid_max_cells : int
+        - grid_target_cells : int
         """
         try:
             self._sync_current_group_from_fields()
@@ -1484,6 +1533,19 @@ class SettingsDialog(wx.Dialog):
             power_pads = prepare_power_pads(self.power_pads, self.power_input.GetValue())
             current_groups = prepare_current_groups(self.current_groups)
             power_str = power_pads_to_power_str(power_pads, self.power_input.GetValue())
+            grid_expert_limits = self.chk_grid_expert_limits.GetValue()
+            if grid_expert_limits:
+                grid_max_cells = int(self.grid_max_cells_input.GetValue())
+                grid_target_cells = int(self.grid_target_cells_input.GetValue())
+                if (
+                    grid_max_cells < 1000
+                    or grid_target_cells < 1000
+                    or grid_target_cells > grid_max_cells
+                ):
+                    raise ValueError
+            else:
+                grid_max_cells = DEFAULT_GRID_MAX_CELLS
+                grid_target_cells = DEFAULT_GRID_TARGET_CELLS
             return {
                 'power_str': power_str,
                 'power_pads': power_pads,
@@ -1504,6 +1566,9 @@ class SettingsDialog(wx.Dialog):
                 'pad_k': float(self.pad_k.GetValue()),
                 'pad_cap_areal': float(self.pad_cap.GetValue()),
                 'h_conv': float(self.h_conv_input.GetValue()),
+                'grid_expert_limits': grid_expert_limits,
+                'grid_max_cells': grid_max_cells,
+                'grid_target_cells': grid_target_cells,
                 'current_enabled': self.chk_current_enabled.GetValue(),
                 'current_groups': current_groups,
             }
@@ -1569,6 +1634,29 @@ class SettingsDialog(wx.Dialog):
 
             if 'h_conv' in defaults:
                 self.h_conv_input.SetValue(float(defaults['h_conv']))
+
+            grid_expert_limits = bool(defaults.get('grid_expert_limits', False))
+            self.chk_grid_expert_limits.SetValue(grid_expert_limits)
+            if grid_expert_limits:
+                grid_max_cells = _safe_int(defaults.get('grid_max_cells'), DEFAULT_GRID_MAX_CELLS)
+                grid_target_cells = _safe_int(
+                    defaults.get('grid_target_cells'),
+                    DEFAULT_GRID_TARGET_CELLS,
+                )
+                if (
+                    grid_max_cells < 1000
+                    or grid_target_cells < 1000
+                    or grid_target_cells > grid_max_cells
+                ):
+                    grid_expert_limits = False
+                    grid_max_cells = DEFAULT_GRID_MAX_CELLS
+                    grid_target_cells = DEFAULT_GRID_TARGET_CELLS
+                    self.chk_grid_expert_limits.SetValue(False)
+                self.grid_max_cells_input.SetValue(grid_max_cells)
+                self.grid_target_cells_input.SetValue(grid_target_cells)
+                self._apply_grid_expert_state(reset_to_defaults=not grid_expert_limits)
+            else:
+                self._apply_grid_expert_state(reset_to_defaults=True)
 
             if 'power_pads' in defaults:
                 self.power_pads = prepare_power_pads(defaults.get('power_pads', []), self.power_input.GetValue())

@@ -151,10 +151,26 @@ def _build_summary_metrics(settings, interactive_heatmap, k_norm_info, snapshot_
         actual_res = (interactive_heatmap or {}).get("res_mm")
     requested_res = (k_norm_info or {}).get("grid_requested_res_mm", settings.get("res"))
     res_detail = grid_label
+    limit_mode = (
+        "expert grid limits enabled"
+        if (k_norm_info or {}).get("grid_expert_limits")
+        else "default grid limits"
+    )
+    max_cells = (k_norm_info or {}).get("grid_max_cells")
+    target_cells = (k_norm_info or {}).get("grid_target_cells")
     if actual_res is not None and requested_res is not None:
         try:
             if abs(float(actual_res) - float(requested_res)) > 1e-9:
-                res_detail = f"requested: {float(requested_res):.3f} mm; grid: {grid_label}"
+                limit_detail = ""
+                if max_cells is not None and target_cells is not None:
+                    limit_detail = f"; limit: {int(max_cells)} -> {int(target_cells)} cells"
+                res_detail = (
+                    f"requested: {float(requested_res):.3f} mm; "
+                    f"auto-coarsened to {float(actual_res):.3f} mm; "
+                    f"grid: {grid_label}{limit_detail}; {limit_mode}"
+                )
+            else:
+                res_detail = f"{grid_label}; {limit_mode}"
         except Exception:
             pass
     metrics = [

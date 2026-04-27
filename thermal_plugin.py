@@ -22,7 +22,13 @@ import wx
 
 from .capabilities import HAS_LIBS, HAS_PARDISO, get_pypardiso_optional_dependency
 from .stackup_parser import parse_stackup_from_board_file, format_stackup_report_um
-from .gui_dialogs import SettingsDialog, prepare_current_groups, prepare_power_pads
+from .gui_dialogs import (
+    DEFAULT_GRID_MAX_CELLS,
+    DEFAULT_GRID_TARGET_CELLS,
+    SettingsDialog,
+    prepare_current_groups,
+    prepare_power_pads,
+)
 from .electrical_solver import CurrentTerminal, ElectricalConfig, solve_electrical_heating
 from .geometry_mapper import build_geometry_state, create_multilayer_maps, get_pad_pixels
 from .thermal_solver import SolverConfig, build_stiffness_matrix, run_simulation
@@ -247,6 +253,58 @@ def _format_timing_summary(timings):
         if key in timings:
             parts.append(f"{key}={float(timings[key]):.4f}s")
     return ", ".join(parts)
+
+
+def _resolve_grid_limits(settings):
+    """
+    Resolve automatic grid coarsening limits from settings.
+
+    Returns
+    -------
+    tuple
+        ``(expert_enabled, max_cells, target_cells)`` with safe defaults.
+    """
+    expert_enabled = bool(settings.get("grid_expert_limits", False))
+    if not expert_enabled:
+        return False, DEFAULT_GRID_MAX_CELLS, DEFAULT_GRID_TARGET_CELLS
+
+    try:
+        max_cells = int(settings.get("grid_max_cells", DEFAULT_GRID_MAX_CELLS))
+        target_cells = int(settings.get("grid_target_cells", DEFAULT_GRID_TARGET_CELLS))
+    except Exception:
+        return False, DEFAULT_GRID_MAX_CELLS, DEFAULT_GRID_TARGET_CELLS
+
+    if max_cells < 1000 or target_cells < 1000 or target_cells > max_cells:
+        return False, DEFAULT_GRID_MAX_CELLS, DEFAULT_GRID_TARGET_CELLS
+    return True, max_cells, target_cells
+
+
+def _coarsen_grid_resolution(w_mm, h_mm, requested_res, settings):
+    """
+    Apply automatic grid coarsening for large boards.
+
+    Parameters
+    ----------
+    w_mm, h_mm : float
+        Board width and height in millimeters.
+    requested_res : float
+        User-requested grid resolution in millimeters.
+    settings : dict
+        Simulation settings.
+
+    Returns
+    -------
+    tuple
+        ``(res, auto_coarsened, expert_enabled, max_cells, target_cells)``.
+    """
+    expert_enabled, max_cells, target_cells = _resolve_grid_limits(settings)
+    area = w_mm * h_mm
+    res = float(requested_res)
+    auto_coarsened = False
+    if res > 0.0 and area > 0.0 and (w_mm / res) * (h_mm / res) > max_cells:
+        res = math.sqrt(area / float(target_cells))
+        auto_coarsened = True
+    return res, auto_coarsened, expert_enabled, max_cells, target_cells
 
 
 class ThermalPlugin(pcbnew.ActionPlugin):
@@ -795,12 +853,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         x_min = bbox.GetX() * 1e-6
         y_min = bbox.GetY() * 1e-6
         requested_res = float(settings['res'])
-        res = requested_res
-        area = w_mm * h_mm
-        auto_coarsened = False
-        if (w_mm / res) * (h_mm / res) > 200000:
-            res = math.sqrt(area / 100000)
-            auto_coarsened = True
+        (
+            res,
+            auto_coarsened,
+            grid_expert_limits,
+            grid_max_cells,
+            grid_target_cells,
+        ) = _coarsen_grid_resolution(w_mm, h_mm, requested_res, settings)
 
         # Apply area limiting if enabled
         if settings.get('limit_area') and settings.get('pad_dist_mm', 0.0) > 0:
@@ -822,6 +881,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "grid_requested_res_mm": requested_res,
             "grid_res_mm": float(res),
             "grid_auto_coarsened": bool(auto_coarsened),
+            "grid_expert_limits": bool(grid_expert_limits),
+            "grid_max_cells": int(grid_max_cells),
+            "grid_target_cells": int(grid_target_cells),
             "grid_rows": int(rows),
             "grid_cols": int(cols),
             "grid_x_min_mm": float(x_min),

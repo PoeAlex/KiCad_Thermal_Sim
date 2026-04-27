@@ -13,6 +13,7 @@ from ThermalSim.geometry_mapper import get_pad_pixels
 from ThermalSim.thermal_plugin import (
     _build_power_vector,
     _build_sparse_pad_contributions,
+    _coarsen_grid_resolution,
 )
 from tests.mocks.pcbnew_mock import (
     MockBoard,
@@ -264,3 +265,60 @@ class TestSettingsPersistence:
         settings_path.write_text("{broken json", encoding="utf-8")
 
         assert plugin._load_settings(str(settings_path)) == {}
+
+
+class TestGridCoarsening:
+    """Tests for automatic grid coarsening limits."""
+
+    def test_default_coarsening_matches_legacy_formula(self):
+        """Without expert settings, the historic 200k/100k limits apply."""
+        res, auto_coarsened, expert, max_cells, target_cells = _coarsen_grid_resolution(
+            w_mm=300.0,
+            h_mm=75.0,
+            requested_res=0.1,
+            settings={},
+        )
+
+        assert auto_coarsened is True
+        assert expert is False
+        assert max_cells == 200000
+        assert target_cells == 100000
+        np.testing.assert_allclose(res, np.sqrt((300.0 * 75.0) / 100000.0))
+
+    def test_expert_limits_change_coarsened_resolution(self):
+        """Expert target cells should control the resulting coarsened resolution."""
+        res, auto_coarsened, expert, max_cells, target_cells = _coarsen_grid_resolution(
+            w_mm=300.0,
+            h_mm=75.0,
+            requested_res=0.1,
+            settings={
+                "grid_expert_limits": True,
+                "grid_max_cells": 1000000,
+                "grid_target_cells": 500000,
+            },
+        )
+
+        assert auto_coarsened is True
+        assert expert is True
+        assert max_cells == 1000000
+        assert target_cells == 500000
+        np.testing.assert_allclose(res, np.sqrt((300.0 * 75.0) / 500000.0))
+
+    def test_expert_limits_can_avoid_coarsening(self):
+        """Raising max cells above the estimate should preserve requested resolution."""
+        res, auto_coarsened, expert, max_cells, target_cells = _coarsen_grid_resolution(
+            w_mm=300.0,
+            h_mm=75.0,
+            requested_res=0.1,
+            settings={
+                "grid_expert_limits": True,
+                "grid_max_cells": 3000000,
+                "grid_target_cells": 1000000,
+            },
+        )
+
+        assert res == 0.1
+        assert auto_coarsened is False
+        assert expert is True
+        assert max_cells == 3000000
+        assert target_cells == 1000000

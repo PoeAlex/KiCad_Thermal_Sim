@@ -124,6 +124,9 @@ class TestSettingsDefaults:
             'pad_th': 1.0,
             'pad_k': 3.0,
             'pad_cap_areal': 0.0,
+            'grid_expert_limits': False,
+            'grid_max_cells': 200000,
+            'grid_target_cells': 100000,
         }
 
     def test_default_power(self, default_values):
@@ -208,6 +211,9 @@ class TestSettingsDictFormat:
             'pad_th': 1.0,
             'pad_k': 3.0,
             'pad_cap_areal': 0.0,
+            'grid_expert_limits': False,
+            'grid_max_cells': 200000,
+            'grid_target_cells': 100000,
         }
 
         # Verify all expected keys are present
@@ -215,7 +221,8 @@ class TestSettingsDictFormat:
             'power_str', 'time', 'amb', 'thick', 'res',
             'show_all', 'snapshots', 'snap_count', 'output_dir',
             'ignore_traces', 'ignore_polygons', 'limit_area', 'pad_dist_mm',
-            'use_heatsink', 'pad_th', 'pad_k', 'pad_cap_areal'
+            'use_heatsink', 'pad_th', 'pad_k', 'pad_cap_areal',
+            'grid_expert_limits', 'grid_max_cells', 'grid_target_cells'
         ]
 
         for key in expected_keys:
@@ -241,6 +248,9 @@ class TestSettingsDictFormat:
             'pad_th': 1.0,
             'pad_k': 3.0,
             'pad_cap_areal': 0.0,
+            'grid_expert_limits': False,
+            'grid_max_cells': 200000,
+            'grid_target_cells': 100000,
         }
 
         # Check types
@@ -260,6 +270,9 @@ class TestSettingsDictFormat:
         assert isinstance(settings['pad_th'], float)
         assert isinstance(settings['pad_k'], float)
         assert isinstance(settings['pad_cap_areal'], float)
+        assert isinstance(settings['grid_expert_limits'], bool)
+        assert isinstance(settings['grid_max_cells'], int)
+        assert isinstance(settings['grid_target_cells'], int)
 
 
 class TestApplyDefaults:
@@ -388,7 +401,8 @@ class TestNewSettingsKeys:
             'power_str', 'time', 'amb', 'thick', 'res',
             'show_all', 'snapshots', 'snap_count', 'output_dir',
             'ignore_traces', 'ignore_polygons', 'limit_area', 'pad_dist_mm',
-            'use_heatsink', 'pad_th', 'pad_k', 'pad_cap_areal', 'h_conv'
+            'use_heatsink', 'pad_th', 'pad_k', 'pad_cap_areal', 'h_conv',
+            'grid_expert_limits', 'grid_max_cells', 'grid_target_cells'
         ]
         settings = {k: None for k in expected_keys}
         for key in expected_keys:
@@ -625,8 +639,9 @@ class TestTooltipTexts:
             'show_all', 'snapshots', 'snap_count', 'output_dir',
             'ignore_traces', 'limit_area', 'limit_dist',
             'enable_pad', 'pad_thick', 'pad_k', 'pad_cap',
-            'h_conv', 'pcb_thick', 'capabilities',
-            'help', 'preview',
+            'h_conv', 'pcb_thick', 'grid_expert_limits',
+            'grid_max_cells', 'grid_target_cells', 'capabilities',
+            'help', 'preview', 'load_settings', 'save_settings',
         ]
 
         for field in expected_fields:
@@ -706,3 +721,81 @@ class TestSettingsDialogInstantiation:
         # Applied values should be updated
         assert values['time'] == 30.0
         assert values['amb'] == 30.0
+
+
+class TestGridExpertSettings:
+    """Tests for expert grid limit settings."""
+
+    def test_default_grid_settings_are_present(self, default_settings):
+        """Default settings should include non-expert grid limits."""
+        assert default_settings['grid_expert_limits'] is False
+        assert default_settings['grid_max_cells'] == 200000
+        assert default_settings['grid_target_cells'] == 100000
+
+    def test_dialog_defaults_save_default_grid_limits(self):
+        """Expert limits disabled should serialize the hardcoded defaults."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
+        values = dlg.get_values()
+
+        assert values['grid_expert_limits'] is False
+        assert values['grid_max_cells'] == 200000
+        assert values['grid_target_cells'] == 100000
+        assert not dlg.grid_max_cells_input.IsEnabled()
+        assert not dlg.grid_target_cells_input.IsEnabled()
+
+    def test_disabling_expert_limits_resets_custom_values(self):
+        """Turning expert limits off should restore default grid limits."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
+        dlg.chk_grid_expert_limits.SetValue(True)
+        dlg._on_grid_expert_limits_toggle(None)
+        dlg.grid_max_cells_input.SetValue(900000)
+        dlg.grid_target_cells_input.SetValue(450000)
+
+        dlg.chk_grid_expert_limits.SetValue(False)
+        dlg._on_grid_expert_limits_toggle(None)
+        values = dlg.get_values()
+
+        assert values['grid_expert_limits'] is False
+        assert values['grid_max_cells'] == 200000
+        assert values['grid_target_cells'] == 100000
+        assert dlg.grid_max_cells_input.GetValue() == 200000
+        assert dlg.grid_target_cells_input.GetValue() == 100000
+
+    def test_apply_defaults_without_grid_settings_keeps_defaults(self):
+        """Old JSON settings should load with default grid limits."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            defaults={'time': 30.0}
+        )
+        values = dlg.get_values()
+
+        assert values['time'] == 30.0
+        assert values['grid_expert_limits'] is False
+        assert values['grid_max_cells'] == 200000
+        assert values['grid_target_cells'] == 100000
+
+    def test_apply_defaults_with_grid_expert_limits(self):
+        """Saved expert grid limits should be restored when enabled."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            defaults={
+                'grid_expert_limits': True,
+                'grid_max_cells': 800000,
+                'grid_target_cells': 400000,
+            }
+        )
+        values = dlg.get_values()
+
+        assert values['grid_expert_limits'] is True
+        assert values['grid_max_cells'] == 800000
+        assert values['grid_target_cells'] == 400000
+        assert dlg.grid_max_cells_input.IsEnabled()
+        assert dlg.grid_target_cells_input.IsEnabled()
