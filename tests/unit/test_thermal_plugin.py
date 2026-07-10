@@ -242,7 +242,7 @@ class TestSettingsPersistence:
         }
 
         assert plugin._save_settings(settings, str(settings_path)) is True
-        assert plugin._load_settings(str(settings_path)) == settings
+        assert plugin._load_settings(str(settings_path)) == {**settings, "schema_version": 2}
 
     def test_load_settings_rejects_non_dict_json(self, tmp_path):
         """Only object-shaped JSON files are valid settings files."""

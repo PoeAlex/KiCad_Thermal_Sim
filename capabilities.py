@@ -23,6 +23,7 @@ HAS_NUMBA : bool
 """
 
 import importlib.util
+import os
 import platform
 import sys
 
@@ -52,11 +53,17 @@ try:
 except ImportError:
     pass
 
-try:
-    import wx
-    HAS_WX = True
-except ImportError:
-    pass
+if os.environ.get("THERMALSIM_HEADLESS", "").strip().lower() in {"1", "true", "yes", "on"}:
+    # Importing wx in the same standalone process as a loaded pcbnew board
+    # makes KiCad register its global image handlers twice. Detection is
+    # sufficient for headless solver/benchmark use.
+    HAS_WX = importlib.util.find_spec("wx") is not None
+else:
+    try:
+        import wx
+        HAS_WX = True
+    except ImportError:
+        pass
 
 # Composite flag for backwards compatibility
 HAS_LIBS = HAS_NUMPY and HAS_SCIPY and HAS_MATPLOTLIB and HAS_WX

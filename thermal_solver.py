@@ -51,10 +51,60 @@ class SolverConfig:
     use_multi_phase: bool = True
     snapshots_enabled: bool = False
     snap_times: List[float] = None
+    time_stepping: str = "multi_phase"
 
     def __post_init__(self):
         if self.snap_times is None:
             self.snap_times = []
+        mode = str(self.time_stepping or "multi_phase").strip().lower()
+        if mode not in {"auto", "multi_phase", "two_phase", "uniform"}:
+            mode = "multi_phase"
+        self.time_stepping = mode
+
+
+def _build_phase_plan(config: SolverConfig, node_count: int, use_pardiso: bool):
+    """Return the validated time-step phase plan for a simulation."""
+    mode = config.time_stepping
+    auto_large = False
+    if not config.use_multi_phase:
+        mode = "uniform"
+    elif mode == "auto":
+        # Large PARDISO systems pay a high price for every distinct matrix
+        # factorization. Uniform BDF2 needs only the BE bootstrap and one BDF2
+        # factorization and uses a smaller maximum dt than the legacy plan.
+        auto_large = use_pardiso and node_count >= 250_000
+        mode = "uniform" if auto_large else "multi_phase"
+
+    if mode == "multi_phase":
+        phase_defs = [
+            {"name": "A", "frac": 0.08, "dt_scale": 0.5},
+            {"name": "B", "frac": 0.35, "dt_scale": 1.0},
+            {"name": "C", "frac": 0.57, "dt_scale": 2.0},
+        ]
+    elif mode == "two_phase":
+        phase_defs = [
+            {"name": "A", "frac": 0.15, "dt_scale": 0.5},
+            {"name": "B", "frac": 0.85, "dt_scale": 1.5},
+        ]
+    else:
+        phase_defs = [{"name": "uniform", "frac": 1.0, "dt_scale": 1.0}]
+        if auto_large:
+            legacy_defs = ((0.08, 0.5), (0.35, 1.0), (0.57, 2.0))
+            phase_defs[0]["steps_override"] = sum(
+                max(1, int(round(config.steps_target * fraction / scale)))
+                for fraction, scale in legacy_defs
+            )
+            phase_defs[0]["derivative_start"] = True
+
+    phase_times = [config.sim_time * p["frac"] for p in phase_defs]
+    phase_times[-1] = config.sim_time - sum(phase_times[:-1])
+    plan = []
+    for phase_time, pdef in zip(phase_times, phase_defs):
+        requested_dt = config.dt_base * pdef["dt_scale"]
+        step_count = int(pdef.get("steps_override", max(1, int(round(phase_time / requested_dt)))))
+        phase_dt = phase_time / step_count if phase_time > 0 else config.dt_base
+        plan.append((pdef, phase_time, step_count, phase_dt))
+    return mode, plan
 
 
 @dataclass
@@ -335,7 +385,8 @@ def run_simulation(
     cols: int,
     progress_callback: Optional[Callable[[int, int], bool]] = None,
     snapshot_callback: Optional[Callable[[np.ndarray, float, int], str]] = None,
-    Q_func: Optional[Callable[[float], np.ndarray]] = None
+    Q_func: Optional[Callable[[float], np.ndarray]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None
 ) -> SolverResult:
     """
     Run the transient thermal simulation using BDF2 time integration.
@@ -378,7 +429,6 @@ def run_simulation(
     """
     N = K.shape[0]
     RC = rows * cols
-    dt = config.dt_base
     sim_time = config.sim_time
     amb = config.amb
 
@@ -410,28 +460,8 @@ def run_simulation(
     phase_metrics = []
     balance_history = []
 
-    # Set up phase plan
-    if config.use_multi_phase:
-        phase_defs = [
-            {"name": "A", "frac": 0.08, "dt_scale": 0.5},
-            {"name": "B", "frac": 0.35, "dt_scale": 1.0},
-            {"name": "C", "frac": 0.57, "dt_scale": 2.0},
-        ]
-        phase_times = [sim_time * p["frac"] for p in phase_defs]
-        phase_times[-1] = sim_time - sum(phase_times[:-1])
-        phase_steps = []
-        phase_dts = []
-        for phase_time, pdef in zip(phase_times, phase_defs):
-            phase_dt = dt * pdef["dt_scale"]
-            step_count = max(1, int(round(phase_time / phase_dt)))
-            phase_dt = phase_time / step_count if phase_time > 0 else dt
-            phase_steps.append(step_count)
-            phase_dts.append(phase_dt)
-        total_steps = sum(phase_steps)
-        phase_plan = list(zip(phase_defs, phase_times, phase_steps, phase_dts))
-    else:
-        total_steps = config.steps_target
-        phase_plan = [({"name": "single"}, sim_time, total_steps, dt)]
+    time_stepping_used, phase_plan = _build_phase_plan(config, N, use_pardiso)
+    total_steps = sum(item[2] for item in phase_plan)
 
     update_interval = max(1, total_steps // 100)
 
@@ -511,27 +541,81 @@ def run_simulation(
         A_bdf2 = K + sp.diags(1.5 * D, format="csr")
         assembly_time = time.perf_counter() - assembly_start
 
-        # Factor matrices
-        factor_start = time.perf_counter()
-        if use_pardiso and hasattr(pypardiso, "factorized"):
-            solve_be = pypardiso.factorized(A_be.tocsc())
-            solve_bdf2 = pypardiso.factorized(A_bdf2.tocsc())
-        elif use_pardiso:
-            solve_be = lambda rhs: pypardiso.spsolve(A_be.tocsc(), rhs)
-            solve_bdf2 = lambda rhs: pypardiso.spsolve(A_bdf2.tocsc(), rhs)
-        else:
-            lu_be = spla.splu(A_be.tocsc())
-            lu_bdf2 = spla.splu(A_bdf2.tocsc())
-            solve_be = lu_be.solve
-            solve_bdf2 = lu_bdf2.solve
-        factor_time = time.perf_counter() - factor_start
-        total_factor_time += factor_time
-        factor_count += 1
+        if pdef.get("derivative_start"):
+            # A derivative-consistent fictitious T(-dt) gives BDF2 its
+            # second-order startup without a separate one-shot BE matrix.
+            # This is used only by Auto on large uniform PARDISO systems.
+            del A_be
+            Q_current = Q_func(current_time) if Q_func is not None else Q
+            pin = float(np.sum(Q_current))
+            derivative0 = (Q_current + b - K.dot(Tn)) / C
+            Tnm1 = Tn - phase_dt * derivative0
+
+            factor_start = time.perf_counter()
+            bdf_owner = pypardiso.PyPardisoSolver()
+            bdf_owner.factorize(A_bdf2)
+            solve_bdf2 = lambda rhs, _owner=bdf_owner, _matrix=A_bdf2: _owner.solve(_matrix, rhs)
+            factor_time = time.perf_counter() - factor_start
+            total_factor_time += factor_time
+            factor_count += 1
+            phase_solve_time = 0.0
+            phase_steps_done = 0
+
+            while not aborted and phase_steps_done < phase_step_count:
+                if cancel_check and cancel_check():
+                    aborted = True
+                    break
+                if Q_func is not None:
+                    Q_current = Q_func(current_time + phase_dt)
+                    pin = float(np.sum(Q_current))
+                rhs = (2.0 * D) * Tn - (0.5 * D) * Tnm1 + Q_current + b
+                phase_solve_time += advance_step(rhs, solve_bdf2, phase_dt)
+                phase_steps_done += 1
+
+                if step_counter % update_interval == 0 or step_counter == total_steps:
+                    if progress_callback and not progress_callback(step_counter, total_steps):
+                        aborted = True
+                        print("[ThermalSim] Simulation cancelled by user.")
+                        break
+                if config.snapshots_enabled:
+                    while next_snap_idx < len(config.snap_times) and current_time >= config.snap_times[next_snap_idx]:
+                        record_snapshot(config.snap_times[next_snap_idx])
+                        next_snap_idx += 1
+
+            bdf_owner.free_memory(everything=True)
+            del solve_bdf2, bdf_owner, A_bdf2
+            phase_metrics.append({
+                "phase": pdef["name"],
+                "dt": phase_dt,
+                "steps": phase_steps_done,
+                "assembly_s": assembly_time,
+                "factorization_s": factor_time,
+                "avg_solve_s": phase_solve_time / max(phase_steps_done, 1),
+                "startup": "derivative_bdf2",
+            })
+            if aborted:
+                break
+            continue
 
         phase_solve_time = 0.0
+        phase_factor_time = 0.0
         phase_steps_done = 0
 
-        # First step: Backward Euler
+        # Backward Euler bootstraps BDF2. It is a one-shot matrix, so release
+        # its factorization before preparing the reusable BDF2 system.
+        factor_start = time.perf_counter()
+        if use_pardiso:
+            be_owner = pypardiso.PyPardisoSolver()
+            be_owner.factorize(A_be)
+            solve_be = lambda rhs, _owner=be_owner, _matrix=A_be: _owner.solve(_matrix, rhs)
+        else:
+            be_owner = spla.splu(A_be.tocsc())
+            solve_be = be_owner.solve
+        factor_elapsed = time.perf_counter() - factor_start
+        phase_factor_time += factor_elapsed
+        total_factor_time += factor_elapsed
+        factor_count += 1
+
         if Q_func is not None:
             Q_current = Q_func(current_time + phase_dt)
             pin = float(np.sum(Q_current))
@@ -539,6 +623,13 @@ def run_simulation(
         solve_elapsed = advance_step(rhs1, solve_be, phase_dt)
         phase_solve_time += solve_elapsed
         phase_steps_done += 1
+
+        if use_pardiso:
+            be_owner.free_memory(everything=True)
+        del solve_be, be_owner, A_be
+
+        if cancel_check and cancel_check():
+            aborted = True
 
         if step_counter % update_interval == 0 or step_counter == total_steps:
             if progress_callback and not progress_callback(step_counter, total_steps):
@@ -551,8 +642,27 @@ def run_simulation(
                 record_snapshot(config.snap_times[next_snap_idx])
                 next_snap_idx += 1
 
-        # Remaining steps: BDF2
-        while phase_steps_done < phase_step_count:
+        # Explicitly factor the BDF2 system once and reuse that exact owner.
+        solve_bdf2 = None
+        bdf_owner = None
+        if not aborted and phase_step_count > 1:
+            factor_start = time.perf_counter()
+            if use_pardiso:
+                bdf_owner = pypardiso.PyPardisoSolver()
+                bdf_owner.factorize(A_bdf2)
+                solve_bdf2 = lambda rhs, _owner=bdf_owner, _matrix=A_bdf2: _owner.solve(_matrix, rhs)
+            else:
+                bdf_owner = spla.splu(A_bdf2.tocsc())
+                solve_bdf2 = bdf_owner.solve
+            factor_elapsed = time.perf_counter() - factor_start
+            phase_factor_time += factor_elapsed
+            total_factor_time += factor_elapsed
+            factor_count += 1
+
+        while not aborted and phase_steps_done < phase_step_count:
+            if cancel_check and cancel_check():
+                aborted = True
+                break
             if Q_func is not None:
                 Q_current = Q_func(current_time + phase_dt)
                 pin = float(np.sum(Q_current))
@@ -575,13 +685,21 @@ def run_simulation(
             if aborted:
                 break
 
+        if use_pardiso and bdf_owner is not None:
+            bdf_owner.free_memory(everything=True)
+        if solve_bdf2 is not None:
+            del solve_bdf2
+        if bdf_owner is not None:
+            del bdf_owner
+        del A_bdf2
+
         phase_avg_solve = phase_solve_time / max(phase_steps_done, 1)
         phase_metrics.append({
             "phase": pdef["name"],
             "dt": phase_dt,
             "steps": phase_steps_done,
             "assembly_s": assembly_time,
-            "factorization_s": factor_time,
+            "factorization_s": phase_factor_time,
             "avg_solve_s": phase_avg_solve
         })
 
@@ -612,7 +730,8 @@ def run_simulation(
     k_norm_info = {
         "strategy": "implicit_fvm_bdf2",
         "backend": backend,
-        "multi_phase": config.use_multi_phase,
+        "multi_phase": time_stepping_used != "uniform",
+        "time_stepping": time_stepping_used,
         "N": N,
         "nnz_K": int(K.nnz),
         "dt_base": config.dt_base,

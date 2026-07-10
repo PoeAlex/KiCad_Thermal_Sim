@@ -6,13 +6,12 @@ workflow using the specialized sub-modules.
 """
 
 import os
-import sys
 import re
 import time
 import math
 import json
 import tempfile
-import subprocess
+import threading
 import traceback
 from dataclasses import dataclass, asdict
 
@@ -38,6 +37,16 @@ from .visualization import (
     build_interactive_heatmap_payload, save_joule_loss_map
 )
 from .thermal_report import write_html_report
+from .workflow import (
+    BoardSnapshot,
+    CancellationToken,
+    GeometryCache,
+    GridEstimate,
+    PreflightResult,
+    SimulationArtifacts,
+    geometry_cache_key,
+    stable_fingerprint,
+)
 
 
 @dataclass
@@ -230,11 +239,13 @@ def _build_power_vector(pad_sources, pad_contributions, total_nodes):
     for times, powers, indices, weights in pwl_terms:
         q_initial[indices] += float(np.interp(0.0, times, powers)) * weights
 
-    def q_func(t, _q_const=q_const, _pwl_terms=tuple(pwl_terms)):
-        q_t = _q_const.copy()
+    q_workspace = np.empty_like(q_const)
+
+    def q_func(t, _q_const=q_const, _pwl_terms=tuple(pwl_terms), _workspace=q_workspace):
+        np.copyto(_workspace, _q_const)
         for times, powers, indices, weights in _pwl_terms:
-            q_t[indices] += float(np.interp(t, times, powers)) * weights
-        return q_t
+            _workspace[indices] += float(np.interp(t, times, powers)) * weights
+        return _workspace
 
     return q_initial, q_func
 
@@ -253,6 +264,17 @@ def _format_timing_summary(timings):
         if key in timings:
             parts.append(f"{key}={float(timings[key]):.4f}s")
     return ", ".join(parts)
+
+
+def _write_run_manifest(run_dir, status, **details):
+    """Persist the lifecycle state of a result directory."""
+    payload = {"schema_version": 1, "status": str(status), "updated_at": time.time()}
+    payload.update(details)
+    try:
+        with open(os.path.join(run_dir, "run_manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+    except Exception:
+        pass
 
 
 def _resolve_grid_limits(settings):
@@ -307,6 +329,54 @@ def _coarsen_grid_resolution(w_mm, h_mm, requested_res, settings):
     return res, auto_coarsened, expert_enabled, max_cells, target_cells
 
 
+def _estimate_solver_grid(bbox, requested_res, settings, layer_count, focus_pads=None):
+    """Compute the final solver grid after area limiting and coarsening."""
+    original_x_min = bbox.GetX() * 1e-6
+    original_y_min = bbox.GetY() * 1e-6
+    original_x_max = original_x_min + bbox.GetWidth() * 1e-6
+    original_y_max = original_y_min + bbox.GetHeight() * 1e-6
+    x_min, y_min = original_x_min, original_y_min
+    x_max, y_max = original_x_max, original_y_max
+
+    if settings.get("limit_area") and settings.get("pad_dist_mm", 0.0) > 0:
+        radius = float(settings["pad_dist_mm"])
+        pad_xs = []
+        pad_ys = []
+        for pad in focus_pads or []:
+            try:
+                pos = pad.GetPosition()
+                pad_xs.append(pos.x * 1e-6)
+                pad_ys.append(pos.y * 1e-6)
+            except Exception:
+                continue
+        if pad_xs and pad_ys:
+            x_min = max(original_x_min, min(pad_xs) - radius)
+            y_min = max(original_y_min, min(pad_ys) - radius)
+            x_max = min(original_x_max, max(pad_xs) + radius)
+            y_max = min(original_y_max, max(pad_ys) + radius)
+
+    width = max(float(requested_res), x_max - x_min)
+    height = max(float(requested_res), y_max - y_min)
+    res, coarsened, expert, max_cells, target_cells = _coarsen_grid_resolution(
+        width, height, requested_res, settings
+    )
+    return GridEstimate(
+        requested_res_mm=float(requested_res),
+        actual_res_mm=float(res),
+        x_min_mm=float(x_min),
+        y_min_mm=float(y_min),
+        width_mm=float(width),
+        height_mm=float(height),
+        rows=int(height / res) + 4,
+        cols=int(width / res) + 4,
+        layer_count=int(layer_count),
+        auto_coarsened=bool(coarsened),
+        expert_limits=bool(expert),
+        max_cells=int(max_cells),
+        target_cells=int(target_cells),
+    )
+
+
 class ThermalPlugin(pcbnew.ActionPlugin):
     """
     KiCad Action Plugin for 2.5D transient thermal simulation.
@@ -331,14 +401,85 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.stack_info = None
         self.last_zone_refill_s = 0.0
         self.settings_dialog = None
+        self.geometry_cache = GeometryCache()
+        self.cancel_token = None
+        self.last_artifacts = None
+
+    def _capture_board_snapshot(self, board, copper_ids, bbox):
+        """Capture a cheap deterministic identity for geometry cache safety."""
+        tracks = list(board.Tracks() if hasattr(board, "Tracks") else board.GetTracks())
+        footprints = list(board.Footprints() if hasattr(board, "Footprints") else board.GetFootprints())
+        zones = list(board.Zones() if hasattr(board, "Zones") else board.GetZones())
+        primitive_rows = []
+        for item in tracks + zones:
+            try:
+                rect = item.GetBoundingBox()
+                primitive_rows.append((
+                    type(item).__name__, int(item.GetLayer()), rect.GetX(), rect.GetY(),
+                    rect.GetWidth(), rect.GetHeight(),
+                ))
+            except Exception:
+                continue
+        for fp in footprints:
+            try:
+                reference = fp.GetReference()
+            except Exception:
+                reference = ""
+            for pad in fp.Pads():
+                try:
+                    pos = pad.GetPosition()
+                    primitive_rows.append(("pad", reference, pad.GetNumber(), pos.x, pos.y, pad.GetLayer()))
+                except Exception:
+                    continue
+        bbox_mm = (
+            bbox.GetX() * 1e-6,
+            bbox.GetY() * 1e-6,
+            bbox.GetWidth() * 1e-6,
+            bbox.GetHeight() * 1e-6,
+        )
+        return BoardSnapshot(
+            filename=str(board.GetFileName() or ""),
+            fingerprint=stable_fingerprint((bbox_mm, tuple(primitive_rows))),
+            bbox_mm=bbox_mm,
+            copper_layers=tuple(int(x) for x in copper_ids),
+            track_count=len(tracks),
+            footprint_count=len(footprints),
+            zone_count=len(zones),
+        )
+
+    def _geometry_key(self, board, copper_ids, bbox, grid, settings, pads):
+        snapshot = self._capture_board_snapshot(board, copper_ids, bbox)
+        pad_keys = []
+        for pad in pads or []:
+            try:
+                pos = pad.GetPosition()
+                pad_keys.append((pad.GetNumber(), pad.GetLayer(), pos.x, pos.y))
+            except Exception:
+                pad_keys.append(id(pad))
+        return geometry_cache_key(snapshot, grid, settings, pad_keys)
 
     def _settings_path(self):
         """Return path to settings persistence file."""
-        return os.path.join(os.path.dirname(__file__), "thermal_sim_last_settings.json")
+        try:
+            base_dir = wx.StandardPaths.Get().GetUserConfigDir()
+        except Exception:
+            base_dir = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+        return os.path.join(base_dir, "ThermalSim", "thermal_sim_last_settings.json")
 
     def _load_settings(self, path=None):
         """Load settings from a JSON file."""
         settings_path = path or self._settings_path()
+        if path is None and not os.path.isfile(settings_path):
+            legacy_path = os.path.join(os.path.dirname(__file__), "thermal_sim_last_settings.json")
+            if os.path.isfile(legacy_path):
+                try:
+                    with open(legacy_path, "r", encoding="utf-8") as f:
+                        legacy = json.load(f)
+                    if isinstance(legacy, dict):
+                        legacy["schema_version"] = 2
+                        self._save_settings(legacy)
+                except Exception:
+                    pass
         try:
             with open(settings_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -350,8 +491,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         """Save settings to a JSON file."""
         settings_path = path or self._settings_path()
         try:
+            parent_dir = os.path.dirname(settings_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            payload = dict(settings)
+            payload["schema_version"] = 2
             with open(settings_path, "w", encoding="utf-8") as f:
-                json.dump(settings, f, indent=2, sort_keys=True)
+                json.dump(payload, f, indent=2, sort_keys=True)
             return True
         except Exception:
             return False
@@ -425,7 +571,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         stackup_details = format_stackup_report_um(stack_info) if stack_info else ""
         pad_names = self._format_pad_names(selected_pads)
         initial_power_pads = self._get_selected_pad_descriptors(board)
-        default_output_dir = os.path.dirname(__file__)
+        board_path = str(board.GetFileName() or "")
+        board_dir = os.path.dirname(board_path) if board_path else ""
+        default_output_dir = (
+            os.path.join(board_dir, "ThermalSim_results")
+            if board_dir else os.path.join(os.path.expanduser("~"), "Documents", "ThermalSim_results")
+        )
         last_settings = self._load_settings()
         if last_settings.get("output_dir") and os.path.isdir(last_settings.get("output_dir")):
             default_output_dir = last_settings.get("output_dir")
@@ -441,7 +592,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             return self._get_selected_pad_descriptors(board)
 
         def run_callback(settings):
-            self.settings_dialog = None
             self._save_settings(settings)
             power_pads = self._resolve_power_pad_objects(board, settings, legacy_pads=pads_list)
             current_pads = self._resolve_current_pad_objects(board, settings)
@@ -455,12 +605,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         def close_callback():
             self.settings_dialog = None
 
+        def preflight_callback(settings):
+            return self._preflight(board, copper_ids, bbox, settings)
+
         dlg = SettingsDialog(
             None, len(pads_list), suggested_res, layer_names,
             preview_callback=self.generate_preview,
             selection_provider=selection_provider,
             run_callback=run_callback,
             close_callback=close_callback,
+            preflight_callback=preflight_callback,
             load_settings_callback=self._load_settings,
             save_settings_callback=self._save_settings,
             stackup_details=stackup_details,
@@ -744,6 +898,71 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             pad_names.append(f"{nm} [{net}]" if net else nm)
         return pad_names
 
+    def _preflight(self, board, copper_ids, bbox, settings):
+        """Validate settings and estimate the exact grid before execution."""
+        result = PreflightResult()
+        power_entries, missing_power = self._resolve_power_pad_entries(board, settings)
+        current_pads = self._resolve_current_pad_objects(board, settings)
+        power_pads = [pad for _, pad, _ in power_entries]
+        focus_pads = self._unique_pads(power_pads + current_pads)
+        result.grid = _estimate_solver_grid(
+            bbox, float(settings.get("res", 0.5)), settings, len(copper_ids), focus_pads
+        )
+
+        if missing_power:
+            result.errors.append(f"{len(missing_power)} heat-source pad(s) are missing from the board.")
+        has_power = False
+        for _, _, entry in power_entries:
+            value = str(entry or "").strip()
+            if not value:
+                continue
+            try:
+                has_power = has_power or abs(float(value)) > 0.0
+            except ValueError:
+                try:
+                    _, pwl_values = parse_pwl_file(value)
+                    has_power = has_power or bool(np.any(np.asarray(pwl_values) != 0.0))
+                except Exception as exc:
+                    result.errors.append(f"Invalid PWL source '{value}': {exc}")
+
+        has_current = False
+        if settings.get("current_enabled"):
+            terminals, missing_current = self._resolve_current_terminals(board, settings)
+            if missing_current:
+                result.errors.append(f"{len(missing_current)} current-terminal pad(s) are missing from the board.")
+            has_current = any(abs(float(item.current_a)) > 0.0 for item in terminals)
+            totals = {}
+            for item in terminals:
+                net = item.net_name or f"net:{item.net_code}"
+                totals[net] = totals.get(net, 0.0) + float(item.current_a)
+            unbalanced = [name for name, total in totals.items() if abs(total) > 1e-9]
+            if unbalanced:
+                result.errors.append("Current is not balanced for: " + ", ".join(unbalanced[:3]))
+            if settings.get("limit_area"):
+                result.warnings.append("Area limiting will be disabled for current heating.")
+
+        if not has_power and not has_current:
+            result.errors.append("Configure at least one non-zero heat source or balanced current path.")
+
+        output_dir = str(settings.get("output_dir", "") or "").strip()
+        writable_parent = output_dir
+        while writable_parent and not os.path.exists(writable_parent):
+            parent = os.path.dirname(writable_parent)
+            if parent == writable_parent:
+                break
+            writable_parent = parent
+        if not output_dir or not writable_parent or not os.access(writable_parent, os.W_OK):
+            result.errors.append("The output folder is not writable.")
+
+        if result.grid.auto_coarsened:
+            result.warnings.append(
+                f"Resolution will be coarsened from {result.grid.requested_res_mm:.3f} "
+                f"to {result.grid.actual_res_mm:.3f} mm."
+            )
+        if settings.get("solver_backend") == "pardiso" and not HAS_PARDISO:
+            result.errors.append("PyPardiso was selected but is not available.")
+        return result
+
     def _derive_stackup_thicknesses(self, board, copper_ids, stack_info, settings):
         """Derive thickness values from stackup or defaults."""
         stack_copper = stack_info.get("copper", []) if isinstance(stack_info, dict) else []
@@ -804,14 +1023,41 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         power_pads = self._resolve_power_pad_objects(self.board, settings, legacy_pads=self.pads_list)
         current_pads = self._resolve_current_pad_objects(self.board, settings)
         preview_pads = self._unique_pads(power_pads + current_pads)
+        effective_settings = dict(settings)
+        if effective_settings.get("current_enabled"):
+            effective_settings["limit_area"] = False
+        grid = _estimate_solver_grid(
+            self.bbox, float(effective_settings["res"]), effective_settings,
+            len(self.copper_ids), preview_pads,
+        )
+        cache_key = self._geometry_key(
+            self.board, self.copper_ids, self.bbox, grid, effective_settings, preview_pads
+        )
+        geometry_state = self.geometry_cache.get(cache_key)
+        if geometry_state is None:
+            geometry_state = build_geometry_state(
+                board=self.board,
+                copper_ids=self.copper_ids,
+                rows=grid.rows,
+                cols=grid.cols,
+                x_min=grid.x_min_mm,
+                y_min=grid.y_min_mm,
+                res=grid.actual_res_mm,
+                settings=effective_settings,
+                via_factor=390.0 / 0.3,
+                pads_list=preview_pads,
+            )
+            self.geometry_cache.put(cache_key, geometry_state)
         output_file = save_preview_image(
             self.board, self.copper_ids, self.bbox, preview_pads,
-            settings, layer_names,
+            effective_settings, layer_names,
             self.stack_info if self.stack_info is not None else parse_stackup_from_board_file(self.board),
             get_pad_pixels,
             create_multilayer_maps,
             self._derive_stackup_thicknesses,
-            open_file=True
+            open_file=True,
+            geometry_state=geometry_state,
+            grid_spec=grid,
         )
         if not output_file:
             wx.MessageBox("Board data missing for preview", "Error")
@@ -835,10 +1081,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # Output folder setup
         base_output_dir = settings.get('output_dir') or os.path.dirname(__file__)
-        if not os.path.isdir(base_output_dir):
-            base_output_dir = os.path.dirname(__file__)
-        run_dir = os.path.join(base_output_dir, time.strftime("Thermalsim_%Y%m%d_%H%M%S"))
         try:
+            os.makedirs(base_output_dir, exist_ok=True)
+            run_dir = os.path.join(base_output_dir, time.strftime("Thermalsim_%Y%m%d_%H%M%S"))
             os.makedirs(run_dir, exist_ok=True)
             test_path = os.path.join(run_dir, ".write_test")
             with open(test_path, "w", encoding="utf-8") as f:
@@ -846,44 +1091,23 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             os.remove(test_path)
         except Exception:
             run_dir = tempfile.mkdtemp(prefix="ThermalSim_")
+        _write_run_manifest(run_dir, "running", settings=settings)
 
-        # Grid setup
-        w_mm = bbox.GetWidth() * 1e-6
-        h_mm = bbox.GetHeight() * 1e-6
-        x_min = bbox.GetX() * 1e-6
-        y_min = bbox.GetY() * 1e-6
         requested_res = float(settings['res'])
-        (
-            res,
-            auto_coarsened,
-            grid_expert_limits,
-            grid_max_cells,
-            grid_target_cells,
-        ) = _coarsen_grid_resolution(w_mm, h_mm, requested_res, settings)
-
-        # Apply area limiting if enabled
-        if settings.get('limit_area') and settings.get('pad_dist_mm', 0.0) > 0:
-            radius_mm = settings['pad_dist_mm']
-            pad_xs = [pad.GetPosition().x * 1e-6 for pad in focus_pads]
-            pad_ys = [pad.GetPosition().y * 1e-6 for pad in focus_pads]
-            if pad_xs and pad_ys:
-                x_min = max(x_min, min(pad_xs) - radius_mm)
-                y_min = max(y_min, min(pad_ys) - radius_mm)
-                x_max = min(x_min + w_mm, max(pad_xs) + radius_mm)
-                y_max = min(y_min + h_mm, max(pad_ys) + radius_mm)
-                w_mm = max(res, x_max - x_min)
-                h_mm = max(res, y_max - y_min)
-
-        cols = int(w_mm / res) + 4
-        rows = int(h_mm / res) + 4
         layer_count = len(copper_ids)
+        grid = _estimate_solver_grid(bbox, requested_res, settings, layer_count, focus_pads)
+        res = grid.actual_res_mm
+        x_min = grid.x_min_mm
+        y_min = grid.y_min_mm
+        rows = grid.rows
+        cols = grid.cols
         grid_info = {
             "grid_requested_res_mm": requested_res,
             "grid_res_mm": float(res),
-            "grid_auto_coarsened": bool(auto_coarsened),
-            "grid_expert_limits": bool(grid_expert_limits),
-            "grid_max_cells": int(grid_max_cells),
-            "grid_target_cells": int(grid_target_cells),
+            "grid_auto_coarsened": grid.auto_coarsened,
+            "grid_expert_limits": grid.expert_limits,
+            "grid_max_cells": grid.max_cells,
+            "grid_target_cells": grid.target_cells,
             "grid_rows": int(rows),
             "grid_cols": int(cols),
             "grid_x_min_mm": float(x_min),
@@ -908,8 +1132,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # Build internal geometry state
         geometry_start = time.perf_counter()
+        cache_key = self._geometry_key(board, copper_ids, bbox, grid, settings, focus_pads)
+        geometry_state = self.geometry_cache.get(cache_key)
+        geometry_cache_hit = geometry_state is not None
         try:
-            geometry_state = build_geometry_state(
+            if geometry_state is None:
+                geometry_state = build_geometry_state(
                 board=board,
                 copper_ids=copper_ids,
                 rows=rows,
@@ -920,11 +1148,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 settings=settings,
                 via_factor=via_factor,
                 pads_list=focus_pads,
-            )
+                )
+                self.geometry_cache.put(cache_key, geometry_state)
         except Exception as e:
             wx.MessageBox(f"Error mapping geometry: {e}", "Error")
             return
         init_timings["geometry_maps_s"] = time.perf_counter() - geometry_start
+        init_timings["geometry_cache_hit"] = geometry_cache_hit
         copper_mask = geometry_state.copper_mask
         V_map = geometry_state.via_map
         H_map = geometry_state.heatsink_mask.astype(np.float64, copy=False)
@@ -1131,16 +1361,14 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             style=wx.PD_CAN_ABORT | wx.PD_APP_MODAL | wx.PD_REMAINING_TIME | wx.PD_AUTO_HIDE
         )
 
+        progress_state = {"current": 0, "total": 1}
+        cancel_token = CancellationToken()
+        self.cancel_token = cancel_token
+
         def progress_callback(current, total):
-            percent = int((current / total) * 100) if total else 0
-            try:
-                result = pd.Update(percent, f"Step {current}/{total}")
-                keep_going = result[0] if isinstance(result, tuple) else result
-                if hasattr(pd, "WasCancelled") and pd.WasCancelled():
-                    keep_going = False
-                return keep_going
-            except Exception:
-                return False
+            progress_state["current"] = int(current)
+            progress_state["total"] = max(1, int(total))
+            return not cancel_token.cancelled
 
         def snapshot_callback(T_view, t_elapsed, snap_idx):
             return save_snapshot(T_view, H_map, amb, layer_names, snap_idx, t_elapsed, out_dir=run_dir)
@@ -1151,35 +1379,69 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             amb=amb,
             dt_base=dt,
             steps_target=steps_target,
-            use_pardiso=HAS_PARDISO,
+            use_pardiso=HAS_PARDISO and settings.get("solver_backend", "auto") != "scipy",
             use_multi_phase=True,
+            time_stepping=settings.get("time_stepping", "auto"),
             snapshots_enabled=settings.get('snapshots', False),
             snap_times=snap_times
         )
 
+        worker_result = {}
+
+        def solver_worker():
+            try:
+                worker_result["result"] = run_simulation(
+                    config, K_matrix, C, Q, b, hA,
+                    layer_count, rows, cols,
+                    progress_callback, snapshot_callback,
+                    Q_func=Q_func,
+                    cancel_check=lambda: cancel_token.cancelled,
+                )
+            except Exception:
+                worker_result["traceback"] = traceback.format_exc()
+
+        worker = threading.Thread(target=solver_worker, name="ThermalSimSolver", daemon=True)
+        worker.start()
+        while worker.is_alive():
+            current = progress_state["current"]
+            total = progress_state["total"]
+            percent = int((current / total) * 100) if total else 0
+            try:
+                update_result = pd.Update(percent, f"Step {current}/{total}")
+                keep_going = update_result[0] if isinstance(update_result, tuple) else update_result
+                if not keep_going or (hasattr(pd, "WasCancelled") and pd.WasCancelled()):
+                    cancel_token.cancel()
+                app = wx.GetApp()
+                if app is not None:
+                    app.Yield(True)
+            except Exception:
+                cancel_token.cancel()
+            worker.join(0.05)
+        worker.join()
+        self.cancel_token = None
+
         try:
-            result = run_simulation(
-                config, K_matrix, C, Q, b, hA,
-                layer_count, rows, cols,
-                progress_callback, snapshot_callback,
-                Q_func=Q_func
-            )
+            pd.Update(100, "Done")
         except Exception:
-            wx.MessageBox(f"Solver failed:\n{traceback.format_exc()}", "Solver Error")
+            pass
+        pd.Hide()
+        pd.Destroy()
+        try:
+            app = wx.GetApp()
+            if app is not None:
+                app.Yield()
+        except Exception:
+            pass
+
+        if "traceback" in worker_result:
+            error_text = worker_result["traceback"]
+            _write_run_manifest(run_dir, "error", traceback=error_text)
+            wx.MessageBox(f"Solver failed:\n{error_text}", "Solver Error")
             return
-        finally:
-            try:
-                pd.Update(100, "Done")
-            except:
-                pass
-            pd.Hide()
-            pd.Destroy()
-            try:
-                wx.GetApp().Yield()
-            except:
-                pass
+        result = worker_result["result"]
 
         if result.aborted:
+            _write_run_manifest(run_dir, "cancelled")
             return
 
         # Add extra info to k_norm_info
@@ -1233,7 +1495,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             settings, layer_names, stack_info,
             get_pad_pixels, create_multilayer_maps,
             self._derive_stackup_thicknesses,
-            open_file=False, out_dir=run_dir
+            open_file=False, out_dir=run_dir,
+            geometry_state=geometry_state,
+            grid_spec=grid,
         )
 
         interactive_heatmap = build_interactive_heatmap_payload(
@@ -1284,6 +1548,25 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             electrical_summary=electrical_summary,
             joule_map_path=joule_map_path
         )
+        _write_run_manifest(
+            run_dir,
+            "success",
+            report_path=report_path,
+            heatmap_path=heatmap_path,
+            preview_path=preview_path,
+        )
+        self.last_artifacts = SimulationArtifacts(
+            report_path=report_path,
+            preview_path=preview_path,
+            heatmap_path=heatmap_path,
+            run_dir=run_dir,
+            status="success",
+        )
+        if self.settings_dialog is not None:
+            try:
+                wx.CallAfter(self.settings_dialog.set_artifacts, report_path, run_dir)
+            except Exception:
+                pass
 
         # Open outputs
         if report_path:
@@ -1293,14 +1576,4 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     webbrowser.open("file://" + os.path.abspath(report_path))
                 except Exception:
                     pass
-                if heatmap_path:
-                    try:
-                        if sys.platform.startswith("win"):
-                            os.startfile(os.path.abspath(heatmap_path))
-                        elif sys.platform == "darwin":
-                            subprocess.Popen(["open", os.path.abspath(heatmap_path)])
-                        else:
-                            subprocess.Popen(["xdg-open", os.path.abspath(heatmap_path)])
-                    except Exception:
-                        pass
             wx.CallAfter(_open_outputs)

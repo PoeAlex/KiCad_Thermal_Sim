@@ -26,7 +26,7 @@ except ImportError:
 # Tooltip text for every control, keyed by internal name
 TOOLTIP_TEXTS = {
     'stackup': "Read-only stackup parsed from your .kicad_pcb file.",
-    'pads': "Pads selected when the dialog opened. Use Power Pads and Current Paths to choose simulation roles.",
+    'pads': "Pads selected when the dialog opened. Use Heat Sources and Current Heating to choose simulation roles.",
     'power': "Heat dissipation for power pads in Watts. Single value, comma-separated values, or PWL file path.",
     'power_pads': "Pads used for manual heat dissipation. This list is independent from current-path terminals.",
     'power_apply': "Apply the Power field to selected power-pad rows. If no row is selected, it is applied to all rows.",
@@ -355,6 +355,7 @@ class SettingsDialog(wx.Dialog):
         selection_provider=None,
         run_callback=None,
         close_callback=None,
+        preflight_callback=None,
         load_settings_callback=None,
         save_settings_callback=None,
         stackup_details="",
@@ -370,6 +371,7 @@ class SettingsDialog(wx.Dialog):
         self.selection_provider = selection_provider
         self.run_callback = run_callback
         self.close_callback = close_callback
+        self.preflight_callback = preflight_callback
         self.load_settings_callback = load_settings_callback
         self.save_settings_callback = save_settings_callback
         self.current_groups = []
@@ -379,6 +381,8 @@ class SettingsDialog(wx.Dialog):
             normalize_power_pad_descriptor(pad) for pad in (initial_power_pads or [])
         ]
         self._power_pads_edited = False
+        self.last_report_path = None
+        self.last_run_dir = None
 
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
@@ -391,24 +395,39 @@ class SettingsDialog(wx.Dialog):
             self.tab_sim, layer_names, stackup_details,
             pad_names, suggested_res, default_output_dir
         )
-        self.notebook.AddPage(self.tab_sim, "Simulation")
+        self.notebook.AddPage(self.tab_sim, "Setup")
 
         # Tab 2: Power pads
         self.tab_power = wx.Panel(self.notebook)
         self._build_power_tab(self.tab_power)
-        self.notebook.AddPage(self.tab_power, "Power Pads")
+        self.notebook.AddPage(self.tab_power, "Heat Sources")
 
-        # Tab 3: Advanced
+        # Tab 3: Current heating
+        self.tab_current = wx.Panel(self.notebook)
+        self._build_current_tab(self.tab_current)
+        self.notebook.AddPage(self.tab_current, "Current Heating")
+
+        # Tab 4: Advanced
         self.tab_adv = wx.Panel(self.notebook)
         self._build_advanced_tab(self.tab_adv)
         self.notebook.AddPage(self.tab_adv, "Advanced")
 
-        # Tab 4: Current paths
-        self.tab_current = wx.Panel(self.notebook)
-        self._build_current_tab(self.tab_current)
-        self.notebook.AddPage(self.tab_current, "Current Paths")
-
         main_sizer.Add(self.notebook, 1, wx.EXPAND | wx.ALL, 5)
+
+        preflight_box = wx.StaticBoxSizer(wx.VERTICAL, self, "Preflight")
+        self.lbl_preflight = wx.StaticText(self, label="Checking simulation setup...")
+        preflight_box.Add(self.lbl_preflight, 0, wx.EXPAND | wx.ALL, 4)
+        result_buttons = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_open_report = wx.Button(self, label="Open Report")
+        self.btn_open_report.Bind(wx.EVT_BUTTON, self._on_open_report)
+        self.btn_open_report.Enable(False)
+        result_buttons.Add(self.btn_open_report, 0, wx.RIGHT, 5)
+        self.btn_open_folder = wx.Button(self, label="Open Folder")
+        self.btn_open_folder.Bind(wx.EVT_BUTTON, self._on_open_folder)
+        self.btn_open_folder.Enable(False)
+        result_buttons.Add(self.btn_open_folder, 0)
+        preflight_box.Add(result_buttons, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 4)
+        main_sizer.Add(preflight_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
 
         # --- Button Bar (always visible below notebook) ---
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -444,12 +463,12 @@ class SettingsDialog(wx.Dialog):
 
         btn_sizer.AddStretchSpacer()
 
-        btn_run = wx.Button(self, label="Run")
-        btn_run.Bind(wx.EVT_BUTTON, self._on_run)
-        btn_cancel = wx.Button(self, label="Cancel")
-        btn_cancel.Bind(wx.EVT_BUTTON, self._on_cancel)
-        btn_sizer.Add(btn_run, 0, wx.ALL, 5)
-        btn_sizer.Add(btn_cancel, 0, wx.ALL, 5)
+        self.btn_run = wx.Button(self, label="Run")
+        self.btn_run.Bind(wx.EVT_BUTTON, self._on_run)
+        self.btn_cancel = wx.Button(self, label="Close")
+        self.btn_cancel.Bind(wx.EVT_BUTTON, self._on_cancel)
+        btn_sizer.Add(self.btn_run, 0, wx.ALL, 5)
+        btn_sizer.Add(self.btn_cancel, 0, wx.ALL, 5)
 
         try:
             self.Bind(wx.EVT_CLOSE, self._on_cancel)
@@ -468,6 +487,7 @@ class SettingsDialog(wx.Dialog):
             self.power_pads = prepare_power_pads(self.initial_power_pads, self.power_input.GetValue())
             self._render_power_pads()
             self._render_current_groups()
+        self._refresh_preflight()
 
     # ------------------------------------------------------------------
     # Tab builders
@@ -475,7 +495,7 @@ class SettingsDialog(wx.Dialog):
 
     def _build_simulation_tab(self, panel, layer_names, stackup_details,
                               pad_names, suggested_res, default_output_dir):
-        """Build the Simulation tab contents."""
+        """Build the Setup tab contents."""
         sizer = wx.BoxSizer(wx.VERTICAL)
 
         # --- Board Info ---
@@ -576,7 +596,7 @@ class SettingsDialog(wx.Dialog):
 
         help_text = wx.StaticText(
             panel,
-            label="Manual heat sources are configured here. Current-path terminals are selected separately."
+            label="Configure manual heat sources here. Current-heating terminals are selected separately."
         )
         sizer.Add(help_text, 0, wx.EXPAND | wx.ALL, 5)
 
@@ -622,6 +642,9 @@ class SettingsDialog(wx.Dialog):
             self.power_pad_list.InsertColumn(idx, title, width=width)
         self.power_pad_list.SetMinSize((-1, 300))
         self.power_pad_list.SetToolTip(TOOLTIP_TEXTS['power_pads'])
+        activated_event = getattr(wx, "EVT_LIST_ITEM_ACTIVATED", None)
+        if activated_event is not None:
+            self.power_pad_list.Bind(activated_event, self._on_power_edit_row)
         edit_box.Add(self.power_pad_list, 1, wx.EXPAND | wx.ALL, 3)
         sizer.Add(edit_box, 1, wx.EXPAND | wx.ALL, 5)
 
@@ -660,6 +683,7 @@ class SettingsDialog(wx.Dialog):
         self.chk_heatsink = wx.CheckBox(panel, label="Enable Pad Simulation")
         self.chk_heatsink.SetValue(False)
         self.chk_heatsink.SetToolTip(TOOLTIP_TEXTS['enable_pad'])
+        self.chk_heatsink.Bind(wx.EVT_CHECKBOX, self._on_heatsink_toggle)
         box_pad.Add(self.chk_heatsink, 0, wx.ALL, 3)
 
         self.pad_thick = self._add_spin_field(
@@ -679,6 +703,9 @@ class SettingsDialog(wx.Dialog):
             min_val=0.0, max_val=100000.0, inc=100.0, digits=0,
             tooltip_key='pad_cap'
         )
+        self._thermal_pad_controls = [self.pad_thick, self.pad_k, self.pad_cap]
+        for control in self._thermal_pad_controls:
+            control.Enable(False)
 
         sizer.Add(box_pad, 0, wx.EXPAND | wx.ALL, 5)
 
@@ -696,6 +723,27 @@ class SettingsDialog(wx.Dialog):
             min_val=0.1, max_val=10.0, inc=0.1, digits=2,
             tooltip_key='pcb_thick'
         )
+
+        backend_row = wx.BoxSizer(wx.HORIZONTAL)
+        backend_row.Add(wx.StaticText(panel, label="Linear Solver:", size=(165, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        backend_choices = ["Auto"]
+        if HAS_PARDISO:
+            backend_choices.append("PyPardiso")
+        backend_choices.append("SciPy / SuperLU")
+        self.solver_backend_choice = wx.Choice(panel, choices=backend_choices)
+        self.solver_backend_choice.SetSelection(0)
+        backend_row.Add(self.solver_backend_choice, 1, wx.EXPAND)
+        box_solver.Add(backend_row, 0, wx.EXPAND | wx.ALL, 3)
+
+        stepping_row = wx.BoxSizer(wx.HORIZONTAL)
+        stepping_row.Add(wx.StaticText(panel, label="Time Stepping:", size=(165, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.time_stepping_choice = wx.Choice(
+            panel,
+            choices=["Auto", "Legacy 3-phase", "2-phase", "Uniform BDF2"],
+        )
+        self.time_stepping_choice.SetSelection(0)
+        stepping_row.Add(self.time_stepping_choice, 1, wx.EXPAND)
+        box_solver.Add(stepping_row, 0, wx.EXPAND | wx.ALL, 3)
 
         self.chk_grid_expert_limits = wx.CheckBox(panel, label="Expert Grid Limits")
         self.chk_grid_expert_limits.SetValue(False)
@@ -766,7 +814,7 @@ class SettingsDialog(wx.Dialog):
         btn_remove = wx.Button(panel, label="Remove Pads")
         btn_remove.Bind(wx.EVT_BUTTON, self._on_current_remove_pads)
         group_buttons.Add(btn_remove, 0, wx.ALL, 2)
-        btn_duplicate = wx.Button(panel, label="Duplizieren")
+        btn_duplicate = wx.Button(panel, label="Duplicate")
         btn_duplicate.Bind(wx.EVT_BUTTON, self._on_current_duplicate_group)
         group_buttons.Add(btn_duplicate, 0, wx.ALL, 2)
         btn_delete = wx.Button(panel, label="Delete")
@@ -1029,7 +1077,7 @@ class SettingsDialog(wx.Dialog):
         """Handle Preview button click."""
         if self.preview_callback:
             settings = self.get_values()
-            if settings:
+            if settings and self._refresh_preflight(settings):
                 self.preview_callback(settings, self.layer_names)
 
     def _on_run(self, event):
@@ -1038,17 +1086,74 @@ class SettingsDialog(wx.Dialog):
         if not settings:
             wx.MessageBox("Invalid simulation settings.", "ThermalSim")
             return
+        if not self._refresh_preflight(settings):
+            return
         if self.run_callback:
             self.run_callback(settings)
-            try:
-                self.Destroy()
-            except Exception:
-                pass
         else:
             try:
                 self.EndModal(wx.ID_OK)
             except Exception:
                 pass
+
+    def _refresh_preflight(self, settings=None):
+        """Refresh the permanent readiness summary and Run availability."""
+        settings = settings if settings is not None else self.get_values()
+        if settings is None:
+            self.lbl_preflight.SetLabel("Blocked - one or more numeric settings are invalid.")
+            self.btn_run.Enable(False)
+            return False
+        if not self.preflight_callback:
+            self.lbl_preflight.SetLabel("Ready - settings are valid.")
+            self.btn_run.Enable(True)
+            return True
+        try:
+            result = self.preflight_callback(settings)
+            grid = getattr(result, "grid", None)
+            details = []
+            if grid is not None:
+                details.append(
+                    f"{grid.actual_res_mm:.3f} mm, {grid.rows} x {grid.cols} x "
+                    f"{grid.layer_count} = {grid.nodes:,} nodes, {grid.complexity} complexity"
+                )
+            messages = list(getattr(result, "errors", []) or getattr(result, "warnings", []))
+            if messages:
+                details.append(messages[0])
+            label = f"{result.status} - " + (details[0] if details else "settings checked")
+            if len(details) > 1:
+                label += "\n" + details[1]
+            self.lbl_preflight.SetLabel(label)
+            self.btn_run.Enable(bool(result.ready))
+            return bool(result.ready)
+        except Exception:
+            self.lbl_preflight.SetLabel("Blocked - preflight could not be completed.")
+            self.btn_run.Enable(False)
+            return False
+
+    def set_artifacts(self, report_path, run_dir):
+        """Expose completion actions for the most recent successful run."""
+        self.last_report_path = report_path
+        self.last_run_dir = run_dir
+        self.btn_open_report.Enable(bool(report_path and os.path.isfile(report_path)))
+        self.btn_open_folder.Enable(bool(run_dir and os.path.isdir(run_dir)))
+
+    def _on_open_report(self, event):
+        if self.last_report_path:
+            import webbrowser
+            webbrowser.open("file://" + os.path.abspath(self.last_report_path))
+
+    def _on_open_folder(self, event):
+        if not self.last_run_dir:
+            return
+        import subprocess
+        import sys
+        path = os.path.abspath(self.last_run_dir)
+        if sys.platform.startswith("win"):
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
 
     def _on_cancel(self, event):
         """Handle Cancel button click."""
@@ -1065,10 +1170,19 @@ class SettingsDialog(wx.Dialog):
     def _on_limit_area_toggle(self, event):
         """Handle Limit Area checkbox toggle."""
         self.pad_dist_input.Enable(self.chk_limit_area.GetValue())
+        self._refresh_preflight()
 
     def _on_snapshots_toggle(self, event):
         """Handle Snapshots checkbox toggle."""
         self.snap_count_input.Enable(self.chk_snapshots.GetValue())
+        self._refresh_preflight()
+
+    def _on_heatsink_toggle(self, event):
+        """Enable thermal-interface fields only when their model is active."""
+        enabled = self.chk_heatsink.GetValue()
+        for control in self._thermal_pad_controls:
+            control.Enable(enabled)
+        self._refresh_preflight()
 
     def _apply_grid_expert_state(self, reset_to_defaults=False):
         """Enable expert grid limit controls and optionally restore defaults."""
@@ -1351,6 +1465,32 @@ class SettingsDialog(wx.Dialog):
         self._power_pads_edited = True
         self._render_power_pads()
 
+    def _on_power_edit_row(self, event):
+        """Edit a heat-source value by activating its table row."""
+        try:
+            index = int(event.GetIndex())
+        except Exception:
+            return
+        if not (0 <= index < len(self.power_pads)):
+            return
+        current = str(self.power_pads[index].get('power', ''))
+        dialog = wx.TextEntryDialog(
+            self,
+            "Enter constant power in W or a PWL file path:",
+            "Edit Heat Source",
+            current,
+        )
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            value = dialog.GetValue().strip()
+        finally:
+            dialog.Destroy()
+        if value:
+            self.power_pads[index]['power'] = value
+            self._power_pads_edited = True
+            self._render_power_pads()
+
     def _render_power_pads(self):
         """Refresh the manual power-pad table."""
         self.power_pads = prepare_power_pads(self.power_pads, self.power_input.GetValue())
@@ -1368,6 +1508,8 @@ class SettingsDialog(wx.Dialog):
                     self.power_pad_list.SetItem(row_idx, col_idx, value)
         except Exception:
             pass
+        if hasattr(self, "lbl_preflight"):
+            self._refresh_preflight()
 
     # ------------------------------------------------------------------
     # Current-path tab helpers
@@ -1434,6 +1576,8 @@ class SettingsDialog(wx.Dialog):
             lines.append("No current groups configured.")
         self.current_balance_text.SetValue("\n".join(lines))
         self._render_current_group_editor()
+        if hasattr(self, "lbl_preflight"):
+            self._refresh_preflight()
 
     def _render_current_group_editor(self):
         """Refresh editor fields for the selected group."""
@@ -1546,6 +1690,16 @@ class SettingsDialog(wx.Dialog):
             else:
                 grid_max_cells = DEFAULT_GRID_MAX_CELLS
                 grid_target_cells = DEFAULT_GRID_TARGET_CELLS
+            backend_label = self.solver_backend_choice.GetStringSelection().lower()
+            if "pardiso" in backend_label:
+                solver_backend = "pardiso"
+            elif "scipy" in backend_label:
+                solver_backend = "scipy"
+            else:
+                solver_backend = "auto"
+            stepping_modes = ["auto", "multi_phase", "two_phase", "uniform"]
+            stepping_idx = self.time_stepping_choice.GetSelection()
+            time_stepping = stepping_modes[stepping_idx] if 0 <= stepping_idx < len(stepping_modes) else "auto"
             return {
                 'power_str': power_str,
                 'power_pads': power_pads,
@@ -1569,6 +1723,8 @@ class SettingsDialog(wx.Dialog):
                 'grid_expert_limits': grid_expert_limits,
                 'grid_max_cells': grid_max_cells,
                 'grid_target_cells': grid_target_cells,
+                'solver_backend': solver_backend,
+                'time_stepping': time_stepping,
                 'current_enabled': self.chk_current_enabled.GetValue(),
                 'current_groups': current_groups,
             }
@@ -1625,6 +1781,8 @@ class SettingsDialog(wx.Dialog):
             self.chk_heatsink.SetValue(
                 bool(defaults.get('use_heatsink', self.chk_heatsink.GetValue()))
             )
+            for control in self._thermal_pad_controls:
+                control.Enable(self.chk_heatsink.GetValue())
             if 'pad_th' in defaults:
                 self.pad_thick.SetValue(float(defaults['pad_th']))
             if 'pad_k' in defaults:
@@ -1634,6 +1792,18 @@ class SettingsDialog(wx.Dialog):
 
             if 'h_conv' in defaults:
                 self.h_conv_input.SetValue(float(defaults['h_conv']))
+
+            backend = str(defaults.get('solver_backend', 'auto')).lower()
+            if backend == 'pardiso' and HAS_PARDISO:
+                self.solver_backend_choice.SetSelection(1)
+            elif backend == 'scipy':
+                self.solver_backend_choice.SetSelection(2 if HAS_PARDISO else 1)
+            else:
+                self.solver_backend_choice.SetSelection(0)
+
+            stepping = str(defaults.get('time_stepping', 'auto')).lower()
+            stepping_idx = {'auto': 0, 'multi_phase': 1, 'two_phase': 2, 'uniform': 3}.get(stepping, 0)
+            self.time_stepping_choice.SetSelection(stepping_idx)
 
             grid_expert_limits = bool(defaults.get('grid_expert_limits', False))
             self.chk_grid_expert_limits.SetValue(grid_expert_limits)

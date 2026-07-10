@@ -495,7 +495,9 @@ def save_preview_image(
     create_maps_func,
     derive_stackup_func,
     open_file=False,
-    out_dir=None
+    out_dir=None,
+    geometry_state=None,
+    grid_spec=None,
 ):
     """
     Save a geometry preview image showing copper, vias, and heat sources.
@@ -536,18 +538,26 @@ def save_preview_image(
         return None
 
     # Keep zone fills up-to-date
-    try:
-        pcbnew.ZONE_FILLER(board).Fill(board.Zones())
-    except Exception:
-        pass
+    if geometry_state is None:
+        try:
+            pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+        except Exception:
+            pass
 
-    res = settings['res']
-    w_mm = bbox.GetWidth() * 1e-6
-    h_mm = bbox.GetHeight() * 1e-6
-    x_min = bbox.GetX() * 1e-6
-    y_min = bbox.GetY() * 1e-6
-    cols = int(w_mm / res) + 4
-    rows = int(h_mm / res) + 4
+    if grid_spec is None:
+        res = settings['res']
+        w_mm = bbox.GetWidth() * 1e-6
+        h_mm = bbox.GetHeight() * 1e-6
+        x_min = bbox.GetX() * 1e-6
+        y_min = bbox.GetY() * 1e-6
+        cols = int(w_mm / res) + 4
+        rows = int(h_mm / res) + 4
+    else:
+        res = float(grid_spec.actual_res_mm)
+        x_min = float(grid_spec.x_min_mm)
+        y_min = float(grid_spec.y_min_mm)
+        rows = int(grid_spec.rows)
+        cols = int(grid_spec.cols)
 
     # Physics constants for mapping
     k_fr4_rel = 1.0
@@ -561,10 +571,17 @@ def save_preview_image(
     k_cu_layers = [k_cu_rel * (th / ref_cu_thick_m) for th in cu_thick_m]
 
     try:
-        K, V_map, H_map = create_maps_func(
-            board, copper_ids, rows, cols, x_min, y_min, res,
-            settings, k_fr4_rel, k_cu_layers, via_factor, pads_list
-        )
+        if geometry_state is None:
+            K, V_map, H_map = create_maps_func(
+                board, copper_ids, rows, cols, x_min, y_min, res,
+                settings, k_fr4_rel, k_cu_layers, via_factor, pads_list
+            )
+        else:
+            K = np.empty((layer_count, rows, cols), dtype=np.float64)
+            for idx, k_cu_layer in enumerate(k_cu_layers):
+                K[idx] = np.where(geometry_state.copper_mask[idx], k_cu_layer, k_fr4_rel)
+            V_map = geometry_state.via_map
+            H_map = geometry_state.heatsink_mask.astype(np.float64, copy=False)
 
         out_dir = out_dir or settings.get('output_dir') or os.path.dirname(__file__)
         if not os.path.isdir(out_dir):

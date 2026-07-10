@@ -606,8 +606,7 @@ class TestCurrentGroupSettings:
         dlg = SettingsDialog(None, 0, 0.5, ["F.Cu", "B.Cu"])
 
         page_labels = [caption for _, caption in dlg.notebook._pages]
-        assert "Power Pads" in page_labels
-        assert "Current Paths" in page_labels
+        assert page_labels == ["Setup", "Heat Sources", "Current Heating", "Advanced"]
         labels = " ".join(
             list(dlg.current_group_list._columns)
             + list(dlg.current_pad_list._columns)

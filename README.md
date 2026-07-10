@@ -19,7 +19,7 @@ This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineer
 
 - **2D in-plane conduction** on each copper layer.
 - **Vertical coupling** between adjacent copper layers through FR4 and via enhancement.
-- **Manual power injection** from explicitly configured **Power Pads**.
+- **Manual power injection** from explicitly configured **Heat Sources**.
 - Constant pad power and time-varying **PWL power profiles**.
 - Optional **DC current-flow heating** from source/sink pads on KiCad nets.
 - **Convection** to ambient on top and bottom outer surfaces.
@@ -71,17 +71,17 @@ Run the plugin in PCB Editor via **Tools -> External Plugins -> 2.5D Thermal Sim
 1. Open your PCB in **KiCad PCB Editor**.
 2. Select one or more pads if you want to pre-fill manual heat sources.
 3. Run **Tools -> External Plugins -> 2.5D Thermal Sim**.
-4. Use **Power Pads** to add pads that dissipate manual power, then enter constant W values or PWL file paths.
+4. Use **Heat Sources** to add pads that dissipate manual power, then enter constant W values or PWL file paths.
 5. Set **Duration**, **Ambient**, and **Resolution** on the **Simulation** tab.
-6. Optionally use **Current Paths** to add source/sink pads and per-pad currents for copper `I^2R` heating.
+6. Optionally use **Current Heating** to add source/sink pads and per-pad currents for copper `I^2R` heating.
 7. Optionally use **Advanced** for geometry filters, thermal pad, convection, solver settings, and expert grid limits.
 8. Click **Preview** to check the mapped geometry, then **Run**.
 
-![GUI simulation tab](docs/images/gui_sim.png "Simulation tab")
+![GUI setup tab](docs/images/gui_sim.png "Setup tab")
 
-![GUI power pads tab](docs/images/gui_powerpads.png "Power Pads tab")
+![GUI heat sources tab](docs/images/gui_powerpads.png "Heat Sources tab")
 
-![GUI current paths tab](docs/images/gui_current-paths.png "Current Paths tab")
+![GUI current heating tab](docs/images/gui_current-paths.png "Current Heating tab")
 
 ![GUI advanced tab](docs/images/gui_adv.png "Advanced tab")
 
@@ -91,16 +91,16 @@ Run the plugin in PCB Editor via **Tools -> External Plugins -> 2.5D Thermal Sim
 
 The dialog has four tabs:
 
-- **Simulation** - board/stackup info, duration, ambient temperature, resolution, and output settings.
-- **Power Pads** - manual heat sources selected independently from current terminals.
-- **Advanced** - geometry filters, thermal pad, convection, and solver settings.
-- **Current Paths** - DC current source/sink terminals for Joule heating.
+- **Setup** - board/stackup info, duration, ambient temperature, resolution, output, and live preflight status.
+- **Heat Sources** - manual heat sources selected independently from current terminals.
+- **Current Heating** - DC current source/sink terminals for Joule heating.
+- **Advanced** - geometry filters, thermal pad, solver backend, time stepping, and expert grid settings.
 
-### Simulation Tab
+### Setup Tab
 
 #### Board Info
 
-Shows detected copper layers with thicknesses and dielectric gaps parsed from the board stackup. Pads selected when the dialog opened are shown only as a convenience; simulation roles are configured in **Power Pads** and **Current Paths**.
+Shows detected copper layers with thicknesses and dielectric gaps parsed from the board stackup. Pads selected when the dialog opened are shown only as a convenience; simulation roles are configured in **Heat Sources** and **Current Heating**.
 
 #### Main Settings
 
@@ -124,7 +124,7 @@ For large boards, ThermalSim may automatically coarsen the requested resolution 
 
 ThermalSim also keeps using `thermal_sim_last_settings.json` in the plugin folder for automatic last-used settings. Manual load/save files use the same JSON structure and can be stored per project or per experiment.
 
-### Power Pads Tab
+### Heat Sources Tab
 
 Manual pad power is configured separately from current-flow terminals.
 
@@ -134,7 +134,7 @@ Manual pad power is configured separately from current-flow terminals.
 4. Use **Apply to Selected** to write the value to selected table rows. If no row is selected, it applies to all power pads.
 5. Use **Apply List** for comma-separated values in table order.
 
-The Power Pads table is:
+The Heat Sources table is:
 
 | Column | Meaning |
 |--------|---------|
@@ -152,7 +152,7 @@ Accepted power entries:
 | `C:\sim\ramp.pwl` | Same PWL profile for selected/listed pads |
 | `1.0, C:\sim\ramp.pwl` | Pad 1 = 1 W constant, Pad 2 = PWL file |
 
-For backward compatibility, pads selected before opening the dialog pre-fill the Power Pads table when no saved `power_pads` setting exists.
+For backward compatibility, pads selected before opening the dialog pre-fill the Heat Sources table when no saved `power_pads` setting exists.
 
 #### PWL File Format
 
@@ -173,7 +173,7 @@ PWL files are LTspice-style text files with two columns:
 - Time values must be monotonically increasing.
 - Power is linearly interpolated between points and held at the first/last value outside the defined range.
 
-### Current Paths Tab
+### Current Heating Tab
 
 Enable current heating to calculate copper losses from DC current flow.
 
@@ -182,7 +182,7 @@ Enable current heating to calculate copper losses from DC current flow.
 3. Enter positive current for source pads and negative current for sink pads.
 4. Make sure every active KiCad net balances to `0 A`.
 
-Current heating is additive with **Power Pads**:
+Current heating is additive with **Heat Sources**:
 
 ```text
 total heat = manual pad power + calculated Joule copper loss
@@ -307,8 +307,8 @@ The plugin is split into focused modules:
 
 ## Suggested Workflow
 
-1. Add manual dissipating components in **Power Pads**.
-2. Add source/sink terminals in **Current Paths** only when copper `I^2R` heating matters.
+1. Add manual dissipating components in **Heat Sources**.
+2. Add source/sink terminals in **Current Heating** only when copper `I^2R` heating matters.
 3. Start pure thermal pad-power runs with **Limit Area to Pads** enabled and a moderate **Limit Distance**, for example 30 mm.
 4. For current-flow runs, let ThermalSim disable area limiting so electrical paths are not clipped.
 5. Tune **Resolution** until hotspots and current-path metrics are stable. Try 0.5 mm, then 0.3 mm.
@@ -334,6 +334,17 @@ run_tests.bat -k "test_thermal_solver"
 run_tests.bat -m physics
 run_tests.bat --cov=ThermalSim
 ```
+
+### Real KiCad Benchmark
+
+Use KiCad's bundled Python to benchmark a real board without saving or modifying it:
+
+```powershell
+& "C:\Program Files\KiCad\9.0\bin\python.exe" benchmark_real_board.py `
+  "C:\path\to\board.kicad_pcb" --scenario thermal --time-stepping auto
+```
+
+Set `THERMALSIM_HEADLESS=1` when importing ThermalSim as a library outside PCB Editor. This prevents ActionPlugin registration while keeping the solver and board readers available.
 
 ---
 

@@ -12,6 +12,11 @@ from typing import Optional, Set
 import numpy as np
 import pcbnew
 
+try:
+    from matplotlib.path import Path as _MplPath
+except ImportError:
+    _MplPath = None
+
 
 @dataclass
 class FillContext:
@@ -413,6 +418,52 @@ def _fill_zone_mask_hit_test(mask, area_mask, x_vals, y_vals, zone):
                 continue
 
 
+def _fill_zone_mask_polygons(mask, area_mask, x_vals, y_vals, lid, zone):
+    """Rasterize KiCad's filled zone polygons in vectorized C code."""
+    if _MplPath is None or not hasattr(zone, "GetFilledPolysList"):
+        return False
+    try:
+        poly_set = zone.GetFilledPolysList(lid)
+        outline_count = int(poly_set.OutlineCount())
+        if outline_count <= 0:
+            return False
+        xx, yy = np.meshgrid(x_vals, y_vals)
+        points = np.column_stack((xx.ravel(), yy.ravel()))
+        filled = np.zeros(points.shape[0], dtype=bool)
+
+        def chain_vertices(chain):
+            count = int(chain.PointCount())
+            vertices = np.empty((count, 2), dtype=np.float64)
+            for idx in range(count):
+                point = chain.CPoint(idx)
+                vertices[idx] = (point.x, point.y)
+            return vertices
+
+        for outline_idx in range(outline_count):
+            outer = chain_vertices(poly_set.Outline(outline_idx))
+            if len(outer) >= 3:
+                inside = _MplPath(outer, closed=True).contains_points(points, radius=1.0)
+            else:
+                continue
+            try:
+                hole_count = int(poly_set.HoleCount(outline_idx))
+            except Exception:
+                hole_count = 0
+            for hole_idx in range(hole_count):
+                hole = chain_vertices(poly_set.Hole(outline_idx, hole_idx))
+                if len(hole) >= 3:
+                    inside &= ~_MplPath(hole, closed=True).contains_points(points, radius=-1.0)
+            filled |= inside
+
+        filled = filled.reshape(mask.shape)
+        if area_mask is not None:
+            filled &= area_mask
+        mask[...] = filled
+        return True
+    except Exception:
+        return False
+
+
 def _state_fill_zone(state, l_idx, lid, zone):
     """
     Mark copper occupancy for a zone using KiCad hit testing.
@@ -430,7 +481,9 @@ def _state_fill_zone(state, l_idx, lid, zone):
     x_vals = state.x_centers_iu[cs:ce]
     y_vals = state.y_centers_iu[rs:re]
 
-    if hasattr(zone, "HitTestFilledArea"):
+    if _fill_zone_mask_polygons(zone_mask, area_mask, x_vals, y_vals, lid, zone):
+        pass
+    elif hasattr(zone, "HitTestFilledArea"):
         _fill_zone_mask_hit_test_filled(zone_mask, area_mask, x_vals, y_vals, lid, zone)
     elif hasattr(zone, "HitTest"):
         _fill_zone_mask_hit_test(zone_mask, area_mask, x_vals, y_vals, zone)
