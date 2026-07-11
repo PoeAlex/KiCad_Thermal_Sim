@@ -150,6 +150,21 @@ class SolverResult:
     k_norm_info: Dict
 
 
+@dataclass
+class CachedLinearSolver:
+    """Reusable factorization for an unchanged implicit BDF2 operator."""
+
+    solve: Callable[[np.ndarray], np.ndarray]
+    owner: Any
+    backend: str
+    spd_residual: Optional[float]
+
+    def release(self):
+        """Release the optional native factorization."""
+        _release_linear_solver(self.owner)
+        self.owner = None
+
+
 def build_stiffness_matrix(
     layer_count: int,
     rows: int,
@@ -373,6 +388,62 @@ def build_stiffness_matrix(
     return K, b, hA, diag_extra
 
 
+def _release_linear_solver(owner):
+    """Release native resources associated with an optional solver owner."""
+    if owner is not None and hasattr(owner, "free_memory"):
+        try:
+            owner.free_memory(everything=True)
+        except Exception:
+            pass
+
+
+def _factor_linear_system(A: sp.csr_matrix, use_pardiso: bool):
+    """Factor a thermal system, preferring PARDISO's SPD representation.
+
+    The transient system is symmetric positive definite: the conduction
+    operator is symmetric and the positive heat-capacity diagonal makes every
+    implicit time-step matrix strictly positive definite.  Supplying only its
+    upper triangle lets PARDISO use the appropriate faster, lower-memory
+    factorization.  A small residual probe protects the existing generic
+    PARDISO path as a fallback for unexpected backend behaviour.
+    """
+    if not use_pardiso:
+        owner = spla.splu(A.tocsc())
+        return owner.solve, owner, "SciPy", None
+
+    spd_owner = None
+    try:
+        spd_matrix = sp.triu(A, format="csr")
+        spd_owner = pypardiso.PyPardisoSolver(mtype=2)
+        spd_owner.factorize(spd_matrix)
+
+        # Verify the backend mode once per factorization before accepting it.
+        # This is negligible compared with factorization and prevents a bad
+        # optional PARDISO installation from silently changing results.
+        probe = np.ones(A.shape[0], dtype=np.float64)
+        probe_solution = spd_owner.solve(spd_matrix, probe)
+        residual = float(np.max(np.abs(A.dot(probe_solution) - probe)))
+        if not np.all(np.isfinite(probe_solution)) or residual > 1e-10:
+            raise RuntimeError(f"SPD residual probe failed ({residual:.3e})")
+
+        solver = lambda rhs, _owner=spd_owner, _matrix=spd_matrix: _owner.solve(_matrix, rhs)
+        return solver, spd_owner, "PARDISO-SPD", residual
+    except Exception as exc:
+        _release_linear_solver(spd_owner)
+        print(f"[ThermalSim][WARN] PARDISO SPD fallback: {exc}")
+
+    try:
+        owner = pypardiso.PyPardisoSolver()
+        owner.factorize(A)
+        solver = lambda rhs, _owner=owner, _matrix=A: _owner.solve(_matrix, rhs)
+        return solver, owner, "PARDISO", None
+    except Exception as exc:
+        _release_linear_solver(locals().get("owner"))
+        print(f"[ThermalSim][WARN] PARDISO fallback to SciPy: {exc}")
+        owner = spla.splu(A.tocsc())
+        return owner.solve, owner, "SciPy fallback", None
+
+
 def run_simulation(
     config: SolverConfig,
     K: sp.csr_matrix,
@@ -386,7 +457,9 @@ def run_simulation(
     progress_callback: Optional[Callable[[int, int], bool]] = None,
     snapshot_callback: Optional[Callable[[np.ndarray, float, int], str]] = None,
     Q_func: Optional[Callable[[float], np.ndarray]] = None,
-    cancel_check: Optional[Callable[[], bool]] = None
+    cancel_check: Optional[Callable[[], bool]] = None,
+    factorization_cache: Optional[Any] = None,
+    factorization_cache_key: Optional[str] = None,
 ) -> SolverResult:
     """
     Run the transient thermal simulation using BDF2 time integration.
@@ -421,6 +494,11 @@ def run_simulation(
         Function(t) -> np.ndarray returning heat source vector at time t.
         When provided, Q is updated each time step for time-varying power.
         When None, the constant Q array is used throughout.
+    factorization_cache : object, optional
+        Single-entry cache exposing ``get(key)`` and ``put(key, value)``.
+        Used only by the source-independent uniform BDF2 operator.
+    factorization_cache_key : str, optional
+        Complete identity for the cached operator and time-step configuration.
 
     Returns
     -------
@@ -434,6 +512,8 @@ def run_simulation(
 
     use_pardiso = config.use_pardiso and HAS_PARDISO
     backend = "PARDISO" if use_pardiso else "SciPy"
+    backend_modes = []
+    spd_residuals = []
 
     # Initialize temperature
     Tn = np.ones(N, dtype=np.float64) * amb
@@ -455,6 +535,7 @@ def run_simulation(
     total_solve_time = 0.0
     total_factor_time = 0.0
     factor_count = 0
+    factorization_cache_used = False
     snapshot_stats = []
     snapshot_files = []
     phase_metrics = []
@@ -537,9 +618,20 @@ def run_simulation(
         # Build system matrices for this phase
         assembly_start = time.perf_counter()
         D = C / phase_dt
+        two_D = 2.0 * D
+        half_D = 0.5 * D
+        rhs_workspace = np.empty(N, dtype=np.float64)
         A_be = K + sp.diags(D, format="csr")
         A_bdf2 = K + sp.diags(1.5 * D, format="csr")
         assembly_time = time.perf_counter() - assembly_start
+
+        def build_bdf2_rhs(q_value):
+            """Populate the reusable BDF2 right-hand-side buffer."""
+            np.multiply(two_D, Tn, out=rhs_workspace)
+            rhs_workspace[...] -= half_D * Tnm1
+            rhs_workspace[...] += q_value
+            rhs_workspace[...] += b
+            return rhs_workspace
 
         if pdef.get("derivative_start"):
             # A derivative-consistent fictitious T(-dt) gives BDF2 its
@@ -551,13 +643,36 @@ def run_simulation(
             derivative0 = (Q_current + b - K.dot(Tn)) / C
             Tnm1 = Tn - phase_dt * derivative0
 
-            factor_start = time.perf_counter()
-            bdf_owner = pypardiso.PyPardisoSolver()
-            bdf_owner.factorize(A_bdf2)
-            solve_bdf2 = lambda rhs, _owner=bdf_owner, _matrix=A_bdf2: _owner.solve(_matrix, rhs)
-            factor_time = time.perf_counter() - factor_start
-            total_factor_time += factor_time
-            factor_count += 1
+            factor_cache_hit = False
+            cached_factor = (
+                factorization_cache.get(factorization_cache_key)
+                if factorization_cache is not None and factorization_cache_key
+                else None
+            )
+            if cached_factor is not None:
+                solve_bdf2 = cached_factor.solve
+                bdf_owner = cached_factor.owner
+                phase_backend = cached_factor.backend
+                spd_residual = cached_factor.spd_residual
+                factor_time = 0.0
+                factor_cache_hit = True
+                factorization_cache_used = True
+            else:
+                factor_start = time.perf_counter()
+                solve_bdf2, bdf_owner, phase_backend, spd_residual = _factor_linear_system(
+                    A_bdf2, use_pardiso
+                )
+                factor_time = time.perf_counter() - factor_start
+                total_factor_time += factor_time
+                factor_count += 1
+                if factorization_cache is not None and factorization_cache_key:
+                    factorization_cache.put(
+                        factorization_cache_key,
+                        CachedLinearSolver(solve_bdf2, bdf_owner, phase_backend, spd_residual),
+                    )
+            backend_modes.append(phase_backend)
+            if spd_residual is not None:
+                spd_residuals.append(spd_residual)
             phase_solve_time = 0.0
             phase_steps_done = 0
 
@@ -568,7 +683,7 @@ def run_simulation(
                 if Q_func is not None:
                     Q_current = Q_func(current_time + phase_dt)
                     pin = float(np.sum(Q_current))
-                rhs = (2.0 * D) * Tn - (0.5 * D) * Tnm1 + Q_current + b
+                rhs = build_bdf2_rhs(Q_current)
                 phase_solve_time += advance_step(rhs, solve_bdf2, phase_dt)
                 phase_steps_done += 1
 
@@ -582,7 +697,8 @@ def run_simulation(
                         record_snapshot(config.snap_times[next_snap_idx])
                         next_snap_idx += 1
 
-            bdf_owner.free_memory(everything=True)
+            if not factor_cache_hit:
+                _release_linear_solver(bdf_owner)
             del solve_bdf2, bdf_owner, A_bdf2
             phase_metrics.append({
                 "phase": pdef["name"],
@@ -592,6 +708,9 @@ def run_simulation(
                 "factorization_s": factor_time,
                 "avg_solve_s": phase_solve_time / max(phase_steps_done, 1),
                 "startup": "derivative_bdf2",
+                "backend": phase_backend,
+                "spd_probe_residual": spd_residual,
+                "factorization_cache_hit": factor_cache_hit,
             })
             if aborted:
                 break
@@ -600,32 +719,35 @@ def run_simulation(
         phase_solve_time = 0.0
         phase_factor_time = 0.0
         phase_steps_done = 0
+        phase_backend = None
+        phase_spd_residual = None
 
         # Backward Euler bootstraps BDF2. It is a one-shot matrix, so release
         # its factorization before preparing the reusable BDF2 system.
         factor_start = time.perf_counter()
-        if use_pardiso:
-            be_owner = pypardiso.PyPardisoSolver()
-            be_owner.factorize(A_be)
-            solve_be = lambda rhs, _owner=be_owner, _matrix=A_be: _owner.solve(_matrix, rhs)
-        else:
-            be_owner = spla.splu(A_be.tocsc())
-            solve_be = be_owner.solve
+        solve_be, be_owner, be_backend, be_spd_residual = _factor_linear_system(A_be, use_pardiso)
         factor_elapsed = time.perf_counter() - factor_start
         phase_factor_time += factor_elapsed
         total_factor_time += factor_elapsed
         factor_count += 1
+        backend_modes.append(be_backend)
+        if be_spd_residual is not None:
+            spd_residuals.append(be_spd_residual)
+        phase_backend = be_backend
+        phase_spd_residual = be_spd_residual
 
         if Q_func is not None:
             Q_current = Q_func(current_time + phase_dt)
             pin = float(np.sum(Q_current))
-        rhs1 = D * Tn + Q_current + b
+        np.multiply(D, Tn, out=rhs_workspace)
+        rhs_workspace += Q_current
+        rhs_workspace += b
+        rhs1 = rhs_workspace
         solve_elapsed = advance_step(rhs1, solve_be, phase_dt)
         phase_solve_time += solve_elapsed
         phase_steps_done += 1
 
-        if use_pardiso:
-            be_owner.free_memory(everything=True)
+        _release_linear_solver(be_owner)
         del solve_be, be_owner, A_be
 
         if cancel_check and cancel_check():
@@ -647,17 +769,18 @@ def run_simulation(
         bdf_owner = None
         if not aborted and phase_step_count > 1:
             factor_start = time.perf_counter()
-            if use_pardiso:
-                bdf_owner = pypardiso.PyPardisoSolver()
-                bdf_owner.factorize(A_bdf2)
-                solve_bdf2 = lambda rhs, _owner=bdf_owner, _matrix=A_bdf2: _owner.solve(_matrix, rhs)
-            else:
-                bdf_owner = spla.splu(A_bdf2.tocsc())
-                solve_bdf2 = bdf_owner.solve
+            solve_bdf2, bdf_owner, bdf_backend, bdf_spd_residual = _factor_linear_system(
+                A_bdf2, use_pardiso
+            )
             factor_elapsed = time.perf_counter() - factor_start
             phase_factor_time += factor_elapsed
             total_factor_time += factor_elapsed
             factor_count += 1
+            backend_modes.append(bdf_backend)
+            if bdf_spd_residual is not None:
+                spd_residuals.append(bdf_spd_residual)
+            phase_backend = bdf_backend
+            phase_spd_residual = bdf_spd_residual
 
         while not aborted and phase_steps_done < phase_step_count:
             if cancel_check and cancel_check():
@@ -666,7 +789,7 @@ def run_simulation(
             if Q_func is not None:
                 Q_current = Q_func(current_time + phase_dt)
                 pin = float(np.sum(Q_current))
-            rhs = (2.0 * D) * Tn - (0.5 * D) * Tnm1 + Q_current + b
+            rhs = build_bdf2_rhs(Q_current)
             solve_elapsed = advance_step(rhs, solve_bdf2, phase_dt)
             phase_solve_time += solve_elapsed
             phase_steps_done += 1
@@ -685,8 +808,7 @@ def run_simulation(
             if aborted:
                 break
 
-        if use_pardiso and bdf_owner is not None:
-            bdf_owner.free_memory(everything=True)
+        _release_linear_solver(bdf_owner)
         if solve_bdf2 is not None:
             del solve_bdf2
         if bdf_owner is not None:
@@ -700,7 +822,9 @@ def run_simulation(
             "steps": phase_steps_done,
             "assembly_s": assembly_time,
             "factorization_s": phase_factor_time,
-            "avg_solve_s": phase_avg_solve
+            "avg_solve_s": phase_avg_solve,
+            "backend": phase_backend,
+            "spd_probe_residual": phase_spd_residual,
         })
 
         if aborted:
@@ -727,6 +851,9 @@ def run_simulation(
             f"Pin={pin:.6f}W Pout={pout_final:.6f}W rel_diff={rel_diff:.6f}"
         )
 
+    if backend_modes:
+        backend = backend_modes[-1] if len(set(backend_modes)) == 1 else " -> ".join(dict.fromkeys(backend_modes))
+
     k_norm_info = {
         "strategy": "implicit_fvm_bdf2",
         "backend": backend,
@@ -739,7 +866,9 @@ def run_simulation(
         "steps_total": step_counter,
         "factorization_s": total_factor_time,
         "factorizations": factor_count,
+        "factorization_cache_hit": factorization_cache_used,
         "avg_solve_s": avg_solve_time,
+        "spd_probe_residual_max": max(spd_residuals) if spd_residuals else None,
         "pin_w": pin,
         "pout_final_w": pout_final,
         "steady_rel_diff": rel_diff

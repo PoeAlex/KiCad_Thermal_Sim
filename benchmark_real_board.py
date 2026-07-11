@@ -27,6 +27,23 @@ def _timed(func, *args, **kwargs):
     return value, time.perf_counter() - start
 
 
+def _enabled_copper_layers(board):
+    """Return KiCad-enabled copper layers when a board has no saved stackup."""
+    enabled = board.GetEnabledLayers()
+    layers = []
+    for layer_id in range(64):
+        try:
+            is_copper = pcbnew.IsCopperLayer(layer_id)
+        except Exception:
+            is_copper = layer_id < 32
+        if is_copper and enabled.Contains(layer_id):
+            layers.append(layer_id)
+    try:
+        return sorted(layers, key=lambda layer_id: int(pcbnew.CopperLayerToOrdinal(layer_id)))
+    except Exception:
+        return layers
+
+
 def _estimate_solver_grid(bbox, requested_res, settings, layer_count, _pads):
     width = bbox.GetWidth() * 1e-6
     height = bbox.GetHeight() * 1e-6
@@ -102,6 +119,14 @@ def benchmark(args):
     board, load_s = _timed(pcbnew.LoadBoard, str(board_path))
     stack, stackup_s = _timed(parse_stackup_from_board_file, board)
     copper_ids = list(stack.get("copper_ids") or [])
+    stackup_fallback = False
+    if not copper_ids:
+        copper_ids = _enabled_copper_layers(board)
+        stack = dict(stack) if isinstance(stack, dict) else {}
+        stack["copper_ids"] = copper_ids
+        stackup_fallback = True
+    if not copper_ids:
+        raise ValueError("Board has no enabled copper layers.")
     bbox = board.GetBoundingBox()
     pads = [pad for footprint in board.Footprints() for pad in footprint.Pads()]
     settings = {
@@ -131,6 +156,7 @@ def benchmark(args):
         "board": str(board_path),
         "kiCad_version": pcbnew.GetBuildVersion(),
         "scenario": args.scenario,
+        "stackup_fallback": stackup_fallback,
         "grid": {
             "requested_res_mm": args.resolution,
             "actual_res_mm": grid.actual_res_mm,

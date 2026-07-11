@@ -8,6 +8,8 @@ from ThermalSim.workflow import (
     GeometryCache,
     GridEstimate,
     PreflightResult,
+    ThermalFactorizationCache,
+    ThermalOperatorCache,
     geometry_cache_key,
 )
 from tests.mocks.pcbnew_mock import EDA_RECT, MockPad, VECTOR2I, F_Cu, B_Cu
@@ -52,6 +54,31 @@ def test_geometry_cache_invalidates_geometry_changes():
     assert cache.get("other") is None
     cache.clear()
     assert cache.get("first") is None
+
+
+def test_thermal_operator_cache_reuses_only_matching_key():
+    cache = ThermalOperatorCache()
+    operator = object()
+    cache.put("thermal-inputs", operator)
+    assert cache.get("thermal-inputs") is operator
+    assert cache.get("changed-boundary-condition") is None
+    cache.clear()
+    assert cache.get("thermal-inputs") is None
+
+
+def test_factorization_cache_releases_evicted_value():
+    class CachedValue:
+        released = False
+
+        def release(self):
+            self.released = True
+
+    cache = ThermalFactorizationCache()
+    first = CachedValue()
+    cache.put("first", first)
+    cache.put("second", CachedValue())
+    assert first.released is True
+    cache.clear()
 
 
 def test_cancellation_token_is_thread_safe_signal():

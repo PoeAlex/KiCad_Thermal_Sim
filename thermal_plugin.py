@@ -41,6 +41,8 @@ from .workflow import (
     BoardSnapshot,
     CancellationToken,
     GeometryCache,
+    ThermalFactorizationCache,
+    ThermalOperatorCache,
     GridEstimate,
     PreflightResult,
     SimulationArtifacts,
@@ -402,6 +404,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.last_zone_refill_s = 0.0
         self.settings_dialog = None
         self.geometry_cache = GeometryCache()
+        self.operator_cache = ThermalOperatorCache()
+        self.electrical_cache = ThermalOperatorCache()
+        self.factorization_cache = ThermalFactorizationCache()
         self.cancel_token = None
         self.last_artifacts = None
 
@@ -1188,22 +1193,41 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         t_fr4_eff = np.clip(np.array(t_fr4_eff), 1e-6, 5e-3)
         t_fr4_eff_mm = (t_fr4_eff * 1e3).tolist()
 
+        operator_key = stable_fingerprint({
+            "geometry": cache_key,
+            "copper_thickness_m": [float(value) for value in t_cu],
+            "dielectric_gap_m": [float(value) for value in gap_m],
+            "fr4_effective_m": [float(value) for value in t_fr4_eff],
+            "cell_size_m": float(dx),
+            "ambient_c": float(amb),
+            "h_conv": float(settings.get("h_conv", 10.0)),
+            "pad_th": float(settings.get("pad_th", 1.0)),
+            "pad_k": float(settings.get("pad_k", 3.0)),
+            "pad_cap_areal": float(settings.get("pad_cap_areal", 0.0) or 0.0),
+        })
+        cached_operator = self.operator_cache.get(operator_key)
+        operator_cache_hit = cached_operator is not None
+
         # Heat capacity
         capacity_start = time.perf_counter()
-        C_layers = np.empty((layer_count, rows, cols), dtype=np.float64)
-        for l in range(layer_count):
-            V_cu = pixel_area * t_cu[l]
-            V_fr4 = pixel_area * t_fr4_eff[l]
-            mask = copper_mask[l]
-            C_layer = np.where(mask, rho_cu * cp_cu * V_cu, rho_fr4 * cp_fr4 * V_fr4)
-            C_layer += mask * (rho_fr4 * cp_fr4 * V_fr4)
-            C_layers[l] = C_layer
         pad_cap_areal = float(settings.get('pad_cap_areal', 0.0) or 0.0)
-        if pad_cap_areal > 0.0 and np.any(H_map):
-            pad_cap_per_cell = pad_cap_areal * pixel_area
-            C_layers[-1] += pad_cap_per_cell * H_map
-        C = C_layers.reshape(-1)
+        if operator_cache_hit:
+            C, K_matrix, b, hA = cached_operator
+        else:
+            C_layers = np.empty((layer_count, rows, cols), dtype=np.float64)
+            for l in range(layer_count):
+                V_cu = pixel_area * t_cu[l]
+                V_fr4 = pixel_area * t_fr4_eff[l]
+                mask = copper_mask[l]
+                C_layer = np.where(mask, rho_cu * cp_cu * V_cu, rho_fr4 * cp_fr4 * V_fr4)
+                C_layer += mask * (rho_fr4 * cp_fr4 * V_fr4)
+                C_layers[l] = C_layer
+            if pad_cap_areal > 0.0 and np.any(H_map):
+                pad_cap_per_cell = pad_cap_areal * pixel_area
+                C_layers[-1] += pad_cap_per_cell * H_map
+            C = C_layers.reshape(-1)
         init_timings["capacity_build_s"] = time.perf_counter() - capacity_start
+        init_timings["operator_cache_hit"] = operator_cache_hit
 
         # Power injection (supports constant values and PWL file paths)
         RC = rows * cols
@@ -1276,6 +1300,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         q_joule = None
         if settings.get("current_enabled"):
             electrical_start = time.perf_counter()
+            electrical_cache_hit = False
             terminals, missing_pads = self._resolve_current_terminals(board, settings)
             if missing_pads:
                 wx.MessageBox(
@@ -1295,7 +1320,20 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     t_cu=np.asarray(t_cu, dtype=np.float64),
                     layer_names={lid: layer_names[idx] for idx, lid in enumerate(copper_ids) if idx < len(layer_names)},
                 )
-                electrical_result = solve_electrical_heating(board, terminals, electrical_config)
+                electrical_key = stable_fingerprint({
+                    "geometry": cache_key,
+                    "copper_thickness_m": [float(value) for value in t_cu],
+                    "terminals": [
+                        (item.name, item.net_name, int(item.net_code), float(item.current_a))
+                        for item in terminals
+                    ],
+                })
+                electrical_result = self.electrical_cache.get(electrical_key)
+                electrical_cache_hit = electrical_result is not None
+                if electrical_result is None:
+                    electrical_result = solve_electrical_heating(board, terminals, electrical_config)
+                    if electrical_result.valid:
+                        self.electrical_cache.put(electrical_key, electrical_result)
                 if not electrical_result.valid:
                     wx.MessageBox(
                         "Current simulation validation failed:\n\n"
@@ -1325,6 +1363,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     "nets": [],
                 }
             init_timings["electrical_solve_s"] = time.perf_counter() - electrical_start
+            init_timings["electrical_cache_hit"] = electrical_cache_hit
 
         # Build pad_power for reporting
         pad_power = []
@@ -1341,10 +1380,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # Build stiffness matrix
         stiffness_start = time.perf_counter()
-        K_matrix, b, hA, _ = build_stiffness_matrix(
-            layer_count, rows, cols, copper_mask, t_cu, t_fr4_eff,
-            k_cu, k_fr4, dx, dy, V_map, gap_m, H_map, settings, amb
-        )
+        if not operator_cache_hit:
+            K_matrix, b, hA, _ = build_stiffness_matrix(
+                layer_count, rows, cols, copper_mask, t_cu, t_fr4_eff,
+                k_cu, k_fr4, dx, dy, V_map, gap_m, H_map, settings, amb
+            )
+            self.operator_cache.put(operator_key, (C, K_matrix, b, hA))
         init_timings["stiffness_matrix_s"] = time.perf_counter() - stiffness_start
         print(f"[ThermalSim] init timings: {_format_timing_summary(init_timings)}")
 
@@ -1385,6 +1426,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snapshots_enabled=settings.get('snapshots', False),
             snap_times=snap_times
         )
+        factorization_cache_key = stable_fingerprint({
+            "operator": operator_key,
+            "backend": "pardiso" if config.use_pardiso else "scipy",
+            "time_stepping": config.time_stepping,
+            "sim_time": float(config.sim_time),
+            "dt_base": float(config.dt_base),
+            "steps_target": int(config.steps_target),
+            "use_multi_phase": bool(config.use_multi_phase),
+        })
 
         worker_result = {}
 
@@ -1396,6 +1446,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     progress_callback, snapshot_callback,
                     Q_func=Q_func,
                     cancel_check=lambda: cancel_token.cancelled,
+                    factorization_cache=self.factorization_cache,
+                    factorization_cache_key=factorization_cache_key,
                 )
             except Exception:
                 worker_result["traceback"] = traceback.format_exc()
@@ -1459,7 +1511,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "init_capacity_build_s": init_timings.get("capacity_build_s"),
             "init_power_vector_build_s": init_timings.get("power_vector_build_s"),
             "init_electrical_solve_s": init_timings.get("electrical_solve_s"),
+            "init_electrical_cache_hit": init_timings.get("electrical_cache_hit"),
             "init_stiffness_matrix_s": init_timings.get("stiffness_matrix_s"),
+            "init_operator_cache_hit": init_timings.get("operator_cache_hit"),
+            "factorization_cache_hit": result.k_norm_info.get("factorization_cache_hit"),
             "electrical_summary": electrical_summary,
         })
 
@@ -1529,7 +1584,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "init_capacity_build_s": init_timings.get("capacity_build_s"),
             "init_power_vector_build_s": init_timings.get("power_vector_build_s"),
             "init_electrical_solve_s": init_timings.get("electrical_solve_s"),
+            "init_electrical_cache_hit": init_timings.get("electrical_cache_hit"),
             "init_stiffness_matrix_s": init_timings.get("stiffness_matrix_s"),
+            "init_operator_cache_hit": init_timings.get("operator_cache_hit"),
+            "factorization_cache_hit": result.k_norm_info.get("factorization_cache_hit"),
         }
 
         report_path = write_html_report(

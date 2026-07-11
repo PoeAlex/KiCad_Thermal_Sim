@@ -160,6 +160,56 @@ class GeometryCache:
         self.value = None
 
 
+class ThermalOperatorCache:
+    """Single-entry cache for assembled, source-independent thermal operators.
+
+    The stiffness matrix and heat-capacity vector are unchanged when users
+    adjust only power values, PWL files, snapshots, or report options.  Keeping
+    this cache separate from geometry avoids reusing an operator after a
+    material or boundary-condition change.
+    """
+
+    def __init__(self):
+        self.key = None
+        self.value = None
+
+    def get(self, key):
+        return self.value if key == self.key else None
+
+    def put(self, key, value):
+        self.key = key
+        self.value = value
+
+    def clear(self):
+        self.key = None
+        self.value = None
+
+
+class ThermalFactorizationCache:
+    """Single-entry cache that releases native solver resources on eviction."""
+
+    def __init__(self):
+        self.key = None
+        self.value = None
+
+    def get(self, key):
+        return self.value if key == self.key else None
+
+    def put(self, key, value):
+        if key != self.key:
+            self.clear()
+        self.key = key
+        self.value = value
+
+    def clear(self):
+        if self.value is not None:
+            release = getattr(self.value, "release", None)
+            if callable(release):
+                release()
+        self.key = None
+        self.value = None
+
+
 def stable_fingerprint(value: Any) -> str:
     """Return a deterministic SHA-256 fingerprint for JSON-compatible data."""
     payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
