@@ -18,6 +18,9 @@ class SimulationSettings:
     current_enabled: bool = False
     limit_area: bool = False
     limit_distance_mm: float = 0.0
+    area_mode: str = "full"
+    grid_detail_level: str = "balanced"
+    grid_node_budget: int = 800000
     backend: str = "auto"
     time_stepping: str = "auto"
 
@@ -32,6 +35,11 @@ class SimulationSettings:
             current_enabled=bool(values.get("current_enabled", False)),
             limit_area=bool(values.get("limit_area", False)),
             limit_distance_mm=float(values.get("pad_dist_mm", 0.0) or 0.0),
+            area_mode=str(values.get("area_mode", "full") or "full"),
+            grid_detail_level=str(
+                values.get("grid_detail_level", "balanced") or "balanced"
+            ),
+            grid_node_budget=int(values.get("grid_node_budget", 800000) or 800000),
             backend=str(values.get("solver_backend", "auto") or "auto").lower(),
             time_stepping=str(values.get("time_stepping", "auto") or "auto").lower(),
         )
@@ -51,6 +59,37 @@ class BoardSnapshot:
 
 
 @dataclass(frozen=True)
+class AreaEstimate:
+    """Effective rectangular simulation area selected from the PCB."""
+
+    mode: str
+    x_min_mm: float
+    y_min_mm: float
+    width_mm: float
+    height_mm: float
+    board_width_mm: float
+    board_height_mm: float
+    margin_mm: float = 0.0
+    heat_source_count: int = 0
+    active_net_names: Tuple[str, ...] = ()
+    fallback_to_full: bool = False
+    warnings: Tuple[str, ...] = ()
+
+    @property
+    def area_fraction(self):
+        """Return the simulated fraction of the board bounding rectangle."""
+        board_area = self.board_width_mm * self.board_height_mm
+        if board_area <= 0.0:
+            return 1.0
+        return min(1.0, max(0.0, self.width_mm * self.height_mm / board_area))
+
+    @property
+    def limited(self):
+        """Return whether the effective domain is smaller than the full board."""
+        return self.mode != "full" and self.area_fraction < 0.999
+
+
+@dataclass(frozen=True)
 class GridEstimate:
     """Final solver grid after area limiting and automatic coarsening."""
 
@@ -67,6 +106,11 @@ class GridEstimate:
     expert_limits: bool
     max_cells: int
     target_cells: int
+    detail_level: str = "legacy"
+    node_budget: int = 0
+    memory_mb_low: int = 0
+    memory_mb_high: int = 0
+    runtime_class: str = "Unknown"
 
     @property
     def base_cells(self):
@@ -84,12 +128,23 @@ class GridEstimate:
             return "Medium"
         return "High"
 
+    @property
+    def feature_min_mm(self):
+        """Approximate smallest feature represented by at least two cells."""
+        return self.actual_res_mm * 2.0
+
+    @property
+    def feature_max_mm(self):
+        """Approximate feature size represented robustly by three cells."""
+        return self.actual_res_mm * 3.0
+
 
 @dataclass
 class PreflightResult:
     """Structured validation result rendered by the settings dialog."""
 
     grid: Optional[GridEstimate] = None
+    area: Optional[AreaEstimate] = None
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 

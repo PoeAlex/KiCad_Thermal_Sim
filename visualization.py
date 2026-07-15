@@ -15,6 +15,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
 import pcbnew
 
@@ -593,6 +594,10 @@ def save_preview_image(
 
         fig, axes = plt.subplots(rows_grid, cols_grid, figsize=(12, 4 * rows_grid), squeeze=False)
         axes = axes.flatten()
+        area_summary = str(settings.get("_preview_area_summary", "") or "")
+        if area_summary:
+            prefix = "Limited simulation area" if settings.get("_preview_area_limited") else "Full simulation area"
+            fig.suptitle(f"{prefix}: {area_summary}", fontsize=11)
 
         # Build pad masks per layer
         pad_masks = [np.zeros((rows, cols), dtype=bool) for _ in range(count)]
@@ -664,12 +669,18 @@ def save_preview_image(
                     if layer_idx == i:
                         ax.text(cx, cy, str(label), color='black', fontsize=8, ha='center', va='center')
 
+            if settings.get("_preview_area_limited"):
+                ax.add_patch(Rectangle(
+                    (-0.5, -0.5), cols, rows,
+                    fill=False, edgecolor="#d62728", linewidth=1.5,
+                ))
+
             ax.axis('off')
 
         for j in range(count, len(axes)):
             axes[j].axis('off')
 
-        plt.tight_layout()
+        plt.tight_layout(rect=(0, 0, 1, 0.96) if area_summary else None)
         plt.savefig(output_file, dpi=120)
         plt.close()
 

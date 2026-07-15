@@ -3,7 +3,7 @@ Build a PCM (Plugin and Content Manager) compatible ZIP for ThermalSim.
 
 Usage:
     python build_pcm_package.py
-    python build_pcm_package.py --version 0.2.0
+    python build_pcm_package.py --version 0.2.3
     python build_pcm_package.py --output-dir dist
 
 The output ZIP can be installed in KiCad via:
@@ -17,7 +17,7 @@ import os
 import sys
 import zipfile
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 
 IDENTIFIER = "com.github.poealex.kicad-thermal-sim"
 

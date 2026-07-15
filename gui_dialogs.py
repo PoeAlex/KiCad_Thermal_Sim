@@ -34,24 +34,26 @@ TOOLTIP_TEXTS = {
     'browse_pwl': "Select a Piecewise-Linear (.pwl/.csv/.txt) file for time-varying power.",
     'duration': "Total simulation time in seconds. Longer durations approach steady-state.",
     'ambient': "Surrounding air temperature in \u00b0C. Typical lab conditions: 25 \u00b0C.",
-    'resolution': "Grid cell size in mm. Smaller = finer detail but quadratically slower.",
+    'resolution': "Desired grid cell size in mm. The compute budget may use a coarser actual size.",
     'show_all': "Show every copper layer in the heatmap (vs. only top and bottom).",
     'snapshots': "Save intermediate temperature snapshots during the simulation.",
     'snap_count': "Number of snapshots between t=0 and the final time.",
     'output_dir': "Directory for results. A timestamped subfolder is created automatically.",
     'browse_output': "Select output directory for simulation results.",
     'ignore_traces': "Exclude traces from the thermal model. Faster, slightly more conservative.",
-    'limit_area': "Restrict simulation to the region around selected pads.",
-    'limit_dist': "Radius in mm around pads when Limit Area is enabled. Typical: 20-40 mm.",
+    'limit_area': "Crop the solver to all active heat sources and complete current-net geometry.",
+    'limit_dist': "Thermal margin around sources and complete current nets. Typical: 10-30 mm.",
     'enable_pad': "Model a thermal pad/heatsink on the bottom layer (shapes on User.Eco1).",
     'pad_thick': "Thermal pad thickness in mm.",
     'pad_k': "Thermal pad conductivity in W/(m\u00b7K). Silicone ~3, aluminium ~200.",
     'pad_cap': "Areal heat capacity in J/(m\u00b2\u00b7K). Set 0 for negligible thermal mass.",
     'h_conv': "Convection coefficient in W/(m\u00b2\u00b7K). Still air ~5-10, light fan ~25, forced ~50-100.",
     'pcb_thick': "PCB thickness override in mm. Usually auto-detected from stackup.",
-    'grid_expert_limits': "Enable expert control over automatic grid coarsening limits.",
-    'grid_max_cells': "Estimated cell count above which the grid is automatically coarsened.",
-    'grid_target_cells': "Target cell count used when automatic grid coarsening is applied.",
+    'grid_detail': "Compute budget used to preserve the desired cell size on large simulations.",
+    'grid_node_budget': "Maximum total solver nodes across all copper layers in Custom mode.",
+    'grid_expert_limits': "Legacy expert-grid setting; loaded as a Custom compute budget.",
+    'grid_max_cells': "Legacy 2D cell threshold retained for settings compatibility.",
+    'grid_target_cells': "Legacy coarsening target retained for settings compatibility.",
     'capabilities': "Detected solver backends. PyPardiso accelerates large grids significantly.",
     'help': "Open the ThermalSim documentation in your web browser.",
     'preview': "Generate a geometry preview image without running the simulation.",
@@ -73,6 +75,15 @@ CURRENT_GROUP_COLORS = [
 
 DEFAULT_GRID_MAX_CELLS = 200000
 DEFAULT_GRID_TARGET_CELLS = 100000
+GRID_DETAIL_LABELS = ["Fast", "Balanced", "Detailed", "Very detailed", "Custom"]
+GRID_DETAIL_VALUES = ["fast", "balanced", "detailed", "very_detailed", "custom"]
+GRID_DETAIL_PRESETS = {
+    "fast": (300000, 150000),
+    "balanced": (800000, 400000),
+    "detailed": (1600000, 800000),
+    "very_detailed": (3000000, 1500000),
+}
+DEFAULT_GRID_NODE_BUDGET = GRID_DETAIL_PRESETS["balanced"][0]
 
 
 def _safe_float(value, default=0.0):
@@ -521,10 +532,9 @@ class SettingsDialog(wx.Dialog):
         self.btn_cancel.Bind(wx.EVT_BUTTON, self._on_cancel)
         footer.Add(self.btn_run, 0, wx.ALL, 4)
         footer.Add(self.btn_cancel, 0, wx.ALL, 4)
-        try:
-            self.btn_run.SetDefault()
-        except Exception:
-            pass
+        # Do not make Run the dialog default button.  Spin controls accept
+        # typed values and users commonly confirm them with Enter; starting a
+        # simulation from that key press is surprising and potentially costly.
 
         try:
             self.Bind(wx.EVT_CLOSE, self._on_cancel)
@@ -544,6 +554,7 @@ class SettingsDialog(wx.Dialog):
             self.power_pads = prepare_power_pads(self.initial_power_pads, self.power_input.GetValue())
             self._render_power_pads()
             self._render_current_groups()
+        self._bind_estimate_controls()
         self._refresh_context_summary()
         self._refresh_preflight()
 
@@ -596,12 +607,36 @@ class SettingsDialog(wx.Dialog):
             tooltip_key='ambient'
         )
 
-        # Resolution
+        # Desired physical resolution and layer-aware compute budget.
         self.res_input = self._add_spin_field(
-            box_params, params_parent, "Resolution (mm)", suggested_res,
+            box_params, params_parent, "Target cell size (mm)", suggested_res,
             min_val=0.05, max_val=10.0, inc=0.05, digits=2,
             tooltip_key='resolution'
         )
+
+        detail_row = wx.BoxSizer(wx.HORIZONTAL)
+        detail_row.Add(
+            wx.StaticText(params_parent, label="Compute budget", size=(160, -1)),
+            0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5,
+        )
+        self.grid_detail_choice = wx.Choice(params_parent, choices=GRID_DETAIL_LABELS)
+        self.grid_detail_choice.SetSelection(1)
+        self.grid_detail_choice.SetToolTip(TOOLTIP_TEXTS['grid_detail'])
+        self.grid_detail_choice.Bind(wx.EVT_CHOICE, self._on_grid_detail_changed)
+        detail_row.Add(self.grid_detail_choice, 1, wx.EXPAND)
+        box_params.Add(detail_row, 0, wx.EXPAND | wx.ALL, 2)
+
+        self.grid_node_budget_input = self._add_int_spin_field(
+            box_params, params_parent, "Maximum solver nodes", DEFAULT_GRID_NODE_BUDGET,
+            min_val=50000, max_val=10000000,
+            tooltip_key='grid_node_budget',
+        )
+        self.grid_node_budget_input.Enable(False)
+        self.lbl_grid_estimate = wx.StaticText(
+            params_parent,
+            label="Estimate will update from the active board and sources.",
+        )
+        box_params.Add(self.lbl_grid_estimate, 0, wx.EXPAND | wx.ALL, 3)
 
         sizer.Add(box_params, 0, wx.EXPAND | wx.ALL, 5)
 
@@ -725,18 +760,24 @@ class SettingsDialog(wx.Dialog):
         self.chk_ignore_traces.SetToolTip(TOOLTIP_TEXTS['ignore_traces'])
         box_filter.Add(self.chk_ignore_traces, 0, wx.ALL, 3)
 
-        self.chk_limit_area = wx.CheckBox(filter_panel, label="Limit area to pads")
+        self.chk_limit_area = wx.CheckBox(
+            filter_panel, label="Limit to active sources and current paths"
+        )
         self.chk_limit_area.SetValue(False)
         self.chk_limit_area.SetToolTip(TOOLTIP_TEXTS['limit_area'])
         box_filter.Add(self.chk_limit_area, 0, wx.ALL, 3)
 
         self.pad_dist_input = self._add_spin_field(
-            box_filter, filter_panel, "Limit distance (mm)", 30.0,
-            min_val=1.0, max_val=200.0, inc=5.0, digits=1,
+            box_filter, filter_panel, "Thermal margin (mm)", 20.0,
+            min_val=0.0, max_val=200.0, inc=5.0, digits=1,
             tooltip_key='limit_dist'
         )
         self.pad_dist_input.Enable(False)
         self.chk_limit_area.Bind(wx.EVT_CHECKBOX, self._on_limit_area_toggle)
+        self.lbl_area_estimate = wx.StaticText(
+            filter_panel, label="Area: full board"
+        )
+        box_filter.Add(self.lbl_area_estimate, 0, wx.EXPAND | wx.ALL, 3)
 
         filter_panel.SetSizer(box_filter)
         sizer.Add(self.geometry_pane, 0, wx.EXPAND | wx.ALL, 5)
@@ -817,31 +858,6 @@ class SettingsDialog(wx.Dialog):
         solver_panel.SetSizer(box_solver)
         sizer.Add(self.solver_pane, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
-        # --- Grid limits ---
-        self.grid_pane = wx.CollapsiblePane(panel, label="Grid Limits")
-        grid_panel = self.grid_pane.GetPane()
-        box_grid = wx.BoxSizer(wx.VERTICAL)
-        self.chk_grid_expert_limits = wx.CheckBox(grid_panel, label="Use expert grid limits")
-        self.chk_grid_expert_limits.SetValue(False)
-        self.chk_grid_expert_limits.SetToolTip(TOOLTIP_TEXTS['grid_expert_limits'])
-        self.chk_grid_expert_limits.Bind(wx.EVT_CHECKBOX, self._on_grid_expert_limits_toggle)
-        box_grid.Add(self.chk_grid_expert_limits, 0, wx.ALL, 3)
-
-        self.grid_max_cells_input = self._add_int_spin_field(
-            box_grid, grid_panel, "Coarsen above cells", DEFAULT_GRID_MAX_CELLS,
-            min_val=1000, max_val=10000000,
-            tooltip_key='grid_max_cells'
-        )
-        self.grid_target_cells_input = self._add_int_spin_field(
-            box_grid, grid_panel, "Target cells", DEFAULT_GRID_TARGET_CELLS,
-            min_val=1000, max_val=10000000,
-            tooltip_key='grid_target_cells'
-        )
-        self._apply_grid_expert_state(reset_to_defaults=True)
-
-        grid_panel.SetSizer(box_grid)
-        sizer.Add(self.grid_pane, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
-
         # --- Capabilities (read-only) ---
         solver_str = "Solver: SciPy + PyPardiso" if HAS_PARDISO else "Solver: SciPy"
         lbl_cap = wx.StaticText(panel, label=solver_str)
@@ -850,7 +866,7 @@ class SettingsDialog(wx.Dialog):
 
         pane_event = getattr(wx, "EVT_COLLAPSIBLEPANE_CHANGED", None)
         if pane_event is not None:
-            for pane in (self.geometry_pane, self.thermal_pad_pane, self.solver_pane, self.grid_pane):
+            for pane in (self.geometry_pane, self.thermal_pad_pane, self.solver_pane):
                 pane.Bind(pane_event, self._on_advanced_pane_changed)
 
         panel.SetSizer(sizer)
@@ -1084,6 +1100,20 @@ class SettingsDialog(wx.Dialog):
     # Event handlers
     # ------------------------------------------------------------------
 
+    def _bind_estimate_controls(self):
+        """Bind controls that materially change the live cost estimate."""
+        bindings = (
+            (self.res_input, getattr(wx, "EVT_SPINCTRLDOUBLE", None)),
+            (self.pad_dist_input, getattr(wx, "EVT_SPINCTRLDOUBLE", None)),
+            (self.grid_node_budget_input, getattr(wx, "EVT_SPINCTRL", None)),
+        )
+        for control, event_type in bindings:
+            if event_type is not None and hasattr(control, "Bind"):
+                control.Bind(event_type, self._on_estimate_input_changed)
+            focus_event = getattr(wx, "EVT_KILL_FOCUS", None)
+            if focus_event is not None and hasattr(control, "Bind"):
+                control.Bind(focus_event, self._on_estimate_input_changed)
+
     def _settings_file_start_dir(self):
         """Return the preferred directory for settings file dialogs."""
         try:
@@ -1220,12 +1250,34 @@ class SettingsDialog(wx.Dialog):
         try:
             result = self.preflight_callback(settings)
             grid = getattr(result, "grid", None)
+            area = getattr(result, "area", None)
             details = []
             if grid is not None:
                 details.append(
                     f"{grid.actual_res_mm:.3f} mm, {grid.rows} x {grid.cols} x "
-                    f"{grid.layer_count} = {grid.nodes:,} nodes, {grid.complexity} complexity"
+                    f"{grid.layer_count} = {grid.nodes:,} nodes, {grid.runtime_class}"
                 )
+                estimate = (
+                    f"Actual {grid.actual_res_mm:.3f} mm / {grid.nodes:,} nodes / "
+                    f"features about {grid.feature_min_mm:.2f}-{grid.feature_max_mm:.2f} mm\n"
+                    f"Estimated memory {grid.memory_mb_low:,}-{grid.memory_mb_high:,} MB / "
+                    f"runtime {grid.runtime_class.lower()}"
+                )
+                if grid.auto_coarsened:
+                    estimate += f" / requested {grid.requested_res_mm:.3f} mm"
+                self.lbl_grid_estimate.SetLabel(estimate)
+            if area is not None:
+                percent = int(round(area.area_fraction * 100.0))
+                nets = len(area.active_net_names)
+                area_text = (
+                    f"Area: {area.width_mm:.1f} x {area.height_mm:.1f} mm "
+                    f"({percent}% of board)"
+                )
+                if nets:
+                    area_text += f" / {nets} complete current net{'s' if nets != 1 else ''}"
+                self.lbl_area_estimate.SetLabel(area_text)
+                if details:
+                    details[0] += f" / area {percent}%"
             messages = list(getattr(result, "errors", []) or getattr(result, "warnings", []))
             if messages:
                 details.append(messages[0])
@@ -1335,21 +1387,19 @@ class SettingsDialog(wx.Dialog):
         except Exception:
             pass
 
-    def _apply_grid_expert_state(self, reset_to_defaults=False):
-        """Enable expert grid limit controls and optionally restore defaults."""
-        expert_enabled = self.chk_grid_expert_limits.GetValue()
-        if reset_to_defaults or not expert_enabled:
-            self.grid_max_cells_input.SetValue(DEFAULT_GRID_MAX_CELLS)
-            self.grid_target_cells_input.SetValue(DEFAULT_GRID_TARGET_CELLS)
-        self.grid_max_cells_input.Enable(expert_enabled)
-        self.grid_target_cells_input.Enable(expert_enabled)
-
-    def _on_grid_expert_limits_toggle(self, event):
-        """Handle Expert Grid Limits checkbox toggle."""
-        self._apply_grid_expert_state(reset_to_defaults=not self.chk_grid_expert_limits.GetValue())
-        if self.chk_grid_expert_limits.GetValue():
-            self.grid_pane.Expand()
+    def _on_grid_detail_changed(self, event):
+        """Enable the explicit node budget only for Custom detail mode."""
+        custom = self.grid_detail_choice.GetSelection() == len(GRID_DETAIL_VALUES) - 1
+        self.grid_node_budget_input.Enable(custom)
         self._refresh_preflight()
+
+    def _on_estimate_input_changed(self, event):
+        """Refresh area and grid estimates after a numeric input changes."""
+        self._refresh_preflight()
+        try:
+            event.Skip()
+        except Exception:
+            pass
 
     def _on_current_enabled_toggle(self, event):
         """Refresh summaries when current simulation is toggled."""
@@ -1867,6 +1917,8 @@ class SettingsDialog(wx.Dialog):
         - ignore_polygons : bool (always False, disabled feature)
         - limit_area : bool
         - pad_dist_mm : float
+        - area_mode : str
+        - area_margin_mm : float
         - use_heatsink : bool
         - pad_th : float
         - pad_k : float
@@ -1875,6 +1927,8 @@ class SettingsDialog(wx.Dialog):
         - grid_expert_limits : bool
         - grid_max_cells : int
         - grid_target_cells : int
+        - grid_detail_level : str
+        - grid_node_budget : int
         """
         try:
             self._sync_current_group_from_fields()
@@ -1890,19 +1944,22 @@ class SettingsDialog(wx.Dialog):
             power_pads = prepare_power_pads(self.power_pads, self.power_input.GetValue())
             current_groups = prepare_current_groups(self.current_groups)
             power_str = power_pads_to_power_str(power_pads, self.power_input.GetValue())
-            grid_expert_limits = self.chk_grid_expert_limits.GetValue()
-            if grid_expert_limits:
-                grid_max_cells = int(self.grid_max_cells_input.GetValue())
-                grid_target_cells = int(self.grid_target_cells_input.GetValue())
-                if (
-                    grid_max_cells < 1000
-                    or grid_target_cells < 1000
-                    or grid_target_cells > grid_max_cells
-                ):
-                    raise ValueError
+            detail_idx = self.grid_detail_choice.GetSelection()
+            if 0 <= detail_idx < len(GRID_DETAIL_VALUES):
+                grid_detail_level = GRID_DETAIL_VALUES[detail_idx]
             else:
-                grid_max_cells = DEFAULT_GRID_MAX_CELLS
-                grid_target_cells = DEFAULT_GRID_TARGET_CELLS
+                grid_detail_level = "balanced"
+            grid_expert_limits = grid_detail_level == "custom"
+            if grid_expert_limits:
+                grid_node_budget = int(self.grid_node_budget_input.GetValue())
+                if grid_node_budget < 50000 or grid_node_budget > 10000000:
+                    raise ValueError
+                target_nodes = grid_node_budget // 2
+            else:
+                grid_node_budget, target_nodes = GRID_DETAIL_PRESETS[grid_detail_level]
+            layer_count = max(1, len(self.layer_names))
+            grid_max_cells = max(1000, grid_node_budget // layer_count)
+            grid_target_cells = max(1000, min(grid_max_cells, target_nodes // layer_count))
             backend_label = self.solver_backend_choice.GetStringSelection().lower()
             if "pardiso" in backend_label:
                 solver_backend = "pardiso"
@@ -1928,6 +1985,8 @@ class SettingsDialog(wx.Dialog):
                 'ignore_polygons': False,  # Disabled by request
                 'limit_area': self.chk_limit_area.GetValue(),
                 'pad_dist_mm': float(self.pad_dist_input.GetValue()),
+                'area_mode': 'active' if self.chk_limit_area.GetValue() else 'full',
+                'area_margin_mm': float(self.pad_dist_input.GetValue()),
                 'use_heatsink': self.chk_heatsink.GetValue(),
                 'pad_th': float(self.pad_thick.GetValue()),
                 'pad_k': float(self.pad_k.GetValue()),
@@ -1936,6 +1995,8 @@ class SettingsDialog(wx.Dialog):
                 'grid_expert_limits': grid_expert_limits,
                 'grid_max_cells': grid_max_cells,
                 'grid_target_cells': grid_target_cells,
+                'grid_detail_level': grid_detail_level,
+                'grid_node_budget': grid_node_budget,
                 'solver_backend': solver_backend,
                 'time_stepping': time_stepping,
                 'current_enabled': self.chk_current_enabled.GetValue(),
@@ -1984,11 +2045,16 @@ class SettingsDialog(wx.Dialog):
             self.chk_ignore_traces.SetValue(
                 bool(defaults.get('ignore_traces', self.chk_ignore_traces.GetValue()))
             )
-            self.chk_limit_area.SetValue(
-                bool(defaults.get('limit_area', self.chk_limit_area.GetValue()))
+            area_mode = str(defaults.get('area_mode', '') or '').lower()
+            area_limited = (
+                area_mode == 'active'
+                if area_mode
+                else bool(defaults.get('limit_area', self.chk_limit_area.GetValue()))
             )
-            if 'pad_dist_mm' in defaults:
-                self.pad_dist_input.SetValue(float(defaults['pad_dist_mm']))
+            self.chk_limit_area.SetValue(area_limited)
+            margin = defaults.get('area_margin_mm', defaults.get('pad_dist_mm'))
+            if margin is not None:
+                self.pad_dist_input.SetValue(float(margin))
             self.pad_dist_input.Enable(self.chk_limit_area.GetValue())
 
             self.chk_heatsink.SetValue(
@@ -2018,28 +2084,25 @@ class SettingsDialog(wx.Dialog):
             stepping_idx = {'auto': 0, 'multi_phase': 1, 'two_phase': 2, 'uniform': 3}.get(stepping, 0)
             self.time_stepping_choice.SetSelection(stepping_idx)
 
-            grid_expert_limits = bool(defaults.get('grid_expert_limits', False))
-            self.chk_grid_expert_limits.SetValue(grid_expert_limits)
-            if grid_expert_limits:
-                grid_max_cells = _safe_int(defaults.get('grid_max_cells'), DEFAULT_GRID_MAX_CELLS)
-                grid_target_cells = _safe_int(
-                    defaults.get('grid_target_cells'),
-                    DEFAULT_GRID_TARGET_CELLS,
-                )
-                if (
-                    grid_max_cells < 1000
-                    or grid_target_cells < 1000
-                    or grid_target_cells > grid_max_cells
-                ):
-                    grid_expert_limits = False
-                    grid_max_cells = DEFAULT_GRID_MAX_CELLS
-                    grid_target_cells = DEFAULT_GRID_TARGET_CELLS
-                    self.chk_grid_expert_limits.SetValue(False)
-                self.grid_max_cells_input.SetValue(grid_max_cells)
-                self.grid_target_cells_input.SetValue(grid_target_cells)
-                self._apply_grid_expert_state(reset_to_defaults=not grid_expert_limits)
+            detail = str(defaults.get('grid_detail_level', '') or '').lower()
+            detail = detail.replace(' ', '_').replace('-', '_')
+            if detail not in GRID_DETAIL_VALUES:
+                detail = 'custom' if defaults.get('grid_expert_limits') else 'balanced'
+            self.grid_detail_choice.SetSelection(GRID_DETAIL_VALUES.index(detail))
+            if detail == 'custom':
+                node_budget = defaults.get('grid_node_budget')
+                if node_budget is None:
+                    legacy_cells = _safe_int(
+                        defaults.get('grid_max_cells'), DEFAULT_GRID_MAX_CELLS
+                    )
+                    node_budget = legacy_cells * max(1, len(self.layer_names))
+                node_budget = min(10000000, max(50000, _safe_int(
+                    node_budget, DEFAULT_GRID_NODE_BUDGET
+                )))
+                self.grid_node_budget_input.SetValue(node_budget)
             else:
-                self._apply_grid_expert_state(reset_to_defaults=True)
+                self.grid_node_budget_input.SetValue(GRID_DETAIL_PRESETS[detail][0])
+            self.grid_node_budget_input.Enable(detail == 'custom')
 
             if 'power_pads' in defaults:
                 self.power_pads = prepare_power_pads(defaults.get('power_pads', []), self.power_input.GetValue())
@@ -2057,8 +2120,6 @@ class SettingsDialog(wx.Dialog):
             self._render_current_groups()
             if self.chk_heatsink.GetValue():
                 self.thermal_pad_pane.Expand()
-            if self.chk_grid_expert_limits.GetValue():
-                self.grid_pane.Expand()
             if (
                 str(defaults.get('solver_backend', 'auto')).lower() != 'auto'
                 or str(defaults.get('time_stepping', 'auto')).lower() != 'auto'

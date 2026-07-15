@@ -304,6 +304,9 @@ class _WxMock:
         def SetMinSize(self, size):
             pass
 
+        def Bind(self, event, handler):
+            pass
+
     class SpinCtrl:
         def __init__(self, parent, value="", min=0, max=100,
                      style=0, **kwargs):
@@ -328,6 +331,9 @@ class _WxMock:
             pass
 
         def SetMinSize(self, size):
+            pass
+
+        def Bind(self, event, handler):
             pass
 
     class CheckBox:
@@ -358,6 +364,7 @@ class _WxMock:
         def __init__(self, parent, id=None, label=""):
             self.label = label
             self._enabled = True
+            self._is_default = False
 
         def Bind(self, event, handler):
             pass
@@ -375,7 +382,7 @@ class _WxMock:
             self.label = label
 
         def SetDefault(self):
-            pass
+            self._is_default = True
 
     class CollapsiblePane:
         def __init__(self, parent, label="", **kwargs):
@@ -473,6 +480,8 @@ class _WxMock:
     EVT_MENU = "EVT_MENU"
     EVT_COLLAPSIBLEPANE_CHANGED = "EVT_COLLAPSIBLEPANE_CHANGED"
     EVT_CLOSE = "EVT_CLOSE"
+    EVT_SPINCTRL = "EVT_SPINCTRL"
+    EVT_SPINCTRLDOUBLE = "EVT_SPINCTRLDOUBLE"
 
     @staticmethod
     def CallAfter(func, *args, **kwargs):

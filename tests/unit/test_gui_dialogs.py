@@ -691,6 +691,7 @@ class TestSettingsDialogInstantiation:
         assert dlg.lbl_board_name.GetLabel() == "controller.kicad_pcb"
         assert dlg.lbl_board_meta.GetLabel() == "120.0 x 80.0 mm / 4 copper layers"
         assert dlg.btn_run.label == "Run Simulation"
+        assert not dlg.btn_run._is_default
 
     def test_context_summarizes_constant_and_pwl_heat_sources(self):
         """Heat-source summary should expose count, total power, and PWL use."""
@@ -766,8 +767,9 @@ class TestSettingsDialogInstantiation:
 
         assert dlg.geometry_pane.IsExpanded()
         assert dlg.thermal_pad_pane.IsExpanded()
-        assert dlg.grid_pane.IsExpanded()
         assert dlg.solver_pane.IsExpanded()
+        assert dlg.grid_detail_choice.GetStringSelection() == "Custom"
+        assert dlg.grid_node_budget_input.IsEnabled()
 
     def test_preflight_and_run_result_states_are_persistent(self, tmp_path):
         """Footer should retain readiness and completion information."""
@@ -854,50 +856,50 @@ class TestSettingsDialogInstantiation:
         assert values['amb'] == 30.0
 
 
-class TestGridExpertSettings:
-    """Tests for expert grid limit settings."""
+class TestSimulationDetailSettings:
+    """Tests for the user-facing simulation-detail settings."""
 
     def test_default_grid_settings_are_present(self, default_settings):
-        """Default settings should include non-expert grid limits."""
+        """Legacy fixture settings should retain compatibility grid fields."""
         assert default_settings['grid_expert_limits'] is False
         assert default_settings['grid_max_cells'] == 200000
         assert default_settings['grid_target_cells'] == 100000
 
     def test_dialog_defaults_save_default_grid_limits(self):
-        """Expert limits disabled should serialize the hardcoded defaults."""
+        """Balanced mode should serialize a layer-aware node budget."""
         from ThermalSim.gui_dialogs import SettingsDialog
 
         dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
         values = dlg.get_values()
 
         assert values['grid_expert_limits'] is False
-        assert values['grid_max_cells'] == 200000
-        assert values['grid_target_cells'] == 100000
-        assert not dlg.grid_max_cells_input.IsEnabled()
-        assert not dlg.grid_target_cells_input.IsEnabled()
+        assert values['grid_detail_level'] == 'balanced'
+        assert values['grid_node_budget'] == 800000
+        assert values['grid_max_cells'] == 400000
+        assert values['grid_target_cells'] == 200000
+        assert not dlg.grid_node_budget_input.IsEnabled()
 
-    def test_disabling_expert_limits_resets_custom_values(self):
-        """Turning expert limits off should restore default grid limits."""
+    def test_switching_from_custom_to_balanced_restores_preset(self):
+        """Leaving Custom should return to the selected preset budget."""
         from ThermalSim.gui_dialogs import SettingsDialog
 
         dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
-        dlg.chk_grid_expert_limits.SetValue(True)
-        dlg._on_grid_expert_limits_toggle(None)
-        dlg.grid_max_cells_input.SetValue(900000)
-        dlg.grid_target_cells_input.SetValue(450000)
+        dlg.grid_detail_choice.SetSelection(4)
+        dlg._on_grid_detail_changed(None)
+        dlg.grid_node_budget_input.SetValue(900000)
+        assert dlg.get_values()['grid_node_budget'] == 900000
 
-        dlg.chk_grid_expert_limits.SetValue(False)
-        dlg._on_grid_expert_limits_toggle(None)
+        dlg.grid_detail_choice.SetSelection(1)
+        dlg._on_grid_detail_changed(None)
         values = dlg.get_values()
 
         assert values['grid_expert_limits'] is False
-        assert values['grid_max_cells'] == 200000
-        assert values['grid_target_cells'] == 100000
-        assert dlg.grid_max_cells_input.GetValue() == 200000
-        assert dlg.grid_target_cells_input.GetValue() == 100000
+        assert values['grid_detail_level'] == 'balanced'
+        assert values['grid_node_budget'] == 800000
+        assert not dlg.grid_node_budget_input.IsEnabled()
 
     def test_apply_defaults_without_grid_settings_keeps_defaults(self):
-        """Old JSON settings should load with default grid limits."""
+        """Old JSON settings should migrate to the Balanced detail preset."""
         from ThermalSim.gui_dialogs import SettingsDialog
 
         dlg = SettingsDialog(
@@ -908,11 +910,11 @@ class TestGridExpertSettings:
 
         assert values['time'] == 30.0
         assert values['grid_expert_limits'] is False
-        assert values['grid_max_cells'] == 200000
-        assert values['grid_target_cells'] == 100000
+        assert values['grid_detail_level'] == 'balanced'
+        assert values['grid_node_budget'] == 800000
 
     def test_apply_defaults_with_grid_expert_limits(self):
-        """Saved expert grid limits should be restored when enabled."""
+        """Saved expert grid limits should migrate to a Custom node budget."""
         from ThermalSim.gui_dialogs import SettingsDialog
 
         dlg = SettingsDialog(
@@ -926,7 +928,21 @@ class TestGridExpertSettings:
         values = dlg.get_values()
 
         assert values['grid_expert_limits'] is True
+        assert values['grid_detail_level'] == 'custom'
+        assert values['grid_node_budget'] == 1600000
         assert values['grid_max_cells'] == 800000
         assert values['grid_target_cells'] == 400000
-        assert dlg.grid_max_cells_input.IsEnabled()
-        assert dlg.grid_target_cells_input.IsEnabled()
+        assert dlg.grid_node_budget_input.IsEnabled()
+
+    def test_area_settings_use_current_aware_mode_and_margin(self):
+        """The geometry checkbox should serialize the new area settings."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
+        dlg.chk_limit_area.SetValue(True)
+        dlg.pad_dist_input.SetValue(15.0)
+        values = dlg.get_values()
+
+        assert values['area_mode'] == 'active'
+        assert values['area_margin_mm'] == 15.0
+        assert values['limit_area'] is True

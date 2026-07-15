@@ -1,6 +1,11 @@
 """Tests for shared workflow, grid, cancellation, and cache behavior."""
 
-from ThermalSim.thermal_plugin import _estimate_solver_grid
+from ThermalSim.electrical_solver import CurrentTerminal
+from ThermalSim.thermal_plugin import (
+    _coarsen_grid_resolution,
+    _estimate_simulation_area,
+    _estimate_solver_grid,
+)
 from ThermalSim.thermal_solver import SolverConfig, _build_phase_plan
 from ThermalSim.workflow import (
     BoardSnapshot,
@@ -13,7 +18,17 @@ from ThermalSim.workflow import (
     ThermalOperatorCache,
     geometry_cache_key,
 )
-from tests.mocks.pcbnew_mock import EDA_RECT, MockPad, VECTOR2I, F_Cu, B_Cu
+from tests.mocks.pcbnew_mock import (
+    B_Cu,
+    EDA_RECT,
+    F_Cu,
+    MockBoard,
+    MockFootprint,
+    MockPad,
+    MockTrack,
+    MockZone,
+    VECTOR2I,
+)
 
 
 def test_area_limit_uses_original_maximum_after_moving_minimum():
@@ -37,6 +52,84 @@ def test_grid_estimate_reports_total_nodes_and_complexity():
     assert grid.base_cells == 250000
     assert grid.nodes == 1000000
     assert grid.complexity == "High"
+
+
+def test_current_aware_area_includes_complete_active_net_geometry():
+    """A routed current net must remain inside the cropped domain."""
+    bbox = EDA_RECT(0, 0, 100_000_000, 50_000_000)
+    source = MockPad(position=VECTOR2I(10_000_000, 10_000_000))
+    terminal_a = MockPad(
+        position=VECTOR2I(20_000_000, 5_000_000), net_code=7, net_name="LOAD"
+    )
+    terminal_b = MockPad(
+        position=VECTOR2I(30_000_000, 5_000_000), net_code=7, net_name="LOAD"
+    )
+    routed_track = MockTrack(
+        bbox=EDA_RECT(20_000_000, 4_500_000, 60_000_000, 1_000_000),
+        net_code=7,
+        net_name="LOAD",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[terminal_a, terminal_b])],
+        tracks=[routed_track],
+    )
+    terminals = [
+        CurrentTerminal(terminal_a, "J1-1", "LOAD", 7, 2.0),
+        CurrentTerminal(terminal_b, "J2-1", "LOAD", 7, -2.0),
+    ]
+
+    area = _estimate_simulation_area(
+        board,
+        bbox,
+        {"area_mode": "active", "area_margin_mm": 5.0, "res": 1.0},
+        power_pads=[source],
+        terminals=terminals,
+    )
+
+    assert area.mode == "active"
+    assert area.x_min_mm <= 3.5
+    assert area.x_min_mm + area.width_mm >= 86.0
+    assert area.active_net_names == ("LOAD",)
+    assert area.area_fraction < 1.0
+
+
+def test_current_zone_covering_board_reports_little_area_saving():
+    """A full-board active zone must not be clipped to terminal pads."""
+    bbox = EDA_RECT(0, 0, 100_000_000, 50_000_000)
+    pad_a = MockPad(position=VECTOR2I(10_000_000, 10_000_000), net_code=1, net_name="GND")
+    pad_b = MockPad(position=VECTOR2I(20_000_000, 10_000_000), net_code=1, net_name="GND")
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_a, pad_b])],
+        zones=[MockZone(bbox=bbox, net_code=1, net_name="GND")],
+    )
+    terminals = [
+        CurrentTerminal(pad_a, "J1-1", "GND", 1, 1.0),
+        CurrentTerminal(pad_b, "J2-1", "GND", 1, -1.0),
+    ]
+
+    area = _estimate_simulation_area(
+        board, bbox,
+        {"area_mode": "active", "area_margin_mm": 10.0, "res": 0.5},
+        terminals=terminals,
+    )
+
+    assert area.area_fraction == 1.0
+    assert any("almost the full board" in item for item in area.warnings)
+
+
+def test_balanced_detail_budget_is_layer_aware():
+    """Four layers should map the Balanced node budget to legacy defaults."""
+    _, _, expert, max_cells, target_cells = _coarsen_grid_resolution(
+        300.0,
+        75.0,
+        0.1,
+        {"grid_detail_level": "balanced"},
+        layer_count=4,
+    )
+
+    assert expert is False
+    assert max_cells == 200000
+    assert target_cells == 100000
 
 
 def test_geometry_cache_key_ignores_non_geometry_settings():

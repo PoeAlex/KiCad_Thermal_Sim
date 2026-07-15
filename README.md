@@ -74,7 +74,7 @@ Run the plugin in PCB Editor via **Tools -> External Plugins -> 2.5D Thermal Sim
 4. Use **Heat Sources** to add pads that dissipate manual power, then enter constant W values or PWL file paths.
 5. Set **Duration**, **Ambient**, and **Resolution** on the **Overview** tab.
 6. Optionally use **Current Heating** to add source/sink pads and per-pad currents for copper `I^2R` heating.
-7. Optionally use **Advanced** for geometry filters, thermal pad, convection, solver settings, and expert grid limits.
+7. Optionally use **Advanced** for the simulation area, thermal pad, convection, and solver settings.
 8. Click **Preview** to check the mapped geometry, then **Run**.
 
 ![GUI overview tab](docs/images/gui_sim.png "Overview tab")
@@ -91,10 +91,10 @@ Run the plugin in PCB Editor via **Tools -> External Plugins -> 2.5D Thermal Sim
 
 The resizable dialog keeps board context and live preflight status visible above and below four compact tabs:
 
-- **Overview** - duration, ambient temperature, resolution, output, and collapsible board details.
+- **Overview** - duration, ambient temperature, target cell size, compute budget, live cost estimate, output, and collapsible board details.
 - **Heat Sources** - manual heat sources selected independently from current terminals.
 - **Current Heating** - DC current source/sink terminals for Joule heating.
-- **Advanced** - collapsible geometry, thermal pad, solver, and expert grid settings.
+- **Advanced** - collapsible simulation-area, thermal-pad, and solver settings.
 
 The header summarizes the board, copper-layer count, heat sources, and current-balance state. The fixed footer shows the requested versus actual grid, readiness warnings, and the main **Preview** and **Run Simulation** actions. Help and settings import/export are available from **More**. After a successful run, the dialog retains maximum temperature, elapsed time, and shortcuts to the report and output folder.
 
@@ -108,9 +108,11 @@ Shows detected copper layers with thicknesses and dielectric gaps parsed from th
 
 - **Duration (sec)** - total simulated time. Shorter durations emphasize transient peaks; longer durations approach quasi steady-state.
 - **Ambient Temp (C)** - reference temperature. Results are relative to ambient.
-- **Resolution (mm)** - spatial grid cell size. Smaller values improve hotspot and trace localization but increase runtime.
+- **Target Cell Size (mm)** - desired spatial grid size. Smaller values improve hotspot and trace localization but increase runtime.
+- **Compute Budget** - choose **Fast**, **Balanced**, **Detailed**, **Very detailed**, or **Custom**. The budget is based on total solver nodes across all copper layers.
+- **Maximum Solver Nodes** - available in Custom mode for an explicit upper limit.
 
-For large boards, ThermalSim may automatically coarsen the requested resolution to keep the grid size practical. The report always records both the requested and actual solver resolution.
+The live estimate shows requested versus actual cell size, grid dimensions, total nodes, approximate resolvable feature size, memory range, and a relative runtime class. For large boards, ThermalSim may automatically coarsen the requested cell size to remain within the selected budget. The report records the requested and actual resolution, compute budget, and simulated board fraction.
 
 #### Output
 
@@ -131,10 +133,9 @@ ThermalSim also keeps using `thermal_sim_last_settings.json` in the plugin folde
 Manual pad power is configured separately from current-flow terminals.
 
 1. Select pads in KiCad.
-2. Click **Add Selected Pads**.
-3. Enter a power value or PWL file path in **Power W/PWL**.
-4. Use **Apply to Selected** to write the value to selected table rows. If no row is selected, it applies to all power pads.
-5. Use **Apply List** for comma-separated values in table order.
+2. Click **Add Selected**.
+3. Enter a power value or PWL file path in **Power / PWL**.
+4. Use **Apply** to write the value to selected table rows. If no row is selected, a comma-separated list is applied in table order.
 
 The Heat Sources table is:
 
@@ -190,7 +191,7 @@ Current heating is additive with **Heat Sources**:
 total heat = manual pad power + calculated Joule copper loss
 ```
 
-Power pads and current terminals may be different pads. When current heating is enabled, **Limit Area** is disabled for that run so electrical paths are not clipped.
+Power pads and current terminals may be different pads. Area limiting remains available with current heating: ThermalSim includes every pad, track, via/PTH, and filled zone belonging to the active current nets, then expands that geometry by the configured thermal margin. A large active plane may therefore require almost the full board.
 
 The report shows **Path Current** as the useful current value. For a `+5 A` source and a `-5 A` sink, the path current is `5 A`. The internal sum of absolute terminal currents (`10 A` in that example) is kept only in raw diagnostics.
 
@@ -199,8 +200,10 @@ The report shows **Path Current** as the useful current value. For a `+5 A` sour
 #### Geometry Filters
 
 - **Ignore Traces** - exclude copper traces from the conductivity map; zones, pours, and pads still contribute.
-- **Limit Area to Pads** - restrict pure thermal simulations to a region around selected power/current pads.
-- **Limit Distance (mm)** - radius around pads when area limiting is enabled. A practical starting point is 20-40 mm.
+- **Limit to Active Sources and Current Paths** - crop the rectangular solver domain around heat sources and complete active current-net geometry.
+- **Thermal Margin (mm)** - additional board area around sources and current paths. A practical starting point is 10-30 mm.
+
+The preflight status shows the effective dimensions and percentage of the board. All copper inside the rectangular domain remains part of the thermal model. If active-net geometry cannot be inspected safely, ThermalSim falls back to the full board and reports a warning.
 
 #### Thermal Pad (`User.Eco1`)
 
@@ -213,18 +216,15 @@ The report shows **Path Current** as the useful current value. For a `+5 A` sour
 
 - **Convection h (W/m2K)** - convection coefficient for top/bottom surfaces. Default is 10.
 - **PCB Thickness (mm)** - overall board thickness. Stackup thickness is used when available.
-- **Expert Grid Limits** - enable expert control over automatic grid coarsening.
-- **Coarsen Above Cells** - estimated cell count above which ThermalSim coarsens the grid. Default is `200000`.
-- **Target Cells** - target cell count after coarsening. Default is `100000`.
 - **Capabilities** - detected solver backend, for example SciPy or PyPardiso.
 
-When **Expert Grid Limits** is disabled, the default limits always apply and any custom expert values are reset. There is no full "disable coarsening" switch; raising **Coarsen Above Cells** is the expert way to allow finer grids intentionally.
+The **Balanced** compute budget is the default. Presets use total solver nodes, so a four-layer board automatically receives fewer 2D cells than a two-layer board at the same budget. **Custom** exposes one explicit maximum-node value; ThermalSim retains headroom when it must auto-coarsen.
 
 ---
 
 ## Preview
 
-The **Preview** button generates a geometry visualization showing copper distribution, power/current pad locations, and via regions on each layer. Use it before running to verify that pads, copper, vias, zones, and optional area limiting were mapped as expected.
+The **Preview** button generates a geometry visualization showing copper distribution, power/current pad locations, via regions, and the effective simulation-area boundary on each layer. Its header reports the cropped dimensions and percentage of the board.
 
 ![Preview](docs/images/preview.png "KiCad editor with geometry preview")
 
@@ -256,7 +256,7 @@ When current heating is enabled, the HTML report includes **Current Path Diagnos
 - **Mapped KiCad Primitives** - pads, tracks, vias/PTHs, zones, track length, and width summary.
 - **Joule Loss Map** - per-layer static image of current-induced copper loss.
 
-The report records both requested and actual grid resolution. If the solver auto-coarsens the grid, the report shows the requested resolution, actual resolution, grid size, active cell limits, and whether default or expert grid limits were used.
+The report records requested and actual grid resolution, grid size, compute-budget preset, node budget, and the simulated percentage of the board.
 
 ---
 
@@ -300,9 +300,9 @@ The plugin is split into focused modules:
 - Radiation is not modeled.
 - Current-flow heating is static DC only; AC effects, skin effect, and temperature-dependent copper resistance are not modeled.
 - Current-path accuracy depends on grid resolution; narrow traces and small pads may need a finer grid to match hand calculations closely.
-- Very fine requested resolutions may be auto-coarsened on large boards unless expert grid limits are raised.
+- Very fine requested resolutions may be auto-coarsened when the selected compute budget is exceeded.
 - Via coupling is an approximation.
-- Results depend strongly on **Resolution (mm)** and, for pure thermal runs, **Limit Area/Distance**.
+- Results depend strongly on **Target Cell Size**, **Compute Budget**, and the selected simulation area and thermal margin.
 - Thermal Pad (`User.Eco1`) is a simplification of real contact pressure, interface quality, and sink temperature.
 
 ---
@@ -311,10 +311,10 @@ The plugin is split into focused modules:
 
 1. Add manual dissipating components in **Heat Sources**.
 2. Add source/sink terminals in **Current Heating** only when copper `I^2R` heating matters.
-3. Start pure thermal pad-power runs with **Limit Area to Pads** enabled and a moderate **Limit Distance**, for example 30 mm.
-4. For current-flow runs, let ThermalSim disable area limiting so electrical paths are not clipped.
-5. Tune **Resolution** until hotspots and current-path metrics are stable. Try 0.5 mm, then 0.3 mm.
-6. For deliberately fine full-board runs, enable **Expert Grid Limits** and raise the cell thresholds while watching runtime and memory use.
+3. Enable **Limit to Active Sources and Current Paths** and start with a moderate thermal margin, for example 20 mm.
+4. Check the effective board percentage; active current nets are always included completely.
+5. Tune **Target Cell Size** until hotspots and current-path metrics are stable. Try 0.5 mm, then 0.3 mm.
+6. Increase the **Compute Budget** only after checking the live node, memory, and runtime estimate.
 7. Save JSON settings for repeatable project comparisons.
 8. Compare layout variants using the same settings.
 9. Validate important designs with measurement or a full 3D thermal workflow.

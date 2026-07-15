@@ -540,7 +540,15 @@ def build_geometry_state(
     num_layers = len(copper_ids)
     limit_area = settings.get('limit_area', False)
     radius_mm = settings.get('pad_dist_mm', 0.0) if limit_area else 0.0
-    area_mask = build_pad_distance_mask(pads_list, rows, cols, x_min, y_min, res, radius_mm)
+    # New area-aware settings crop the rectangular solver domain itself.  The
+    # legacy circular pad mask is retained only for settings files that do not
+    # yet contain ``area_mode``; applying it to a current path could remove
+    # valid copper without reducing the number of solver nodes.
+    area_mask = None
+    if 'area_mode' not in settings:
+        area_mask = build_pad_distance_mask(
+            pads_list, rows, cols, x_min, y_min, res, radius_mm
+        )
 
     state = GeometryState(
         copper_mask=np.zeros((num_layers, rows, cols), dtype=bool),

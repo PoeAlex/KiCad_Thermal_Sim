@@ -151,18 +151,26 @@ def _build_summary_metrics(settings, interactive_heatmap, k_norm_info, snapshot_
         actual_res = (interactive_heatmap or {}).get("res_mm")
     requested_res = (k_norm_info or {}).get("grid_requested_res_mm", settings.get("res"))
     res_detail = grid_label
-    limit_mode = (
-        "expert grid limits enabled"
-        if (k_norm_info or {}).get("grid_expert_limits")
-        else "default grid limits"
-    )
+    detail_level = str((k_norm_info or {}).get("grid_detail_level", "") or "")
+    node_budget = (k_norm_info or {}).get("grid_node_budget")
+    if detail_level and detail_level != "legacy":
+        detail_label = detail_level.replace("_", " ").title()
+        limit_mode = f"{detail_label} compute budget"
+        if node_budget is not None:
+            limit_mode += f" ({int(node_budget):,} nodes)"
+    else:
+        limit_mode = (
+            "expert grid limits enabled"
+            if (k_norm_info or {}).get("grid_expert_limits")
+            else "default grid limits"
+        )
     max_cells = (k_norm_info or {}).get("grid_max_cells")
     target_cells = (k_norm_info or {}).get("grid_target_cells")
     if actual_res is not None and requested_res is not None:
         try:
             if abs(float(actual_res) - float(requested_res)) > 1e-9:
                 limit_detail = ""
-                if max_cells is not None and target_cells is not None:
+                if not detail_level and max_cells is not None and target_cells is not None:
                     limit_detail = f"; limit: {int(max_cells)} -> {int(target_cells)} cells"
                 res_detail = (
                     f"requested: {float(requested_res):.3f} mm; "
@@ -171,6 +179,12 @@ def _build_summary_metrics(settings, interactive_heatmap, k_norm_info, snapshot_
                 )
             else:
                 res_detail = f"{grid_label}; {limit_mode}"
+        except Exception:
+            pass
+    area_fraction = (k_norm_info or {}).get("area_fraction")
+    if area_fraction is not None:
+        try:
+            res_detail += f"; simulation area: {float(area_fraction) * 100.0:.0f}% of board"
         except Exception:
             pass
     metrics = [

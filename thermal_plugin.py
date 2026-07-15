@@ -28,7 +28,13 @@ from .gui_dialogs import (
     prepare_current_groups,
     prepare_power_pads,
 )
-from .electrical_solver import CurrentTerminal, ElectricalConfig, solve_electrical_heating
+from .electrical_solver import (
+    CurrentTerminal,
+    ElectricalConfig,
+    net_key_from_obj,
+    net_key_from_values,
+    solve_electrical_heating,
+)
 from .geometry_mapper import build_geometry_state, create_multilayer_maps, get_pad_pixels
 from .thermal_solver import SolverConfig, build_stiffness_matrix, run_simulation
 from .pwl_parser import parse_pwl_file
@@ -38,6 +44,7 @@ from .visualization import (
 )
 from .thermal_report import write_html_report
 from .workflow import (
+    AreaEstimate,
     BoardSnapshot,
     CancellationToken,
     GeometryCache,
@@ -49,6 +56,16 @@ from .workflow import (
     geometry_cache_key,
     stable_fingerprint,
 )
+
+
+GRID_DETAIL_PRESETS = {
+    "fast": (300_000, 150_000),
+    "balanced": (800_000, 400_000),
+    "detailed": (1_600_000, 800_000),
+    "very_detailed": (3_000_000, 1_500_000),
+}
+DEFAULT_GRID_DETAIL = "balanced"
+DEFAULT_GRID_NODE_BUDGET = GRID_DETAIL_PRESETS[DEFAULT_GRID_DETAIL][0]
 
 
 @dataclass
@@ -303,7 +320,37 @@ def _resolve_grid_limits(settings):
     return True, max_cells, target_cells
 
 
-def _coarsen_grid_resolution(w_mm, h_mm, requested_res, settings):
+def _resolve_grid_policy(settings, layer_count):
+    """Resolve a layer-aware detail preset to legacy 2D cell limits."""
+    layers = max(1, int(layer_count or 1))
+    if "grid_detail_level" not in settings:
+        expert, max_cells, target_cells = _resolve_grid_limits(settings)
+        detail = "custom" if expert else "legacy"
+        return detail, expert, max_cells, target_cells, max_cells * layers
+
+    detail = str(settings.get("grid_detail_level") or DEFAULT_GRID_DETAIL).strip().lower()
+    detail = detail.replace(" ", "_").replace("-", "_")
+    if detail not in set(GRID_DETAIL_PRESETS) | {"custom"}:
+        detail = DEFAULT_GRID_DETAIL
+
+    if detail == "custom":
+        try:
+            max_nodes = int(settings.get("grid_node_budget", DEFAULT_GRID_NODE_BUDGET))
+        except Exception:
+            max_nodes = DEFAULT_GRID_NODE_BUDGET
+        max_nodes = min(10_000_000, max(50_000, max_nodes))
+        target_nodes = max(25_000, max_nodes // 2)
+        expert = True
+    else:
+        max_nodes, target_nodes = GRID_DETAIL_PRESETS[detail]
+        expert = False
+
+    max_cells = max(1000, max_nodes // layers)
+    target_cells = max(1000, min(max_cells, target_nodes // layers))
+    return detail, expert, max_cells, target_cells, max_nodes
+
+
+def _coarsen_grid_resolution(w_mm, h_mm, requested_res, settings, layer_count=1):
     """
     Apply automatic grid coarsening for large boards.
 
@@ -321,7 +368,9 @@ def _coarsen_grid_resolution(w_mm, h_mm, requested_res, settings):
     tuple
         ``(res, auto_coarsened, expert_enabled, max_cells, target_cells)``.
     """
-    expert_enabled, max_cells, target_cells = _resolve_grid_limits(settings)
+    _, expert_enabled, max_cells, target_cells, _ = _resolve_grid_policy(
+        settings, layer_count
+    )
     area = w_mm * h_mm
     res = float(requested_res)
     auto_coarsened = False
@@ -331,16 +380,185 @@ def _coarsen_grid_resolution(w_mm, h_mm, requested_res, settings):
     return res, auto_coarsened, expert_enabled, max_cells, target_cells
 
 
-def _estimate_solver_grid(bbox, requested_res, settings, layer_count, focus_pads=None):
+def _bbox_bounds_mm(bbox):
+    """Return a KiCad rectangle as absolute millimetre bounds."""
+    x_min = float(bbox.GetX()) * 1e-6
+    y_min = float(bbox.GetY()) * 1e-6
+    return (
+        x_min,
+        y_min,
+        x_min + float(bbox.GetWidth()) * 1e-6,
+        y_min + float(bbox.GetHeight()) * 1e-6,
+    )
+
+
+def _estimate_simulation_area(board, bbox, settings, power_pads=None, terminals=None):
+    """Build a safe rectangular domain around heat sources and current nets."""
+    board_x0, board_y0, board_x1, board_y1 = _bbox_bounds_mm(bbox)
+    board_w = max(0.0, board_x1 - board_x0)
+    board_h = max(0.0, board_y1 - board_y0)
+    legacy_limited = bool(settings.get("limit_area", False))
+    mode = str(settings.get("area_mode") or ("active" if legacy_limited else "full"))
+    mode = mode.strip().lower()
+    if mode not in ("full", "active"):
+        mode = "active" if legacy_limited else "full"
+    margin = max(0.0, float(settings.get("area_margin_mm", settings.get("pad_dist_mm", 0.0)) or 0.0))
+
+    active_terms = [
+        item for item in (terminals or []) if abs(float(getattr(item, "current_a", 0.0))) > 0.0
+    ]
+    active_keys = {
+        net_key_from_values(item.net_code, item.net_name) for item in active_terms
+    }
+    active_names = tuple(sorted({
+        str(item.net_name or net_key_from_values(item.net_code, item.net_name))
+        for item in active_terms
+    }))
+
+    if mode == "full":
+        return AreaEstimate(
+            mode="full", x_min_mm=board_x0, y_min_mm=board_y0,
+            width_mm=board_w, height_mm=board_h,
+            board_width_mm=board_w, board_height_mm=board_h,
+            margin_mm=margin, heat_source_count=len(power_pads or []),
+            active_net_names=active_names,
+        )
+
+    bounds = []
+    warnings = []
+    collection_failed = False
+
+    def add_bbox(item):
+        try:
+            item_bbox = item.GetBoundingBox() if hasattr(item, "GetBoundingBox") else item
+            x0, y0, x1, y1 = _bbox_bounds_mm(item_bbox)
+            if x1 > x0 and y1 > y0:
+                bounds.append((x0, y0, x1, y1))
+        except Exception:
+            return
+
+    for pad in power_pads or []:
+        add_bbox(pad)
+
+    if active_keys:
+        try:
+            footprints = list(
+                board.Footprints() if hasattr(board, "Footprints") else board.GetFootprints()
+            )
+            for footprint in footprints:
+                for pad in footprint.Pads():
+                    if net_key_from_obj(pad)[0] in active_keys:
+                        add_bbox(pad)
+        except Exception:
+            collection_failed = True
+
+        try:
+            tracks = list(board.Tracks() if hasattr(board, "Tracks") else board.GetTracks())
+            for track in tracks:
+                if net_key_from_obj(track)[0] in active_keys:
+                    add_bbox(track)
+        except Exception:
+            collection_failed = True
+
+        try:
+            zones = list(board.Zones() if hasattr(board, "Zones") else board.GetZones())
+            for zone in zones:
+                if net_key_from_obj(zone)[0] not in active_keys:
+                    continue
+                if hasattr(zone, "IsFilled") and not zone.IsFilled():
+                    continue
+                add_bbox(zone)
+        except Exception:
+            collection_failed = True
+
+    if settings.get("use_heatsink"):
+        try:
+            for drawing in list(board.GetDrawings() if hasattr(board, "GetDrawings") else []):
+                if drawing.GetLayer() == pcbnew.Eco1_User:
+                    add_bbox(drawing)
+        except Exception:
+            warnings.append("Thermal-pad geometry could not be included in the area estimate.")
+
+    if collection_failed and active_keys:
+        warnings.append("Current-net geometry could not be inspected safely; the full board is used.")
+        return AreaEstimate(
+            mode="full", x_min_mm=board_x0, y_min_mm=board_y0,
+            width_mm=board_w, height_mm=board_h,
+            board_width_mm=board_w, board_height_mm=board_h,
+            margin_mm=margin, heat_source_count=len(power_pads or []),
+            active_net_names=active_names, fallback_to_full=True,
+            warnings=tuple(warnings),
+        )
+
+    if not bounds:
+        warnings.append("No active source geometry was found; the full board is used.")
+        return AreaEstimate(
+            mode="full", x_min_mm=board_x0, y_min_mm=board_y0,
+            width_mm=board_w, height_mm=board_h,
+            board_width_mm=board_w, board_height_mm=board_h,
+            margin_mm=margin, heat_source_count=0,
+            active_net_names=active_names, fallback_to_full=True,
+            warnings=tuple(warnings),
+        )
+
+    safety = max(0.0, float(settings.get("res", 0.0) or 0.0))
+    x0 = max(board_x0, min(item[0] for item in bounds) - margin - safety)
+    y0 = max(board_y0, min(item[1] for item in bounds) - margin - safety)
+    x1 = min(board_x1, max(item[2] for item in bounds) + margin + safety)
+    y1 = min(board_y1, max(item[3] for item in bounds) + margin + safety)
+    area = AreaEstimate(
+        mode="active", x_min_mm=x0, y_min_mm=y0,
+        width_mm=max(0.0, x1 - x0), height_mm=max(0.0, y1 - y0),
+        board_width_mm=board_w, board_height_mm=board_h,
+        margin_mm=margin, heat_source_count=len(power_pads or []),
+        active_net_names=active_names, warnings=tuple(warnings),
+    )
+    if active_keys and area.area_fraction >= 0.95:
+        warnings.append("Active current geometry covers almost the full board; area limiting saves little work.")
+        area = AreaEstimate(
+            mode=area.mode, x_min_mm=area.x_min_mm, y_min_mm=area.y_min_mm,
+            width_mm=area.width_mm, height_mm=area.height_mm,
+            board_width_mm=area.board_width_mm, board_height_mm=area.board_height_mm,
+            margin_mm=area.margin_mm, heat_source_count=area.heat_source_count,
+            active_net_names=area.active_net_names, warnings=tuple(warnings),
+        )
+    return area
+
+
+def _estimate_solver_cost(nodes, settings):
+    """Return conservative memory bounds and a relative runtime class."""
+    nodes = max(0, int(nodes))
+    memory_low = int(math.ceil(nodes * 0.00035))
+    memory_high = int(math.ceil(nodes * 0.00120))
+    backend = str(settings.get("solver_backend", "auto") or "auto").lower()
+    thresholds = (150_000, 500_000, 1_000_000)
+    if backend == "pardiso" or (backend == "auto" and HAS_PARDISO):
+        thresholds = (250_000, 800_000, 1_600_000)
+    if nodes < thresholds[0]:
+        runtime = "Fast"
+    elif nodes < thresholds[1]:
+        runtime = "Moderate"
+    elif nodes < thresholds[2]:
+        runtime = "Slow"
+    else:
+        runtime = "Very slow"
+    return memory_low, memory_high, runtime
+
+
+def _estimate_solver_grid(
+    bbox, requested_res, settings, layer_count, focus_pads=None, area=None
+):
     """Compute the final solver grid after area limiting and coarsening."""
-    original_x_min = bbox.GetX() * 1e-6
-    original_y_min = bbox.GetY() * 1e-6
-    original_x_max = original_x_min + bbox.GetWidth() * 1e-6
-    original_y_max = original_y_min + bbox.GetHeight() * 1e-6
+    original_x_min, original_y_min, original_x_max, original_y_max = _bbox_bounds_mm(bbox)
     x_min, y_min = original_x_min, original_y_min
     x_max, y_max = original_x_max, original_y_max
 
-    if settings.get("limit_area") and settings.get("pad_dist_mm", 0.0) > 0:
+    if area is not None:
+        x_min = float(area.x_min_mm)
+        y_min = float(area.y_min_mm)
+        x_max = x_min + float(area.width_mm)
+        y_max = y_min + float(area.height_mm)
+    elif settings.get("limit_area") and settings.get("pad_dist_mm", 0.0) > 0:
         radius = float(settings["pad_dist_mm"])
         pad_xs = []
         pad_ys = []
@@ -360,8 +578,13 @@ def _estimate_solver_grid(bbox, requested_res, settings, layer_count, focus_pads
     width = max(float(requested_res), x_max - x_min)
     height = max(float(requested_res), y_max - y_min)
     res, coarsened, expert, max_cells, target_cells = _coarsen_grid_resolution(
-        width, height, requested_res, settings
+        width, height, requested_res, settings, layer_count
     )
+    rows = int(height / res) + 4
+    cols = int(width / res) + 4
+    nodes = rows * cols * int(layer_count)
+    detail, _, _, _, node_budget = _resolve_grid_policy(settings, layer_count)
+    memory_low, memory_high, runtime = _estimate_solver_cost(nodes, settings)
     return GridEstimate(
         requested_res_mm=float(requested_res),
         actual_res_mm=float(res),
@@ -369,13 +592,18 @@ def _estimate_solver_grid(bbox, requested_res, settings, layer_count, focus_pads
         y_min_mm=float(y_min),
         width_mm=float(width),
         height_mm=float(height),
-        rows=int(height / res) + 4,
-        cols=int(width / res) + 4,
+        rows=rows,
+        cols=cols,
         layer_count=int(layer_count),
         auto_coarsened=bool(coarsened),
         expert_limits=bool(expert),
         max_cells=int(max_cells),
         target_cells=int(target_cells),
+        detail_level=detail,
+        node_budget=int(node_budget),
+        memory_mb_low=memory_low,
+        memory_mb_high=memory_high,
+        runtime_class=runtime,
     )
 
 
@@ -921,12 +1149,21 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         """Validate settings and estimate the exact grid before execution."""
         result = PreflightResult()
         power_entries, missing_power = self._resolve_power_pad_entries(board, settings)
-        current_pads = self._resolve_current_pad_objects(board, settings)
         power_pads = [pad for _, pad, _ in power_entries]
+        terminals = []
+        missing_current = []
+        if settings.get("current_enabled"):
+            terminals, missing_current = self._resolve_current_terminals(board, settings)
+        current_pads = [item.pad for item in terminals]
         focus_pads = self._unique_pads(power_pads + current_pads)
-        result.grid = _estimate_solver_grid(
-            bbox, float(settings.get("res", 0.5)), settings, len(copper_ids), focus_pads
+        result.area = _estimate_simulation_area(
+            board, bbox, settings, power_pads=power_pads, terminals=terminals
         )
+        result.grid = _estimate_solver_grid(
+            bbox, float(settings.get("res", 0.5)), settings, len(copper_ids),
+            focus_pads, area=result.area,
+        )
+        result.warnings.extend(result.area.warnings)
 
         if missing_power:
             result.errors.append(f"{len(missing_power)} heat-source pad(s) are missing from the board.")
@@ -946,7 +1183,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         has_current = False
         if settings.get("current_enabled"):
-            terminals, missing_current = self._resolve_current_terminals(board, settings)
             if missing_current:
                 result.errors.append(f"{len(missing_current)} current-terminal pad(s) are missing from the board.")
             has_current = any(abs(float(item.current_a)) > 0.0 for item in terminals)
@@ -957,8 +1193,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             unbalanced = [name for name, total in totals.items() if abs(total) > 1e-9]
             if unbalanced:
                 result.errors.append("Current is not balanced for: " + ", ".join(unbalanced[:3]))
-            if settings.get("limit_area"):
-                result.warnings.append("Area limiting will be disabled for current heating.")
 
         if not has_power and not has_current:
             result.errors.append("Configure at least one non-zero heat source or balanced current path.")
@@ -1040,14 +1274,22 @@ class ThermalPlugin(pcbnew.ActionPlugin):
     def generate_preview(self, settings, layer_names):
         """Generate geometry preview image."""
         power_pads = self._resolve_power_pad_objects(self.board, settings, legacy_pads=self.pads_list)
-        current_pads = self._resolve_current_pad_objects(self.board, settings)
+        terminals, _ = self._resolve_current_terminals(self.board, settings)
+        current_pads = [item.pad for item in terminals]
         preview_pads = self._unique_pads(power_pads + current_pads)
         effective_settings = dict(settings)
-        if effective_settings.get("current_enabled"):
-            effective_settings["limit_area"] = False
+        area = _estimate_simulation_area(
+            self.board, self.bbox, effective_settings,
+            power_pads=power_pads, terminals=terminals,
+        )
+        effective_settings["_preview_area_summary"] = (
+            f"{area.width_mm:.1f} x {area.height_mm:.1f} mm / "
+            f"{area.area_fraction * 100.0:.0f}% of board"
+        )
+        effective_settings["_preview_area_limited"] = area.limited
         grid = _estimate_solver_grid(
             self.bbox, float(effective_settings["res"]), effective_settings,
-            len(self.copper_ids), preview_pads,
+            len(self.copper_ids), preview_pads, area=area,
         )
         cache_key = self._geometry_key(
             self.board, self.copper_ids, self.bbox, grid, effective_settings, preview_pads
@@ -1096,13 +1338,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     pass
 
         focus_pads = focus_pads if focus_pads is not None else pads_list
-        if settings.get("current_enabled") and settings.get("limit_area"):
-            settings = dict(settings)
-            settings["limit_area"] = False
-            wx.MessageBox(
-                "Limit Area was disabled for current-flow simulation so copper paths are not cut off.",
-                "ThermalSim"
-            )
+        area_power_pads = self._resolve_power_pad_objects(
+            board, settings, legacy_pads=pads_list
+        )
+        area_terminals = []
+        if settings.get("current_enabled"):
+            area_terminals, _ = self._resolve_current_terminals(board, settings)
+        area = _estimate_simulation_area(
+            board, bbox, settings,
+            power_pads=area_power_pads,
+            terminals=area_terminals,
+        )
         # Derive thicknesses
         stackup_derived = self._derive_stackup_thicknesses(board, copper_ids, stack_info, settings)
         total_thick_mm = stackup_derived["total_thick_mm_used"]
@@ -1124,7 +1370,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         requested_res = float(settings['res'])
         layer_count = len(copper_ids)
-        grid = _estimate_solver_grid(bbox, requested_res, settings, layer_count, focus_pads)
+        grid = _estimate_solver_grid(
+            bbox, requested_res, settings, layer_count, focus_pads, area=area
+        )
         res = grid.actual_res_mm
         x_min = grid.x_min_mm
         y_min = grid.y_min_mm
@@ -1144,6 +1392,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "grid_width_mm": float(cols * res),
             "grid_height_mm": float(rows * res),
             "grid_cell_area_mm2": float(res * res),
+            "grid_detail_level": grid.detail_level,
+            "grid_node_budget": grid.node_budget,
+            "grid_memory_mb_low": grid.memory_mb_low,
+            "grid_memory_mb_high": grid.memory_mb_high,
+            "grid_runtime_class": grid.runtime_class,
+            "area_mode": area.mode,
+            "area_fraction": area.area_fraction,
+            "area_margin_mm": area.margin_mm,
+            "area_active_nets": list(area.active_net_names),
         }
 
         # Physical parameters
