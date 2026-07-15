@@ -139,6 +139,8 @@ class SimulationArtifacts:
     heatmap_path: Optional[str] = None
     run_dir: Optional[str] = None
     status: str = "running"
+    elapsed_s: Optional[float] = None
+    max_temp_c: Optional[float] = None
 
 
 class GeometryCache:

@@ -606,7 +606,7 @@ class TestCurrentGroupSettings:
         dlg = SettingsDialog(None, 0, 0.5, ["F.Cu", "B.Cu"])
 
         page_labels = [caption for _, caption in dlg.notebook._pages]
-        assert page_labels == ["Setup", "Heat Sources", "Current Heating", "Advanced"]
+        assert page_labels == ["Overview", "Heat Sources", "Current Heating", "Advanced"]
         labels = " ".join(
             list(dlg.current_group_list._columns)
             + list(dlg.current_pad_list._columns)
@@ -675,6 +675,138 @@ class TestSettingsDialogInstantiation:
             default_output_dir="/tmp"
         )
         assert dlg is not None
+
+    def test_dialog_uses_responsive_size_and_board_context(self):
+        """Modern dialog should expose board context and resize safely."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(
+            None, 0, 0.5, ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"],
+            board_name="controller.kicad_pcb",
+            board_size_mm=(120.0, 80.0),
+        )
+
+        assert dlg.GetSize() == (820, 720)
+        assert dlg.GetMinSize() == (760, 640)
+        assert dlg.lbl_board_name.GetLabel() == "controller.kicad_pcb"
+        assert dlg.lbl_board_meta.GetLabel() == "120.0 x 80.0 mm / 4 copper layers"
+        assert dlg.btn_run.label == "Run Simulation"
+
+    def test_context_summarizes_constant_and_pwl_heat_sources(self):
+        """Heat-source summary should expose count, total power, and PWL use."""
+        from ThermalSim.gui_dialogs import summarize_power_pads
+
+        assert summarize_power_pads([]) == "0 heat sources"
+        assert summarize_power_pads([
+            {'power': '1.25'}, {'power': '0.75'},
+        ]) == "2 heat sources / 2 W"
+        assert summarize_power_pads([
+            {'power': '1.0'}, {'power': r'C:\\sim\\ramp.pwl'},
+        ]) == "2 heat sources (contains PWL)"
+
+    def test_heat_source_table_supports_multi_row_removal(self):
+        """Power-pad actions should operate on multiple selected rows."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        pads = [
+            {'pad_key': str(idx), 'name': f'P{idx}', 'power': '1.0'}
+            for idx in range(3)
+        ]
+        dlg = SettingsDialog(
+            None, 0, 0.5, ["F.Cu", "B.Cu"],
+            defaults={'power_pads': pads},
+        )
+        dlg.power_pad_list.Select(0)
+        dlg.power_pad_list.Select(1)
+
+        dlg._on_power_remove_pads(None)
+
+        assert [pad['pad_key'] for pad in dlg.power_pads] == ['2']
+        assert dlg.lbl_heat_summary.GetLabel() == "1 heat source / 1 W"
+
+    def test_current_mode_shows_only_relevant_entry_rows(self):
+        """Current-entry rows should follow the selected distribution mode."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(
+            None, 0, 0.5, ["F.Cu", "B.Cu"],
+            defaults={
+                'current_enabled': True,
+                'current_groups': [{
+                    'name': 'Supply', 'mode': 'total', 'total_current_a': 4.0,
+                    'pads': [{'pad_key': '1', 'name': 'J1-1', 'net_name': 'VIN'}],
+                }],
+            },
+        )
+
+        assert dlg.current_total_row._shown is True
+        assert dlg.current_pad_current_row._shown is False
+        assert dlg.current_pad_list_row._shown is False
+
+        dlg.current_mode_choice.SetSelection(0)
+        dlg._on_current_mode_changed(None)
+        assert dlg.current_total_row._shown is False
+        assert dlg.current_pad_current_row._shown is True
+        assert dlg.current_pad_list_row._shown is True
+
+    def test_active_advanced_sections_expand_from_defaults(self):
+        """Non-default advanced settings should reveal their native panes."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(
+            None, 0, 0.5, ["F.Cu", "B.Cu"],
+            defaults={
+                'use_heatsink': True,
+                'grid_expert_limits': True,
+                'grid_max_cells': 800000,
+                'grid_target_cells': 400000,
+                'solver_backend': 'scipy',
+            },
+        )
+
+        assert dlg.geometry_pane.IsExpanded()
+        assert dlg.thermal_pad_pane.IsExpanded()
+        assert dlg.grid_pane.IsExpanded()
+        assert dlg.solver_pane.IsExpanded()
+
+    def test_preflight_and_run_result_states_are_persistent(self, tmp_path):
+        """Footer should retain readiness and completion information."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+        from ThermalSim.workflow import GridEstimate, PreflightResult
+
+        grid = GridEstimate(0.5, 0.5, 0, 0, 10, 10, 24, 24, 4, False, False, 200000, 100000)
+        dlg = SettingsDialog(
+            None, 0, 0.5, ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"],
+            preflight_callback=lambda settings: PreflightResult(grid=grid),
+        )
+        assert dlg.lbl_preflight_status.GetLabel() == "Ready"
+        assert "2,304 nodes" in dlg.lbl_preflight.GetLabel()
+        assert dlg.btn_run.IsEnabled()
+
+        dlg.preflight_callback = lambda settings: PreflightResult(
+            grid=grid, warnings=["Resolution was automatically coarsened."],
+        )
+        assert dlg._refresh_preflight()
+        assert dlg.lbl_preflight_status.GetLabel() == "Warning"
+        assert dlg.btn_run.IsEnabled()
+
+        dlg.preflight_callback = lambda settings: PreflightResult(
+            grid=grid, errors=["Configure at least one heat source."],
+        )
+        assert not dlg._refresh_preflight()
+        assert dlg.lbl_preflight_status.GetLabel() == "Blocked"
+        assert not dlg.btn_run.IsEnabled()
+
+        report_path = tmp_path / "thermal_report.html"
+        report_path.write_text("report", encoding="utf-8")
+        dlg.set_run_state("running")
+        assert not dlg.btn_run.IsEnabled()
+        dlg.set_artifacts(str(report_path), str(tmp_path), elapsed_s=8.2, max_temp_c=56.3)
+
+        assert dlg.result_panel.IsShown()
+        assert dlg.lbl_result.GetLabel() == "Completed / max 56.3 °C / 8.2 s"
+        assert dlg.btn_open_report.IsEnabled()
+        assert dlg.btn_open_folder.IsEnabled()
 
     def test_get_values_returns_dict(self):
         """Test that get_values returns a dict with all expected keys."""

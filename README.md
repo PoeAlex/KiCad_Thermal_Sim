@@ -72,12 +72,12 @@ Run the plugin in PCB Editor via **Tools -> External Plugins -> 2.5D Thermal Sim
 2. Select one or more pads if you want to pre-fill manual heat sources.
 3. Run **Tools -> External Plugins -> 2.5D Thermal Sim**.
 4. Use **Heat Sources** to add pads that dissipate manual power, then enter constant W values or PWL file paths.
-5. Set **Duration**, **Ambient**, and **Resolution** on the **Simulation** tab.
+5. Set **Duration**, **Ambient**, and **Resolution** on the **Overview** tab.
 6. Optionally use **Current Heating** to add source/sink pads and per-pad currents for copper `I^2R` heating.
 7. Optionally use **Advanced** for geometry filters, thermal pad, convection, solver settings, and expert grid limits.
 8. Click **Preview** to check the mapped geometry, then **Run**.
 
-![GUI setup tab](docs/images/gui_sim.png "Setup tab")
+![GUI overview tab](docs/images/gui_sim.png "Overview tab")
 
 ![GUI heat sources tab](docs/images/gui_powerpads.png "Heat Sources tab")
 
@@ -89,14 +89,16 @@ Run the plugin in PCB Editor via **Tools -> External Plugins -> 2.5D Thermal Sim
 
 ## GUI Settings
 
-The dialog has four tabs:
+The resizable dialog keeps board context and live preflight status visible above and below four compact tabs:
 
-- **Setup** - board/stackup info, duration, ambient temperature, resolution, output, and live preflight status.
+- **Overview** - duration, ambient temperature, resolution, output, and collapsible board details.
 - **Heat Sources** - manual heat sources selected independently from current terminals.
 - **Current Heating** - DC current source/sink terminals for Joule heating.
-- **Advanced** - geometry filters, thermal pad, solver backend, time stepping, and expert grid settings.
+- **Advanced** - collapsible geometry, thermal pad, solver, and expert grid settings.
 
-### Setup Tab
+The header summarizes the board, copper-layer count, heat sources, and current-balance state. The fixed footer shows the requested versus actual grid, readiness warnings, and the main **Preview** and **Run Simulation** actions. Help and settings import/export are available from **More**. After a successful run, the dialog retains maximum temperature, elapsed time, and shortcuts to the report and output folder.
+
+### Overview Tab
 
 #### Board Info
 

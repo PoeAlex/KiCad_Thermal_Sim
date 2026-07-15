@@ -35,12 +35,15 @@ class _WxMock:
     LC_SINGLE_SEL = 0x8000
     LIST_NEXT_ALL = 0
     LIST_STATE_SELECTED = 1
+    DEFAULT_DIALOG_STYLE = 0x10000
+    RESIZE_BORDER = 0x20000
 
     adv = _WxAdvMock()
 
     class Dialog:
         def __init__(self, *args, **kwargs):
-            pass
+            self._size = (-1, -1)
+            self._min_size = (-1, -1)
 
         def ShowModal(self):
             return _WxMock.ID_OK
@@ -67,9 +70,24 @@ class _WxMock:
             pass
 
         def SetSize(self, size):
-            pass
+            self._size = tuple(size)
 
         def SetMinSize(self, size):
+            self._min_size = tuple(size)
+
+        def GetSize(self):
+            return self._size
+
+        def GetMinSize(self):
+            return self._min_size
+
+        def Bind(self, event, handler, source=None):
+            pass
+
+        def PopupMenu(self, menu):
+            pass
+
+        def Layout(self):
             pass
 
         def SetToolTip(self, tip):
@@ -77,12 +95,21 @@ class _WxMock:
 
     class Panel:
         def __init__(self, parent, **kwargs):
-            pass
+            self._shown = True
 
         def SetSizer(self, sizer):
             pass
 
         def SetToolTip(self, tip):
+            pass
+
+        def Show(self, show=True):
+            self._shown = bool(show)
+
+        def IsShown(self):
+            return self._shown
+
+        def Layout(self):
             pass
 
     class Notebook:
@@ -108,9 +135,16 @@ class _WxMock:
         def AddStretchSpacer(self):
             pass
 
+        def ShowItems(self, show=True):
+            self._shown = bool(show)
+
     class StaticBoxSizer(BoxSizer):
         def __init__(self, orient, parent, label=""):
             super().__init__(orient)
+            self._static_box = parent
+
+        def GetStaticBox(self):
+            return self._static_box
 
     class StaticText:
         def __init__(self, parent, label="", size=None, **kwargs):
@@ -121,6 +155,9 @@ class _WxMock:
 
         def SetLabel(self, label):
             self.label = label
+
+        def GetLabel(self):
+            return self.label
 
         def GetFont(self):
             return _WxMock.Font()
@@ -189,7 +226,7 @@ class _WxMock:
         def __init__(self, parent, style=0, **kwargs):
             self._columns = []
             self._items = []
-            self._selected = -1
+            self._selected = []
 
         def InsertColumn(self, idx, heading, width=-1):
             if idx >= len(self._columns):
@@ -198,7 +235,7 @@ class _WxMock:
 
         def DeleteAllItems(self):
             self._items = []
-            self._selected = -1
+            self._selected = []
 
         def InsertItem(self, idx, text):
             row = ["" for _ in range(max(1, len(self._columns)))]
@@ -214,14 +251,20 @@ class _WxMock:
                 row.extend([""] * (col - len(row) + 1))
             row[col] = str(text)
 
-        def Select(self, idx):
-            self._selected = int(idx)
+        def Select(self, idx, on=True):
+            idx = int(idx)
+            if on and idx not in self._selected:
+                self._selected.append(idx)
+                self._selected.sort()
+            elif not on and idx in self._selected:
+                self._selected.remove(idx)
 
         def GetFirstSelected(self):
-            return self._selected
+            return self._selected[0] if self._selected else -1
 
         def GetNextItem(self, item, flags=0, state=0):
-            return -1
+            later = [idx for idx in self._selected if idx > item]
+            return later[0] if later else -1
 
         def Bind(self, event, handler):
             pass
@@ -331,6 +374,49 @@ class _WxMock:
         def SetLabel(self, label):
             self.label = label
 
+        def SetDefault(self):
+            pass
+
+    class CollapsiblePane:
+        def __init__(self, parent, label="", **kwargs):
+            self.label = label
+            self._expanded = False
+            self._pane = _WxMock.Panel(parent)
+
+        def GetPane(self):
+            return self._pane
+
+        def Expand(self):
+            self._expanded = True
+
+        def Collapse(self, collapse=True):
+            self._expanded = not bool(collapse)
+
+        def IsExpanded(self):
+            return self._expanded
+
+        def Bind(self, event, handler):
+            pass
+
+    class MenuItem:
+        def __init__(self, label=""):
+            self.label = label
+
+    class Menu:
+        def __init__(self):
+            self.items = []
+
+        def Append(self, item_id, label):
+            item = _WxMock.MenuItem(label)
+            self.items.append(item)
+            return item
+
+        def AppendSeparator(self):
+            pass
+
+        def Destroy(self):
+            pass
+
     class DirDialog:
         def __init__(self, parent, message="", defaultPath="", style=0):
             self.path = defaultPath
@@ -383,6 +469,9 @@ class _WxMock:
     EVT_BUTTON = "EVT_BUTTON"
     EVT_CHECKBOX = "EVT_CHECKBOX"
     EVT_LIST_ITEM_SELECTED = "EVT_LIST_ITEM_SELECTED"
+    EVT_CHOICE = "EVT_CHOICE"
+    EVT_MENU = "EVT_MENU"
+    EVT_COLLAPSIBLEPANE_CHANGED = "EVT_COLLAPSIBLEPANE_CHANGED"
     EVT_CLOSE = "EVT_CLOSE"
 
     @staticmethod

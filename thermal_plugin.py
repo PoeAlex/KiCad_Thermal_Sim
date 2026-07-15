@@ -601,11 +601,23 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             power_pads = self._resolve_power_pad_objects(board, settings, legacy_pads=pads_list)
             current_pads = self._resolve_current_pad_objects(board, settings)
             focus_pads = self._unique_pads(power_pads + current_pads)
-            self._run_simulation(
-                board, copper_ids, layer_names, bbox, pads_list,
-                settings, stack_info, pad_names, zone_refill_s=zone_refill_s,
-                focus_pads=focus_pads
-            )
+            try:
+                self._run_simulation(
+                    board, copper_ids, layer_names, bbox, pads_list,
+                    settings, stack_info, pad_names, zone_refill_s=zone_refill_s,
+                    focus_pads=focus_pads
+                )
+            except Exception:
+                error_text = traceback.format_exc()
+                if self.settings_dialog is not None:
+                    try:
+                        self.settings_dialog.set_run_state(
+                            "failed",
+                            "The simulation failed. See the error dialog for details.",
+                        )
+                    except Exception:
+                        pass
+                wx.MessageBox(error_text, "Thermal Sim Error")
 
         def close_callback():
             self.settings_dialog = None
@@ -626,7 +638,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             pad_names=pad_names,
             initial_power_pads=initial_power_pads,
             default_output_dir=default_output_dir,
-            defaults=last_settings
+            defaults=last_settings,
+            board_name=os.path.basename(board_path) if board_path else "Unsaved board",
+            board_size_mm=(w_mm, h_mm),
         )
         self.settings_dialog = dlg
         try:
@@ -1066,11 +1080,21 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         )
         if not output_file:
             wx.MessageBox("Board data missing for preview", "Error")
+        return output_file
 
     def _run_simulation(self, board, copper_ids, layer_names, bbox, pads_list,
                         settings, stack_info, pad_names, zone_refill_s=0.0,
                         focus_pads=None):
         """Execute the thermal simulation."""
+        run_started_at = time.perf_counter()
+
+        def set_dialog_state(status, message=""):
+            if self.settings_dialog is not None:
+                try:
+                    wx.CallAfter(self.settings_dialog.set_run_state, status, message)
+                except Exception:
+                    pass
+
         focus_pads = focus_pads if focus_pads is not None else pads_list
         if settings.get("current_enabled") and settings.get("limit_area"):
             settings = dict(settings)
@@ -1157,6 +1181,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 self.geometry_cache.put(cache_key, geometry_state)
         except Exception as e:
             wx.MessageBox(f"Error mapping geometry: {e}", "Error")
+            set_dialog_state("failed", "Board geometry could not be mapped.")
             return
         init_timings["geometry_maps_s"] = time.perf_counter() - geometry_start
         init_timings["geometry_cache_hit"] = geometry_cache_hit
@@ -1254,6 +1279,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 + "\n".join(str(name) for name in missing_power_pads),
                 "Power Pad Error"
             )
+            set_dialog_state("failed", "One or more heat-source pads were not found.")
             return
 
         # Parse each entry as constant float or PWL file path
@@ -1270,6 +1296,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         f"Error reading PWL file:\n{entry}\n\n{e}",
                         "PWL Error"
                     )
+                    set_dialog_state("failed", "A PWL power profile could not be read.")
                     return
 
         if len(pad_sources) == 1 and len(power_pads) > 1:
@@ -1308,6 +1335,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     + "\n".join(str(name) for name in missing_pads),
                     "Current Path Error"
                 )
+                set_dialog_state("failed", "One or more current-terminal pads were not found.")
                 return
             if terminals:
                 electrical_config = ElectricalConfig(
@@ -1340,6 +1368,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         + "\n".join(electrical_result.errors),
                         "Current Path Error"
                     )
+                    set_dialog_state("failed", "Current-path validation failed.")
                     return
                 q_joule = electrical_result.q_joule
                 if np.any(q_joule):
@@ -1398,7 +1427,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # Progress dialog
         pd = wx.ProgressDialog(
-            "Simulating...", "Initializing...", 100,
+            "ThermalSim", "Preparing thermal model...", 100,
             style=wx.PD_CAN_ABORT | wx.PD_APP_MODAL | wx.PD_REMAINING_TIME | wx.PD_AUTO_HIDE
         )
 
@@ -1459,7 +1488,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             total = progress_state["total"]
             percent = int((current / total) * 100) if total else 0
             try:
-                update_result = pd.Update(percent, f"Step {current}/{total}")
+                update_result = pd.Update(percent, f"Solving thermal model - step {current}/{total}")
                 keep_going = update_result[0] if isinstance(update_result, tuple) else update_result
                 if not keep_going or (hasattr(pd, "WasCancelled") and pd.WasCancelled()):
                     cancel_token.cancel()
@@ -1489,11 +1518,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             error_text = worker_result["traceback"]
             _write_run_manifest(run_dir, "error", traceback=error_text)
             wx.MessageBox(f"Solver failed:\n{error_text}", "Solver Error")
+            set_dialog_state("failed", "The thermal solver failed. See the error dialog for details.")
             return
         result = worker_result["result"]
 
         if result.aborted:
             _write_run_manifest(run_dir, "cancelled")
+            set_dialog_state("cancelled")
             return
 
         # Add extra info to k_norm_info
@@ -1613,16 +1644,26 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             heatmap_path=heatmap_path,
             preview_path=preview_path,
         )
+        elapsed_s = time.perf_counter() - run_started_at
+        max_temp_c = float(np.max(result.T))
         self.last_artifacts = SimulationArtifacts(
             report_path=report_path,
             preview_path=preview_path,
             heatmap_path=heatmap_path,
             run_dir=run_dir,
             status="success",
+            elapsed_s=elapsed_s,
+            max_temp_c=max_temp_c,
         )
         if self.settings_dialog is not None:
             try:
-                wx.CallAfter(self.settings_dialog.set_artifacts, report_path, run_dir)
+                wx.CallAfter(
+                    self.settings_dialog.set_artifacts,
+                    report_path,
+                    run_dir,
+                    elapsed_s,
+                    max_temp_c,
+                )
             except Exception:
                 pass
 

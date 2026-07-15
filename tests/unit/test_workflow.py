@@ -8,6 +8,7 @@ from ThermalSim.workflow import (
     GeometryCache,
     GridEstimate,
     PreflightResult,
+    SimulationArtifacts,
     ThermalFactorizationCache,
     ThermalOperatorCache,
     geometry_cache_key,
@@ -94,6 +95,18 @@ def test_preflight_status_prioritizes_errors():
     result.errors.append("error")
     assert result.status == "Blocked"
     assert result.ready is False
+
+
+def test_simulation_artifacts_carry_compact_result_summary():
+    artifacts = SimulationArtifacts(
+        report_path="report.html",
+        run_dir="results",
+        status="success",
+        elapsed_s=8.2,
+        max_temp_c=56.3,
+    )
+    assert artifacts.elapsed_s == 8.2
+    assert artifacts.max_temp_c == 56.3
 
 
 def test_large_auto_pardiso_plan_uses_single_uniform_phase():
