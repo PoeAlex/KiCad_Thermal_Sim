@@ -7,15 +7,10 @@ discretized conductivity arrays for thermal simulation.
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Set
+from typing import Callable, Optional, Set
 
 import numpy as np
 import pcbnew
-
-try:
-    from matplotlib.path import Path as _MplPath
-except ImportError:
-    _MplPath = None
 
 
 @dataclass
@@ -293,6 +288,242 @@ def _state_fill_box(state, l_idx, bbox):
         target |= region_mask
 
 
+def _state_apply_shape(
+    state,
+    l_idx,
+    bbox,
+    predicate: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    tile_size=512,
+):
+    """Rasterize a shape predicate into one copper layer in bounded tiles."""
+    rs, re, cs, ce = _bbox_to_grid_indices(bbox, state)
+    if cs >= ce or rs >= re or rs >= state.rows or cs >= state.cols:
+        return
+
+    for r0 in range(rs, re, tile_size):
+        r1 = min(re, r0 + tile_size)
+        y = state.y_min + (np.arange(r0, r1, dtype=np.float64) + 0.5) * state.res
+        for c0 in range(cs, ce, tile_size):
+            c1 = min(ce, c0 + tile_size)
+            if state.area_mask is not None:
+                allowed = state.area_mask[r0:r1, c0:c1]
+                if not np.any(allowed):
+                    continue
+            else:
+                allowed = None
+            x = state.x_min + (np.arange(c0, c1, dtype=np.float64) + 0.5) * state.res
+            xx, yy = np.meshgrid(x, y)
+            inside = np.asarray(predicate(xx, yy), dtype=bool)
+            if allowed is not None:
+                inside &= allowed
+            if np.any(inside):
+                state.copper_mask[l_idx, r0:r1, c0:c1] |= inside
+
+
+def _segment_parameters(start, end):
+    """Return a line-segment representation in millimetres."""
+    sx = float(start.x) * 1e-6
+    sy = float(start.y) * 1e-6
+    ex = float(end.x) * 1e-6
+    ey = float(end.y) * 1e-6
+    vx = ex - sx
+    vy = ey - sy
+    return sx, sy, vx, vy, vx * vx + vy * vy
+
+
+def _state_fill_segment(state, l_idx, track):
+    """Rasterize a straight track using its centreline and actual width."""
+    try:
+        start = track.GetStart()
+        end = track.GetEnd()
+        width_mm = max(float(track.GetWidth()) * 1e-6, 0.0)
+        bbox = track.GetBoundingBox()
+    except Exception:
+        _state_fill_box(state, l_idx, track.GetBoundingBox())
+        return
+
+    sx, sy, vx, vy, seg_len_sq = _segment_parameters(start, end)
+    radius = 0.5 * width_mm
+
+    def predicate(xx, yy):
+        if seg_len_sq <= 1e-24:
+            return np.hypot(xx - sx, yy - sy) <= radius
+        projection = ((xx - sx) * vx + (yy - sy) * vy) / seg_len_sq
+        projection = np.clip(projection, 0.0, 1.0)
+        px = sx + projection * vx
+        py = sy + projection * vy
+        return np.hypot(xx - px, yy - py) <= radius
+
+    _state_apply_shape(state, l_idx, bbox, predicate)
+
+
+def _circle_from_three_points(start, middle, end):
+    """Return circle centre and radius for three KiCad points, if defined."""
+    x1, y1 = float(start.x) * 1e-6, float(start.y) * 1e-6
+    x2, y2 = float(middle.x) * 1e-6, float(middle.y) * 1e-6
+    x3, y3 = float(end.x) * 1e-6, float(end.y) * 1e-6
+    det = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
+    if abs(det) <= 1e-18:
+        return None
+    u1 = x1 * x1 + y1 * y1
+    u2 = x2 * x2 + y2 * y2
+    u3 = x3 * x3 + y3 * y3
+    cx = (u1 * (y2 - y3) + u2 * (y3 - y1) + u3 * (y1 - y2)) / det
+    cy = (u1 * (x3 - x2) + u2 * (x1 - x3) + u3 * (x2 - x1)) / det
+    return cx, cy, math.hypot(x1 - cx, y1 - cy)
+
+
+def _state_fill_arc(state, l_idx, track):
+    """Rasterize a circular PCB arc when start/mid/end are available."""
+    try:
+        start = track.GetStart()
+        middle = track.GetMid()
+        end = track.GetEnd()
+        circle = _circle_from_three_points(start, middle, end)
+        if circle is None:
+            _state_fill_segment(state, l_idx, track)
+            return
+        cx, cy, radius = circle
+        half_width = 0.5 * float(track.GetWidth()) * 1e-6
+        bbox = track.GetBoundingBox()
+        start_angle = math.atan2(float(start.y) * 1e-6 - cy, float(start.x) * 1e-6 - cx)
+        middle_angle = math.atan2(float(middle.y) * 1e-6 - cy, float(middle.x) * 1e-6 - cx)
+        end_angle = math.atan2(float(end.y) * 1e-6 - cy, float(end.x) * 1e-6 - cx)
+    except Exception:
+        _state_fill_segment(state, l_idx, track)
+        return
+
+    def predicate(xx, yy):
+        dx = xx - cx
+        dy = yy - cy
+        radial = np.abs(np.hypot(dx, dy) - radius) <= half_width
+        angles = np.arctan2(dy, dx)
+        tau = 2.0 * np.pi
+        ccw_span = (end_angle - start_angle) % tau
+        ccw_middle = (middle_angle - start_angle) % tau
+        if ccw_middle <= ccw_span:
+            angular = np.mod(angles - start_angle, tau) <= ccw_span
+        else:
+            clockwise_span = (start_angle - end_angle) % tau
+            angular = np.mod(start_angle - angles, tau) <= clockwise_span
+        return radial & angular
+
+    _state_apply_shape(state, l_idx, bbox, predicate)
+
+
+def _state_fill_circle(state, layer_indices, bbox, center, diameter_mm):
+    """Rasterize a circular pad or via on one or more layers."""
+    cx = float(center.x) * 1e-6
+    cy = float(center.y) * 1e-6
+    radius = 0.5 * max(float(diameter_mm), 0.0)
+
+    def predicate(xx, yy):
+        return (xx - cx) ** 2 + (yy - cy) ** 2 <= radius * radius
+
+    for layer_idx in layer_indices:
+        _state_apply_shape(state, layer_idx, bbox, predicate)
+
+
+def _pad_orientation_radians(pad):
+    """Return pad rotation in radians across supported KiCad APIs."""
+    try:
+        return math.radians(float(pad.GetOrientationDegrees()))
+    except Exception:
+        pass
+    try:
+        orientation = pad.GetOrientation()
+        if hasattr(orientation, "AsDegrees"):
+            return math.radians(float(orientation.AsDegrees()))
+        return math.radians(float(orientation) / 10.0)
+    except Exception:
+        return 0.0
+
+
+def _state_fill_pad(state, layer_indices, pad):
+    """Rasterize common KiCad pad shapes, falling back safely for custom pads."""
+    bbox = pad.GetBoundingBox()
+    try:
+        center = pad.GetPosition()
+        size = pad.GetSize()
+        width_mm = max(float(size.x) * 1e-6, state.res)
+        height_mm = max(float(size.y) * 1e-6, state.res)
+        shape = pad.GetShape()
+    except Exception:
+        for layer_idx in layer_indices:
+            _state_fill_box(state, layer_idx, bbox)
+        return
+
+    circle_shape = getattr(pcbnew, "PAD_SHAPE_CIRCLE", object())
+    oval_shape = getattr(pcbnew, "PAD_SHAPE_OVAL", object())
+    rect_shape = getattr(pcbnew, "PAD_SHAPE_RECT", object())
+    roundrect_shape = getattr(pcbnew, "PAD_SHAPE_ROUNDRECT", object())
+    if shape == circle_shape:
+        _state_fill_circle(state, layer_indices, bbox, center, max(width_mm, height_mm))
+        return
+
+    cx = float(center.x) * 1e-6
+    cy = float(center.y) * 1e-6
+    angle = _pad_orientation_radians(pad)
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    half_w = 0.5 * width_mm
+    half_h = 0.5 * height_mm
+
+    def local_coordinates(xx, yy):
+        dx = xx - cx
+        dy = yy - cy
+        return cos_a * dx + sin_a * dy, -sin_a * dx + cos_a * dy
+
+    if shape == oval_shape:
+        if width_mm >= height_mm:
+            segment_half = max(0.0, 0.5 * (width_mm - height_mm))
+            radius = half_h
+
+            def predicate(xx, yy):
+                local_x, local_y = local_coordinates(xx, yy)
+                nearest_x = np.clip(local_x, -segment_half, segment_half)
+                return (local_x - nearest_x) ** 2 + local_y ** 2 <= radius ** 2
+        else:
+            segment_half = max(0.0, 0.5 * (height_mm - width_mm))
+            radius = half_w
+
+            def predicate(xx, yy):
+                local_x, local_y = local_coordinates(xx, yy)
+                nearest_y = np.clip(local_y, -segment_half, segment_half)
+                return local_x ** 2 + (local_y - nearest_y) ** 2 <= radius ** 2
+    elif shape == roundrect_shape:
+        try:
+            corner_radius = float(pad.GetRoundRectCornerRadius()) * 1e-6
+        except Exception:
+            try:
+                corner_radius = (
+                    float(pad.GetRoundRectRadiusRatio())
+                    * min(width_mm, height_mm)
+                )
+            except Exception:
+                corner_radius = 0.25 * min(width_mm, height_mm)
+        corner_radius = min(max(corner_radius, 0.0), half_w, half_h)
+
+        def predicate(xx, yy):
+            local_x, local_y = local_coordinates(xx, yy)
+            qx = np.abs(local_x) - (half_w - corner_radius)
+            qy = np.abs(local_y) - (half_h - corner_radius)
+            outside = np.hypot(np.maximum(qx, 0.0), np.maximum(qy, 0.0))
+            inside = np.minimum(np.maximum(qx, qy), 0.0)
+            return outside + inside <= corner_radius
+    elif shape == rect_shape:
+        def predicate(xx, yy):
+            local_x, local_y = local_coordinates(xx, yy)
+            return (np.abs(local_x) <= half_w) & (np.abs(local_y) <= half_h)
+    else:
+        for layer_idx in layer_indices:
+            _state_fill_box(state, layer_idx, bbox)
+        return
+
+    for layer_idx in layer_indices:
+        _state_apply_shape(state, layer_idx, bbox, predicate)
+
+
 def _state_fill_box_all_layers(state, bbox):
     """Mark copper occupancy for all layers in a rectangular region."""
     rs, re, cs, ce = _bbox_to_grid_indices(bbox, state)
@@ -323,6 +554,29 @@ def _state_fill_via(state, bbox, val):
     region_mask = state.area_mask[rs:re, cs:ce]
     if np.any(region_mask):
         np.maximum(target, val, out=target, where=region_mask)
+
+
+def _state_fill_via_circle(state, bbox, center, diameter_mm, val, tile_size=512):
+    """Apply via enhancement using the actual circular outer diameter."""
+    rs, re, cs, ce = _bbox_to_grid_indices(bbox, state)
+    if cs >= ce or rs >= re:
+        return
+    cx = float(center.x) * 1e-6
+    cy = float(center.y) * 1e-6
+    radius = 0.5 * max(float(diameter_mm), 0.0)
+    radius_sq = radius * radius
+    for r0 in range(rs, re, tile_size):
+        r1 = min(re, r0 + tile_size)
+        y = state.y_min + (np.arange(r0, r1, dtype=np.float64) + 0.5) * state.res
+        for c0 in range(cs, ce, tile_size):
+            c1 = min(ce, c0 + tile_size)
+            x = state.x_min + (np.arange(c0, c1, dtype=np.float64) + 0.5) * state.res
+            inside = (x[None, :] - cx) ** 2 + (y[:, None] - cy) ** 2 <= radius_sq
+            if state.area_mask is not None:
+                inside &= state.area_mask[r0:r1, c0:c1]
+            if np.any(inside):
+                target = state.via_map[r0:r1, c0:c1]
+                np.maximum(target, val, out=target, where=inside)
 
 
 def _state_fill_heatsink(state, bbox):
@@ -418,18 +672,60 @@ def _fill_zone_mask_hit_test(mask, area_mask, x_vals, y_vals, zone):
                 continue
 
 
+def _scanline_fill_polygon(target, x_vals, y_vals, vertices, value=True):
+    """Fill one polygon chain using an even/odd scanline rule."""
+    if len(vertices) < 3:
+        return
+    x0 = vertices[:, 0]
+    y0 = vertices[:, 1]
+    x1 = np.roll(x0, -1)
+    y1 = np.roll(y0, -1)
+    non_horizontal = y0 != y1
+    if not np.any(non_horizontal):
+        return
+    x0 = x0[non_horizontal]
+    y0 = y0[non_horizontal]
+    x1 = x1[non_horizontal]
+    y1 = y1[non_horizontal]
+
+    for row_idx, y_value in enumerate(y_vals):
+        crosses = ((y0 <= y_value) & (y_value < y1)) | (
+            (y1 <= y_value) & (y_value < y0)
+        )
+        if not np.any(crosses):
+            continue
+        intersections = x0[crosses] + (
+            (float(y_value) - y0[crosses])
+            * (x1[crosses] - x0[crosses])
+            / (y1[crosses] - y0[crosses])
+        )
+        intersections.sort()
+        pair_count = intersections.size // 2
+        if pair_count <= 0:
+            continue
+        intersections = intersections[:pair_count * 2]
+        starts = np.searchsorted(x_vals, intersections[0::2], side="left")
+        ends = np.searchsorted(x_vals, intersections[1::2], side="right")
+        row = target[row_idx]
+        for start, end in zip(starts, ends):
+            if start < end:
+                row[int(start):int(end)] = value
+
+
 def _fill_zone_mask_polygons(mask, area_mask, x_vals, y_vals, lid, zone):
-    """Rasterize KiCad's filled zone polygons in vectorized C code."""
-    if _MplPath is None or not hasattr(zone, "GetFilledPolysList"):
+    """Rasterize filled zone polygons using a memory-bounded scanline fill."""
+    if not hasattr(zone, "GetFilledPolysList"):
         return False
     try:
+        if hasattr(zone, "IsFilled") and not zone.IsFilled():
+            return False
+        if hasattr(zone, "IsOnLayer") and not zone.IsOnLayer(lid):
+            return False
         poly_set = zone.GetFilledPolysList(lid)
         outline_count = int(poly_set.OutlineCount())
         if outline_count <= 0:
             return False
-        xx, yy = np.meshgrid(x_vals, y_vals)
-        points = np.column_stack((xx.ravel(), yy.ravel()))
-        filled = np.zeros(points.shape[0], dtype=bool)
+        filled = np.zeros(mask.shape, dtype=bool)
 
         def chain_vertices(chain):
             count = int(chain.PointCount())
@@ -441,10 +737,10 @@ def _fill_zone_mask_polygons(mask, area_mask, x_vals, y_vals, lid, zone):
 
         for outline_idx in range(outline_count):
             outer = chain_vertices(poly_set.Outline(outline_idx))
-            if len(outer) >= 3:
-                inside = _MplPath(outer, closed=True).contains_points(points, radius=1.0)
-            else:
+            if len(outer) < 3:
                 continue
+            inside = np.zeros(mask.shape, dtype=bool)
+            _scanline_fill_polygon(inside, x_vals, y_vals, outer, True)
             try:
                 hole_count = int(poly_set.HoleCount(outline_idx))
             except Exception:
@@ -452,10 +748,9 @@ def _fill_zone_mask_polygons(mask, area_mask, x_vals, y_vals, lid, zone):
             for hole_idx in range(hole_count):
                 hole = chain_vertices(poly_set.Hole(outline_idx, hole_idx))
                 if len(hole) >= 3:
-                    inside &= ~_MplPath(hole, closed=True).contains_points(points, radius=-1.0)
+                    _scanline_fill_polygon(inside, x_vals, y_vals, hole, False)
             filled |= inside
 
-        filled = filled.reshape(mask.shape)
         if area_mask is not None:
             filled &= area_mask
         mask[...] = filled
@@ -601,28 +896,62 @@ def build_geometry_state(
             lid = track.GetLayer()
             layer_idx = lid_to_idx.get(lid)
             bbox = track.GetBoundingBox()
-            if layer_idx is not None:
-                _state_fill_box(state, layer_idx, bbox)
             if is_via:
-                _state_fill_via(state, bbox, via_factor)
+                via_layers = []
+                try:
+                    layer_set = track.GetLayerSet()
+                    via_layers = [
+                        idx for idx, copper_lid in enumerate(copper_ids)
+                        if layer_set.Contains(copper_lid)
+                    ]
+                except Exception:
+                    pass
+                if not via_layers:
+                    via_layers = list(range(num_layers))
+                try:
+                    diameter_mm = float(track.GetWidth()) * 1e-6
+                    center = track.GetPosition()
+                except Exception:
+                    diameter_mm = max(
+                        float(bbox.GetWidth()), float(bbox.GetHeight())
+                    ) * 1e-6
+                    center = pcbnew.VECTOR2I(
+                        bbox.GetX() + bbox.GetWidth() // 2,
+                        bbox.GetY() + bbox.GetHeight() // 2,
+                    )
+                _state_fill_circle(state, via_layers, bbox, center, diameter_mm)
+                _state_fill_via_circle(
+                    state, bbox, center, diameter_mm, via_factor
+                )
+            elif layer_idx is not None:
+                if hasattr(track, "GetMid"):
+                    _state_fill_arc(state, layer_idx, track)
+                else:
+                    _state_fill_segment(state, layer_idx, track)
 
         for fp in footprints:
             for pad in fp.Pads():
                 bbox = pad.GetBoundingBox()
                 if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
-                    _state_fill_box_all_layers(state, bbox)
-                    _state_fill_via(state, bbox, via_factor)
+                    pad_layers = list(range(num_layers))
+                    _state_fill_pad(state, pad_layers, pad)
+                    try:
+                        size = pad.GetSize()
+                        diameter_mm = min(float(size.x), float(size.y)) * 1e-6
+                        center = pad.GetPosition()
+                        _state_fill_via_circle(
+                            state, bbox, center, diameter_mm, via_factor
+                        )
+                    except Exception:
+                        _state_fill_via(state, bbox, via_factor)
                 else:
                     layer_idx = lid_to_idx.get(pad.GetLayer())
                     if layer_idx is not None:
-                        _state_fill_box(state, layer_idx, bbox)
+                        _state_fill_pad(state, [layer_idx], pad)
 
         for zone in zones:
             if hasattr(zone, "IsFilled") and not zone.IsFilled():
-                is_rule_area = getattr(zone, "GetIsRuleArea", lambda: False)()
-                is_keepout = getattr(zone, "GetIsKeepout", lambda: False)()
-                if is_rule_area or is_keepout:
-                    continue
+                continue
 
             if ignore_polygons:
                 zone_net_name = None

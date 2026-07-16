@@ -1,5 +1,7 @@
 """Tests for shared workflow, grid, cancellation, and cache behavior."""
 
+import numpy as np
+
 from ThermalSim.electrical_solver import CurrentTerminal
 from ThermalSim.thermal_plugin import (
     _coarsen_grid_resolution,
@@ -16,6 +18,7 @@ from ThermalSim.workflow import (
     SimulationArtifacts,
     ThermalFactorizationCache,
     ThermalOperatorCache,
+    get_process_memory_mb,
     geometry_cache_key,
 )
 from tests.mocks.pcbnew_mock import (
@@ -150,6 +153,40 @@ def test_geometry_cache_invalidates_geometry_changes():
     assert cache.get("first") is None
 
 
+def test_geometry_cache_can_persist_between_instances(tmp_path):
+    cache_dir = tmp_path / "geometry-cache"
+    first = GeometryCache(
+        persistent=True,
+        max_bytes=1024 * 1024,
+        cache_dir=str(cache_dir),
+    )
+    value = {"mask": np.arange(12).reshape(3, 4)}
+    first.put("abc123", value)
+
+    second = GeometryCache(
+        persistent=True,
+        max_bytes=1024 * 1024,
+        cache_dir=str(cache_dir),
+    )
+    loaded = second.get("abc123")
+
+    np.testing.assert_array_equal(loaded["mask"], value["mask"])
+
+
+def test_geometry_cache_prunes_old_files(tmp_path):
+    cache = GeometryCache(
+        persistent=True,
+        max_bytes=600,
+        cache_dir=str(tmp_path / "geometry-cache"),
+    )
+    cache.put("first", {"data": b"x" * 400})
+    cache.put("second", {"data": b"y" * 400})
+
+    files = list((tmp_path / "geometry-cache").glob("*.pickle"))
+    assert len(files) == 1
+    assert files[0].name == "second.pickle"
+
+
 def test_thermal_operator_cache_reuses_only_matching_key():
     cache = ThermalOperatorCache()
     operator = object()
@@ -180,6 +217,11 @@ def test_cancellation_token_is_thread_safe_signal():
     assert token.cancelled is False
     token.cancel()
     assert token.cancelled is True
+
+
+def test_process_memory_probe_is_safe():
+    value = get_process_memory_mb()
+    assert value is None or value > 0.0
 
 
 def test_preflight_status_prioritizes_errors():

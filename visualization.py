@@ -499,6 +499,7 @@ def save_preview_image(
     out_dir=None,
     geometry_state=None,
     grid_spec=None,
+    adaptive_mesh=None,
 ):
     """
     Save a geometry preview image showing copper, vias, and heat sources.
@@ -537,13 +538,6 @@ def save_preview_image(
     """
     if not board or not bbox:
         return None
-
-    # Keep zone fills up-to-date
-    if geometry_state is None:
-        try:
-            pcbnew.ZONE_FILLER(board).Fill(board.Zones())
-        except Exception:
-            pass
 
     if grid_spec is None:
         res = settings['res']
@@ -640,6 +634,24 @@ def save_preview_image(
             # Show copper as a mask overlay
             copper_mask = K[i] > k_fr4_rel
             ax.imshow(copper_mask, cmap='Greens', origin='upper', interpolation='none', alpha=0.35)
+
+            if adaptive_mesh is not None:
+                leaf_sizes = np.maximum(
+                    adaptive_mesh.leaves[:, 1] - adaptive_mesh.leaves[:, 0],
+                    adaptive_mesh.leaves[:, 3] - adaptive_mesh.leaves[:, 2],
+                ).astype(np.uint8)
+                cell_sizes = leaf_sizes[adaptive_mesh.leaf_map]
+                refinement = np.ma.masked_where(
+                    cell_sizes <= 1,
+                    adaptive_mesh.max_cell_ratio - cell_sizes + 1,
+                )
+                ax.imshow(
+                    refinement,
+                    cmap='Purples',
+                    origin='upper',
+                    interpolation='none',
+                    alpha=0.16,
+                )
 
             # Heatsink overlay (board-level)
             if settings.get('use_heatsink'):

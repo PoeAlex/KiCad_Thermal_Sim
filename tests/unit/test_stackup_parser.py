@@ -240,6 +240,16 @@ class TestParseStackupFromBoardFile:
         assert 0 in result["copper_ids"]  # F.Cu
         assert 31 in result["copper_ids"]  # B.Cu
 
+    def test_invalid_layer_ids_are_not_returned(self, mock_board_with_file):
+        """Unknown stackup layer names must not reach GetLayerName later."""
+        board = mock_board_with_file(SIMPLE_2_LAYER_STACKUP)
+        board.GetLayerID = lambda _name: -1
+
+        result = parse_stackup_from_board_file(board)
+
+        assert result["copper_ids"] == []
+        assert all(item["layer_id"] is None for item in result["copper"])
+
     def test_copper_order_preserved(self, mock_board_with_file):
         """Test that copper layer order is preserved (top to bottom)."""
         content = generate_kicad_pcb_content(layer_count=4)

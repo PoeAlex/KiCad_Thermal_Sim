@@ -220,3 +220,10 @@ nul
 
 # Claude Code
 .claude/
+
+# ThermalSim native/benchmark build artifacts
+native/build/
+native/bin/*.pdb
+benchmark_fast_engine_*.json
+dist_test_*/
+.codex-remote-attachments/

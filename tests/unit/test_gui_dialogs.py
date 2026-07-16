@@ -898,6 +898,36 @@ class TestSimulationDetailSettings:
         assert values['grid_node_budget'] == 800000
         assert not dlg.grid_node_budget_input.IsEnabled()
 
+    def test_custom_mode_accepts_one_hundred_million_nodes(self):
+        """The Custom spinner and settings serializer should accept 100M nodes."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
+        dlg.grid_detail_choice.SetSelection(4)
+        dlg._on_grid_detail_changed(None)
+        dlg.grid_node_budget_input.SetValue(100_000_000)
+        values = dlg.get_values()
+
+        assert values['grid_detail_level'] == 'custom'
+        assert values['grid_node_budget'] == 100_000_000
+        assert values['grid_max_cells'] == 50_000_000
+        assert values['grid_target_cells'] == 25_000_000
+
+    def test_custom_defaults_are_clamped_to_one_hundred_million_nodes(self):
+        """Oversized imported settings should be clamped to the UI maximum."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            defaults={
+                'grid_detail_level': 'custom',
+                'grid_node_budget': 250_000_000,
+            },
+        )
+
+        assert dlg.grid_node_budget_input.GetValue() == 100_000_000
+        assert dlg.get_values()['grid_node_budget'] == 100_000_000
+
     def test_apply_defaults_without_grid_settings_keeps_defaults(self):
         """Old JSON settings should migrate to the Balanced detail preset."""
         from ThermalSim.gui_dialogs import SettingsDialog

@@ -187,6 +187,16 @@ def _build_summary_metrics(settings, interactive_heatmap, k_norm_info, snapshot_
             res_detail += f"; simulation area: {float(area_fraction) * 100.0:.0f}% of board"
         except Exception:
             pass
+    mesh_mode = str((k_norm_info or {}).get("mesh_mode", "uniform") or "uniform")
+    adaptive_nodes = (k_norm_info or {}).get("adaptive_nodes")
+    uniform_nodes = (k_norm_info or {}).get("equivalent_uniform_nodes")
+    reduction = (k_norm_info or {}).get("mesh_reduction_ratio")
+    mesh_value = mesh_mode.title()
+    mesh_detail = None
+    if adaptive_nodes is not None and uniform_nodes is not None:
+        mesh_detail = f"{int(adaptive_nodes):,} / {int(uniform_nodes):,} nodes"
+        if reduction is not None:
+            mesh_detail += f"; {float(reduction):.1f}x reduction"
     metrics = [
         ("Duration", f"{float(settings.get('time', 0.0)):.2f} s" if "time" in settings else "n/a", None),
         ("Ambient", f"{float(settings.get('amb', 0.0)):.2f} C" if "amb" in settings else "n/a", None),
@@ -196,12 +206,13 @@ def _build_summary_metrics(settings, interactive_heatmap, k_norm_info, snapshot_
         ("Bottom Peak", f"{float(bottom_layer.get('max_c')):.2f} C" if bottom_layer and bottom_layer.get("max_c") is not None else "n/a", bottom_layer.get("name") if bottom_layer else None),
         ("Overall Peak", f"{float(overall_peak):.2f} C" if overall_peak is not None else "n/a", None),
         ("Solver", str((k_norm_info or {}).get("backend", "n/a")), f"steps: {(k_norm_info or {}).get('steps_total', 'n/a')}"),
+        ("Mesh", mesh_value, mesh_detail),
         ("Input Power", f"{float((k_norm_info or {}).get('pin_w')):.3f} W" if (k_norm_info or {}).get("pin_w") is not None else "n/a", None),
         ("Final Cooling", f"{float((k_norm_info or {}).get('pout_final_w')):.3f} W" if (k_norm_info or {}).get("pout_final_w") is not None else "n/a", None),
         ("Snapshots", "enabled" if settings.get("snapshots") else "disabled", f"target: {settings.get('snap_count', 0)}"),
         ("Output Folder", os.path.basename(str((snapshot_debug or {}).get("run_dir", ""))) or "n/a", None),
     ]
-    featured_labels = {"Overall Peak", "Input Power", "Resolution", "Solver"}
+    featured_labels = {"Overall Peak", "Input Power", "Resolution", "Solver", "Mesh"}
     cards = []
     for label, value, detail in metrics:
         detail_html = f"<p class='metric-detail'>{_esc(detail)}</p>" if detail else ""

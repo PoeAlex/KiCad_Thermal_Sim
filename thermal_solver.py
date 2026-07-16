@@ -14,6 +14,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
 from .capabilities import HAS_PARDISO
+from .native_core import HAS_NATIVE_CORE, apply_structured_native
 
 if HAS_PARDISO:
     import pypardiso
@@ -163,6 +164,199 @@ class CachedLinearSolver:
         """Release the optional native factorization."""
         _release_linear_solver(self.owner)
         self.owner = None
+
+
+@dataclass
+class StructuredThermalOperator:
+    """Matrix-free thermal operator for the regular multilayer grid."""
+
+    layer_count: int
+    rows: int
+    cols: int
+    gx: np.ndarray
+    gy: np.ndarray
+    gz: np.ndarray
+    boundary_diag: np.ndarray
+    stiffness_diag: np.ndarray
+
+    @property
+    def shape(self):
+        """Return the equivalent square matrix shape."""
+        node_count = self.layer_count * self.rows * self.cols
+        return node_count, node_count
+
+    @property
+    def nnz_estimate(self):
+        """Return the non-zero count of the equivalent assembled matrix."""
+        edge_count = self.gx.size + self.gy.size + self.gz.size
+        return int(self.shape[0] + 2 * edge_count)
+
+    def dot(self, vector):
+        """Apply the stiffness operator without assembling a sparse matrix."""
+        flat_vector = np.ascontiguousarray(vector, dtype=np.float64).reshape(-1)
+        if HAS_NATIVE_CORE:
+            native_result = apply_structured_native(
+                self.layer_count,
+                self.rows,
+                self.cols,
+                self.gx,
+                self.gy,
+                self.gz,
+                self.boundary_diag,
+                flat_vector,
+            )
+            if native_result is not None:
+                return native_result
+        values = np.asarray(vector, dtype=np.float64).reshape(
+            self.layer_count, self.rows, self.cols
+        )
+        result = self.boundary_diag.reshape(values.shape) * values
+
+        if self.cols > 1:
+            difference = values[:, :, :-1] - values[:, :, 1:]
+            flux = self.gx * difference
+            result[:, :, :-1] += flux
+            result[:, :, 1:] -= flux
+        if self.rows > 1:
+            difference = values[:, :-1, :] - values[:, 1:, :]
+            flux = self.gy * difference
+            result[:, :-1, :] += flux
+            result[:, 1:, :] -= flux
+        if self.layer_count > 1 and self.gz.size:
+            difference = values[:-1, :, :] - values[1:, :, :]
+            flux = self.gz * difference
+            result[:-1, :, :] += flux
+            result[1:, :, :] -= flux
+        return result.reshape(-1)
+
+    def implicit_linear_operator(self, capacity, derivative_scale):
+        """Return ``K + derivative_scale * C`` as a SciPy LinearOperator."""
+        capacity = np.asarray(capacity, dtype=np.float64)
+        diagonal = self.stiffness_diag + derivative_scale * capacity
+        shape = self.shape
+
+        def matvec(vector):
+            return self.dot(vector) + derivative_scale * capacity * vector
+
+        operator = spla.LinearOperator(shape, matvec=matvec, dtype=np.float64)
+        inverse_diagonal = np.divide(
+            1.0,
+            diagonal,
+            out=np.zeros_like(diagonal),
+            where=np.abs(diagonal) > 1e-30,
+        )
+        preconditioner = spla.LinearOperator(
+            shape,
+            matvec=lambda vector: inverse_diagonal * vector,
+            dtype=np.float64,
+        )
+        return operator, preconditioner
+
+
+def build_structured_operator(
+    layer_count: int,
+    rows: int,
+    cols: int,
+    copper_mask: np.ndarray,
+    t_cu: np.ndarray,
+    t_fr4_eff: np.ndarray,
+    k_cu: float,
+    k_fr4: float,
+    dx: float,
+    dy: float,
+    V_map: np.ndarray,
+    gap_m: List[float],
+    H_map: np.ndarray,
+    settings: Dict,
+    amb: float,
+):
+    """Build the matrix-free equivalent of :func:`build_stiffness_matrix`."""
+    eps = 1e-12
+    pixel_area = dx * dy
+    node_count = layer_count * rows * cols
+    gx = np.empty((layer_count, rows, max(cols - 1, 0)), dtype=np.float64)
+    gy = np.empty((layer_count, max(rows - 1, 0), cols), dtype=np.float64)
+
+    for layer_idx in range(layer_count):
+        mask = copper_mask[layer_idx]
+        conductivity = np.where(mask, k_cu, k_fr4)
+        thickness = np.where(mask, t_cu[layer_idx], t_fr4_eff[layer_idx])
+        if cols > 1:
+            harmonic_k = (
+                2.0
+                * conductivity[:, :-1]
+                * conductivity[:, 1:]
+                / (conductivity[:, :-1] + conductivity[:, 1:] + eps)
+            )
+            edge_thickness = 0.5 * (thickness[:, :-1] + thickness[:, 1:])
+            gx[layer_idx] = harmonic_k * (edge_thickness * dy) / dx
+        if rows > 1:
+            harmonic_k = (
+                2.0
+                * conductivity[:-1, :]
+                * conductivity[1:, :]
+                / (conductivity[:-1, :] + conductivity[1:, :] + eps)
+            )
+            edge_thickness = 0.5 * (thickness[:-1, :] + thickness[1:, :])
+            gy[layer_idx] = harmonic_k * (edge_thickness * dx) / dy
+
+    if layer_count > 1 and gap_m:
+        gz = np.empty((layer_count - 1, rows, cols), dtype=np.float64)
+        via_enhancement = np.clip(V_map, 1.0, 50.0)
+        for layer_idx in range(layer_count - 1):
+            gap_value = max(gap_m[layer_idx], 1e-6)
+            gz[layer_idx] = (
+                k_fr4 * pixel_area / gap_value
+            ) * via_enhancement
+    else:
+        gz = np.empty((0, rows, cols), dtype=np.float64)
+
+    boundary_diag = np.zeros(node_count, dtype=np.float64)
+    boundary_rhs = np.zeros(node_count, dtype=np.float64)
+    h_area = np.zeros(node_count, dtype=np.float64)
+    plane_cells = rows * cols
+    plane_indices = np.arange(plane_cells, dtype=np.int64)
+
+    h_top = float(settings.get("h_conv", 10.0))
+    top_addition = h_top * pixel_area
+    boundary_diag[plane_indices] += top_addition
+    boundary_rhs[plane_indices] += top_addition * amb
+    h_area[plane_indices] += top_addition
+
+    h_air_bottom = float(settings.get("h_conv", 10.0))
+    pad_thickness = max(0.0001, settings["pad_th"] * 1e-3)
+    h_sink = (settings["pad_k"] / pad_thickness) * 0.2
+    bottom_effective = (
+        (1.0 - H_map) * h_air_bottom + H_map * h_sink
+    )
+    bottom_addition = (bottom_effective * pixel_area).reshape(-1)
+    bottom_indices = (layer_count - 1) * plane_cells + plane_indices
+    boundary_diag[bottom_indices] += bottom_addition
+    boundary_rhs[bottom_indices] += bottom_addition * amb
+    h_area[bottom_indices] += bottom_addition
+
+    diagonal_view = boundary_diag.reshape(layer_count, rows, cols).copy()
+    if cols > 1:
+        diagonal_view[:, :, :-1] += gx
+        diagonal_view[:, :, 1:] += gx
+    if rows > 1:
+        diagonal_view[:, :-1, :] += gy
+        diagonal_view[:, 1:, :] += gy
+    if layer_count > 1 and gz.size:
+        diagonal_view[:-1, :, :] += gz
+        diagonal_view[1:, :, :] += gz
+
+    operator = StructuredThermalOperator(
+        layer_count=layer_count,
+        rows=rows,
+        cols=cols,
+        gx=gx,
+        gy=gy,
+        gz=gz,
+        boundary_diag=boundary_diag,
+        stiffness_diag=diagonal_view.reshape(-1),
+    )
+    return operator, boundary_rhs, h_area, boundary_diag
 
 
 def build_stiffness_matrix(
@@ -442,6 +636,359 @@ def _factor_linear_system(A: sp.csr_matrix, use_pardiso: bool):
         print(f"[ThermalSim][WARN] PARDISO fallback to SciPy: {exc}")
         owner = spla.splu(A.tocsc())
         return owner.solve, owner, "SciPy fallback", None
+
+
+class _CancelledIterativeSolve(RuntimeError):
+    """Internal signal used to stop SciPy CG from its callback."""
+
+
+def _solve_pcg(
+    operator,
+    preconditioner,
+    rhs,
+    initial,
+    cancel_check=None,
+    relative_tolerance=1e-6,
+):
+    """Solve one implicit step with Jacobi-preconditioned conjugate gradients."""
+    iterations = 0
+
+    def callback(_value):
+        nonlocal iterations
+        iterations += 1
+        if cancel_check and cancel_check():
+            raise _CancelledIterativeSolve()
+
+    solution, info = spla.cg(
+        operator,
+        rhs,
+        x0=initial,
+        M=preconditioner,
+        rtol=relative_tolerance,
+        atol=0.0,
+        maxiter=100,
+        callback=callback,
+    )
+    retried = False
+    if info > 0:
+        retried = True
+        solution, retry_info = spla.cg(
+            operator,
+            rhs,
+            x0=solution,
+            M=preconditioner,
+            rtol=relative_tolerance,
+            atol=0.0,
+            maxiter=200,
+            callback=callback,
+        )
+        info = retry_info
+    if info < 0:
+        raise RuntimeError(f"PCG failed with solver status {info}.")
+    if info > 0:
+        raise RuntimeError(
+            f"PCG did not converge after {iterations} iterations "
+            f"(relative tolerance {relative_tolerance:g})."
+        )
+    residual = operator.matvec(solution) - rhs
+    relative_residual = float(
+        np.linalg.norm(residual) / max(np.linalg.norm(rhs), 1e-30)
+    )
+    return solution, iterations, retried, relative_residual
+
+
+def run_simulation_matrix_free(
+    config: SolverConfig,
+    operator: StructuredThermalOperator,
+    C: np.ndarray,
+    Q: np.ndarray,
+    b: np.ndarray,
+    hA: np.ndarray,
+    progress_callback: Optional[Callable[[int, int], bool]] = None,
+    snapshot_callback: Optional[Callable[[np.ndarray, float, int], str]] = None,
+    Q_func: Optional[Callable[[float], np.ndarray]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> SolverResult:
+    """Run BDF2 using a matrix-free structured operator and iterative solves."""
+    layer_count = operator.layer_count
+    rows = operator.rows
+    cols = operator.cols
+    node_count = operator.shape[0]
+    ambient = config.amb
+    temperature = np.full(node_count, ambient, dtype=np.float64)
+    previous_temperature = temperature.copy()
+    initial_energy = float(np.sum(C * (temperature - ambient)))
+    current_time = 0.0
+    step_counter = 0
+    aborted = False
+    total_solve_time = 0.0
+    total_iterations = 0
+    retry_count = 0
+    max_relative_residual = 0.0
+    snapshot_stats = []
+    snapshot_files = []
+    phase_metrics = []
+    balance_history = []
+    previous_snapshot_time = 0.0
+    previous_snapshot_energy = initial_energy
+    balance_integral = 0.0
+    pout_step = 0.0
+    source = Q_func(0.0) if Q_func is not None else Q
+    pin = float(np.sum(source))
+    next_snapshot_idx = 0
+    snapshot_number = 1
+    if bool(getattr(operator, "prefer_derivative_start", False)):
+        backend_name = "Adaptive-Multigrid-PCG"
+    elif HAS_NATIVE_CORE:
+        backend_name = "Native-MatrixFree-PCG"
+    else:
+        backend_name = "MatrixFree-PCG"
+
+    time_stepping_used, phase_plan = _build_phase_plan(config, node_count, False)
+    total_steps = sum(item[2] for item in phase_plan)
+    update_interval = max(1, total_steps // 100)
+
+    def record_snapshot(t_elapsed):
+        nonlocal previous_snapshot_time, previous_snapshot_energy, snapshot_number
+        view = temperature.reshape(layer_count, rows, cols)
+        energy = float(np.sum(C * (temperature - ambient)))
+        energy_delta = energy - initial_energy
+        absolute_error = abs(energy_delta - balance_integral)
+        relative_error = absolute_error / max(abs(t_elapsed * pin), 1e-9)
+        interval = t_elapsed - previous_snapshot_time
+        if interval > 0.0:
+            balance_history.append({
+                "delta_t": interval,
+                "dE": energy - previous_snapshot_energy,
+            })
+        previous_snapshot_time = t_elapsed
+        previous_snapshot_energy = energy
+        snapshot_stats.append({
+            "t": t_elapsed,
+            "max_top": float(np.max(view[0])),
+            "max_bottom": float(np.max(view[-1])),
+            "energy": energy,
+            "pin": pin,
+            "pout": pout_step,
+            "eps_abs": absolute_error,
+            "eps_rel": relative_error,
+            "energy_warn": relative_error > 0.01 or absolute_error > 0.01,
+        })
+        if snapshot_callback:
+            path = snapshot_callback(view, t_elapsed, snapshot_number)
+            if path:
+                snapshot_files.append((t_elapsed, path))
+        snapshot_number += 1
+
+    def advance(rhs, implicit_operator, preconditioner, dt_value):
+        nonlocal temperature, previous_temperature, current_time, step_counter
+        nonlocal total_solve_time, total_iterations, retry_count
+        nonlocal max_relative_residual, pout_step, balance_integral
+        solve_started = time.perf_counter()
+        solution, iterations, retried, relative_residual = _solve_pcg(
+            implicit_operator,
+            preconditioner,
+            rhs,
+            temperature,
+            cancel_check=cancel_check,
+        )
+        elapsed = time.perf_counter() - solve_started
+        previous_temperature, temperature = temperature, solution
+        current_time += dt_value
+        step_counter += 1
+        total_solve_time += elapsed
+        total_iterations += iterations
+        retry_count += int(retried)
+        max_relative_residual = max(max_relative_residual, relative_residual)
+        pout_step = float(np.sum(hA * (temperature - ambient)))
+        balance_integral += dt_value * (pin - pout_step)
+        return elapsed, iterations
+
+    for phase_definition, _, phase_steps, phase_dt in phase_plan:
+        if phase_steps <= 0 or aborted:
+            continue
+        phase_started = time.perf_counter()
+        derivative = C / phase_dt
+        phase_solve_time = 0.0
+        phase_iterations = 0
+        phase_steps_done = 0
+        derivative_start = (
+            time_stepping_used == "uniform"
+            and (
+                node_count >= 250_000
+                or bool(getattr(operator, "prefer_derivative_start", False))
+            )
+        )
+
+        try:
+            if derivative_start:
+                bdf_operator, bdf_preconditioner = operator.implicit_linear_operator(
+                    C, 1.5 / phase_dt
+                )
+                if Q_func is not None:
+                    source = Q_func(current_time)
+                    pin = float(np.sum(source))
+                initial_derivative = (
+                    source + b - operator.dot(temperature)
+                ) / C
+                previous_temperature = temperature - phase_dt * initial_derivative
+                while phase_steps_done < phase_steps and not aborted:
+                    if cancel_check and cancel_check():
+                        aborted = True
+                        break
+                    if Q_func is not None:
+                        source = Q_func(current_time + phase_dt)
+                        pin = float(np.sum(source))
+                    rhs = (
+                        2.0 * derivative * temperature
+                        - 0.5 * derivative * previous_temperature
+                        + source
+                        + b
+                    )
+                    elapsed, iterations = advance(
+                        rhs, bdf_operator, bdf_preconditioner, phase_dt
+                    )
+                    phase_solve_time += elapsed
+                    phase_iterations += iterations
+                    phase_steps_done += 1
+                    if (
+                        step_counter % update_interval == 0
+                        or step_counter == total_steps
+                    ):
+                        if progress_callback and not progress_callback(
+                            step_counter, total_steps
+                        ):
+                            aborted = True
+                            break
+                    if config.snapshots_enabled:
+                        while (
+                            next_snapshot_idx < len(config.snap_times)
+                            and current_time >= config.snap_times[next_snapshot_idx]
+                        ):
+                            record_snapshot(config.snap_times[next_snapshot_idx])
+                            next_snapshot_idx += 1
+                phase_metrics.append({
+                    "phase": phase_definition["name"],
+                    "dt": phase_dt,
+                    "steps": phase_steps_done,
+                    "assembly_s": time.perf_counter() - phase_started - phase_solve_time,
+                    "factorization_s": 0.0,
+                    "avg_solve_s": phase_solve_time / max(phase_steps_done, 1),
+                    "avg_pcg_iterations": phase_iterations / max(phase_steps_done, 1),
+                    "startup": "derivative_bdf2",
+                    "backend": backend_name,
+                })
+                continue
+
+            be_operator, be_preconditioner = operator.implicit_linear_operator(
+                C, 1.0 / phase_dt
+            )
+            bdf_operator, bdf_preconditioner = operator.implicit_linear_operator(
+                C, 1.5 / phase_dt
+            )
+            if Q_func is not None:
+                source = Q_func(current_time + phase_dt)
+                pin = float(np.sum(source))
+            rhs = derivative * temperature + source + b
+            elapsed, iterations = advance(
+                rhs, be_operator, be_preconditioner, phase_dt
+            )
+            phase_solve_time += elapsed
+            phase_iterations += iterations
+            phase_steps_done += 1
+            if step_counter % update_interval == 0 or step_counter == total_steps:
+                if progress_callback and not progress_callback(step_counter, total_steps):
+                    aborted = True
+            if config.snapshots_enabled:
+                while (
+                    next_snapshot_idx < len(config.snap_times)
+                    and current_time >= config.snap_times[next_snapshot_idx]
+                ):
+                    record_snapshot(config.snap_times[next_snapshot_idx])
+                    next_snapshot_idx += 1
+
+            while phase_steps_done < phase_steps and not aborted:
+                if cancel_check and cancel_check():
+                    aborted = True
+                    break
+                if Q_func is not None:
+                    source = Q_func(current_time + phase_dt)
+                    pin = float(np.sum(source))
+                rhs = (
+                    2.0 * derivative * temperature
+                    - 0.5 * derivative * previous_temperature
+                    + source
+                    + b
+                )
+                elapsed, iterations = advance(
+                    rhs, bdf_operator, bdf_preconditioner, phase_dt
+                )
+                phase_solve_time += elapsed
+                phase_iterations += iterations
+                phase_steps_done += 1
+
+                if step_counter % update_interval == 0 or step_counter == total_steps:
+                    if progress_callback and not progress_callback(step_counter, total_steps):
+                        aborted = True
+                        break
+                if config.snapshots_enabled:
+                    while (
+                        next_snapshot_idx < len(config.snap_times)
+                        and current_time >= config.snap_times[next_snapshot_idx]
+                    ):
+                        record_snapshot(config.snap_times[next_snapshot_idx])
+                        next_snapshot_idx += 1
+        except _CancelledIterativeSolve:
+            aborted = True
+
+        phase_metrics.append({
+            "phase": phase_definition["name"],
+            "dt": phase_dt,
+            "steps": phase_steps_done,
+            "assembly_s": time.perf_counter() - phase_started - phase_solve_time,
+            "factorization_s": 0.0,
+            "avg_solve_s": phase_solve_time / max(phase_steps_done, 1),
+            "avg_pcg_iterations": phase_iterations / max(phase_steps_done, 1),
+            "backend": backend_name,
+        })
+
+    final_view = temperature.reshape(layer_count, rows, cols)
+    pout_final = float(np.sum(hA * (temperature - ambient)))
+    average_solve = total_solve_time / max(step_counter, 1)
+    k_norm_info = {
+        "strategy": "matrix_free_implicit_fvm_bdf2",
+        "backend": backend_name,
+        "multi_phase": time_stepping_used != "uniform",
+        "time_stepping": time_stepping_used,
+        "N": node_count,
+        "nnz_K": operator.nnz_estimate,
+        "dt_base": config.dt_base,
+        "steps_target": config.steps_target,
+        "steps_total": step_counter,
+        "factorization_s": 0.0,
+        "factorizations": 0,
+        "factorization_cache_hit": False,
+        "avg_solve_s": average_solve,
+        "avg_pcg_iterations": total_iterations / max(step_counter, 1),
+        "pcg_retry_count": retry_count,
+        "pcg_relative_residual_max": max_relative_residual,
+        "pin_w": pin,
+        "pout_final_w": pout_final,
+        "steady_rel_diff": None,
+    }
+    return SolverResult(
+        T=final_view,
+        aborted=aborted,
+        step_counter=step_counter,
+        total_solve_time=total_solve_time,
+        total_factor_time=0.0,
+        factor_count=0,
+        snapshot_stats=snapshot_stats,
+        snapshot_files=snapshot_files,
+        phase_metrics=phase_metrics,
+        balance_history=balance_history,
+        k_norm_info=k_norm_info,
+    )
 
 
 def run_simulation(

@@ -20,6 +20,8 @@ HAS_PARDISO : bool
     True if pypardiso (Intel MKL sparse solver) is available.
 HAS_NUMBA : bool
     True if numba (JIT compilation) is available.
+HAS_NATIVE_CORE : bool
+    True if the optional Windows x64 CPU DLL is available.
 """
 
 import importlib.util
@@ -85,6 +87,11 @@ try:
     HAS_NUMBA = True
 except ImportError:
     HAS_NUMBA = False
+
+try:
+    from .native_core import HAS_NATIVE_CORE
+except (ImportError, OSError):
+    HAS_NATIVE_CORE = False
 
 
 def is_pypardiso_supported_platform(platform_name=None, machine=None):
@@ -197,4 +204,5 @@ def get_capabilities_summary():
     lines.append(f"  Core libs (all): {_avail(HAS_LIBS)}")
     lines.append(f"  PyPardiso (Intel MKL solver): {_avail(HAS_PARDISO)}")
     lines.append(f"  Numba (JIT compilation): {_avail(HAS_NUMBA)}")
+    lines.append(f"  Native matrix-free CPU core: {_avail(HAS_NATIVE_CORE)}")
     return "\n".join(lines)

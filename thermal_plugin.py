@@ -24,6 +24,7 @@ from .stackup_parser import parse_stackup_from_board_file, format_stackup_report
 from .gui_dialogs import (
     DEFAULT_GRID_MAX_CELLS,
     DEFAULT_GRID_TARGET_CELLS,
+    MAX_CUSTOM_GRID_NODES,
     SettingsDialog,
     prepare_current_groups,
     prepare_power_pads,
@@ -35,8 +36,15 @@ from .electrical_solver import (
     net_key_from_values,
     solve_electrical_heating,
 )
+from .adaptive_mesh import build_adaptive_mesh, build_adaptive_system
 from .geometry_mapper import build_geometry_state, create_multilayer_maps, get_pad_pixels
-from .thermal_solver import SolverConfig, build_stiffness_matrix, run_simulation
+from .thermal_solver import (
+    SolverConfig,
+    build_stiffness_matrix,
+    build_structured_operator,
+    run_simulation,
+    run_simulation_matrix_free,
+)
 from .pwl_parser import parse_pwl_file
 from .visualization import (
     save_snapshot, show_results_top_bot, show_results_all_layers, save_preview_image,
@@ -53,6 +61,7 @@ from .workflow import (
     GridEstimate,
     PreflightResult,
     SimulationArtifacts,
+    get_process_memory_mb,
     geometry_cache_key,
     stable_fingerprint,
 )
@@ -338,7 +347,7 @@ def _resolve_grid_policy(settings, layer_count):
             max_nodes = int(settings.get("grid_node_budget", DEFAULT_GRID_NODE_BUDGET))
         except Exception:
             max_nodes = DEFAULT_GRID_NODE_BUDGET
-        max_nodes = min(10_000_000, max(50_000, max_nodes))
+        max_nodes = min(MAX_CUSTOM_GRID_NODES, max(50_000, max_nodes))
         target_nodes = max(25_000, max_nodes // 2)
         expert = True
     else:
@@ -528,11 +537,25 @@ def _estimate_simulation_area(board, bbox, settings, power_pads=None, terminals=
 def _estimate_solver_cost(nodes, settings):
     """Return conservative memory bounds and a relative runtime class."""
     nodes = max(0, int(nodes))
-    memory_low = int(math.ceil(nodes * 0.00035))
-    memory_high = int(math.ceil(nodes * 0.00120))
+    compute_engine = str(
+        settings.get("compute_engine", "auto") or "auto"
+    ).lower()
+    fast_engine = (
+        compute_engine == "fast_native"
+        or (compute_engine == "auto" and nodes >= 250_000)
+    )
+    if fast_engine:
+        memory_low = int(math.ceil(nodes * 0.00012))
+        memory_high = int(math.ceil(nodes * 0.00045))
+        thresholds = (500_000, 2_000_000, 7_000_000)
+    else:
+        memory_low = int(math.ceil(nodes * 0.00035))
+        memory_high = int(math.ceil(nodes * 0.00120))
+        thresholds = (150_000, 500_000, 1_000_000)
     backend = str(settings.get("solver_backend", "auto") or "auto").lower()
-    thresholds = (150_000, 500_000, 1_000_000)
-    if backend == "pardiso" or (backend == "auto" and HAS_PARDISO):
+    if not fast_engine and (
+        backend == "pardiso" or (backend == "auto" and HAS_PARDISO)
+    ):
         thresholds = (250_000, 800_000, 1_600_000)
     if nodes < thresholds[0]:
         runtime = "Fast"
@@ -631,26 +654,129 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.stack_info = None
         self.last_zone_refill_s = 0.0
         self.settings_dialog = None
-        self.geometry_cache = GeometryCache()
+        self.geometry_cache = GeometryCache(persistent=True)
         self.operator_cache = ThermalOperatorCache()
         self.electrical_cache = ThermalOperatorCache()
         self.factorization_cache = ThermalFactorizationCache()
         self.cancel_token = None
         self.last_artifacts = None
+        self.startup_dialog = None
+
+    def _show_startup_progress(self, percent, message):
+        """Show immediate feedback while the settings dialog is prepared."""
+        try:
+            if self.startup_dialog is None:
+                self.startup_dialog = wx.ProgressDialog(
+                    "ThermalSim",
+                    message,
+                    maximum=100,
+                    style=getattr(wx, "PD_APP_MODAL", 0),
+                )
+            self.startup_dialog.Update(int(percent), message)
+            app = wx.GetApp()
+            if app is not None:
+                app.Yield()
+        except Exception:
+            pass
+
+    def _close_startup_progress(self):
+        """Close the temporary startup progress window."""
+        if self.startup_dialog is None:
+            return
+        try:
+            self.startup_dialog.Destroy()
+        except Exception:
+            pass
+        self.startup_dialog = None
+
+    def _count_unfilled_copper_zones(self, board):
+        """Return the number of normal copper zones without a valid fill."""
+        try:
+            zones = list(board.Zones() if hasattr(board, "Zones") else board.GetZones())
+        except Exception:
+            return 0
+        unfilled = 0
+        for zone in zones:
+            try:
+                is_rule_area = bool(
+                    getattr(zone, "GetIsRuleArea", lambda: False)()
+                )
+                is_keepout = bool(
+                    getattr(zone, "GetIsKeepout", lambda: False)()
+                )
+                if is_rule_area or is_keepout:
+                    continue
+                if hasattr(zone, "IsFilled") and not zone.IsFilled():
+                    unfilled += 1
+            except Exception:
+                continue
+        return unfilled
+
+    def _require_filled_zones(self, board):
+        """Block geometry work safely when KiCad copper zones are stale."""
+        unfilled = self._count_unfilled_copper_zones(board)
+        if unfilled <= 0:
+            return True
+        wx.MessageBox(
+            f"{unfilled} copper zone(s) are not filled.\n\n"
+            "Please return to PCB Editor, press B to refill all zones, "
+            "then start Preview or Run again.\n\n"
+            "ThermalSim no longer refills zones automatically because that "
+            "can block the UI for a long time and can crash some KiCad builds.",
+            "ThermalSim - Refill Copper Zones",
+        )
+        return False
 
     def _capture_board_snapshot(self, board, copper_ids, bbox):
-        """Capture a cheap deterministic identity for geometry cache safety."""
+        """Capture a deterministic identity for safe persistent geometry reuse."""
         tracks = list(board.Tracks() if hasattr(board, "Tracks") else board.GetTracks())
         footprints = list(board.Footprints() if hasattr(board, "Footprints") else board.GetFootprints())
         zones = list(board.Zones() if hasattr(board, "Zones") else board.GetZones())
         primitive_rows = []
-        for item in tracks + zones:
+        for item in tracks:
             try:
                 rect = item.GetBoundingBox()
-                primitive_rows.append((
+                row = [
                     type(item).__name__, int(item.GetLayer()), rect.GetX(), rect.GetY(),
                     rect.GetWidth(), rect.GetHeight(),
-                ))
+                ]
+                for getter in ("GetStart", "GetMid", "GetEnd", "GetPosition"):
+                    try:
+                        point = getattr(item, getter)()
+                        row.extend((getter, int(point.x), int(point.y)))
+                    except Exception:
+                        continue
+                try:
+                    row.extend(("width", int(item.GetWidth())))
+                except Exception:
+                    pass
+                primitive_rows.append(tuple(row))
+            except Exception:
+                continue
+        for zone in zones:
+            try:
+                rect = zone.GetBoundingBox()
+                zone_row = [
+                    type(zone).__name__, int(zone.GetLayer()),
+                    rect.GetX(), rect.GetY(), rect.GetWidth(), rect.GetHeight(),
+                ]
+                try:
+                    zone_row.extend(
+                        ("layers", tuple(int(value) for value in zone.GetLayerSet().IntSeq()))
+                    )
+                except Exception:
+                    pass
+                for getter in (
+                    "GetNetCode",
+                    "GetNetname",
+                    "GetAssignedPriority",
+                    "IsFilled",
+                ):
+                    try:
+                        zone_row.extend((getter, str(getattr(zone, getter)())))
+                    except Exception:
+                        continue
+                primitive_rows.append(tuple(zone_row))
             except Exception:
                 continue
         for fp in footprints:
@@ -661,7 +787,22 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             for pad in fp.Pads():
                 try:
                     pos = pad.GetPosition()
-                    primitive_rows.append(("pad", reference, pad.GetNumber(), pos.x, pos.y, pad.GetLayer()))
+                    rect = pad.GetBoundingBox()
+                    row = [
+                        "pad", reference, pad.GetNumber(), pos.x, pos.y,
+                        pad.GetLayer(), rect.GetX(), rect.GetY(),
+                        rect.GetWidth(), rect.GetHeight(),
+                    ]
+                    for getter in ("GetShape", "GetSize", "GetOrientationDegrees"):
+                        try:
+                            value = getattr(pad, getter)()
+                            if hasattr(value, "x") and hasattr(value, "y"):
+                                row.extend((getter, int(value.x), int(value.y)))
+                            else:
+                                row.extend((getter, str(value)))
+                        except Exception:
+                            continue
+                    primitive_rows.append(tuple(row))
                 except Exception:
                     continue
         bbox_mm = (
@@ -670,9 +811,19 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             bbox.GetWidth() * 1e-6,
             bbox.GetHeight() * 1e-6,
         )
+        filename = str(board.GetFileName() or "")
+        try:
+            file_identity = (
+                os.path.getsize(filename),
+                os.stat(filename).st_mtime_ns,
+            )
+        except OSError:
+            file_identity = None
         return BoardSnapshot(
-            filename=str(board.GetFileName() or ""),
-            fingerprint=stable_fingerprint((bbox_mm, tuple(primitive_rows))),
+            filename=filename,
+            fingerprint=stable_fingerprint(
+                (bbox_mm, file_identity, tuple(primitive_rows))
+            ),
             bbox_mm=bbox_mm,
             copper_layers=tuple(int(x) for x in copper_ids),
             track_count=len(tracks),
@@ -741,6 +892,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             self.RunSafe()
         except Exception:
             wx.MessageBox(traceback.format_exc(), "Thermal Sim Error")
+        finally:
+            self._close_startup_progress()
 
     def RunSafe(self):
         """Main plugin execution logic."""
@@ -760,26 +913,33 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             return
 
         board = pcbnew.GetBoard()
+        self._show_startup_progress(5, "Reading active PCB...")
 
-        # Keep zone fills up-to-date
-        zone_refill_start = time.perf_counter()
-        try:
-            pcbnew.ZONE_FILLER(board).Fill(board.Zones())
-        except Exception:
-            pass
-        zone_refill_s = time.perf_counter() - zone_refill_start
+        # Zone filling is intentionally not performed here. It can take
+        # minutes on large boards and some KiCad builds let C++ map lookup
+        # exceptions escape the Python boundary. Preview/Run validate the
+        # existing fills and ask the user to press B when needed.
+        zone_refill_s = 0.0
 
         # --- 1. Layer Detection ---
+        self._show_startup_progress(20, "Detecting copper layers...")
         copper_ids, layer_names = self._detect_copper_layers(board)
+        self._show_startup_progress(35, "Reading PCB stackup...")
         stack_info = parse_stackup_from_board_file(board)
 
         # Use stackup order if available
         copper_ids_stack = stack_info.get("copper_ids") if isinstance(stack_info, dict) else None
-        if copper_ids_stack and len(copper_ids_stack) >= 2:
-            copper_ids = copper_ids_stack
-            layer_names = [board.GetLayerName(lid) for lid in copper_ids]
+        detected_names = dict(zip(copper_ids, layer_names))
+        valid_stack_ids = [
+            layer_id for layer_id in (copper_ids_stack or [])
+            if layer_id in detected_names
+        ]
+        if len(valid_stack_ids) >= 2:
+            copper_ids = valid_stack_ids
+            layer_names = [detected_names[layer_id] for layer_id in copper_ids]
 
         # --- 2. Auto-Resolution ---
+        self._show_startup_progress(50, "Measuring board dimensions...")
         try:
             bbox = board.GetBoundingBox()
         except:
@@ -789,6 +949,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         suggested_res = self._calculate_suggested_resolution(w_mm, h_mm, len(copper_ids))
 
         # --- 3. Initial Pad Selection ---
+        self._show_startup_progress(65, "Reading selected heat-source pads...")
         selected_pads = self._get_selected_pads(board)
         pads_list = [p[1] for p in selected_pads]
 
@@ -801,9 +962,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.last_zone_refill_s = zone_refill_s
 
         # --- 4. Show Dialog ---
+        self._show_startup_progress(78, "Preparing simulation settings...")
         stackup_details = format_stackup_report_um(stack_info) if stack_info else ""
         pad_names = self._format_pad_names(selected_pads)
-        initial_power_pads = self._get_selected_pad_descriptors(board)
+        initial_power_pads = self._descriptors_from_selected_pads(
+            board, selected_pads
+        )
         board_path = str(board.GetFileName() or "")
         board_dir = os.path.dirname(board_path) if board_path else ""
         default_output_dir = (
@@ -816,6 +980,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         if self.settings_dialog is not None:
             try:
+                self._close_startup_progress()
                 self.settings_dialog.Raise()
                 return
             except Exception:
@@ -853,6 +1018,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         def preflight_callback(settings):
             return self._preflight(board, copper_ids, bbox, settings)
 
+        self._show_startup_progress(92, "Creating ThermalSim dialog...")
         dlg = SettingsDialog(
             None, len(pads_list), suggested_res, layer_names,
             preview_callback=self.generate_preview,
@@ -869,8 +1035,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             defaults=last_settings,
             board_name=os.path.basename(board_path) if board_path else "Unsaved board",
             board_size_mm=(w_mm, h_mm),
+            defer_initial_preflight=True,
         )
         self.settings_dialog = dlg
+        self._close_startup_progress()
         try:
             dlg.Show()
         except Exception:
@@ -1026,6 +1194,20 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         descriptors.append(self._pad_descriptor(board, fp_ref, pad))
         except Exception:
             return []
+        descriptors.sort(key=lambda item: item.get("name", ""))
+        return descriptors
+
+    def _descriptors_from_selected_pads(self, board, selected_pads):
+        """Build descriptors without scanning every footprint a second time."""
+        descriptors = []
+        for name, pad in selected_pads or []:
+            try:
+                number = str(pad.GetNumber())
+                suffix = f"-{number}"
+                fp_ref = name[:-len(suffix)] if name.endswith(suffix) else name
+                descriptors.append(self._pad_descriptor(board, fp_ref, pad))
+            except Exception:
+                continue
         descriptors.sort(key=lambda item: item.get("name", ""))
         return descriptors
 
@@ -1212,6 +1394,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 f"Resolution will be coarsened from {result.grid.requested_res_mm:.3f} "
                 f"to {result.grid.actual_res_mm:.3f} mm."
             )
+        if result.grid.nodes > 10_000_000:
+            result.warnings.append(
+                f"The requested grid contains {result.grid.nodes:,} equivalent "
+                "uniform nodes. Adaptive reduction depends on the actual PCB "
+                "geometry; verify the displayed RAM estimate before running."
+            )
         if settings.get("solver_backend") == "pardiso" and not HAS_PARDISO:
             result.errors.append("PyPardiso was selected but is not available.")
         return result
@@ -1273,6 +1461,21 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
     def generate_preview(self, settings, layer_names):
         """Generate geometry preview image."""
+        def preview_status(message):
+            if self.settings_dialog is None:
+                return
+            try:
+                self.settings_dialog.lbl_preflight.SetLabel(message)
+                app = wx.GetApp()
+                if app is not None:
+                    app.Yield()
+            except Exception:
+                pass
+
+        preview_status("Checking existing KiCad copper-zone fills...")
+        if not self._require_filled_zones(self.board):
+            return None
+        preview_status("Resolving heat sources and simulation area...")
         power_pads = self._resolve_power_pad_objects(self.board, settings, legacy_pads=self.pads_list)
         terminals, _ = self._resolve_current_terminals(self.board, settings)
         current_pads = [item.pad for item in terminals]
@@ -1296,6 +1499,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         )
         geometry_state = self.geometry_cache.get(cache_key)
         if geometry_state is None:
+            preview_status("Rasterizing exact tracks, pads, vias, and zones...")
             geometry_state = build_geometry_state(
                 board=self.board,
                 copper_ids=self.copper_ids,
@@ -1309,6 +1513,49 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 pads_list=preview_pads,
             )
             self.geometry_cache.put(cache_key, geometry_state)
+        preview_adaptive_mesh = None
+        preview_engine = str(
+            effective_settings.get("compute_engine", "auto") or "auto"
+        ).lower()
+        preview_mesh_mode = str(
+            effective_settings.get("mesh_mode", "adaptive") or "adaptive"
+        ).lower()
+        if (
+            preview_mesh_mode == "adaptive"
+            and preview_engine != "legacy"
+        ):
+            preview_status("Building adaptive refinement levels...")
+            source_mask = np.zeros(
+                (len(self.copper_ids), grid.rows, grid.cols), dtype=bool
+            )
+            for pad in preview_pads:
+                pixels = get_pad_pixels(
+                    pad, grid.rows, grid.cols,
+                    grid.x_min_mm, grid.y_min_mm, grid.actual_res_mm
+                )
+                if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
+                    target_layers = range(len(self.copper_ids))
+                else:
+                    try:
+                        target_layers = [self.copper_ids.index(pad.GetLayer())]
+                    except ValueError:
+                        target_layers = [0]
+                for layer_idx in target_layers:
+                    for row, col in pixels:
+                        if 0 <= row < grid.rows and 0 <= col < grid.cols:
+                            source_mask[layer_idx, row, col] = True
+            preview_adaptive_mesh = build_adaptive_mesh(
+                geometry_state.copper_mask,
+                geometry_state.via_map,
+                geometry_state.heatsink_mask,
+                source_mask=source_mask,
+                max_cell_ratio=max(
+                    1, min(16, int(
+                        effective_settings.get("adaptive_max_cell_ratio", 8) or 8
+                    ))
+                ),
+            )
+        preview_status("Rendering preview layers...")
         output_file = save_preview_image(
             self.board, self.copper_ids, self.bbox, preview_pads,
             effective_settings, layer_names,
@@ -1319,6 +1566,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             open_file=True,
             geometry_state=geometry_state,
             grid_spec=grid,
+            adaptive_mesh=preview_adaptive_mesh,
         )
         if not output_file:
             wx.MessageBox("Board data missing for preview", "Error")
@@ -1336,6 +1584,14 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     wx.CallAfter(self.settings_dialog.set_run_state, status, message)
                 except Exception:
                     pass
+
+        set_dialog_state("running", "Checking existing KiCad copper-zone fills...")
+        if not self._require_filled_zones(board):
+            set_dialog_state(
+                "failed",
+                "Copper zones must be refilled in KiCad before simulation.",
+            )
+            return
 
         focus_pads = focus_pads if focus_pads is not None else pads_list
         area_power_pads = self._resolve_power_pad_objects(
@@ -1417,6 +1673,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         gap_m = [max(1e-9, g * 1e-3) for g in gap_mm_used]
 
         # Build internal geometry state
+        set_dialog_state("running", "Mapping exact PCB geometry...")
         geometry_start = time.perf_counter()
         cache_key = self._geometry_key(board, copper_ids, bbox, grid, settings, focus_pads)
         geometry_state = self.geometry_cache.get(cache_key)
@@ -1474,9 +1731,25 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             t_fr4_eff = [max(total_thick_mm * 1e-3, 1e-5)] * layer_count
         t_fr4_eff = np.clip(np.array(t_fr4_eff), 1e-6, 5e-3)
         t_fr4_eff_mm = (t_fr4_eff * 1e3).tolist()
+        engine_setting = str(
+            settings.get("compute_engine", "auto") or "auto"
+        ).strip().lower()
+        if engine_setting not in {"auto", "fast_native", "legacy"}:
+            engine_setting = "auto"
+        use_fast_engine = (
+            engine_setting == "fast_native"
+            or (engine_setting == "auto" and grid.nodes >= 250_000)
+        )
+        resolved_engine = "fast_native" if use_fast_engine else "legacy"
+        mesh_mode = str(settings.get("mesh_mode", "adaptive") or "adaptive").lower()
+        if mesh_mode not in {"adaptive", "uniform"}:
+            mesh_mode = "adaptive"
+        if not use_fast_engine:
+            mesh_mode = "uniform"
 
         operator_key = stable_fingerprint({
             "geometry": cache_key,
+            "compute_engine": resolved_engine,
             "copper_thickness_m": [float(value) for value in t_cu],
             "dielectric_gap_m": [float(value) for value in gap_m],
             "fr4_effective_m": [float(value) for value in t_fr4_eff],
@@ -1491,6 +1764,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         operator_cache_hit = cached_operator is not None
 
         # Heat capacity
+        set_dialog_state("running", "Preparing material capacities...")
         capacity_start = time.perf_counter()
         pad_cap_areal = float(settings.get('pad_cap_areal', 0.0) or 0.0)
         if operator_cache_hit:
@@ -1583,6 +1857,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         electrical_summary = None
         q_joule = None
         if settings.get("current_enabled"):
+            set_dialog_state("running", "Solving active electrical paths...")
             electrical_start = time.perf_counter()
             electrical_cache_hit = False
             terminals, missing_pads = self._resolve_current_terminals(board, settings)
@@ -1664,16 +1939,63 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             else:
                 pad_power.append((name, None))
 
-        # Build stiffness matrix
+        # Build the thermal operator. Large jobs use the matrix-free regular
+        # grid representation, avoiding COO/CSR construction and direct
+        # factorization startup.
+        set_dialog_state("running", "Building the thermal operator...")
         stiffness_start = time.perf_counter()
         if not operator_cache_hit:
-            K_matrix, b, hA, _ = build_stiffness_matrix(
+            builder = build_structured_operator if use_fast_engine else build_stiffness_matrix
+            K_matrix, b, hA, _ = builder(
                 layer_count, rows, cols, copper_mask, t_cu, t_fr4_eff,
                 k_cu, k_fr4, dx, dy, V_map, gap_m, H_map, settings, amb
             )
             self.operator_cache.put(operator_key, (C, K_matrix, b, hA))
         init_timings["stiffness_matrix_s"] = time.perf_counter() - stiffness_start
+        init_timings["compute_engine"] = resolved_engine
+
+        adaptive_system = None
+        if use_fast_engine and mesh_mode == "adaptive":
+            set_dialog_state("running", "Building the adaptive multilevel mesh...")
+            adaptive_started = time.perf_counter()
+            source_mask = np.zeros(N, dtype=bool)
+            for contribution in pad_contributions:
+                source_mask[contribution.indices] = True
+            if q_joule is not None:
+                source_mask |= np.asarray(q_joule) != 0.0
+            max_cell_ratio = max(
+                1, min(16, int(settings.get("adaptive_max_cell_ratio", 8) or 8))
+            )
+            adaptive_grid = build_adaptive_mesh(
+                copper_mask,
+                V_map,
+                geometry_state.heatsink_mask,
+                source_mask=source_mask.reshape(layer_count, rows, cols),
+                max_cell_ratio=max_cell_ratio,
+            )
+            adaptive_system = build_adaptive_system(
+                K_matrix, C, Q, b, hA, adaptive_grid
+            )
+            init_timings["adaptive_mesh_s"] = time.perf_counter() - adaptive_started
+            grid_info.update({
+                "mesh_mode": "adaptive",
+                "equivalent_uniform_nodes": int(N),
+                "adaptive_nodes": int(adaptive_system.operator.shape[0]),
+                "mesh_reduction_ratio": float(
+                    N / max(adaptive_system.operator.shape[0], 1)
+                ),
+                "adaptive_max_cell_ratio": max_cell_ratio,
+            })
+        else:
+            grid_info.update({
+                "mesh_mode": "uniform",
+                "equivalent_uniform_nodes": int(N),
+                "adaptive_nodes": int(N),
+                "mesh_reduction_ratio": 1.0,
+                "adaptive_max_cell_ratio": 1,
+            })
         print(f"[ThermalSim] init timings: {_format_timing_summary(init_timings)}")
+        set_dialog_state("running", "Starting transient solver...")
 
         # Snapshot configuration
         snap_times = []
@@ -1700,15 +2022,31 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         def snapshot_callback(T_view, t_elapsed, snap_idx):
             return save_snapshot(T_view, H_map, amb, layer_names, snap_idx, t_elapsed, out_dir=run_dir)
 
+        if adaptive_system is not None:
+            def solver_snapshot_callback(T_view, t_elapsed, snap_idx):
+                fine_view = adaptive_system.mesh.prolong(
+                    T_view.reshape(-1), layer_count
+                )
+                return snapshot_callback(fine_view, t_elapsed, snap_idx)
+        else:
+            solver_snapshot_callback = snapshot_callback
+
         # Run solver
+        configured_time_stepping = settings.get("time_stepping", "auto")
+        if use_fast_engine and configured_time_stepping == "auto":
+            configured_time_stepping = "uniform"
         config = SolverConfig(
             sim_time=sim_time,
             amb=amb,
             dt_base=dt,
             steps_target=steps_target,
-            use_pardiso=HAS_PARDISO and settings.get("solver_backend", "auto") != "scipy",
+            use_pardiso=(
+                not use_fast_engine
+                and HAS_PARDISO
+                and settings.get("solver_backend", "auto") != "scipy"
+            ),
             use_multi_phase=True,
-            time_stepping=settings.get("time_stepping", "auto"),
+            time_stepping=configured_time_stepping,
             snapshots_enabled=settings.get('snapshots', False),
             snap_times=snap_times
         )
@@ -1726,17 +2064,120 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         def solver_worker():
             try:
-                worker_result["result"] = run_simulation(
-                    config, K_matrix, C, Q, b, hA,
-                    layer_count, rows, cols,
-                    progress_callback, snapshot_callback,
-                    Q_func=Q_func,
-                    cancel_check=lambda: cancel_token.cancelled,
-                    factorization_cache=self.factorization_cache,
-                    factorization_cache_key=factorization_cache_key,
-                )
+                if use_fast_engine:
+                    solver_operator = (
+                        adaptive_system.operator
+                        if adaptive_system is not None
+                        else K_matrix
+                    )
+                    solver_capacity = (
+                        adaptive_system.capacity
+                        if adaptive_system is not None
+                        else C
+                    )
+                    solver_power = (
+                        adaptive_system.power
+                        if adaptive_system is not None
+                        else Q
+                    )
+                    solver_boundary = (
+                        adaptive_system.boundary_rhs
+                        if adaptive_system is not None
+                        else b
+                    )
+                    solver_h_area = (
+                        adaptive_system.h_area
+                        if adaptive_system is not None
+                        else hA
+                    )
+                    solver_power_func = (
+                        adaptive_system.wrap_power_function(Q_func, layer_count)
+                        if adaptive_system is not None
+                        else Q_func
+                    )
+                    worker_result["result"] = run_simulation_matrix_free(
+                        config, solver_operator, solver_capacity, solver_power,
+                        solver_boundary, solver_h_area,
+                        progress_callback, solver_snapshot_callback,
+                        Q_func=solver_power_func,
+                        cancel_check=lambda: cancel_token.cancelled,
+                    )
+                    if adaptive_system is not None:
+                        worker_result["result"].T = adaptive_system.mesh.prolong(
+                            worker_result["result"].T.reshape(-1), layer_count
+                        )
+                else:
+                    worker_result["result"] = run_simulation(
+                        config, K_matrix, C, Q, b, hA,
+                        layer_count, rows, cols,
+                        progress_callback, snapshot_callback,
+                        Q_func=Q_func,
+                        cancel_check=lambda: cancel_token.cancelled,
+                        factorization_cache=self.factorization_cache,
+                        factorization_cache_key=factorization_cache_key,
+                    )
             except Exception:
-                worker_result["traceback"] = traceback.format_exc()
+                fast_traceback = traceback.format_exc()
+                if use_fast_engine and N <= 1_000_000 and not cancel_token.cancelled:
+                    try:
+                        print(
+                            "[ThermalSim][WARN] Fast CPU solver failed; "
+                            "retrying the safe legacy backend."
+                        )
+                        fallback_matrix, fallback_b, fallback_h_area, _ = (
+                            build_stiffness_matrix(
+                                layer_count, rows, cols, copper_mask,
+                                t_cu, t_fr4_eff, k_cu, k_fr4,
+                                dx, dy, V_map, gap_m, H_map, settings, amb,
+                            )
+                        )
+                        fallback_config = SolverConfig(
+                            sim_time=sim_time,
+                            amb=amb,
+                            dt_base=dt,
+                            steps_target=steps_target,
+                            use_pardiso=(
+                                HAS_PARDISO
+                                and settings.get("solver_backend", "auto") != "scipy"
+                            ),
+                            use_multi_phase=True,
+                            time_stepping=settings.get("time_stepping", "auto"),
+                            snapshots_enabled=settings.get("snapshots", False),
+                            snap_times=snap_times,
+                        )
+                        worker_result["result"] = run_simulation(
+                            fallback_config,
+                            fallback_matrix,
+                            C,
+                            Q,
+                            fallback_b,
+                            fallback_h_area,
+                            layer_count,
+                            rows,
+                            cols,
+                            progress_callback,
+                            snapshot_callback,
+                            Q_func=Q_func,
+                            cancel_check=lambda: cancel_token.cancelled,
+                        )
+                        worker_result["result"].k_norm_info.update({
+                            "compute_engine": "legacy_fallback",
+                            "fast_engine_error": fast_traceback,
+                        })
+                        grid_info.update({
+                            "mesh_mode": "uniform",
+                            "adaptive_nodes": int(N),
+                            "mesh_reduction_ratio": 1.0,
+                            "adaptive_max_cell_ratio": 1,
+                        })
+                    except Exception:
+                        worker_result["traceback"] = (
+                            fast_traceback
+                            + "\nLegacy fallback also failed:\n"
+                            + traceback.format_exc()
+                        )
+                else:
+                    worker_result["traceback"] = fast_traceback
 
         worker = threading.Thread(target=solver_worker, name="ThermalSimSolver", daemon=True)
         worker.start()
@@ -1801,7 +2242,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "init_electrical_solve_s": init_timings.get("electrical_solve_s"),
             "init_electrical_cache_hit": init_timings.get("electrical_cache_hit"),
             "init_stiffness_matrix_s": init_timings.get("stiffness_matrix_s"),
+            "init_adaptive_mesh_s": init_timings.get("adaptive_mesh_s"),
             "init_operator_cache_hit": init_timings.get("operator_cache_hit"),
+            "compute_engine": result.k_norm_info.get(
+                "compute_engine", resolved_engine
+            ),
+            "process_working_set_mb": get_process_memory_mb(),
+            "process_peak_working_set_mb": get_process_memory_mb(peak=True),
             "factorization_cache_hit": result.k_norm_info.get("factorization_cache_hit"),
             "electrical_summary": electrical_summary,
         })

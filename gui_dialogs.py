@@ -50,7 +50,10 @@ TOOLTIP_TEXTS = {
     'h_conv': "Convection coefficient in W/(m\u00b2\u00b7K). Still air ~5-10, light fan ~25, forced ~50-100.",
     'pcb_thick': "PCB thickness override in mm. Usually auto-detected from stackup.",
     'grid_detail': "Compute budget used to preserve the desired cell size on large simulations.",
-    'grid_node_budget': "Maximum total solver nodes across all copper layers in Custom mode.",
+    'grid_node_budget': (
+        "Maximum total solver nodes across all copper layers in Custom mode "
+        "(up to 100 million). Very large values can require tens of GB of RAM."
+    ),
     'grid_expert_limits': "Legacy expert-grid setting; loaded as a Custom compute budget.",
     'grid_max_cells': "Legacy 2D cell threshold retained for settings compatibility.",
     'grid_target_cells': "Legacy coarsening target retained for settings compatibility.",
@@ -84,6 +87,7 @@ GRID_DETAIL_PRESETS = {
     "very_detailed": (3000000, 1500000),
 }
 DEFAULT_GRID_NODE_BUDGET = GRID_DETAIL_PRESETS["balanced"][0]
+MAX_CUSTOM_GRID_NODES = 100_000_000
 
 
 def _safe_float(value, default=0.0):
@@ -375,6 +379,8 @@ class SettingsDialog(wx.Dialog):
         Default output directory path.
     defaults : dict, optional
         Default values to pre-fill in the dialog.
+    defer_initial_preflight : bool, optional
+        Schedule the first board scan after the dialog becomes visible.
 
     Attributes
     ----------
@@ -404,6 +410,7 @@ class SettingsDialog(wx.Dialog):
         defaults=None,
         board_name="",
         board_size_mm=None,
+        defer_initial_preflight=False,
     ):
         dialog_style = (
             getattr(wx, "DEFAULT_DIALOG_STYLE", 0)
@@ -556,7 +563,17 @@ class SettingsDialog(wx.Dialog):
             self._render_current_groups()
         self._bind_estimate_controls()
         self._refresh_context_summary()
-        self._refresh_preflight()
+        if defer_initial_preflight:
+            self.lbl_preflight_status.SetLabel("Dialog ready")
+            self.lbl_preflight.SetLabel(
+                "Checking board and simulation settings..."
+            )
+            try:
+                wx.CallAfter(self._refresh_preflight)
+            except Exception:
+                self._refresh_preflight()
+        else:
+            self._refresh_preflight()
 
     # ------------------------------------------------------------------
     # Tab builders
@@ -628,7 +645,7 @@ class SettingsDialog(wx.Dialog):
 
         self.grid_node_budget_input = self._add_int_spin_field(
             box_params, params_parent, "Maximum solver nodes", DEFAULT_GRID_NODE_BUDGET,
-            min_val=50000, max_val=10000000,
+            min_val=50000, max_val=MAX_CUSTOM_GRID_NODES,
             tooltip_key='grid_node_budget',
         )
         self.grid_node_budget_input.Enable(False)
@@ -832,6 +849,37 @@ class SettingsDialog(wx.Dialog):
             box_solver, solver_panel, "PCB thickness (mm)", 1.6,
             min_val=0.1, max_val=10.0, inc=0.1, digits=2,
             tooltip_key='pcb_thick'
+        )
+
+        engine_row = wx.BoxSizer(wx.HORIZONTAL)
+        engine_row.Add(
+            wx.StaticText(solver_panel, label="Compute engine", size=(165, -1)),
+            0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5
+        )
+        self.compute_engine_choice = wx.Choice(
+            solver_panel,
+            choices=["Auto", "Fast CPU (matrix-free)", "Legacy sparse"],
+        )
+        self.compute_engine_choice.SetSelection(0)
+        engine_row.Add(self.compute_engine_choice, 1, wx.EXPAND)
+        box_solver.Add(engine_row, 0, wx.EXPAND | wx.ALL, 3)
+
+        mesh_row = wx.BoxSizer(wx.HORIZONTAL)
+        mesh_row.Add(
+            wx.StaticText(solver_panel, label="Spatial mesh", size=(165, -1)),
+            0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5
+        )
+        self.mesh_mode_choice = wx.Choice(
+            solver_panel,
+            choices=["Adaptive", "Uniform"],
+        )
+        self.mesh_mode_choice.SetSelection(0)
+        mesh_row.Add(self.mesh_mode_choice, 1, wx.EXPAND)
+        box_solver.Add(mesh_row, 0, wx.EXPAND | wx.ALL, 3)
+
+        self.adaptive_ratio_input = self._add_spin_field(
+            box_solver, solver_panel, "Adaptive max cell ratio", 8,
+            min_val=2, max_val=16, inc=1, digits=0,
         )
 
         backend_row = wx.BoxSizer(wx.HORIZONTAL)
@@ -1204,6 +1252,9 @@ class SettingsDialog(wx.Dialog):
         if self.preview_callback:
             settings = self.get_values()
             if settings and self._refresh_preflight(settings):
+                self.lbl_preflight_status.SetLabel("Building preview...")
+                self.lbl_preflight.SetLabel("Extracting and rasterizing board geometry.")
+                self.btn_preview.Enable(False)
                 try:
                     output_path = self.preview_callback(settings, self.layer_names)
                     if output_path:
@@ -1216,6 +1267,8 @@ class SettingsDialog(wx.Dialog):
                     self.lbl_preflight_status.SetLabel("Preview failed")
                     self.lbl_preflight.SetLabel("The geometry preview could not be created.")
                     wx.MessageBox("Geometry preview failed.", "ThermalSim")
+                finally:
+                    self.btn_preview.Enable(True)
 
     def _on_run(self, event):
         """Handle Run button click for modal and modeless workflows."""
@@ -1929,6 +1982,9 @@ class SettingsDialog(wx.Dialog):
         - grid_target_cells : int
         - grid_detail_level : str
         - grid_node_budget : int
+        - compute_engine : str
+        - mesh_mode : str
+        - adaptive_max_cell_ratio : int
         """
         try:
             self._sync_current_group_from_fields()
@@ -1952,7 +2008,10 @@ class SettingsDialog(wx.Dialog):
             grid_expert_limits = grid_detail_level == "custom"
             if grid_expert_limits:
                 grid_node_budget = int(self.grid_node_budget_input.GetValue())
-                if grid_node_budget < 50000 or grid_node_budget > 10000000:
+                if (
+                    grid_node_budget < 50000
+                    or grid_node_budget > MAX_CUSTOM_GRID_NODES
+                ):
                     raise ValueError
                 target_nodes = grid_node_budget // 2
             else:
@@ -1970,6 +2029,20 @@ class SettingsDialog(wx.Dialog):
             stepping_modes = ["auto", "multi_phase", "two_phase", "uniform"]
             stepping_idx = self.time_stepping_choice.GetSelection()
             time_stepping = stepping_modes[stepping_idx] if 0 <= stepping_idx < len(stepping_modes) else "auto"
+            engine_modes = ["auto", "fast_native", "legacy"]
+            engine_idx = self.compute_engine_choice.GetSelection()
+            compute_engine = (
+                engine_modes[engine_idx]
+                if 0 <= engine_idx < len(engine_modes)
+                else "auto"
+            )
+            mesh_modes = ["adaptive", "uniform"]
+            mesh_idx = self.mesh_mode_choice.GetSelection()
+            mesh_mode = (
+                mesh_modes[mesh_idx]
+                if 0 <= mesh_idx < len(mesh_modes)
+                else "adaptive"
+            )
             return {
                 'power_str': power_str,
                 'power_pads': power_pads,
@@ -1997,6 +2070,9 @@ class SettingsDialog(wx.Dialog):
                 'grid_target_cells': grid_target_cells,
                 'grid_detail_level': grid_detail_level,
                 'grid_node_budget': grid_node_budget,
+                'compute_engine': compute_engine,
+                'mesh_mode': mesh_mode,
+                'adaptive_max_cell_ratio': int(self.adaptive_ratio_input.GetValue()),
                 'solver_backend': solver_backend,
                 'time_stepping': time_stepping,
                 'current_enabled': self.chk_current_enabled.GetValue(),
@@ -2072,6 +2148,21 @@ class SettingsDialog(wx.Dialog):
             if 'h_conv' in defaults:
                 self.h_conv_input.SetValue(float(defaults['h_conv']))
 
+            compute_engine = str(defaults.get('compute_engine', 'auto')).lower()
+            compute_engine_idx = {
+                'auto': 0,
+                'fast_native': 1,
+                'legacy': 2,
+            }.get(compute_engine, 0)
+            self.compute_engine_choice.SetSelection(compute_engine_idx)
+
+            mesh_mode = str(defaults.get('mesh_mode', 'adaptive')).lower()
+            self.mesh_mode_choice.SetSelection(1 if mesh_mode == 'uniform' else 0)
+            if 'adaptive_max_cell_ratio' in defaults:
+                self.adaptive_ratio_input.SetValue(
+                    min(16, max(2, int(defaults['adaptive_max_cell_ratio'])))
+                )
+
             backend = str(defaults.get('solver_backend', 'auto')).lower()
             if backend == 'pardiso' and HAS_PARDISO:
                 self.solver_backend_choice.SetSelection(1)
@@ -2096,7 +2187,7 @@ class SettingsDialog(wx.Dialog):
                         defaults.get('grid_max_cells'), DEFAULT_GRID_MAX_CELLS
                     )
                     node_budget = legacy_cells * max(1, len(self.layer_names))
-                node_budget = min(10000000, max(50000, _safe_int(
+                node_budget = min(MAX_CUSTOM_GRID_NODES, max(50000, _safe_int(
                     node_budget, DEFAULT_GRID_NODE_BUDGET
                 )))
                 self.grid_node_budget_input.SetValue(node_budget)
@@ -2121,7 +2212,9 @@ class SettingsDialog(wx.Dialog):
             if self.chk_heatsink.GetValue():
                 self.thermal_pad_pane.Expand()
             if (
-                str(defaults.get('solver_backend', 'auto')).lower() != 'auto'
+                str(defaults.get('compute_engine', 'auto')).lower() != 'auto'
+                or str(defaults.get('mesh_mode', 'adaptive')).lower() != 'adaptive'
+                or str(defaults.get('solver_backend', 'auto')).lower() != 'auto'
                 or str(defaults.get('time_stepping', 'auto')).lower() != 'auto'
                 or float(defaults.get('h_conv', 10.0)) != 10.0
                 or float(defaults.get('thick', 1.6)) != 1.6

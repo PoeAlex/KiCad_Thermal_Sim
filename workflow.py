@@ -1,10 +1,55 @@
 """Shared workflow models for responsive ThermalSim jobs."""
 
 from dataclasses import dataclass, field
+import ctypes
 import hashlib
 import json
+import os
+import pickle
+import tempfile
 import threading
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def get_process_memory_mb(peak=False):
+    """Return current or peak process working set in MiB when supported."""
+    if os.name == "nt":
+        class Counters(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.c_ulong),
+                ("PageFaultCount", ctypes.c_ulong),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        try:
+            counters = Counters()
+            counters.cb = ctypes.sizeof(counters)
+            get_process = ctypes.windll.kernel32.GetCurrentProcess
+            get_process.argtypes = []
+            get_process.restype = ctypes.c_void_p
+            get_memory = ctypes.windll.psapi.GetProcessMemoryInfo
+            get_memory.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(Counters),
+                ctypes.c_ulong,
+            ]
+            get_memory.restype = ctypes.c_int
+            if get_memory(get_process(), ctypes.byref(counters), counters.cb):
+                value = (
+                    counters.PeakWorkingSetSize
+                    if peak else counters.WorkingSetSize
+                )
+                return float(value) / (1024.0 ** 2)
+        except (AttributeError, OSError, ValueError):
+            return None
+    return None
 
 
 @dataclass(frozen=True)
@@ -21,6 +66,9 @@ class SimulationSettings:
     area_mode: str = "full"
     grid_detail_level: str = "balanced"
     grid_node_budget: int = 800000
+    compute_engine: str = "auto"
+    mesh_mode: str = "adaptive"
+    adaptive_max_cell_ratio: int = 8
     backend: str = "auto"
     time_stepping: str = "auto"
 
@@ -40,6 +88,13 @@ class SimulationSettings:
                 values.get("grid_detail_level", "balanced") or "balanced"
             ),
             grid_node_budget=int(values.get("grid_node_budget", 800000) or 800000),
+            compute_engine=str(
+                values.get("compute_engine", "auto") or "auto"
+            ).lower(),
+            mesh_mode=str(values.get("mesh_mode", "adaptive") or "adaptive").lower(),
+            adaptive_max_cell_ratio=int(
+                values.get("adaptive_max_cell_ratio", 8) or 8
+            ),
             backend=str(values.get("solver_backend", "auto") or "auto").lower(),
             time_stepping=str(values.get("time_stepping", "auto") or "auto").lower(),
         )
@@ -199,18 +254,91 @@ class SimulationArtifacts:
 
 
 class GeometryCache:
-    """Single-entry geometry cache optimized for Preview -> Run reuse."""
+    """Geometry cache with optional persistent local-disk reuse."""
 
-    def __init__(self):
+    def __init__(self, persistent=False, max_bytes=4 * 1024 ** 3, cache_dir=None):
         self.key = None
         self.value = None
+        self.persistent = bool(persistent)
+        self.max_bytes = max(0, int(max_bytes))
+        default_root = (
+            os.environ.get("LOCALAPPDATA")
+            or os.path.join(os.path.expanduser("~"), ".cache")
+        )
+        self.cache_dir = cache_dir or os.path.join(
+            default_root, "ThermalSim", "cache", "geometry-v1"
+        )
+
+    def _path(self, key):
+        return os.path.join(self.cache_dir, f"{key}.pickle")
+
+    def _prune(self, keep_path=None):
+        if not self.persistent or self.max_bytes <= 0:
+            return
+        try:
+            entries = [
+                item for item in os.scandir(self.cache_dir)
+                if item.is_file() and item.name.endswith(".pickle")
+            ]
+            total = sum(item.stat().st_size for item in entries)
+            if total <= self.max_bytes:
+                return
+            entries.sort(key=lambda item: item.stat().st_mtime)
+            for item in entries:
+                if keep_path and os.path.normcase(item.path) == os.path.normcase(keep_path):
+                    continue
+                try:
+                    size = item.stat().st_size
+                    os.remove(item.path)
+                    total -= size
+                except OSError:
+                    continue
+                if total <= self.max_bytes:
+                    break
+        except OSError:
+            return
 
     def get(self, key):
-        return self.value if key == self.key else None
+        if key == self.key:
+            return self.value
+        if not self.persistent:
+            return None
+        path = self._path(key)
+        try:
+            with open(path, "rb") as stream:
+                value = pickle.load(stream)
+            os.utime(path, None)
+            self.key = key
+            self.value = value
+            return value
+        except (OSError, EOFError, pickle.PickleError, AttributeError, ValueError):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return None
 
     def put(self, key, value):
         self.key = key
         self.value = value
+        if not self.persistent:
+            return
+        path = self._path(key)
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            handle, temp_path = tempfile.mkstemp(
+                prefix=f"{key}.", suffix=".tmp", dir=self.cache_dir
+            )
+            try:
+                with os.fdopen(handle, "wb") as stream:
+                    pickle.dump(value, stream, protocol=pickle.HIGHEST_PROTOCOL)
+                os.replace(temp_path, path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            self._prune(keep_path=path)
+        except (OSError, pickle.PickleError, AttributeError, TypeError):
+            return
 
     def clear(self):
         self.key = None
@@ -276,6 +404,7 @@ def stable_fingerprint(value: Any) -> str:
 def geometry_cache_key(snapshot: BoardSnapshot, grid: GridEstimate, settings, pad_keys):
     """Build a cache key containing only geometry-affecting inputs."""
     payload = {
+        "geometry_cache_version": 3,
         "board": snapshot.fingerprint,
         "grid": {
             "res": grid.actual_res_mm,

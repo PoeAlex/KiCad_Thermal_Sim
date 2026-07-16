@@ -110,7 +110,10 @@ Shows detected copper layers with thicknesses and dielectric gaps parsed from th
 - **Ambient Temp (C)** - reference temperature. Results are relative to ambient.
 - **Target Cell Size (mm)** - desired spatial grid size. Smaller values improve hotspot and trace localization but increase runtime.
 - **Compute Budget** - choose **Fast**, **Balanced**, **Detailed**, **Very detailed**, or **Custom**. The budget is based on total solver nodes across all copper layers.
-- **Maximum Solver Nodes** - available in Custom mode for an explicit upper limit.
+- **Maximum Solver Nodes** - available in Custom mode for an explicit upper
+  limit of up to 100 million equivalent uniform nodes. Values above 10 million
+  are expert settings and may require tens of GB of RAM before adaptive
+  reduction.
 
 The live estimate shows requested versus actual cell size, grid dimensions, total nodes, approximate resolvable feature size, memory range, and a relative runtime class. For large boards, ThermalSim may automatically coarsen the requested cell size to remain within the selected budget. The report records the requested and actual resolution, compute budget, and simulated board fraction.
 
@@ -216,15 +219,29 @@ The preflight status shows the effective dimensions and percentage of the board.
 
 - **Convection h (W/m2K)** - convection coefficient for top/bottom surfaces. Default is 10.
 - **PCB Thickness (mm)** - overall board thickness. Stackup thickness is used when available.
-- **Capabilities** - detected solver backend, for example SciPy or PyPardiso.
+- **Compute Engine** - `Auto` selects the matrix-free CPU engine for large jobs and keeps the legacy sparse solver for small jobs. Both engines remain manually selectable.
+- **Spatial Mesh** - `Adaptive` keeps the requested cell size at copper edges, pads, vias, sources, and thermal-pad boundaries while merging homogeneous interiors. `Uniform` keeps the full regular grid.
+- **Adaptive Max Cell Ratio** - largest adaptive cell relative to the requested cell size. The default is 8.
+- **Capabilities** - detected solver backend, including the optional `thermalsim_core.dll`.
 
 The **Balanced** compute budget is the default. Presets use total solver nodes, so a four-layer board automatically receives fewer 2D cells than a two-layer board at the same budget. **Custom** exposes one explicit maximum-node value; ThermalSim retains headroom when it must auto-coarsen.
+
+The fast engine applies the finite-volume operator without constructing the
+large global COO/CSR matrix used by the legacy direct solver. Adaptive runs use
+a conservative reduced graph and geometrically coarsened multigrid
+preconditioning. Reports show the equivalent uniform nodes, actual adaptive
+nodes, reduction factor, PCG iterations, and residual.
 
 ---
 
 ## Preview
 
 The **Preview** button generates a geometry visualization showing copper distribution, power/current pad locations, via regions, and the effective simulation-area boundary on each layer. Its header reports the cropped dimensions and percentage of the board.
+
+ThermalSim uses the copper-zone fills already stored by KiCad. If zones are
+stale or unfilled, press **B** in PCB Editor before Preview or Run. The plugin
+does not refill zones automatically because this can block the interface for
+minutes on large boards and is unstable in some KiCad builds.
 
 ![Preview](docs/images/preview.png "KiCad editor with geometry preview")
 
@@ -283,9 +300,11 @@ The plugin is split into focused modules:
 | `dependency_installer.py` | Auto-install dialog for missing packages via pip |
 | `stackup_parser.py` | Parse copper/dielectric layers from `.kicad_pcb` S-expressions |
 | `gui_dialogs.py` | wxPython dialog for simulation parameters |
-| `geometry_mapper.py` | Convert PCB geometry to discretized conductivity arrays |
+| `geometry_mapper.py` | Accurately rasterize tracks, arcs, pads, vias, and filled zones |
+| `adaptive_mesh.py` | Build conservative adaptive meshes and multigrid operators |
 | `electrical_solver.py` | Solve DC current flow and convert copper losses to heat sources |
-| `thermal_solver.py` | Sparse matrix assembly and BDF2 time integration |
+| `thermal_solver.py` | Legacy sparse and matrix-free PCG/BDF2 thermal solvers |
+| `native_core.py` | Load the optional Windows x64 C++/OpenMP CPU core |
 | `pwl_parser.py` | Parse LTspice-style PWL power profiles |
 | `visualization.py` | Generate thermal plots, previews, heatmap payloads, and Joule loss maps |
 | `thermal_report.py` | Generate the HTML report |
@@ -311,13 +330,14 @@ The plugin is split into focused modules:
 
 1. Add manual dissipating components in **Heat Sources**.
 2. Add source/sink terminals in **Current Heating** only when copper `I^2R` heating matters.
-3. Enable **Limit to Active Sources and Current Paths** and start with a moderate thermal margin, for example 20 mm.
-4. Check the effective board percentage; active current nets are always included completely.
-5. Tune **Target Cell Size** until hotspots and current-path metrics are stable. Try 0.5 mm, then 0.3 mm.
-6. Increase the **Compute Budget** only after checking the live node, memory, and runtime estimate.
-7. Save JSON settings for repeatable project comparisons.
-8. Compare layout variants using the same settings.
-9. Validate important designs with measurement or a full 3D thermal workflow.
+3. Press **B** in PCB Editor so every copper zone has a current fill.
+4. Enable **Limit to Active Sources and Current Paths** and start with a moderate thermal margin, for example 20 mm.
+5. Check the effective board percentage; active current nets are always included completely.
+6. Tune **Target Cell Size** until hotspots and current-path metrics are stable. Try 0.5 mm, then 0.3 mm.
+7. Increase the **Compute Budget** only after checking the live node, memory, and runtime estimate.
+8. Save JSON settings for repeatable project comparisons.
+9. Compare layout variants using the same settings.
+10. Validate important designs with measurement or a full 3D thermal workflow.
 
 ---
 
@@ -328,6 +348,28 @@ Run the test suite from the repository root:
 ```bat
 run_tests.bat
 ```
+
+Run the synthetic large-grid benchmark without a proprietary board file:
+
+```bash
+python benchmark_fast_engine.py --nodes 10000000 --layers 4 --solve-steps 3
+```
+
+Legacy matrix construction is automatically skipped above the configured
+safety limit. The benchmark reports equivalent/adaptive node counts, operator
+build times, solve time, iteration counts, and process memory.
+
+To build the optional native Windows CPU core, install Visual Studio Build
+Tools with the C++ workload, then run:
+
+```bash
+cmake -S native -B native/build
+cmake --build native/build --config Release
+```
+
+The generated `native/bin/thermalsim_core.dll` is included automatically by
+`build_pcm_package.py`. Without the DLL, the same fast-engine interface uses
+the NumPy/SciPy CPU implementation.
 
 Useful variants:
 

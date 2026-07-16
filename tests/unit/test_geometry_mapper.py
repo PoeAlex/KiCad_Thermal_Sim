@@ -14,6 +14,7 @@ from ThermalSim.geometry_mapper import (
     _fill_box,
     _fill_via,
     _fill_heatsink,
+    _scanline_fill_polygon,
     build_pad_distance_mask,
     get_pad_pixels,
     create_multilayer_maps,
@@ -587,3 +588,50 @@ class TestCreateMultilayerMaps:
         assert state.copper_mask[0, 1, 1]
         assert state.copper_mask[0, 1, 2]
         assert np.count_nonzero(state.copper_mask[0]) == 2
+
+    def test_diagonal_track_does_not_fill_its_bounding_box(self):
+        """Exact track rasterization must not create false corner copper."""
+        track = MockTrack(
+            layer=F_Cu,
+            bbox=EDA_RECT(750000, 750000, 8500000, 8500000),
+            start=VECTOR2I(1000000, 1000000),
+            end=VECTOR2I(9000000, 9000000),
+            width=500000,
+        )
+        board = MockBoard(tracks=[track], layer_names={F_Cu: "F.Cu"})
+        state = build_geometry_state(
+            board=board,
+            copper_ids=[F_Cu],
+            rows=11,
+            cols=11,
+            x_min=0.0,
+            y_min=0.0,
+            res=1.0,
+            settings={
+                "ignore_traces": False,
+                "ignore_polygons": False,
+                "use_heatsink": False,
+            },
+            via_factor=1300.0,
+            pads_list=[],
+        )
+
+        assert state.copper_mask[0, 1, 1]
+        assert state.copper_mask[0, 8, 8]
+        assert not state.copper_mask[0, 1, 8]
+        assert not state.copper_mask[0, 8, 1]
+
+    def test_scanline_polygon_supports_holes(self):
+        """Scanline fill can add an outline and remove an inner hole."""
+        x_values = np.arange(10, dtype=np.float64) + 0.5
+        y_values = np.arange(10, dtype=np.float64) + 0.5
+        mask = np.zeros((10, 10), dtype=bool)
+        outer = np.asarray([(1, 1), (9, 1), (9, 9), (1, 9)], dtype=np.float64)
+        hole = np.asarray([(4, 4), (6, 4), (6, 6), (4, 6)], dtype=np.float64)
+
+        _scanline_fill_polygon(mask, x_values, y_values, outer, True)
+        _scanline_fill_polygon(mask, x_values, y_values, hole, False)
+
+        assert mask[2, 2]
+        assert not mask[4, 4]
+        assert not mask[0, 0]

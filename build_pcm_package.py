@@ -17,7 +17,7 @@ import os
 import sys
 import zipfile
 
-VERSION = "0.2.3"
+VERSION = "0.3.2"
 
 IDENTIFIER = "com.github.poealex.kicad-thermal-sim"
 
@@ -26,9 +26,11 @@ PLUGIN_FILES = [
     "__init__.py",
     "thermal_plugin.py",
     "capabilities.py",
+    "native_core.py",
     "stackup_parser.py",
     "gui_dialogs.py",
     "geometry_mapper.py",
+    "adaptive_mesh.py",
     "electrical_solver.py",
     "thermal_solver.py",
     "visualization.py",
@@ -72,6 +74,7 @@ def build_metadata(version):
             "- Multi-layer heat spreading with via coupling\n"
             "- DC current-flow Joule heating in traces, vias, and zones\n"
             "- BDF2 implicit time integration\n"
+            "- Matrix-free CPU solver with adaptive multilevel meshes\n"
             "- Piecewise-linear (PWL) time-varying power profiles\n"
             "- Heatsink/thermal-pad support (User.Eco1 layer)\n"
             "- HTML report with embedded thermal images\n\n"
@@ -136,6 +139,12 @@ def build_zip(version, output_dir):
                 continue
             arc_name = f"plugins/{filename}"
             zf.write(src_path, arc_name)
+
+        native_dll = os.path.join(
+            script_dir, "native", "bin", "thermalsim_core.dll"
+        )
+        if os.path.isfile(native_dll):
+            zf.write(native_dll, "plugins/thermalsim_core.dll")
 
     return zip_path
 

@@ -14,16 +14,75 @@ from ThermalSim.thermal_plugin import (
     _build_power_vector,
     _build_sparse_pad_contributions,
     _coarsen_grid_resolution,
+    _resolve_grid_policy,
 )
 from tests.mocks.pcbnew_mock import (
     MockBoard,
     MockFootprint,
     MockPad,
+    MockZone,
     VECTOR2I,
     EDA_RECT,
     F_Cu,
     B_Cu,
 )
+
+
+class TestStartupSafety:
+    """Regression tests for KiCad startup and zone-map safety."""
+
+    def test_unfilled_zones_are_detected_without_running_zone_filler(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        board = MockBoard(zones=[
+            MockZone(layers=[F_Cu], filled=False),
+            MockZone(layers=[F_Cu], filled=True),
+        ])
+        plugin = ThermalPlugin()
+        plugin.defaults()
+
+        assert plugin._count_unfilled_copper_zones(board) == 1
+        assert plugin._require_filled_zones(board) is False
+
+    def test_cache_snapshot_never_reads_filled_polygon_map(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        class UnsafePolygonZone(MockZone):
+            def GetFilledPolysList(self, _layer):
+                raise AssertionError("unsafe filled-polygon map access")
+
+        board = MockBoard(
+            zones=[UnsafePolygonZone(layers=[F_Cu], filled=True)],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+        )
+        plugin = ThermalPlugin()
+        plugin.defaults()
+
+        snapshot = plugin._capture_board_snapshot(
+            board,
+            [F_Cu, B_Cu],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+        )
+
+        assert snapshot.zone_count == 1
+
+    def test_selected_descriptors_reuse_existing_selection_scan(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        pad = MockPad(
+            position=VECTOR2I(1_000_000, 2_000_000),
+            layer=F_Cu,
+            number="7",
+        )
+        board = MockBoard(layer_names={F_Cu: "F.Cu"})
+        plugin = ThermalPlugin()
+        plugin.defaults()
+
+        descriptors = plugin._descriptors_from_selected_pads(
+            board, [("U42-7", pad)]
+        )
+
+        assert descriptors[0]["name"].startswith("U42-7")
 
 
 def _legacy_power_vector(board, copper_ids, pads_list, pad_sources, rows, cols, x_min, y_min, res):
@@ -269,6 +328,36 @@ class TestSettingsPersistence:
 
 class TestGridCoarsening:
     """Tests for automatic grid coarsening limits."""
+
+    def test_custom_node_budget_supports_one_hundred_million_nodes(self):
+        """Custom mode should preserve the documented 100 million-node limit."""
+        detail, expert, max_cells, target_cells, max_nodes = _resolve_grid_policy(
+            {
+                "grid_detail_level": "custom",
+                "grid_node_budget": 100_000_000,
+            },
+            layer_count=4,
+        )
+
+        assert detail == "custom"
+        assert expert is True
+        assert max_nodes == 100_000_000
+        assert max_cells == 25_000_000
+        assert target_cells == 12_500_000
+
+    def test_custom_node_budget_is_clamped_at_one_hundred_million(self):
+        """Imported settings must not bypass the 100 million-node safety cap."""
+        _, _, max_cells, target_cells, max_nodes = _resolve_grid_policy(
+            {
+                "grid_detail_level": "custom",
+                "grid_node_budget": 250_000_000,
+            },
+            layer_count=2,
+        )
+
+        assert max_nodes == 100_000_000
+        assert max_cells == 50_000_000
+        assert target_cells == 25_000_000
 
     def test_default_coarsening_matches_legacy_formula(self):
         """Without expert settings, the historic 200k/100k limits apply."""
