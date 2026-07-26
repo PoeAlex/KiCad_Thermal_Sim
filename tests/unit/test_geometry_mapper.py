@@ -621,6 +621,35 @@ class TestCreateMultilayerMaps:
         assert not state.copper_mask[0, 1, 8]
         assert not state.copper_mask[0, 8, 1]
 
+    def test_mapping_error_does_not_return_partial_geometry(self):
+        """Unexpected KiCad geometry errors must abort instead of returning."""
+        class BrokenTrack:
+            def GetLayer(self):
+                raise RuntimeError("broken KiCad track")
+
+        board = MockBoard(
+            tracks=[BrokenTrack()],
+            layer_names={F_Cu: "F.Cu"},
+        )
+
+        with pytest.raises(RuntimeError, match="refusing to use a partial map"):
+            build_geometry_state(
+                board=board,
+                copper_ids=[F_Cu],
+                rows=4,
+                cols=4,
+                x_min=0.0,
+                y_min=0.0,
+                res=1.0,
+                settings={
+                    "ignore_traces": False,
+                    "ignore_polygons": False,
+                    "use_heatsink": False,
+                },
+                via_factor=1300.0,
+                pads_list=[],
+            )
+
     def test_scanline_polygon_supports_holes(self):
         """Scanline fill can add an outline and remove an inner hole."""
         x_values = np.arange(10, dtype=np.float64) + 0.5

@@ -389,6 +389,53 @@ def _coarsen_grid_resolution(w_mm, h_mm, requested_res, settings, layer_count=1)
     return res, auto_coarsened, expert_enabled, max_cells, target_cells
 
 
+def _effective_fr4_control_volume_thicknesses(
+    gap_m, total_thickness_m, layer_count
+):
+    """Return the FR4 thickness assigned to each copper-plane control volume.
+
+    Each dielectric gap is split equally between its two neighboring copper
+    planes. This conserves the total dielectric volume represented by the
+    multilayer finite-volume model.
+
+    Parameters
+    ----------
+    gap_m : sequence of float
+        Dielectric gaps between adjacent copper planes, in meters.
+    total_thickness_m : float
+        Fallback board thickness in meters.
+    layer_count : int
+        Number of copper planes.
+
+    Returns
+    -------
+    numpy.ndarray
+        Effective FR4 thickness per copper-plane control volume, in meters.
+    """
+    count = max(1, int(layer_count))
+    total = max(float(total_thickness_m), 1e-5)
+    if count == 1:
+        return np.asarray([total], dtype=np.float64)
+
+    gaps = np.asarray(
+        list(gap_m) if gap_m is not None else [],
+        dtype=np.float64,
+    )
+    if (
+        gaps.size != count - 1
+        or not np.all(np.isfinite(gaps))
+        or np.any(gaps <= 0.0)
+    ):
+        gaps = np.full(count - 1, total / float(count - 1), dtype=np.float64)
+
+    thicknesses = np.empty(count, dtype=np.float64)
+    thicknesses[0] = 0.5 * gaps[0]
+    thicknesses[-1] = 0.5 * gaps[-1]
+    if count > 2:
+        thicknesses[1:-1] = 0.5 * (gaps[:-1] + gaps[1:])
+    return np.clip(thicknesses, 1e-6, 5e-3)
+
+
 def _bbox_bounds_mm(bbox):
     """Return a KiCad rectangle as absolute millimetre bounds."""
     x_min = float(bbox.GetX()) * 1e-6
@@ -1814,20 +1861,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         copper_threshold_rel = k_fr4_rel * 1.5
         t_cu = np.array(cu_thick_m)
 
-        # Effective FR4 thickness per layer
-        if layer_count > 1 and gap_m:
-            t_fr4_eff = []
-            for i in range(layer_count):
-                if i == 0:
-                    gap = gap_m[0]
-                elif i == layer_count - 1:
-                    gap = gap_m[-1]
-                else:
-                    gap = 0.5 * (gap_m[i - 1] + gap_m[i])
-                t_fr4_eff.append(gap)
-        else:
-            t_fr4_eff = [max(total_thick_mm * 1e-3, 1e-5)] * layer_count
-        t_fr4_eff = np.clip(np.array(t_fr4_eff), 1e-6, 5e-3)
+        # Effective FR4 thickness per copper-plane control volume.
+        t_fr4_eff = _effective_fr4_control_volume_thicknesses(
+            gap_m,
+            total_thick_mm * 1e-3,
+            layer_count,
+        )
         t_fr4_eff_mm = (t_fr4_eff * 1e3).tolist()
         engine_setting = str(
             settings.get("compute_engine", "auto") or "auto"

@@ -831,6 +831,11 @@ def build_geometry_state(
     -------
     GeometryState
         Internal geometry state with boolean copper occupancy and masks.
+
+    Raises
+    ------
+    RuntimeError
+        If KiCad geometry cannot be mapped completely and safely.
     """
     num_layers = len(copper_ids)
     limit_area = settings.get('limit_area', False)
@@ -1014,6 +1019,9 @@ def build_geometry_state(
 
     except Exception as exc:
         print(f"[ThermalSim][WARN] Geometry mapping error: {exc}")
+        raise RuntimeError(
+            "PCB geometry mapping failed; refusing to use a partial map."
+        ) from exc
 
     return state
 

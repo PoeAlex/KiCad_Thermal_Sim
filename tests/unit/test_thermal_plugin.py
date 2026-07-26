@@ -14,6 +14,7 @@ from ThermalSim.thermal_plugin import (
     _build_power_vector,
     _build_sparse_pad_contributions,
     _coarsen_grid_resolution,
+    _effective_fr4_control_volume_thicknesses,
     _find_pcb_editor_parent,
     _resolve_grid_policy,
 )
@@ -138,6 +139,40 @@ class TestStartupSafety:
         )
 
         assert _find_pcb_editor_parent() is editor
+
+
+class TestFr4ControlVolumes:
+    """Regression tests for conserved dielectric control-volume thickness."""
+
+    def test_two_layer_gap_is_split_between_outer_planes(self):
+        """A two-layer board must contain one gap, not one gap per plane."""
+        thicknesses = _effective_fr4_control_volume_thicknesses(
+            [1.53e-3], 1.6e-3, 2
+        )
+
+        np.testing.assert_allclose(thicknesses, [0.765e-3, 0.765e-3])
+        np.testing.assert_allclose(np.sum(thicknesses), 1.53e-3)
+
+    def test_multilayer_control_volumes_conserve_all_gaps(self):
+        """Outer half-gaps and inner half-pairs must conserve FR4 volume."""
+        gaps = np.asarray([0.2e-3, 1.0e-3, 0.2e-3])
+        thicknesses = _effective_fr4_control_volume_thicknesses(
+            gaps, 1.6e-3, 4
+        )
+
+        np.testing.assert_allclose(
+            thicknesses,
+            [0.1e-3, 0.6e-3, 0.6e-3, 0.1e-3],
+        )
+        np.testing.assert_allclose(np.sum(thicknesses), np.sum(gaps))
+
+    def test_single_layer_uses_full_board_thickness(self):
+        """A single copper plane owns the full fallback board thickness."""
+        thicknesses = _effective_fr4_control_volume_thicknesses(
+            [], 1.6e-3, 1
+        )
+
+        np.testing.assert_allclose(thicknesses, [1.6e-3])
 
 
 def _legacy_power_vector(board, copper_ids, pads_list, pad_sources, rows, cols, x_min, y_min, res):
