@@ -19,7 +19,9 @@ from ThermalSim.thermal_solver import (
     SolverConfig,
     SolverResult,
     build_stiffness_matrix,
+    build_structured_operator,
     run_simulation,
+    run_simulation_matrix_free,
 )
 
 
@@ -306,6 +308,23 @@ class TestBuildStiffnessMatrix:
         np.testing.assert_allclose(hA_new, hA_ref, atol=1e-12)
         np.testing.assert_allclose(diag_new, diag_ref, atol=1e-12)
 
+    def test_matrix_free_operator_matches_sparse_matrix(self, simple_setup):
+        """Structured operator application must equal assembled CSR exactly."""
+        setup = simple_setup.copy()
+        copper_mask = np.zeros_like(setup["copper_mask"])
+        copper_mask[0, 2:8, 3:7] = True
+        setup["copper_mask"] = copper_mask
+        setup["V_map"] = np.ones_like(setup["V_map"])
+        setup["V_map"][4:6, 4:6] = 12.0
+        sparse_matrix, sparse_b, sparse_h, sparse_diag = build_stiffness_matrix(**setup)
+        operator, fast_b, fast_h, fast_diag = build_structured_operator(**setup)
+        vector = np.linspace(20.0, 80.0, sparse_matrix.shape[0])
+
+        np.testing.assert_allclose(operator.dot(vector), sparse_matrix.dot(vector), rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(fast_b, sparse_b, rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(fast_h, sparse_h, rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(fast_diag, sparse_diag, rtol=1e-12, atol=1e-12)
+
 
 class TestRunSimulation:
     """Tests for run_simulation function."""
@@ -427,6 +446,38 @@ class TestRunSimulation:
 
         assert result.aborted is True
         assert result.step_counter <= abort_at_step + 1
+
+    def test_matrix_free_solver_matches_sparse_solver(self):
+        """PCG BDF2 should reproduce the existing solver on the same grid."""
+        setup = TestBuildStiffnessMatrix().simple_setup.__wrapped__(
+            TestBuildStiffnessMatrix()
+        )
+        sparse_matrix, b, h_area, _ = build_stiffness_matrix(**setup)
+        operator, fast_b, fast_h_area, _ = build_structured_operator(**setup)
+        node_count = sparse_matrix.shape[0]
+        capacity = np.full(node_count, 0.0025, dtype=np.float64)
+        power = np.zeros(node_count, dtype=np.float64)
+        power[node_count // 3] = 1.25
+        config = SolverConfig(
+            sim_time=0.4,
+            amb=25.0,
+            dt_base=0.02,
+            steps_target=20,
+            use_multi_phase=False,
+            time_stepping="uniform",
+        )
+
+        reference = run_simulation(
+            config, sparse_matrix, capacity, power, b, h_area,
+            setup["layer_count"], setup["rows"], setup["cols"],
+        )
+        fast = run_simulation_matrix_free(
+            config, operator, capacity, power, fast_b, fast_h_area,
+        )
+
+        np.testing.assert_allclose(fast.T, reference.T, rtol=5e-5, atol=1e-3)
+        assert fast.k_norm_info["factorizations"] == 0
+        assert fast.k_norm_info["backend"] == "MatrixFree-PCG"
 
 
 class TestPhysicsValidation:

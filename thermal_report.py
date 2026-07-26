@@ -151,18 +151,26 @@ def _build_summary_metrics(settings, interactive_heatmap, k_norm_info, snapshot_
         actual_res = (interactive_heatmap or {}).get("res_mm")
     requested_res = (k_norm_info or {}).get("grid_requested_res_mm", settings.get("res"))
     res_detail = grid_label
-    limit_mode = (
-        "expert grid limits enabled"
-        if (k_norm_info or {}).get("grid_expert_limits")
-        else "default grid limits"
-    )
+    detail_level = str((k_norm_info or {}).get("grid_detail_level", "") or "")
+    node_budget = (k_norm_info or {}).get("grid_node_budget")
+    if detail_level and detail_level != "legacy":
+        detail_label = detail_level.replace("_", " ").title()
+        limit_mode = f"{detail_label} compute budget"
+        if node_budget is not None:
+            limit_mode += f" ({int(node_budget):,} nodes)"
+    else:
+        limit_mode = (
+            "expert grid limits enabled"
+            if (k_norm_info or {}).get("grid_expert_limits")
+            else "default grid limits"
+        )
     max_cells = (k_norm_info or {}).get("grid_max_cells")
     target_cells = (k_norm_info or {}).get("grid_target_cells")
     if actual_res is not None and requested_res is not None:
         try:
             if abs(float(actual_res) - float(requested_res)) > 1e-9:
                 limit_detail = ""
-                if max_cells is not None and target_cells is not None:
+                if not detail_level and max_cells is not None and target_cells is not None:
                     limit_detail = f"; limit: {int(max_cells)} -> {int(target_cells)} cells"
                 res_detail = (
                     f"requested: {float(requested_res):.3f} mm; "
@@ -173,6 +181,22 @@ def _build_summary_metrics(settings, interactive_heatmap, k_norm_info, snapshot_
                 res_detail = f"{grid_label}; {limit_mode}"
         except Exception:
             pass
+    area_fraction = (k_norm_info or {}).get("area_fraction")
+    if area_fraction is not None:
+        try:
+            res_detail += f"; simulation area: {float(area_fraction) * 100.0:.0f}% of board"
+        except Exception:
+            pass
+    mesh_mode = str((k_norm_info or {}).get("mesh_mode", "uniform") or "uniform")
+    adaptive_nodes = (k_norm_info or {}).get("adaptive_nodes")
+    uniform_nodes = (k_norm_info or {}).get("equivalent_uniform_nodes")
+    reduction = (k_norm_info or {}).get("mesh_reduction_ratio")
+    mesh_value = mesh_mode.title()
+    mesh_detail = None
+    if adaptive_nodes is not None and uniform_nodes is not None:
+        mesh_detail = f"{int(adaptive_nodes):,} / {int(uniform_nodes):,} nodes"
+        if reduction is not None:
+            mesh_detail += f"; {float(reduction):.1f}x reduction"
     metrics = [
         ("Duration", f"{float(settings.get('time', 0.0)):.2f} s" if "time" in settings else "n/a", None),
         ("Ambient", f"{float(settings.get('amb', 0.0)):.2f} C" if "amb" in settings else "n/a", None),
@@ -182,12 +206,13 @@ def _build_summary_metrics(settings, interactive_heatmap, k_norm_info, snapshot_
         ("Bottom Peak", f"{float(bottom_layer.get('max_c')):.2f} C" if bottom_layer and bottom_layer.get("max_c") is not None else "n/a", bottom_layer.get("name") if bottom_layer else None),
         ("Overall Peak", f"{float(overall_peak):.2f} C" if overall_peak is not None else "n/a", None),
         ("Solver", str((k_norm_info or {}).get("backend", "n/a")), f"steps: {(k_norm_info or {}).get('steps_total', 'n/a')}"),
+        ("Mesh", mesh_value, mesh_detail),
         ("Input Power", f"{float((k_norm_info or {}).get('pin_w')):.3f} W" if (k_norm_info or {}).get("pin_w") is not None else "n/a", None),
         ("Final Cooling", f"{float((k_norm_info or {}).get('pout_final_w')):.3f} W" if (k_norm_info or {}).get("pout_final_w") is not None else "n/a", None),
         ("Snapshots", "enabled" if settings.get("snapshots") else "disabled", f"target: {settings.get('snap_count', 0)}"),
         ("Output Folder", os.path.basename(str((snapshot_debug or {}).get("run_dir", ""))) or "n/a", None),
     ]
-    featured_labels = {"Overall Peak", "Input Power", "Resolution", "Solver"}
+    featured_labels = {"Overall Peak", "Input Power", "Resolution", "Solver", "Mesh"}
     cards = []
     for label, value, detail in metrics:
         detail_html = f"<p class='metric-detail'>{_esc(detail)}</p>" if detail else ""

@@ -6,13 +6,12 @@ workflow using the specialized sub-modules.
 """
 
 import os
-import sys
 import re
 import time
 import math
 import json
 import tempfile
-import subprocess
+import threading
 import traceback
 from dataclasses import dataclass, asdict
 
@@ -25,19 +24,57 @@ from .stackup_parser import parse_stackup_from_board_file, format_stackup_report
 from .gui_dialogs import (
     DEFAULT_GRID_MAX_CELLS,
     DEFAULT_GRID_TARGET_CELLS,
+    MAX_CUSTOM_GRID_NODES,
     SettingsDialog,
     prepare_current_groups,
     prepare_power_pads,
 )
-from .electrical_solver import CurrentTerminal, ElectricalConfig, solve_electrical_heating
+from .electrical_solver import (
+    CurrentTerminal,
+    ElectricalConfig,
+    net_key_from_obj,
+    net_key_from_values,
+    solve_electrical_heating,
+)
+from .adaptive_mesh import build_adaptive_mesh, build_adaptive_system
 from .geometry_mapper import build_geometry_state, create_multilayer_maps, get_pad_pixels
-from .thermal_solver import SolverConfig, build_stiffness_matrix, run_simulation
+from .thermal_solver import (
+    SolverConfig,
+    build_stiffness_matrix,
+    build_structured_operator,
+    run_simulation,
+    run_simulation_matrix_free,
+)
 from .pwl_parser import parse_pwl_file
 from .visualization import (
     save_snapshot, show_results_top_bot, show_results_all_layers, save_preview_image,
     build_interactive_heatmap_payload, save_joule_loss_map
 )
 from .thermal_report import write_html_report
+from .workflow import (
+    AreaEstimate,
+    BoardSnapshot,
+    CancellationToken,
+    GeometryCache,
+    ThermalFactorizationCache,
+    ThermalOperatorCache,
+    GridEstimate,
+    PreflightResult,
+    SimulationArtifacts,
+    get_process_memory_mb,
+    geometry_cache_key,
+    stable_fingerprint,
+)
+
+
+GRID_DETAIL_PRESETS = {
+    "fast": (300_000, 150_000),
+    "balanced": (800_000, 400_000),
+    "detailed": (1_600_000, 800_000),
+    "very_detailed": (3_000_000, 1_500_000),
+}
+DEFAULT_GRID_DETAIL = "balanced"
+DEFAULT_GRID_NODE_BUDGET = GRID_DETAIL_PRESETS[DEFAULT_GRID_DETAIL][0]
 
 
 @dataclass
@@ -230,11 +267,13 @@ def _build_power_vector(pad_sources, pad_contributions, total_nodes):
     for times, powers, indices, weights in pwl_terms:
         q_initial[indices] += float(np.interp(0.0, times, powers)) * weights
 
-    def q_func(t, _q_const=q_const, _pwl_terms=tuple(pwl_terms)):
-        q_t = _q_const.copy()
+    q_workspace = np.empty_like(q_const)
+
+    def q_func(t, _q_const=q_const, _pwl_terms=tuple(pwl_terms), _workspace=q_workspace):
+        np.copyto(_workspace, _q_const)
         for times, powers, indices, weights in _pwl_terms:
-            q_t[indices] += float(np.interp(t, times, powers)) * weights
-        return q_t
+            _workspace[indices] += float(np.interp(t, times, powers)) * weights
+        return _workspace
 
     return q_initial, q_func
 
@@ -253,6 +292,17 @@ def _format_timing_summary(timings):
         if key in timings:
             parts.append(f"{key}={float(timings[key]):.4f}s")
     return ", ".join(parts)
+
+
+def _write_run_manifest(run_dir, status, **details):
+    """Persist the lifecycle state of a result directory."""
+    payload = {"schema_version": 1, "status": str(status), "updated_at": time.time()}
+    payload.update(details)
+    try:
+        with open(os.path.join(run_dir, "run_manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+    except Exception:
+        pass
 
 
 def _resolve_grid_limits(settings):
@@ -279,7 +329,37 @@ def _resolve_grid_limits(settings):
     return True, max_cells, target_cells
 
 
-def _coarsen_grid_resolution(w_mm, h_mm, requested_res, settings):
+def _resolve_grid_policy(settings, layer_count):
+    """Resolve a layer-aware detail preset to legacy 2D cell limits."""
+    layers = max(1, int(layer_count or 1))
+    if "grid_detail_level" not in settings:
+        expert, max_cells, target_cells = _resolve_grid_limits(settings)
+        detail = "custom" if expert else "legacy"
+        return detail, expert, max_cells, target_cells, max_cells * layers
+
+    detail = str(settings.get("grid_detail_level") or DEFAULT_GRID_DETAIL).strip().lower()
+    detail = detail.replace(" ", "_").replace("-", "_")
+    if detail not in set(GRID_DETAIL_PRESETS) | {"custom"}:
+        detail = DEFAULT_GRID_DETAIL
+
+    if detail == "custom":
+        try:
+            max_nodes = int(settings.get("grid_node_budget", DEFAULT_GRID_NODE_BUDGET))
+        except Exception:
+            max_nodes = DEFAULT_GRID_NODE_BUDGET
+        max_nodes = min(MAX_CUSTOM_GRID_NODES, max(50_000, max_nodes))
+        target_nodes = max(25_000, max_nodes // 2)
+        expert = True
+    else:
+        max_nodes, target_nodes = GRID_DETAIL_PRESETS[detail]
+        expert = False
+
+    max_cells = max(1000, max_nodes // layers)
+    target_cells = max(1000, min(max_cells, target_nodes // layers))
+    return detail, expert, max_cells, target_cells, max_nodes
+
+
+def _coarsen_grid_resolution(w_mm, h_mm, requested_res, settings, layer_count=1):
     """
     Apply automatic grid coarsening for large boards.
 
@@ -297,7 +377,9 @@ def _coarsen_grid_resolution(w_mm, h_mm, requested_res, settings):
     tuple
         ``(res, auto_coarsened, expert_enabled, max_cells, target_cells)``.
     """
-    expert_enabled, max_cells, target_cells = _resolve_grid_limits(settings)
+    _, expert_enabled, max_cells, target_cells, _ = _resolve_grid_policy(
+        settings, layer_count
+    )
     area = w_mm * h_mm
     res = float(requested_res)
     auto_coarsened = False
@@ -305,6 +387,384 @@ def _coarsen_grid_resolution(w_mm, h_mm, requested_res, settings):
         res = math.sqrt(area / float(target_cells))
         auto_coarsened = True
     return res, auto_coarsened, expert_enabled, max_cells, target_cells
+
+
+def _effective_fr4_control_volume_thicknesses(
+    gap_m, total_thickness_m, layer_count
+):
+    """Return the FR4 thickness assigned to each copper-plane control volume.
+
+    Each dielectric gap is split equally between its two neighboring copper
+    planes. This conserves the total dielectric volume represented by the
+    multilayer finite-volume model.
+
+    Parameters
+    ----------
+    gap_m : sequence of float
+        Dielectric gaps between adjacent copper planes, in meters.
+    total_thickness_m : float
+        Fallback board thickness in meters.
+    layer_count : int
+        Number of copper planes.
+
+    Returns
+    -------
+    numpy.ndarray
+        Effective FR4 thickness per copper-plane control volume, in meters.
+    """
+    count = max(1, int(layer_count))
+    total = max(float(total_thickness_m), 1e-5)
+    if count == 1:
+        return np.asarray([total], dtype=np.float64)
+
+    gaps = np.asarray(
+        list(gap_m) if gap_m is not None else [],
+        dtype=np.float64,
+    )
+    if (
+        gaps.size != count - 1
+        or not np.all(np.isfinite(gaps))
+        or np.any(gaps <= 0.0)
+    ):
+        gaps = np.full(count - 1, total / float(count - 1), dtype=np.float64)
+
+    thicknesses = np.empty(count, dtype=np.float64)
+    thicknesses[0] = 0.5 * gaps[0]
+    thicknesses[-1] = 0.5 * gaps[-1]
+    if count > 2:
+        thicknesses[1:-1] = 0.5 * (gaps[:-1] + gaps[1:])
+    return np.clip(thicknesses, 1e-6, 5e-3)
+
+
+def _bbox_bounds_mm(bbox):
+    """Return a KiCad rectangle as absolute millimetre bounds."""
+    x_min = float(bbox.GetX()) * 1e-6
+    y_min = float(bbox.GetY()) * 1e-6
+    return (
+        x_min,
+        y_min,
+        x_min + float(bbox.GetWidth()) * 1e-6,
+        y_min + float(bbox.GetHeight()) * 1e-6,
+    )
+
+
+def _find_pcb_editor_parent(board=None):
+    """Return the PCB Editor top-level window for parenting plugin dialogs.
+
+    KiCad can run the project manager and PCB Editor in the same wx
+    application. A dialog created with ``parent=None`` may then be attached to
+    the project manager even when the plugin was launched from PCB Editor.
+    """
+    try:
+        active = wx.GetActiveWindow()
+    except Exception:
+        active = None
+
+    def top_level(window):
+        current = window
+        seen = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            try:
+                parent = current.GetParent()
+            except Exception:
+                parent = None
+            if parent is None:
+                break
+            current = parent
+        return current
+
+    active_top = top_level(active)
+    candidates = []
+    try:
+        candidates.extend(list(wx.GetTopLevelWindows()))
+    except Exception:
+        pass
+    if active_top is not None and active_top not in candidates:
+        candidates.append(active_top)
+
+    board_tokens = []
+    if board is not None:
+        try:
+            board_name = os.path.basename(str(board.GetFileName() or "")).lower()
+            board_stem = os.path.splitext(board_name)[0]
+            board_tokens = [token for token in (board_name, board_stem) if token]
+        except Exception:
+            pass
+
+    editor_markers = (
+        "pcb editor", "pcbnew", "pcb_edit_frame", "pcb editor frame",
+        "leiterplatteneditor", "platteneditor",
+    )
+    manager_markers = ("project manager", "projektmanager")
+
+    def window_text(window):
+        parts = [type(window).__name__]
+        for getter_name in ("GetTitle", "GetName", "GetClassName"):
+            try:
+                value = getattr(window, getter_name)()
+                if value:
+                    parts.append(str(value))
+            except Exception:
+                continue
+        try:
+            parts.append(str(window.GetClassInfo().GetClassName()))
+        except Exception:
+            pass
+        return " ".join(parts).lower()
+
+    best = None
+    best_score = -10_000
+    for window in candidates:
+        if window is None:
+            continue
+        try:
+            if hasattr(window, "IsBeingDeleted") and window.IsBeingDeleted():
+                continue
+        except Exception:
+            continue
+        text = window_text(window)
+        score = 100 if window is active_top else 0
+        if any(marker in text for marker in editor_markers):
+            score += 1_000
+        if any(token in text for token in board_tokens):
+            score += 500
+        if any(marker in text for marker in manager_markers):
+            score -= 1_000
+        if score > best_score:
+            best = window
+            best_score = score
+
+    return best if best_score > 0 else active_top
+
+
+def _estimate_simulation_area(board, bbox, settings, power_pads=None, terminals=None):
+    """Build a safe rectangular domain around heat sources and current nets."""
+    board_x0, board_y0, board_x1, board_y1 = _bbox_bounds_mm(bbox)
+    board_w = max(0.0, board_x1 - board_x0)
+    board_h = max(0.0, board_y1 - board_y0)
+    legacy_limited = bool(settings.get("limit_area", False))
+    mode = str(settings.get("area_mode") or ("active" if legacy_limited else "full"))
+    mode = mode.strip().lower()
+    if mode not in ("full", "active"):
+        mode = "active" if legacy_limited else "full"
+    margin = max(0.0, float(settings.get("area_margin_mm", settings.get("pad_dist_mm", 0.0)) or 0.0))
+
+    active_terms = [
+        item for item in (terminals or []) if abs(float(getattr(item, "current_a", 0.0))) > 0.0
+    ]
+    active_keys = {
+        net_key_from_values(item.net_code, item.net_name) for item in active_terms
+    }
+    active_names = tuple(sorted({
+        str(item.net_name or net_key_from_values(item.net_code, item.net_name))
+        for item in active_terms
+    }))
+
+    if mode == "full":
+        return AreaEstimate(
+            mode="full", x_min_mm=board_x0, y_min_mm=board_y0,
+            width_mm=board_w, height_mm=board_h,
+            board_width_mm=board_w, board_height_mm=board_h,
+            margin_mm=margin, heat_source_count=len(power_pads or []),
+            active_net_names=active_names,
+        )
+
+    bounds = []
+    warnings = []
+    collection_failed = False
+
+    def add_bbox(item):
+        try:
+            item_bbox = item.GetBoundingBox() if hasattr(item, "GetBoundingBox") else item
+            x0, y0, x1, y1 = _bbox_bounds_mm(item_bbox)
+            if x1 > x0 and y1 > y0:
+                bounds.append((x0, y0, x1, y1))
+        except Exception:
+            return
+
+    for pad in power_pads or []:
+        add_bbox(pad)
+
+    if active_keys:
+        try:
+            footprints = list(
+                board.Footprints() if hasattr(board, "Footprints") else board.GetFootprints()
+            )
+            for footprint in footprints:
+                for pad in footprint.Pads():
+                    if net_key_from_obj(pad)[0] in active_keys:
+                        add_bbox(pad)
+        except Exception:
+            collection_failed = True
+
+        try:
+            tracks = list(board.Tracks() if hasattr(board, "Tracks") else board.GetTracks())
+            for track in tracks:
+                if net_key_from_obj(track)[0] in active_keys:
+                    add_bbox(track)
+        except Exception:
+            collection_failed = True
+
+        try:
+            zones = list(board.Zones() if hasattr(board, "Zones") else board.GetZones())
+            for zone in zones:
+                if net_key_from_obj(zone)[0] not in active_keys:
+                    continue
+                if hasattr(zone, "IsFilled") and not zone.IsFilled():
+                    continue
+                add_bbox(zone)
+        except Exception:
+            collection_failed = True
+
+    if settings.get("use_heatsink"):
+        try:
+            for drawing in list(board.GetDrawings() if hasattr(board, "GetDrawings") else []):
+                if drawing.GetLayer() == pcbnew.Eco1_User:
+                    add_bbox(drawing)
+        except Exception:
+            warnings.append("Thermal-pad geometry could not be included in the area estimate.")
+
+    if collection_failed and active_keys:
+        warnings.append("Current-net geometry could not be inspected safely; the full board is used.")
+        return AreaEstimate(
+            mode="full", x_min_mm=board_x0, y_min_mm=board_y0,
+            width_mm=board_w, height_mm=board_h,
+            board_width_mm=board_w, board_height_mm=board_h,
+            margin_mm=margin, heat_source_count=len(power_pads or []),
+            active_net_names=active_names, fallback_to_full=True,
+            warnings=tuple(warnings),
+        )
+
+    if not bounds:
+        warnings.append("No active source geometry was found; the full board is used.")
+        return AreaEstimate(
+            mode="full", x_min_mm=board_x0, y_min_mm=board_y0,
+            width_mm=board_w, height_mm=board_h,
+            board_width_mm=board_w, board_height_mm=board_h,
+            margin_mm=margin, heat_source_count=0,
+            active_net_names=active_names, fallback_to_full=True,
+            warnings=tuple(warnings),
+        )
+
+    safety = max(0.0, float(settings.get("res", 0.0) or 0.0))
+    x0 = max(board_x0, min(item[0] for item in bounds) - margin - safety)
+    y0 = max(board_y0, min(item[1] for item in bounds) - margin - safety)
+    x1 = min(board_x1, max(item[2] for item in bounds) + margin + safety)
+    y1 = min(board_y1, max(item[3] for item in bounds) + margin + safety)
+    area = AreaEstimate(
+        mode="active", x_min_mm=x0, y_min_mm=y0,
+        width_mm=max(0.0, x1 - x0), height_mm=max(0.0, y1 - y0),
+        board_width_mm=board_w, board_height_mm=board_h,
+        margin_mm=margin, heat_source_count=len(power_pads or []),
+        active_net_names=active_names, warnings=tuple(warnings),
+    )
+    if active_keys and area.area_fraction >= 0.95:
+        warnings.append("Active current geometry covers almost the full board; area limiting saves little work.")
+        area = AreaEstimate(
+            mode=area.mode, x_min_mm=area.x_min_mm, y_min_mm=area.y_min_mm,
+            width_mm=area.width_mm, height_mm=area.height_mm,
+            board_width_mm=area.board_width_mm, board_height_mm=area.board_height_mm,
+            margin_mm=area.margin_mm, heat_source_count=area.heat_source_count,
+            active_net_names=area.active_net_names, warnings=tuple(warnings),
+        )
+    return area
+
+
+def _estimate_solver_cost(nodes, settings):
+    """Return conservative memory bounds and a relative runtime class."""
+    nodes = max(0, int(nodes))
+    compute_engine = str(
+        settings.get("compute_engine", "auto") or "auto"
+    ).lower()
+    fast_engine = (
+        compute_engine == "fast_native"
+        or (compute_engine == "auto" and nodes >= 250_000)
+    )
+    if fast_engine:
+        memory_low = int(math.ceil(nodes * 0.00012))
+        memory_high = int(math.ceil(nodes * 0.00045))
+        thresholds = (500_000, 2_000_000, 7_000_000)
+    else:
+        memory_low = int(math.ceil(nodes * 0.00035))
+        memory_high = int(math.ceil(nodes * 0.00120))
+        thresholds = (150_000, 500_000, 1_000_000)
+    backend = str(settings.get("solver_backend", "auto") or "auto").lower()
+    if not fast_engine and (
+        backend == "pardiso" or (backend == "auto" and HAS_PARDISO)
+    ):
+        thresholds = (250_000, 800_000, 1_600_000)
+    if nodes < thresholds[0]:
+        runtime = "Fast"
+    elif nodes < thresholds[1]:
+        runtime = "Moderate"
+    elif nodes < thresholds[2]:
+        runtime = "Slow"
+    else:
+        runtime = "Very slow"
+    return memory_low, memory_high, runtime
+
+
+def _estimate_solver_grid(
+    bbox, requested_res, settings, layer_count, focus_pads=None, area=None
+):
+    """Compute the final solver grid after area limiting and coarsening."""
+    original_x_min, original_y_min, original_x_max, original_y_max = _bbox_bounds_mm(bbox)
+    x_min, y_min = original_x_min, original_y_min
+    x_max, y_max = original_x_max, original_y_max
+
+    if area is not None:
+        x_min = float(area.x_min_mm)
+        y_min = float(area.y_min_mm)
+        x_max = x_min + float(area.width_mm)
+        y_max = y_min + float(area.height_mm)
+    elif settings.get("limit_area") and settings.get("pad_dist_mm", 0.0) > 0:
+        radius = float(settings["pad_dist_mm"])
+        pad_xs = []
+        pad_ys = []
+        for pad in focus_pads or []:
+            try:
+                pos = pad.GetPosition()
+                pad_xs.append(pos.x * 1e-6)
+                pad_ys.append(pos.y * 1e-6)
+            except Exception:
+                continue
+        if pad_xs and pad_ys:
+            x_min = max(original_x_min, min(pad_xs) - radius)
+            y_min = max(original_y_min, min(pad_ys) - radius)
+            x_max = min(original_x_max, max(pad_xs) + radius)
+            y_max = min(original_y_max, max(pad_ys) + radius)
+
+    width = max(float(requested_res), x_max - x_min)
+    height = max(float(requested_res), y_max - y_min)
+    res, coarsened, expert, max_cells, target_cells = _coarsen_grid_resolution(
+        width, height, requested_res, settings, layer_count
+    )
+    rows = int(height / res) + 4
+    cols = int(width / res) + 4
+    nodes = rows * cols * int(layer_count)
+    detail, _, _, _, node_budget = _resolve_grid_policy(settings, layer_count)
+    memory_low, memory_high, runtime = _estimate_solver_cost(nodes, settings)
+    return GridEstimate(
+        requested_res_mm=float(requested_res),
+        actual_res_mm=float(res),
+        x_min_mm=float(x_min),
+        y_min_mm=float(y_min),
+        width_mm=float(width),
+        height_mm=float(height),
+        rows=rows,
+        cols=cols,
+        layer_count=int(layer_count),
+        auto_coarsened=bool(coarsened),
+        expert_limits=bool(expert),
+        max_cells=int(max_cells),
+        target_cells=int(target_cells),
+        detail_level=detail,
+        node_budget=int(node_budget),
+        memory_mb_low=memory_low,
+        memory_mb_high=memory_high,
+        runtime_class=runtime,
+    )
 
 
 class ThermalPlugin(pcbnew.ActionPlugin):
@@ -331,14 +791,218 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.stack_info = None
         self.last_zone_refill_s = 0.0
         self.settings_dialog = None
+        self.geometry_cache = GeometryCache(persistent=True)
+        self.operator_cache = ThermalOperatorCache()
+        self.electrical_cache = ThermalOperatorCache()
+        self.factorization_cache = ThermalFactorizationCache()
+        self.cancel_token = None
+        self.last_artifacts = None
+        self.startup_dialog = None
+        self.host_window = None
+
+    def _show_startup_progress(self, percent, message):
+        """Show immediate feedback while the settings dialog is prepared."""
+        try:
+            if self.startup_dialog is None:
+                self.startup_dialog = wx.ProgressDialog(
+                    "ThermalSim",
+                    message,
+                    maximum=100,
+                    parent=self.host_window,
+                    style=getattr(wx, "PD_APP_MODAL", 0),
+                )
+            self.startup_dialog.Update(int(percent), message)
+            app = wx.GetApp()
+            if app is not None:
+                app.Yield()
+        except Exception:
+            pass
+
+    def _close_startup_progress(self):
+        """Close the temporary startup progress window."""
+        if self.startup_dialog is None:
+            return
+        try:
+            self.startup_dialog.Destroy()
+        except Exception:
+            pass
+        self.startup_dialog = None
+
+    def _count_unfilled_copper_zones(self, board):
+        """Return the number of normal copper zones without a valid fill."""
+        try:
+            zones = list(board.Zones() if hasattr(board, "Zones") else board.GetZones())
+        except Exception:
+            return 0
+        unfilled = 0
+        for zone in zones:
+            try:
+                is_rule_area = bool(
+                    getattr(zone, "GetIsRuleArea", lambda: False)()
+                )
+                is_keepout = bool(
+                    getattr(zone, "GetIsKeepout", lambda: False)()
+                )
+                if is_rule_area or is_keepout:
+                    continue
+                if hasattr(zone, "IsFilled") and not zone.IsFilled():
+                    unfilled += 1
+            except Exception:
+                continue
+        return unfilled
+
+    def _require_filled_zones(self, board):
+        """Block geometry work safely when KiCad copper zones are stale."""
+        unfilled = self._count_unfilled_copper_zones(board)
+        if unfilled <= 0:
+            return True
+        wx.MessageBox(
+            f"{unfilled} copper zone(s) are not filled.\n\n"
+            "Please return to PCB Editor, press B to refill all zones, "
+            "then start Preview or Run again.\n\n"
+            "ThermalSim no longer refills zones automatically because that "
+            "can block the UI for a long time and can crash some KiCad builds.",
+            "ThermalSim - Refill Copper Zones",
+        )
+        return False
+
+    def _capture_board_snapshot(self, board, copper_ids, bbox):
+        """Capture a deterministic identity for safe persistent geometry reuse."""
+        tracks = list(board.Tracks() if hasattr(board, "Tracks") else board.GetTracks())
+        footprints = list(board.Footprints() if hasattr(board, "Footprints") else board.GetFootprints())
+        zones = list(board.Zones() if hasattr(board, "Zones") else board.GetZones())
+        primitive_rows = []
+        for item in tracks:
+            try:
+                rect = item.GetBoundingBox()
+                row = [
+                    type(item).__name__, int(item.GetLayer()), rect.GetX(), rect.GetY(),
+                    rect.GetWidth(), rect.GetHeight(),
+                ]
+                for getter in ("GetStart", "GetMid", "GetEnd", "GetPosition"):
+                    try:
+                        point = getattr(item, getter)()
+                        row.extend((getter, int(point.x), int(point.y)))
+                    except Exception:
+                        continue
+                try:
+                    row.extend(("width", int(item.GetWidth())))
+                except Exception:
+                    pass
+                primitive_rows.append(tuple(row))
+            except Exception:
+                continue
+        for zone in zones:
+            try:
+                rect = zone.GetBoundingBox()
+                zone_row = [
+                    type(zone).__name__, int(zone.GetLayer()),
+                    rect.GetX(), rect.GetY(), rect.GetWidth(), rect.GetHeight(),
+                ]
+                try:
+                    zone_row.extend(
+                        ("layers", tuple(int(value) for value in zone.GetLayerSet().IntSeq()))
+                    )
+                except Exception:
+                    pass
+                for getter in (
+                    "GetNetCode",
+                    "GetNetname",
+                    "GetAssignedPriority",
+                    "IsFilled",
+                ):
+                    try:
+                        zone_row.extend((getter, str(getattr(zone, getter)())))
+                    except Exception:
+                        continue
+                primitive_rows.append(tuple(zone_row))
+            except Exception:
+                continue
+        for fp in footprints:
+            try:
+                reference = fp.GetReference()
+            except Exception:
+                reference = ""
+            for pad in fp.Pads():
+                try:
+                    pos = pad.GetPosition()
+                    rect = pad.GetBoundingBox()
+                    row = [
+                        "pad", reference, pad.GetNumber(), pos.x, pos.y,
+                        pad.GetLayer(), rect.GetX(), rect.GetY(),
+                        rect.GetWidth(), rect.GetHeight(),
+                    ]
+                    for getter in ("GetShape", "GetSize", "GetOrientationDegrees"):
+                        try:
+                            value = getattr(pad, getter)()
+                            if hasattr(value, "x") and hasattr(value, "y"):
+                                row.extend((getter, int(value.x), int(value.y)))
+                            else:
+                                row.extend((getter, str(value)))
+                        except Exception:
+                            continue
+                    primitive_rows.append(tuple(row))
+                except Exception:
+                    continue
+        bbox_mm = (
+            bbox.GetX() * 1e-6,
+            bbox.GetY() * 1e-6,
+            bbox.GetWidth() * 1e-6,
+            bbox.GetHeight() * 1e-6,
+        )
+        filename = str(board.GetFileName() or "")
+        try:
+            file_identity = (
+                os.path.getsize(filename),
+                os.stat(filename).st_mtime_ns,
+            )
+        except OSError:
+            file_identity = None
+        return BoardSnapshot(
+            filename=filename,
+            fingerprint=stable_fingerprint(
+                (bbox_mm, file_identity, tuple(primitive_rows))
+            ),
+            bbox_mm=bbox_mm,
+            copper_layers=tuple(int(x) for x in copper_ids),
+            track_count=len(tracks),
+            footprint_count=len(footprints),
+            zone_count=len(zones),
+        )
+
+    def _geometry_key(self, board, copper_ids, bbox, grid, settings, pads):
+        snapshot = self._capture_board_snapshot(board, copper_ids, bbox)
+        pad_keys = []
+        for pad in pads or []:
+            try:
+                pos = pad.GetPosition()
+                pad_keys.append((pad.GetNumber(), pad.GetLayer(), pos.x, pos.y))
+            except Exception:
+                pad_keys.append(id(pad))
+        return geometry_cache_key(snapshot, grid, settings, pad_keys)
 
     def _settings_path(self):
         """Return path to settings persistence file."""
-        return os.path.join(os.path.dirname(__file__), "thermal_sim_last_settings.json")
+        try:
+            base_dir = wx.StandardPaths.Get().GetUserConfigDir()
+        except Exception:
+            base_dir = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+        return os.path.join(base_dir, "ThermalSim", "thermal_sim_last_settings.json")
 
     def _load_settings(self, path=None):
         """Load settings from a JSON file."""
         settings_path = path or self._settings_path()
+        if path is None and not os.path.isfile(settings_path):
+            legacy_path = os.path.join(os.path.dirname(__file__), "thermal_sim_last_settings.json")
+            if os.path.isfile(legacy_path):
+                try:
+                    with open(legacy_path, "r", encoding="utf-8") as f:
+                        legacy = json.load(f)
+                    if isinstance(legacy, dict):
+                        legacy["schema_version"] = 2
+                        self._save_settings(legacy)
+                except Exception:
+                    pass
         try:
             with open(settings_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -350,8 +1014,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         """Save settings to a JSON file."""
         settings_path = path or self._settings_path()
         try:
+            parent_dir = os.path.dirname(settings_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            payload = dict(settings)
+            payload["schema_version"] = 2
             with open(settings_path, "w", encoding="utf-8") as f:
-                json.dump(settings, f, indent=2, sort_keys=True)
+                json.dump(payload, f, indent=2, sort_keys=True)
             return True
         except Exception:
             return False
@@ -362,15 +1031,24 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             self.RunSafe()
         except Exception:
             wx.MessageBox(traceback.format_exc(), "Thermal Sim Error")
+        finally:
+            self._close_startup_progress()
 
     def RunSafe(self):
         """Main plugin execution logic."""
+        board = pcbnew.GetBoard()
+        # Capture the editor before a progress/dependency dialog can become
+        # wx's active window and obscure the actual plugin host.
+        self.host_window = _find_pcb_editor_parent(board)
+
         if not HAS_LIBS:
             from .capabilities import get_missing_packages
             from .dependency_installer import DependencyInstallDialog
             missing = get_missing_packages()
             if missing:
-                dlg = DependencyInstallDialog(None, missing, [get_pypardiso_optional_dependency()])
+                dlg = DependencyInstallDialog(
+                    self.host_window, missing, [get_pypardiso_optional_dependency()]
+                )
                 dlg.ShowModal()
                 dlg.Destroy()
             else:
@@ -380,27 +1058,33 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 )
             return
 
-        board = pcbnew.GetBoard()
+        self._show_startup_progress(5, "Reading active PCB...")
 
-        # Keep zone fills up-to-date
-        zone_refill_start = time.perf_counter()
-        try:
-            pcbnew.ZONE_FILLER(board).Fill(board.Zones())
-        except Exception:
-            pass
-        zone_refill_s = time.perf_counter() - zone_refill_start
+        # Zone filling is intentionally not performed here. It can take
+        # minutes on large boards and some KiCad builds let C++ map lookup
+        # exceptions escape the Python boundary. Preview/Run validate the
+        # existing fills and ask the user to press B when needed.
+        zone_refill_s = 0.0
 
         # --- 1. Layer Detection ---
+        self._show_startup_progress(20, "Detecting copper layers...")
         copper_ids, layer_names = self._detect_copper_layers(board)
+        self._show_startup_progress(35, "Reading PCB stackup...")
         stack_info = parse_stackup_from_board_file(board)
 
         # Use stackup order if available
         copper_ids_stack = stack_info.get("copper_ids") if isinstance(stack_info, dict) else None
-        if copper_ids_stack and len(copper_ids_stack) >= 2:
-            copper_ids = copper_ids_stack
-            layer_names = [board.GetLayerName(lid) for lid in copper_ids]
+        detected_names = dict(zip(copper_ids, layer_names))
+        valid_stack_ids = [
+            layer_id for layer_id in (copper_ids_stack or [])
+            if layer_id in detected_names
+        ]
+        if len(valid_stack_ids) >= 2:
+            copper_ids = valid_stack_ids
+            layer_names = [detected_names[layer_id] for layer_id in copper_ids]
 
         # --- 2. Auto-Resolution ---
+        self._show_startup_progress(50, "Measuring board dimensions...")
         try:
             bbox = board.GetBoundingBox()
         except:
@@ -410,6 +1094,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         suggested_res = self._calculate_suggested_resolution(w_mm, h_mm, len(copper_ids))
 
         # --- 3. Initial Pad Selection ---
+        self._show_startup_progress(65, "Reading selected heat-source pads...")
         selected_pads = self._get_selected_pads(board)
         pads_list = [p[1] for p in selected_pads]
 
@@ -422,16 +1107,25 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.last_zone_refill_s = zone_refill_s
 
         # --- 4. Show Dialog ---
+        self._show_startup_progress(78, "Preparing simulation settings...")
         stackup_details = format_stackup_report_um(stack_info) if stack_info else ""
         pad_names = self._format_pad_names(selected_pads)
-        initial_power_pads = self._get_selected_pad_descriptors(board)
-        default_output_dir = os.path.dirname(__file__)
+        initial_power_pads = self._descriptors_from_selected_pads(
+            board, selected_pads
+        )
+        board_path = str(board.GetFileName() or "")
+        board_dir = os.path.dirname(board_path) if board_path else ""
+        default_output_dir = (
+            os.path.join(board_dir, "ThermalSim_results")
+            if board_dir else os.path.join(os.path.expanduser("~"), "Documents", "ThermalSim_results")
+        )
         last_settings = self._load_settings()
         if last_settings.get("output_dir") and os.path.isdir(last_settings.get("output_dir")):
             default_output_dir = last_settings.get("output_dir")
 
         if self.settings_dialog is not None:
             try:
+                self._close_startup_progress()
                 self.settings_dialog.Raise()
                 return
             except Exception:
@@ -441,35 +1135,55 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             return self._get_selected_pad_descriptors(board)
 
         def run_callback(settings):
-            self.settings_dialog = None
             self._save_settings(settings)
             power_pads = self._resolve_power_pad_objects(board, settings, legacy_pads=pads_list)
             current_pads = self._resolve_current_pad_objects(board, settings)
             focus_pads = self._unique_pads(power_pads + current_pads)
-            self._run_simulation(
-                board, copper_ids, layer_names, bbox, pads_list,
-                settings, stack_info, pad_names, zone_refill_s=zone_refill_s,
-                focus_pads=focus_pads
-            )
+            try:
+                self._run_simulation(
+                    board, copper_ids, layer_names, bbox, pads_list,
+                    settings, stack_info, pad_names, zone_refill_s=zone_refill_s,
+                    focus_pads=focus_pads
+                )
+            except Exception:
+                error_text = traceback.format_exc()
+                if self.settings_dialog is not None:
+                    try:
+                        self.settings_dialog.set_run_state(
+                            "failed",
+                            "The simulation failed. See the error dialog for details.",
+                        )
+                    except Exception:
+                        pass
+                wx.MessageBox(error_text, "Thermal Sim Error")
 
         def close_callback():
             self.settings_dialog = None
 
+        def preflight_callback(settings):
+            return self._preflight(board, copper_ids, bbox, settings)
+
+        self._show_startup_progress(92, "Creating ThermalSim dialog...")
         dlg = SettingsDialog(
-            None, len(pads_list), suggested_res, layer_names,
+            self.host_window, len(pads_list), suggested_res, layer_names,
             preview_callback=self.generate_preview,
             selection_provider=selection_provider,
             run_callback=run_callback,
             close_callback=close_callback,
+            preflight_callback=preflight_callback,
             load_settings_callback=self._load_settings,
             save_settings_callback=self._save_settings,
             stackup_details=stackup_details,
             pad_names=pad_names,
             initial_power_pads=initial_power_pads,
             default_output_dir=default_output_dir,
-            defaults=last_settings
+            defaults=last_settings,
+            board_name=os.path.basename(board_path) if board_path else "Unsaved board",
+            board_size_mm=(w_mm, h_mm),
+            defer_initial_preflight=True,
         )
         self.settings_dialog = dlg
+        self._close_startup_progress()
         try:
             dlg.Show()
         except Exception:
@@ -628,6 +1342,20 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         descriptors.sort(key=lambda item: item.get("name", ""))
         return descriptors
 
+    def _descriptors_from_selected_pads(self, board, selected_pads):
+        """Build descriptors without scanning every footprint a second time."""
+        descriptors = []
+        for name, pad in selected_pads or []:
+            try:
+                number = str(pad.GetNumber())
+                suffix = f"-{number}"
+                fp_ref = name[:-len(suffix)] if name.endswith(suffix) else name
+                descriptors.append(self._pad_descriptor(board, fp_ref, pad))
+            except Exception:
+                continue
+        descriptors.sort(key=lambda item: item.get("name", ""))
+        return descriptors
+
     def _build_pad_lookup(self, board):
         """Build lookup maps from persisted pad descriptors to live pad objects."""
         by_key = {}
@@ -744,6 +1472,83 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             pad_names.append(f"{nm} [{net}]" if net else nm)
         return pad_names
 
+    def _preflight(self, board, copper_ids, bbox, settings):
+        """Validate settings and estimate the exact grid before execution."""
+        result = PreflightResult()
+        power_entries, missing_power = self._resolve_power_pad_entries(board, settings)
+        power_pads = [pad for _, pad, _ in power_entries]
+        terminals = []
+        missing_current = []
+        if settings.get("current_enabled"):
+            terminals, missing_current = self._resolve_current_terminals(board, settings)
+        current_pads = [item.pad for item in terminals]
+        focus_pads = self._unique_pads(power_pads + current_pads)
+        result.area = _estimate_simulation_area(
+            board, bbox, settings, power_pads=power_pads, terminals=terminals
+        )
+        result.grid = _estimate_solver_grid(
+            bbox, float(settings.get("res", 0.5)), settings, len(copper_ids),
+            focus_pads, area=result.area,
+        )
+        result.warnings.extend(result.area.warnings)
+
+        if missing_power:
+            result.errors.append(f"{len(missing_power)} heat-source pad(s) are missing from the board.")
+        has_power = False
+        for _, _, entry in power_entries:
+            value = str(entry or "").strip()
+            if not value:
+                continue
+            try:
+                has_power = has_power or abs(float(value)) > 0.0
+            except ValueError:
+                try:
+                    _, pwl_values = parse_pwl_file(value)
+                    has_power = has_power or bool(np.any(np.asarray(pwl_values) != 0.0))
+                except Exception as exc:
+                    result.errors.append(f"Invalid PWL source '{value}': {exc}")
+
+        has_current = False
+        if settings.get("current_enabled"):
+            if missing_current:
+                result.errors.append(f"{len(missing_current)} current-terminal pad(s) are missing from the board.")
+            has_current = any(abs(float(item.current_a)) > 0.0 for item in terminals)
+            totals = {}
+            for item in terminals:
+                net = item.net_name or f"net:{item.net_code}"
+                totals[net] = totals.get(net, 0.0) + float(item.current_a)
+            unbalanced = [name for name, total in totals.items() if abs(total) > 1e-9]
+            if unbalanced:
+                result.errors.append("Current is not balanced for: " + ", ".join(unbalanced[:3]))
+
+        if not has_power and not has_current:
+            result.errors.append("Configure at least one non-zero heat source or balanced current path.")
+
+        output_dir = str(settings.get("output_dir", "") or "").strip()
+        writable_parent = output_dir
+        while writable_parent and not os.path.exists(writable_parent):
+            parent = os.path.dirname(writable_parent)
+            if parent == writable_parent:
+                break
+            writable_parent = parent
+        if not output_dir or not writable_parent or not os.access(writable_parent, os.W_OK):
+            result.errors.append("The output folder is not writable.")
+
+        if result.grid.auto_coarsened:
+            result.warnings.append(
+                f"Resolution will be coarsened from {result.grid.requested_res_mm:.3f} "
+                f"to {result.grid.actual_res_mm:.3f} mm."
+            )
+        if result.grid.nodes > 10_000_000:
+            result.warnings.append(
+                f"The requested grid contains {result.grid.nodes:,} equivalent "
+                "uniform nodes. Adaptive reduction depends on the actual PCB "
+                "geometry; verify the displayed RAM estimate before running."
+            )
+        if settings.get("solver_backend") == "pardiso" and not HAS_PARDISO:
+            result.errors.append("PyPardiso was selected but is not available.")
+        return result
+
     def _derive_stackup_thicknesses(self, board, copper_ids, stack_info, settings):
         """Derive thickness values from stackup or defaults."""
         stack_copper = stack_info.get("copper", []) if isinstance(stack_info, dict) else []
@@ -801,33 +1606,150 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
     def generate_preview(self, settings, layer_names):
         """Generate geometry preview image."""
+        def preview_status(message):
+            if self.settings_dialog is None:
+                return
+            try:
+                self.settings_dialog.lbl_preflight.SetLabel(message)
+                app = wx.GetApp()
+                if app is not None:
+                    app.Yield()
+            except Exception:
+                pass
+
+        preview_status("Checking existing KiCad copper-zone fills...")
+        if not self._require_filled_zones(self.board):
+            return None
+        preview_status("Resolving heat sources and simulation area...")
         power_pads = self._resolve_power_pad_objects(self.board, settings, legacy_pads=self.pads_list)
-        current_pads = self._resolve_current_pad_objects(self.board, settings)
+        terminals, _ = self._resolve_current_terminals(self.board, settings)
+        current_pads = [item.pad for item in terminals]
         preview_pads = self._unique_pads(power_pads + current_pads)
+        effective_settings = dict(settings)
+        area = _estimate_simulation_area(
+            self.board, self.bbox, effective_settings,
+            power_pads=power_pads, terminals=terminals,
+        )
+        effective_settings["_preview_area_summary"] = (
+            f"{area.width_mm:.1f} x {area.height_mm:.1f} mm / "
+            f"{area.area_fraction * 100.0:.0f}% of board"
+        )
+        effective_settings["_preview_area_limited"] = area.limited
+        grid = _estimate_solver_grid(
+            self.bbox, float(effective_settings["res"]), effective_settings,
+            len(self.copper_ids), preview_pads, area=area,
+        )
+        cache_key = self._geometry_key(
+            self.board, self.copper_ids, self.bbox, grid, effective_settings, preview_pads
+        )
+        geometry_state = self.geometry_cache.get(cache_key)
+        if geometry_state is None:
+            preview_status("Rasterizing exact tracks, pads, vias, and zones...")
+            geometry_state = build_geometry_state(
+                board=self.board,
+                copper_ids=self.copper_ids,
+                rows=grid.rows,
+                cols=grid.cols,
+                x_min=grid.x_min_mm,
+                y_min=grid.y_min_mm,
+                res=grid.actual_res_mm,
+                settings=effective_settings,
+                via_factor=390.0 / 0.3,
+                pads_list=preview_pads,
+            )
+            self.geometry_cache.put(cache_key, geometry_state)
+        preview_adaptive_mesh = None
+        preview_engine = str(
+            effective_settings.get("compute_engine", "auto") or "auto"
+        ).lower()
+        preview_mesh_mode = str(
+            effective_settings.get("mesh_mode", "adaptive") or "adaptive"
+        ).lower()
+        if (
+            preview_mesh_mode == "adaptive"
+            and preview_engine != "legacy"
+        ):
+            preview_status("Building adaptive refinement levels...")
+            source_mask = np.zeros(
+                (len(self.copper_ids), grid.rows, grid.cols), dtype=bool
+            )
+            for pad in preview_pads:
+                pixels = get_pad_pixels(
+                    pad, grid.rows, grid.cols,
+                    grid.x_min_mm, grid.y_min_mm, grid.actual_res_mm
+                )
+                if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
+                    target_layers = range(len(self.copper_ids))
+                else:
+                    try:
+                        target_layers = [self.copper_ids.index(pad.GetLayer())]
+                    except ValueError:
+                        target_layers = [0]
+                for layer_idx in target_layers:
+                    for row, col in pixels:
+                        if 0 <= row < grid.rows and 0 <= col < grid.cols:
+                            source_mask[layer_idx, row, col] = True
+            preview_adaptive_mesh = build_adaptive_mesh(
+                geometry_state.copper_mask,
+                geometry_state.via_map,
+                geometry_state.heatsink_mask,
+                source_mask=source_mask,
+                max_cell_ratio=max(
+                    1, min(16, int(
+                        effective_settings.get("adaptive_max_cell_ratio", 8) or 8
+                    ))
+                ),
+            )
+        preview_status("Rendering preview layers...")
         output_file = save_preview_image(
             self.board, self.copper_ids, self.bbox, preview_pads,
-            settings, layer_names,
+            effective_settings, layer_names,
             self.stack_info if self.stack_info is not None else parse_stackup_from_board_file(self.board),
             get_pad_pixels,
             create_multilayer_maps,
             self._derive_stackup_thicknesses,
-            open_file=True
+            open_file=True,
+            geometry_state=geometry_state,
+            grid_spec=grid,
+            adaptive_mesh=preview_adaptive_mesh,
         )
         if not output_file:
             wx.MessageBox("Board data missing for preview", "Error")
+        return output_file
 
     def _run_simulation(self, board, copper_ids, layer_names, bbox, pads_list,
                         settings, stack_info, pad_names, zone_refill_s=0.0,
                         focus_pads=None):
         """Execute the thermal simulation."""
-        focus_pads = focus_pads if focus_pads is not None else pads_list
-        if settings.get("current_enabled") and settings.get("limit_area"):
-            settings = dict(settings)
-            settings["limit_area"] = False
-            wx.MessageBox(
-                "Limit Area was disabled for current-flow simulation so copper paths are not cut off.",
-                "ThermalSim"
+        run_started_at = time.perf_counter()
+
+        def set_dialog_state(status, message=""):
+            if self.settings_dialog is not None:
+                try:
+                    wx.CallAfter(self.settings_dialog.set_run_state, status, message)
+                except Exception:
+                    pass
+
+        set_dialog_state("running", "Checking existing KiCad copper-zone fills...")
+        if not self._require_filled_zones(board):
+            set_dialog_state(
+                "failed",
+                "Copper zones must be refilled in KiCad before simulation.",
             )
+            return
+
+        focus_pads = focus_pads if focus_pads is not None else pads_list
+        area_power_pads = self._resolve_power_pad_objects(
+            board, settings, legacy_pads=pads_list
+        )
+        area_terminals = []
+        if settings.get("current_enabled"):
+            area_terminals, _ = self._resolve_current_terminals(board, settings)
+        area = _estimate_simulation_area(
+            board, bbox, settings,
+            power_pads=area_power_pads,
+            terminals=area_terminals,
+        )
         # Derive thicknesses
         stackup_derived = self._derive_stackup_thicknesses(board, copper_ids, stack_info, settings)
         total_thick_mm = stackup_derived["total_thick_mm_used"]
@@ -835,10 +1757,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # Output folder setup
         base_output_dir = settings.get('output_dir') or os.path.dirname(__file__)
-        if not os.path.isdir(base_output_dir):
-            base_output_dir = os.path.dirname(__file__)
-        run_dir = os.path.join(base_output_dir, time.strftime("Thermalsim_%Y%m%d_%H%M%S"))
         try:
+            os.makedirs(base_output_dir, exist_ok=True)
+            run_dir = os.path.join(base_output_dir, time.strftime("Thermalsim_%Y%m%d_%H%M%S"))
             os.makedirs(run_dir, exist_ok=True)
             test_path = os.path.join(run_dir, ".write_test")
             with open(test_path, "w", encoding="utf-8") as f:
@@ -846,44 +1767,25 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             os.remove(test_path)
         except Exception:
             run_dir = tempfile.mkdtemp(prefix="ThermalSim_")
+        _write_run_manifest(run_dir, "running", settings=settings)
 
-        # Grid setup
-        w_mm = bbox.GetWidth() * 1e-6
-        h_mm = bbox.GetHeight() * 1e-6
-        x_min = bbox.GetX() * 1e-6
-        y_min = bbox.GetY() * 1e-6
         requested_res = float(settings['res'])
-        (
-            res,
-            auto_coarsened,
-            grid_expert_limits,
-            grid_max_cells,
-            grid_target_cells,
-        ) = _coarsen_grid_resolution(w_mm, h_mm, requested_res, settings)
-
-        # Apply area limiting if enabled
-        if settings.get('limit_area') and settings.get('pad_dist_mm', 0.0) > 0:
-            radius_mm = settings['pad_dist_mm']
-            pad_xs = [pad.GetPosition().x * 1e-6 for pad in focus_pads]
-            pad_ys = [pad.GetPosition().y * 1e-6 for pad in focus_pads]
-            if pad_xs and pad_ys:
-                x_min = max(x_min, min(pad_xs) - radius_mm)
-                y_min = max(y_min, min(pad_ys) - radius_mm)
-                x_max = min(x_min + w_mm, max(pad_xs) + radius_mm)
-                y_max = min(y_min + h_mm, max(pad_ys) + radius_mm)
-                w_mm = max(res, x_max - x_min)
-                h_mm = max(res, y_max - y_min)
-
-        cols = int(w_mm / res) + 4
-        rows = int(h_mm / res) + 4
         layer_count = len(copper_ids)
+        grid = _estimate_solver_grid(
+            bbox, requested_res, settings, layer_count, focus_pads, area=area
+        )
+        res = grid.actual_res_mm
+        x_min = grid.x_min_mm
+        y_min = grid.y_min_mm
+        rows = grid.rows
+        cols = grid.cols
         grid_info = {
             "grid_requested_res_mm": requested_res,
             "grid_res_mm": float(res),
-            "grid_auto_coarsened": bool(auto_coarsened),
-            "grid_expert_limits": bool(grid_expert_limits),
-            "grid_max_cells": int(grid_max_cells),
-            "grid_target_cells": int(grid_target_cells),
+            "grid_auto_coarsened": grid.auto_coarsened,
+            "grid_expert_limits": grid.expert_limits,
+            "grid_max_cells": grid.max_cells,
+            "grid_target_cells": grid.target_cells,
             "grid_rows": int(rows),
             "grid_cols": int(cols),
             "grid_x_min_mm": float(x_min),
@@ -891,6 +1793,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "grid_width_mm": float(cols * res),
             "grid_height_mm": float(rows * res),
             "grid_cell_area_mm2": float(res * res),
+            "grid_detail_level": grid.detail_level,
+            "grid_node_budget": grid.node_budget,
+            "grid_memory_mb_low": grid.memory_mb_low,
+            "grid_memory_mb_high": grid.memory_mb_high,
+            "grid_runtime_class": grid.runtime_class,
+            "area_mode": area.mode,
+            "area_fraction": area.area_fraction,
+            "area_margin_mm": area.margin_mm,
+            "area_active_nets": list(area.active_net_names),
         }
 
         # Physical parameters
@@ -907,9 +1818,14 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         gap_m = [max(1e-9, g * 1e-3) for g in gap_mm_used]
 
         # Build internal geometry state
+        set_dialog_state("running", "Mapping exact PCB geometry...")
         geometry_start = time.perf_counter()
+        cache_key = self._geometry_key(board, copper_ids, bbox, grid, settings, focus_pads)
+        geometry_state = self.geometry_cache.get(cache_key)
+        geometry_cache_hit = geometry_state is not None
         try:
-            geometry_state = build_geometry_state(
+            if geometry_state is None:
+                geometry_state = build_geometry_state(
                 board=board,
                 copper_ids=copper_ids,
                 rows=rows,
@@ -920,11 +1836,14 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 settings=settings,
                 via_factor=via_factor,
                 pads_list=focus_pads,
-            )
+                )
+                self.geometry_cache.put(cache_key, geometry_state)
         except Exception as e:
             wx.MessageBox(f"Error mapping geometry: {e}", "Error")
+            set_dialog_state("failed", "Board geometry could not be mapped.")
             return
         init_timings["geometry_maps_s"] = time.perf_counter() - geometry_start
+        init_timings["geometry_cache_hit"] = geometry_cache_hit
         copper_mask = geometry_state.copper_mask
         V_map = geometry_state.via_map
         H_map = geometry_state.heatsink_mask.astype(np.float64, copy=False)
@@ -942,38 +1861,66 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         copper_threshold_rel = k_fr4_rel * 1.5
         t_cu = np.array(cu_thick_m)
 
-        # Effective FR4 thickness per layer
-        if layer_count > 1 and gap_m:
-            t_fr4_eff = []
-            for i in range(layer_count):
-                if i == 0:
-                    gap = gap_m[0]
-                elif i == layer_count - 1:
-                    gap = gap_m[-1]
-                else:
-                    gap = 0.5 * (gap_m[i - 1] + gap_m[i])
-                t_fr4_eff.append(gap)
-        else:
-            t_fr4_eff = [max(total_thick_mm * 1e-3, 1e-5)] * layer_count
-        t_fr4_eff = np.clip(np.array(t_fr4_eff), 1e-6, 5e-3)
+        # Effective FR4 thickness per copper-plane control volume.
+        t_fr4_eff = _effective_fr4_control_volume_thicknesses(
+            gap_m,
+            total_thick_mm * 1e-3,
+            layer_count,
+        )
         t_fr4_eff_mm = (t_fr4_eff * 1e3).tolist()
+        engine_setting = str(
+            settings.get("compute_engine", "auto") or "auto"
+        ).strip().lower()
+        if engine_setting not in {"auto", "fast_native", "legacy"}:
+            engine_setting = "auto"
+        use_fast_engine = (
+            engine_setting == "fast_native"
+            or (engine_setting == "auto" and grid.nodes >= 250_000)
+        )
+        resolved_engine = "fast_native" if use_fast_engine else "legacy"
+        mesh_mode = str(settings.get("mesh_mode", "adaptive") or "adaptive").lower()
+        if mesh_mode not in {"adaptive", "uniform"}:
+            mesh_mode = "adaptive"
+        if not use_fast_engine:
+            mesh_mode = "uniform"
+
+        operator_key = stable_fingerprint({
+            "geometry": cache_key,
+            "compute_engine": resolved_engine,
+            "copper_thickness_m": [float(value) for value in t_cu],
+            "dielectric_gap_m": [float(value) for value in gap_m],
+            "fr4_effective_m": [float(value) for value in t_fr4_eff],
+            "cell_size_m": float(dx),
+            "ambient_c": float(amb),
+            "h_conv": float(settings.get("h_conv", 10.0)),
+            "pad_th": float(settings.get("pad_th", 1.0)),
+            "pad_k": float(settings.get("pad_k", 3.0)),
+            "pad_cap_areal": float(settings.get("pad_cap_areal", 0.0) or 0.0),
+        })
+        cached_operator = self.operator_cache.get(operator_key)
+        operator_cache_hit = cached_operator is not None
 
         # Heat capacity
+        set_dialog_state("running", "Preparing material capacities...")
         capacity_start = time.perf_counter()
-        C_layers = np.empty((layer_count, rows, cols), dtype=np.float64)
-        for l in range(layer_count):
-            V_cu = pixel_area * t_cu[l]
-            V_fr4 = pixel_area * t_fr4_eff[l]
-            mask = copper_mask[l]
-            C_layer = np.where(mask, rho_cu * cp_cu * V_cu, rho_fr4 * cp_fr4 * V_fr4)
-            C_layer += mask * (rho_fr4 * cp_fr4 * V_fr4)
-            C_layers[l] = C_layer
         pad_cap_areal = float(settings.get('pad_cap_areal', 0.0) or 0.0)
-        if pad_cap_areal > 0.0 and np.any(H_map):
-            pad_cap_per_cell = pad_cap_areal * pixel_area
-            C_layers[-1] += pad_cap_per_cell * H_map
-        C = C_layers.reshape(-1)
+        if operator_cache_hit:
+            C, K_matrix, b, hA = cached_operator
+        else:
+            C_layers = np.empty((layer_count, rows, cols), dtype=np.float64)
+            for l in range(layer_count):
+                V_cu = pixel_area * t_cu[l]
+                V_fr4 = pixel_area * t_fr4_eff[l]
+                mask = copper_mask[l]
+                C_layer = np.where(mask, rho_cu * cp_cu * V_cu, rho_fr4 * cp_fr4 * V_fr4)
+                C_layer += mask * (rho_fr4 * cp_fr4 * V_fr4)
+                C_layers[l] = C_layer
+            if pad_cap_areal > 0.0 and np.any(H_map):
+                pad_cap_per_cell = pad_cap_areal * pixel_area
+                C_layers[-1] += pad_cap_per_cell * H_map
+            C = C_layers.reshape(-1)
         init_timings["capacity_build_s"] = time.perf_counter() - capacity_start
+        init_timings["operator_cache_hit"] = operator_cache_hit
 
         # Power injection (supports constant values and PWL file paths)
         RC = rows * cols
@@ -1000,6 +1947,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 + "\n".join(str(name) for name in missing_power_pads),
                 "Power Pad Error"
             )
+            set_dialog_state("failed", "One or more heat-source pads were not found.")
             return
 
         # Parse each entry as constant float or PWL file path
@@ -1016,6 +1964,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         f"Error reading PWL file:\n{entry}\n\n{e}",
                         "PWL Error"
                     )
+                    set_dialog_state("failed", "A PWL power profile could not be read.")
                     return
 
         if len(pad_sources) == 1 and len(power_pads) > 1:
@@ -1045,7 +1994,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         electrical_summary = None
         q_joule = None
         if settings.get("current_enabled"):
+            set_dialog_state("running", "Solving active electrical paths...")
             electrical_start = time.perf_counter()
+            electrical_cache_hit = False
             terminals, missing_pads = self._resolve_current_terminals(board, settings)
             if missing_pads:
                 wx.MessageBox(
@@ -1053,6 +2004,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     + "\n".join(str(name) for name in missing_pads),
                     "Current Path Error"
                 )
+                set_dialog_state("failed", "One or more current-terminal pads were not found.")
                 return
             if terminals:
                 electrical_config = ElectricalConfig(
@@ -1065,13 +2017,27 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     t_cu=np.asarray(t_cu, dtype=np.float64),
                     layer_names={lid: layer_names[idx] for idx, lid in enumerate(copper_ids) if idx < len(layer_names)},
                 )
-                electrical_result = solve_electrical_heating(board, terminals, electrical_config)
+                electrical_key = stable_fingerprint({
+                    "geometry": cache_key,
+                    "copper_thickness_m": [float(value) for value in t_cu],
+                    "terminals": [
+                        (item.name, item.net_name, int(item.net_code), float(item.current_a))
+                        for item in terminals
+                    ],
+                })
+                electrical_result = self.electrical_cache.get(electrical_key)
+                electrical_cache_hit = electrical_result is not None
+                if electrical_result is None:
+                    electrical_result = solve_electrical_heating(board, terminals, electrical_config)
+                    if electrical_result.valid:
+                        self.electrical_cache.put(electrical_key, electrical_result)
                 if not electrical_result.valid:
                     wx.MessageBox(
                         "Current simulation validation failed:\n\n"
                         + "\n".join(electrical_result.errors),
                         "Current Path Error"
                     )
+                    set_dialog_state("failed", "Current-path validation failed.")
                     return
                 q_joule = electrical_result.q_joule
                 if np.any(q_joule):
@@ -1095,6 +2061,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     "nets": [],
                 }
             init_timings["electrical_solve_s"] = time.perf_counter() - electrical_start
+            init_timings["electrical_cache_hit"] = electrical_cache_hit
 
         # Build pad_power for reporting
         pad_power = []
@@ -1109,14 +2076,63 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             else:
                 pad_power.append((name, None))
 
-        # Build stiffness matrix
+        # Build the thermal operator. Large jobs use the matrix-free regular
+        # grid representation, avoiding COO/CSR construction and direct
+        # factorization startup.
+        set_dialog_state("running", "Building the thermal operator...")
         stiffness_start = time.perf_counter()
-        K_matrix, b, hA, _ = build_stiffness_matrix(
-            layer_count, rows, cols, copper_mask, t_cu, t_fr4_eff,
-            k_cu, k_fr4, dx, dy, V_map, gap_m, H_map, settings, amb
-        )
+        if not operator_cache_hit:
+            builder = build_structured_operator if use_fast_engine else build_stiffness_matrix
+            K_matrix, b, hA, _ = builder(
+                layer_count, rows, cols, copper_mask, t_cu, t_fr4_eff,
+                k_cu, k_fr4, dx, dy, V_map, gap_m, H_map, settings, amb
+            )
+            self.operator_cache.put(operator_key, (C, K_matrix, b, hA))
         init_timings["stiffness_matrix_s"] = time.perf_counter() - stiffness_start
+        init_timings["compute_engine"] = resolved_engine
+
+        adaptive_system = None
+        if use_fast_engine and mesh_mode == "adaptive":
+            set_dialog_state("running", "Building the adaptive multilevel mesh...")
+            adaptive_started = time.perf_counter()
+            source_mask = np.zeros(N, dtype=bool)
+            for contribution in pad_contributions:
+                source_mask[contribution.indices] = True
+            if q_joule is not None:
+                source_mask |= np.asarray(q_joule) != 0.0
+            max_cell_ratio = max(
+                1, min(16, int(settings.get("adaptive_max_cell_ratio", 8) or 8))
+            )
+            adaptive_grid = build_adaptive_mesh(
+                copper_mask,
+                V_map,
+                geometry_state.heatsink_mask,
+                source_mask=source_mask.reshape(layer_count, rows, cols),
+                max_cell_ratio=max_cell_ratio,
+            )
+            adaptive_system = build_adaptive_system(
+                K_matrix, C, Q, b, hA, adaptive_grid
+            )
+            init_timings["adaptive_mesh_s"] = time.perf_counter() - adaptive_started
+            grid_info.update({
+                "mesh_mode": "adaptive",
+                "equivalent_uniform_nodes": int(N),
+                "adaptive_nodes": int(adaptive_system.operator.shape[0]),
+                "mesh_reduction_ratio": float(
+                    N / max(adaptive_system.operator.shape[0], 1)
+                ),
+                "adaptive_max_cell_ratio": max_cell_ratio,
+            })
+        else:
+            grid_info.update({
+                "mesh_mode": "uniform",
+                "equivalent_uniform_nodes": int(N),
+                "adaptive_nodes": int(N),
+                "mesh_reduction_ratio": 1.0,
+                "adaptive_max_cell_ratio": 1,
+            })
         print(f"[ThermalSim] init timings: {_format_timing_summary(init_timings)}")
+        set_dialog_state("running", "Starting transient solver...")
 
         # Snapshot configuration
         snap_times = []
@@ -1127,59 +2143,223 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         # Progress dialog
         pd = wx.ProgressDialog(
-            "Simulating...", "Initializing...", 100,
+            "ThermalSim", "Preparing thermal model...", 100,
             style=wx.PD_CAN_ABORT | wx.PD_APP_MODAL | wx.PD_REMAINING_TIME | wx.PD_AUTO_HIDE
         )
 
+        progress_state = {"current": 0, "total": 1}
+        cancel_token = CancellationToken()
+        self.cancel_token = cancel_token
+
         def progress_callback(current, total):
-            percent = int((current / total) * 100) if total else 0
-            try:
-                result = pd.Update(percent, f"Step {current}/{total}")
-                keep_going = result[0] if isinstance(result, tuple) else result
-                if hasattr(pd, "WasCancelled") and pd.WasCancelled():
-                    keep_going = False
-                return keep_going
-            except Exception:
-                return False
+            progress_state["current"] = int(current)
+            progress_state["total"] = max(1, int(total))
+            return not cancel_token.cancelled
 
         def snapshot_callback(T_view, t_elapsed, snap_idx):
             return save_snapshot(T_view, H_map, amb, layer_names, snap_idx, t_elapsed, out_dir=run_dir)
 
+        if adaptive_system is not None:
+            def solver_snapshot_callback(T_view, t_elapsed, snap_idx):
+                fine_view = adaptive_system.mesh.prolong(
+                    T_view.reshape(-1), layer_count
+                )
+                return snapshot_callback(fine_view, t_elapsed, snap_idx)
+        else:
+            solver_snapshot_callback = snapshot_callback
+
         # Run solver
+        configured_time_stepping = settings.get("time_stepping", "auto")
+        if use_fast_engine and configured_time_stepping == "auto":
+            configured_time_stepping = "uniform"
         config = SolverConfig(
             sim_time=sim_time,
             amb=amb,
             dt_base=dt,
             steps_target=steps_target,
-            use_pardiso=HAS_PARDISO,
+            use_pardiso=(
+                not use_fast_engine
+                and HAS_PARDISO
+                and settings.get("solver_backend", "auto") != "scipy"
+            ),
             use_multi_phase=True,
+            time_stepping=configured_time_stepping,
             snapshots_enabled=settings.get('snapshots', False),
             snap_times=snap_times
         )
+        factorization_cache_key = stable_fingerprint({
+            "operator": operator_key,
+            "backend": "pardiso" if config.use_pardiso else "scipy",
+            "time_stepping": config.time_stepping,
+            "sim_time": float(config.sim_time),
+            "dt_base": float(config.dt_base),
+            "steps_target": int(config.steps_target),
+            "use_multi_phase": bool(config.use_multi_phase),
+        })
+
+        worker_result = {}
+
+        def solver_worker():
+            try:
+                if use_fast_engine:
+                    solver_operator = (
+                        adaptive_system.operator
+                        if adaptive_system is not None
+                        else K_matrix
+                    )
+                    solver_capacity = (
+                        adaptive_system.capacity
+                        if adaptive_system is not None
+                        else C
+                    )
+                    solver_power = (
+                        adaptive_system.power
+                        if adaptive_system is not None
+                        else Q
+                    )
+                    solver_boundary = (
+                        adaptive_system.boundary_rhs
+                        if adaptive_system is not None
+                        else b
+                    )
+                    solver_h_area = (
+                        adaptive_system.h_area
+                        if adaptive_system is not None
+                        else hA
+                    )
+                    solver_power_func = (
+                        adaptive_system.wrap_power_function(Q_func, layer_count)
+                        if adaptive_system is not None
+                        else Q_func
+                    )
+                    worker_result["result"] = run_simulation_matrix_free(
+                        config, solver_operator, solver_capacity, solver_power,
+                        solver_boundary, solver_h_area,
+                        progress_callback, solver_snapshot_callback,
+                        Q_func=solver_power_func,
+                        cancel_check=lambda: cancel_token.cancelled,
+                    )
+                    if adaptive_system is not None:
+                        worker_result["result"].T = adaptive_system.mesh.prolong(
+                            worker_result["result"].T.reshape(-1), layer_count
+                        )
+                else:
+                    worker_result["result"] = run_simulation(
+                        config, K_matrix, C, Q, b, hA,
+                        layer_count, rows, cols,
+                        progress_callback, snapshot_callback,
+                        Q_func=Q_func,
+                        cancel_check=lambda: cancel_token.cancelled,
+                        factorization_cache=self.factorization_cache,
+                        factorization_cache_key=factorization_cache_key,
+                    )
+            except Exception:
+                fast_traceback = traceback.format_exc()
+                if use_fast_engine and N <= 1_000_000 and not cancel_token.cancelled:
+                    try:
+                        print(
+                            "[ThermalSim][WARN] Fast CPU solver failed; "
+                            "retrying the safe legacy backend."
+                        )
+                        fallback_matrix, fallback_b, fallback_h_area, _ = (
+                            build_stiffness_matrix(
+                                layer_count, rows, cols, copper_mask,
+                                t_cu, t_fr4_eff, k_cu, k_fr4,
+                                dx, dy, V_map, gap_m, H_map, settings, amb,
+                            )
+                        )
+                        fallback_config = SolverConfig(
+                            sim_time=sim_time,
+                            amb=amb,
+                            dt_base=dt,
+                            steps_target=steps_target,
+                            use_pardiso=(
+                                HAS_PARDISO
+                                and settings.get("solver_backend", "auto") != "scipy"
+                            ),
+                            use_multi_phase=True,
+                            time_stepping=settings.get("time_stepping", "auto"),
+                            snapshots_enabled=settings.get("snapshots", False),
+                            snap_times=snap_times,
+                        )
+                        worker_result["result"] = run_simulation(
+                            fallback_config,
+                            fallback_matrix,
+                            C,
+                            Q,
+                            fallback_b,
+                            fallback_h_area,
+                            layer_count,
+                            rows,
+                            cols,
+                            progress_callback,
+                            snapshot_callback,
+                            Q_func=Q_func,
+                            cancel_check=lambda: cancel_token.cancelled,
+                        )
+                        worker_result["result"].k_norm_info.update({
+                            "compute_engine": "legacy_fallback",
+                            "fast_engine_error": fast_traceback,
+                        })
+                        grid_info.update({
+                            "mesh_mode": "uniform",
+                            "adaptive_nodes": int(N),
+                            "mesh_reduction_ratio": 1.0,
+                            "adaptive_max_cell_ratio": 1,
+                        })
+                    except Exception:
+                        worker_result["traceback"] = (
+                            fast_traceback
+                            + "\nLegacy fallback also failed:\n"
+                            + traceback.format_exc()
+                        )
+                else:
+                    worker_result["traceback"] = fast_traceback
+
+        worker = threading.Thread(target=solver_worker, name="ThermalSimSolver", daemon=True)
+        worker.start()
+        while worker.is_alive():
+            current = progress_state["current"]
+            total = progress_state["total"]
+            percent = int((current / total) * 100) if total else 0
+            try:
+                update_result = pd.Update(percent, f"Solving thermal model - step {current}/{total}")
+                keep_going = update_result[0] if isinstance(update_result, tuple) else update_result
+                if not keep_going or (hasattr(pd, "WasCancelled") and pd.WasCancelled()):
+                    cancel_token.cancel()
+                app = wx.GetApp()
+                if app is not None:
+                    app.Yield(True)
+            except Exception:
+                cancel_token.cancel()
+            worker.join(0.05)
+        worker.join()
+        self.cancel_token = None
 
         try:
-            result = run_simulation(
-                config, K_matrix, C, Q, b, hA,
-                layer_count, rows, cols,
-                progress_callback, snapshot_callback,
-                Q_func=Q_func
-            )
+            pd.Update(100, "Done")
         except Exception:
-            wx.MessageBox(f"Solver failed:\n{traceback.format_exc()}", "Solver Error")
+            pass
+        pd.Hide()
+        pd.Destroy()
+        try:
+            app = wx.GetApp()
+            if app is not None:
+                app.Yield()
+        except Exception:
+            pass
+
+        if "traceback" in worker_result:
+            error_text = worker_result["traceback"]
+            _write_run_manifest(run_dir, "error", traceback=error_text)
+            wx.MessageBox(f"Solver failed:\n{error_text}", "Solver Error")
+            set_dialog_state("failed", "The thermal solver failed. See the error dialog for details.")
             return
-        finally:
-            try:
-                pd.Update(100, "Done")
-            except:
-                pass
-            pd.Hide()
-            pd.Destroy()
-            try:
-                wx.GetApp().Yield()
-            except:
-                pass
+        result = worker_result["result"]
 
         if result.aborted:
+            _write_run_manifest(run_dir, "cancelled")
+            set_dialog_state("cancelled")
             return
 
         # Add extra info to k_norm_info
@@ -1197,7 +2377,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "init_capacity_build_s": init_timings.get("capacity_build_s"),
             "init_power_vector_build_s": init_timings.get("power_vector_build_s"),
             "init_electrical_solve_s": init_timings.get("electrical_solve_s"),
+            "init_electrical_cache_hit": init_timings.get("electrical_cache_hit"),
             "init_stiffness_matrix_s": init_timings.get("stiffness_matrix_s"),
+            "init_adaptive_mesh_s": init_timings.get("adaptive_mesh_s"),
+            "init_operator_cache_hit": init_timings.get("operator_cache_hit"),
+            "compute_engine": result.k_norm_info.get(
+                "compute_engine", resolved_engine
+            ),
+            "process_working_set_mb": get_process_memory_mb(),
+            "process_peak_working_set_mb": get_process_memory_mb(peak=True),
+            "factorization_cache_hit": result.k_norm_info.get("factorization_cache_hit"),
             "electrical_summary": electrical_summary,
         })
 
@@ -1233,7 +2422,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             settings, layer_names, stack_info,
             get_pad_pixels, create_multilayer_maps,
             self._derive_stackup_thicknesses,
-            open_file=False, out_dir=run_dir
+            open_file=False, out_dir=run_dir,
+            geometry_state=geometry_state,
+            grid_spec=grid,
         )
 
         interactive_heatmap = build_interactive_heatmap_payload(
@@ -1265,7 +2456,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "init_capacity_build_s": init_timings.get("capacity_build_s"),
             "init_power_vector_build_s": init_timings.get("power_vector_build_s"),
             "init_electrical_solve_s": init_timings.get("electrical_solve_s"),
+            "init_electrical_cache_hit": init_timings.get("electrical_cache_hit"),
             "init_stiffness_matrix_s": init_timings.get("stiffness_matrix_s"),
+            "init_operator_cache_hit": init_timings.get("operator_cache_hit"),
+            "factorization_cache_hit": result.k_norm_info.get("factorization_cache_hit"),
         }
 
         report_path = write_html_report(
@@ -1284,6 +2478,35 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             electrical_summary=electrical_summary,
             joule_map_path=joule_map_path
         )
+        _write_run_manifest(
+            run_dir,
+            "success",
+            report_path=report_path,
+            heatmap_path=heatmap_path,
+            preview_path=preview_path,
+        )
+        elapsed_s = time.perf_counter() - run_started_at
+        max_temp_c = float(np.max(result.T))
+        self.last_artifacts = SimulationArtifacts(
+            report_path=report_path,
+            preview_path=preview_path,
+            heatmap_path=heatmap_path,
+            run_dir=run_dir,
+            status="success",
+            elapsed_s=elapsed_s,
+            max_temp_c=max_temp_c,
+        )
+        if self.settings_dialog is not None:
+            try:
+                wx.CallAfter(
+                    self.settings_dialog.set_artifacts,
+                    report_path,
+                    run_dir,
+                    elapsed_s,
+                    max_temp_c,
+                )
+            except Exception:
+                pass
 
         # Open outputs
         if report_path:
@@ -1293,14 +2516,4 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     webbrowser.open("file://" + os.path.abspath(report_path))
                 except Exception:
                     pass
-                if heatmap_path:
-                    try:
-                        if sys.platform.startswith("win"):
-                            os.startfile(os.path.abspath(heatmap_path))
-                        elif sys.platform == "darwin":
-                            subprocess.Popen(["open", os.path.abspath(heatmap_path)])
-                        else:
-                            subprocess.Popen(["xdg-open", os.path.abspath(heatmap_path)])
-                    except Exception:
-                        pass
             wx.CallAfter(_open_outputs)

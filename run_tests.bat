@@ -6,6 +6,12 @@ echo Running ThermalSim unit tests...
 echo.
 
 python -c "import sys; sys.path.insert(0, 'tests'); from mocks.pcbnew_mock import install_mock; from mocks.wx_mock import install_wx_mock; install_mock(); install_wx_mock(); sys.path.insert(0, '.'); import pytest; sys.exit(pytest.main(['-v', '--tb=short', 'tests/'] + sys.argv[1:]))" %*
+set "test_exit=%ERRORLEVEL%"
 
 echo.
+if not "%test_exit%"=="0" (
+    echo Tests failed with exit code %test_exit%.
+    exit /b %test_exit%
+)
 echo Done.
+exit /b 0

@@ -16,6 +16,8 @@ from scipy.sparse.csgraph import connected_components
 
 import pcbnew
 
+from .geometry_mapper import _fill_zone_mask_polygons
+
 
 @dataclass
 class CurrentTerminal:
@@ -944,7 +946,7 @@ def _fill_track(mask: np.ndarray, layer_idx: int, track: Any, config: Electrical
     ex, ey = end.x * 1e-6, end.y * 1e-6
     vx, vy = ex - sx, ey - sy
     seg_len_sq = vx * vx + vy * vy
-    radius = 0.5 * width_mm + 0.5 * config.res
+    radius = 0.5 * width_mm
 
     y = config.y_min + (np.arange(rs, re, dtype=np.float64) + 0.5) * config.res
     x = config.x_min + (np.arange(cs, ce, dtype=np.float64) + 0.5) * config.res
@@ -965,6 +967,27 @@ def _fill_zone(mask: np.ndarray, layer_idx: int, lid: int, zone: Any, config: El
     bbox = zone.GetBoundingBox()
     rs, re, cs, ce = _bbox_indices(bbox, config)
     if rs >= re or cs >= ce:
+        return
+
+    x_values = np.asarray(
+        (
+            config.x_min
+            + (np.arange(cs, ce, dtype=np.float64) + 0.5) * config.res
+        ) * 1e6,
+        dtype=np.int64,
+    )
+    y_values = np.asarray(
+        (
+            config.y_min
+            + (np.arange(rs, re, dtype=np.float64) + 0.5) * config.res
+        ) * 1e6,
+        dtype=np.int64,
+    )
+    zone_mask = np.zeros((re - rs, ce - cs), dtype=bool)
+    if _fill_zone_mask_polygons(
+        zone_mask, None, x_values, y_values, lid, zone
+    ):
+        mask[layer_idx, rs:re, cs:ce] |= zone_mask
         return
 
     has_hit = hasattr(zone, "HitTestFilledArea")

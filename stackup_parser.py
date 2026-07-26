@@ -230,6 +230,8 @@ def parse_stackup_from_board_file(board):
         if typ == "copper" and name:
             try:
                 lid = int(board.GetLayerID(name))
+                if lid < 0 or lid >= 64:
+                    lid = None
             except Exception:
                 lid = None
             copper.append({

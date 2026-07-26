@@ -14,16 +14,165 @@ from ThermalSim.thermal_plugin import (
     _build_power_vector,
     _build_sparse_pad_contributions,
     _coarsen_grid_resolution,
+    _effective_fr4_control_volume_thicknesses,
+    _find_pcb_editor_parent,
+    _resolve_grid_policy,
 )
 from tests.mocks.pcbnew_mock import (
     MockBoard,
     MockFootprint,
     MockPad,
+    MockZone,
     VECTOR2I,
     EDA_RECT,
     F_Cu,
     B_Cu,
 )
+
+
+class TestStartupSafety:
+    """Regression tests for KiCad startup and zone-map safety."""
+
+    def test_unfilled_zones_are_detected_without_running_zone_filler(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        board = MockBoard(zones=[
+            MockZone(layers=[F_Cu], filled=False),
+            MockZone(layers=[F_Cu], filled=True),
+        ])
+        plugin = ThermalPlugin()
+        plugin.defaults()
+
+        assert plugin._count_unfilled_copper_zones(board) == 1
+        assert plugin._require_filled_zones(board) is False
+
+    def test_cache_snapshot_never_reads_filled_polygon_map(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        class UnsafePolygonZone(MockZone):
+            def GetFilledPolysList(self, _layer):
+                raise AssertionError("unsafe filled-polygon map access")
+
+        board = MockBoard(
+            zones=[UnsafePolygonZone(layers=[F_Cu], filled=True)],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+        )
+        plugin = ThermalPlugin()
+        plugin.defaults()
+
+        snapshot = plugin._capture_board_snapshot(
+            board,
+            [F_Cu, B_Cu],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+        )
+
+        assert snapshot.zone_count == 1
+
+    def test_selected_descriptors_reuse_existing_selection_scan(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        pad = MockPad(
+            position=VECTOR2I(1_000_000, 2_000_000),
+            layer=F_Cu,
+            number="7",
+        )
+        board = MockBoard(layer_names={F_Cu: "F.Cu"})
+        plugin = ThermalPlugin()
+        plugin.defaults()
+
+        descriptors = plugin._descriptors_from_selected_pads(
+            board, [("U42-7", pad)]
+        )
+
+        assert descriptors[0]["name"].startswith("U42-7")
+
+    def test_dialog_parent_prefers_pcb_editor_over_project_manager(self, monkeypatch):
+        """Plugin dialogs should remain owned by the PCB Editor frame."""
+        import ThermalSim.thermal_plugin as thermal_plugin_module
+
+        wx_api = thermal_plugin_module.wx
+
+        class Window:
+            def __init__(self, title, parent=None):
+                self.title = title
+                self.parent = parent
+
+            def GetTitle(self):
+                return self.title
+
+            def GetParent(self):
+                return self.parent
+
+        manager = Window("KiCad Project Manager")
+        editor = Window("power_board.kicad_pcb - PCB Editor")
+        toolbar_child = Window("Plugin toolbar", parent=editor)
+        board = MockBoard(filename=r"C:\boards\power_board.kicad_pcb")
+
+        monkeypatch.setattr(wx_api, "GetActiveWindow", lambda: toolbar_child, raising=False)
+        monkeypatch.setattr(
+            wx_api, "GetTopLevelWindows", lambda: [manager, editor], raising=False
+        )
+
+        assert _find_pcb_editor_parent(board) is editor
+
+    def test_dialog_parent_does_not_choose_active_project_manager(self, monkeypatch):
+        """An identifiable editor wins even if the manager is currently active."""
+        import ThermalSim.thermal_plugin as thermal_plugin_module
+
+        wx_api = thermal_plugin_module.wx
+
+        class Window:
+            def __init__(self, title):
+                self.title = title
+
+            def GetTitle(self):
+                return self.title
+
+            def GetParent(self):
+                return None
+
+        manager = Window("KiCad Project Manager")
+        editor = Window("layout - PCB Editor")
+        monkeypatch.setattr(wx_api, "GetActiveWindow", lambda: manager, raising=False)
+        monkeypatch.setattr(
+            wx_api, "GetTopLevelWindows", lambda: [manager, editor], raising=False
+        )
+
+        assert _find_pcb_editor_parent() is editor
+
+
+class TestFr4ControlVolumes:
+    """Regression tests for conserved dielectric control-volume thickness."""
+
+    def test_two_layer_gap_is_split_between_outer_planes(self):
+        """A two-layer board must contain one gap, not one gap per plane."""
+        thicknesses = _effective_fr4_control_volume_thicknesses(
+            [1.53e-3], 1.6e-3, 2
+        )
+
+        np.testing.assert_allclose(thicknesses, [0.765e-3, 0.765e-3])
+        np.testing.assert_allclose(np.sum(thicknesses), 1.53e-3)
+
+    def test_multilayer_control_volumes_conserve_all_gaps(self):
+        """Outer half-gaps and inner half-pairs must conserve FR4 volume."""
+        gaps = np.asarray([0.2e-3, 1.0e-3, 0.2e-3])
+        thicknesses = _effective_fr4_control_volume_thicknesses(
+            gaps, 1.6e-3, 4
+        )
+
+        np.testing.assert_allclose(
+            thicknesses,
+            [0.1e-3, 0.6e-3, 0.6e-3, 0.1e-3],
+        )
+        np.testing.assert_allclose(np.sum(thicknesses), np.sum(gaps))
+
+    def test_single_layer_uses_full_board_thickness(self):
+        """A single copper plane owns the full fallback board thickness."""
+        thicknesses = _effective_fr4_control_volume_thicknesses(
+            [], 1.6e-3, 1
+        )
+
+        np.testing.assert_allclose(thicknesses, [1.6e-3])
 
 
 def _legacy_power_vector(board, copper_ids, pads_list, pad_sources, rows, cols, x_min, y_min, res):
@@ -242,7 +391,7 @@ class TestSettingsPersistence:
         }
 
         assert plugin._save_settings(settings, str(settings_path)) is True
-        assert plugin._load_settings(str(settings_path)) == settings
+        assert plugin._load_settings(str(settings_path)) == {**settings, "schema_version": 2}
 
     def test_load_settings_rejects_non_dict_json(self, tmp_path):
         """Only object-shaped JSON files are valid settings files."""
@@ -269,6 +418,36 @@ class TestSettingsPersistence:
 
 class TestGridCoarsening:
     """Tests for automatic grid coarsening limits."""
+
+    def test_custom_node_budget_supports_one_hundred_million_nodes(self):
+        """Custom mode should preserve the documented 100 million-node limit."""
+        detail, expert, max_cells, target_cells, max_nodes = _resolve_grid_policy(
+            {
+                "grid_detail_level": "custom",
+                "grid_node_budget": 100_000_000,
+            },
+            layer_count=4,
+        )
+
+        assert detail == "custom"
+        assert expert is True
+        assert max_nodes == 100_000_000
+        assert max_cells == 25_000_000
+        assert target_cells == 12_500_000
+
+    def test_custom_node_budget_is_clamped_at_one_hundred_million(self):
+        """Imported settings must not bypass the 100 million-node safety cap."""
+        _, _, max_cells, target_cells, max_nodes = _resolve_grid_policy(
+            {
+                "grid_detail_level": "custom",
+                "grid_node_budget": 250_000_000,
+            },
+            layer_count=2,
+        )
+
+        assert max_nodes == 100_000_000
+        assert max_cells == 50_000_000
+        assert target_cells == 25_000_000
 
     def test_default_coarsening_matches_legacy_formula(self):
         """Without expert settings, the historic 200k/100k limits apply."""
