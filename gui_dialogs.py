@@ -512,30 +512,46 @@ class SettingsDialog(wx.Dialog):
 
         main_sizer.Add(wx.StaticLine(self), 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 12)
 
-        # Fixed status and action footer.
-        footer = wx.BoxSizer(wx.HORIZONTAL)
+        # Keep status text and actions in separate child panels.  Native
+        # StaticText controls may otherwise paint beyond their horizontal
+        # sizer allocation and cover adjacent buttons when a warning is long.
+        self.footer_status_panel = wx.Panel(self)
         status_sizer = wx.BoxSizer(wx.VERTICAL)
-        self.lbl_preflight_status = wx.StaticText(self, label="Checking setup...")
+        self.lbl_preflight_status = wx.StaticText(
+            self.footer_status_panel, label="Checking setup..."
+        )
         status_font = self.lbl_preflight_status.GetFont()
         status_font.SetWeight(wx.FONTWEIGHT_BOLD)
         self.lbl_preflight_status.SetFont(status_font)
         status_sizer.Add(self.lbl_preflight_status, 0, wx.EXPAND)
-        self.lbl_preflight = wx.StaticText(self, label="Checking simulation setup...")
+        self.lbl_preflight = wx.StaticText(
+            self.footer_status_panel, label="Checking simulation setup..."
+        )
         status_sizer.Add(self.lbl_preflight, 0, wx.EXPAND | wx.TOP, 2)
-        footer.Add(status_sizer, 1, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 12)
+        self.footer_status_panel.SetSizer(status_sizer)
+        main_sizer.Add(
+            self.footer_status_panel,
+            0,
+            wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP,
+            12,
+        )
 
-        self.btn_more = wx.Button(self, label="More")
+        self.footer_actions_panel = wx.Panel(self)
+        footer = wx.BoxSizer(wx.HORIZONTAL)
+        footer.AddStretchSpacer()
+
+        self.btn_more = wx.Button(self.footer_actions_panel, label="More")
         self.btn_more.Bind(wx.EVT_BUTTON, self._on_more)
         footer.Add(self.btn_more, 0, wx.ALL, 4)
 
-        self.btn_preview = wx.Button(self, label="Preview")
+        self.btn_preview = wx.Button(self.footer_actions_panel, label="Preview")
         self.btn_preview.Bind(wx.EVT_BUTTON, self._on_preview)
         self.btn_preview.SetToolTip(TOOLTIP_TEXTS['preview'])
         footer.Add(self.btn_preview, 0, wx.ALL, 4)
 
-        self.btn_run = wx.Button(self, label="Run Simulation")
+        self.btn_run = wx.Button(self.footer_actions_panel, label="Run Simulation")
         self.btn_run.Bind(wx.EVT_BUTTON, self._on_run)
-        self.btn_cancel = wx.Button(self, label="Close")
+        self.btn_cancel = wx.Button(self.footer_actions_panel, label="Close")
         self.btn_cancel.Bind(wx.EVT_BUTTON, self._on_cancel)
         footer.Add(self.btn_run, 0, wx.ALL, 4)
         footer.Add(self.btn_cancel, 0, wx.ALL, 4)
@@ -548,7 +564,13 @@ class SettingsDialog(wx.Dialog):
         except Exception:
             pass
 
-        main_sizer.Add(footer, 0, wx.EXPAND | wx.ALL, 8)
+        self.footer_actions_panel.SetSizer(footer)
+        main_sizer.Add(
+            self.footer_actions_panel,
+            0,
+            wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM,
+            8,
+        )
 
         self.SetSizer(main_sizer)
         self.SetSize((820, 720))
@@ -564,9 +586,8 @@ class SettingsDialog(wx.Dialog):
         self._bind_estimate_controls()
         self._refresh_context_summary()
         if defer_initial_preflight:
-            self.lbl_preflight_status.SetLabel("Dialog ready")
-            self.lbl_preflight.SetLabel(
-                "Checking board and simulation settings..."
+            self._set_footer_status(
+                "Dialog ready", "Checking board and simulation settings..."
             )
             try:
                 wx.CallAfter(self._refresh_preflight)
@@ -1247,25 +1268,57 @@ class SettingsDialog(wx.Dialog):
         else:
             wx.MessageBox("Settings could not be saved.", "ThermalSim")
 
+    def _set_footer_status(self, title, message):
+        """Update and wrap the footer status without touching its action row."""
+        title = str(title or "")
+        message = str(message or "")
+        self.lbl_preflight_status.SetLabel(title)
+        self.lbl_preflight.SetLabel(message)
+        try:
+            self.lbl_preflight.SetToolTip(message)
+        except Exception:
+            pass
+        try:
+            width = self.footer_status_panel.GetClientSize().GetWidth() - 24
+        except Exception:
+            width = 700
+        if width <= 0:
+            width = 700
+        try:
+            self.lbl_preflight.Wrap(max(240, int(width)))
+        except Exception:
+            pass
+        try:
+            self.footer_status_panel.Layout()
+            self.Layout()
+        except Exception:
+            pass
+
     def _on_preview(self, event):
         """Handle Preview button click."""
         if self.preview_callback:
             settings = self.get_values()
             if settings and self._refresh_preflight(settings):
-                self.lbl_preflight_status.SetLabel("Building preview...")
-                self.lbl_preflight.SetLabel("Extracting and rasterizing board geometry.")
+                self._set_footer_status(
+                    "Building preview...",
+                    "Extracting and rasterizing board geometry.",
+                )
                 self.btn_preview.Enable(False)
                 try:
                     output_path = self.preview_callback(settings, self.layer_names)
                     if output_path:
-                        self.lbl_preflight_status.SetLabel("Preview ready")
-                        self.lbl_preflight.SetLabel(os.path.basename(output_path))
+                        self._set_footer_status(
+                            "Preview ready", os.path.basename(output_path)
+                        )
                     else:
-                        self.lbl_preflight_status.SetLabel("Preview failed")
-                        self.lbl_preflight.SetLabel("No preview image was created.")
+                        self._set_footer_status(
+                            "Preview failed", "No preview image was created."
+                        )
                 except Exception:
-                    self.lbl_preflight_status.SetLabel("Preview failed")
-                    self.lbl_preflight.SetLabel("The geometry preview could not be created.")
+                    self._set_footer_status(
+                        "Preview failed",
+                        "The geometry preview could not be created.",
+                    )
                     wx.MessageBox("Geometry preview failed.", "ThermalSim")
                 finally:
                     self.btn_preview.Enable(True)
@@ -1291,13 +1344,13 @@ class SettingsDialog(wx.Dialog):
         """Refresh the permanent readiness summary and Run availability."""
         settings = settings if settings is not None else self.get_values()
         if settings is None:
-            self.lbl_preflight_status.SetLabel("Blocked")
-            self.lbl_preflight.SetLabel("One or more numeric settings are invalid.")
+            self._set_footer_status(
+                "Blocked", "One or more numeric settings are invalid."
+            )
             self.btn_run.Enable(False)
             return False
         if not self.preflight_callback:
-            self.lbl_preflight_status.SetLabel("Ready")
-            self.lbl_preflight.SetLabel("Settings are valid.")
+            self._set_footer_status("Ready", "Settings are valid.")
             self.btn_run.Enable(True)
             return True
         try:
@@ -1337,13 +1390,13 @@ class SettingsDialog(wx.Dialog):
             label = details[0] if details else "Settings checked."
             if len(details) > 1:
                 label += "\n" + details[1]
-            self.lbl_preflight_status.SetLabel(str(result.status))
-            self.lbl_preflight.SetLabel(label)
+            self._set_footer_status(str(result.status), label)
             self.btn_run.Enable(bool(result.ready))
             return bool(result.ready)
         except Exception:
-            self.lbl_preflight_status.SetLabel("Blocked")
-            self.lbl_preflight.SetLabel("Preflight could not be completed.")
+            self._set_footer_status(
+                "Blocked", "Preflight could not be completed."
+            )
             self.btn_run.Enable(False)
             return False
 
@@ -1356,8 +1409,7 @@ class SettingsDialog(wx.Dialog):
             "failed": ("Failed", "The simulation did not complete."),
         }
         title, default_message = labels.get(self.last_run_status, (self.last_run_status.title(), ""))
-        self.lbl_preflight_status.SetLabel(title)
-        self.lbl_preflight.SetLabel(message or default_message)
+        self._set_footer_status(title, message or default_message)
         self.btn_run.Enable(self.last_run_status != "running")
 
     def set_artifacts(self, report_path, run_dir, elapsed_s=None, max_temp_c=None):
@@ -1372,8 +1424,7 @@ class SettingsDialog(wx.Dialog):
             summary.append(f"{float(elapsed_s):.1f} s")
         label = " / ".join(summary)
         self.lbl_result.SetLabel(label)
-        self.lbl_preflight_status.SetLabel("Completed")
-        self.lbl_preflight.SetLabel("Simulation results are ready.")
+        self._set_footer_status("Completed", "Simulation results are ready.")
         self.btn_open_report.Enable(bool(report_path and os.path.isfile(report_path)))
         self.btn_open_folder.Enable(bool(run_dir and os.path.isdir(run_dir)))
         self.result_panel.Show(True)

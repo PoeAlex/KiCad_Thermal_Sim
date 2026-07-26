@@ -401,6 +401,96 @@ def _bbox_bounds_mm(bbox):
     )
 
 
+def _find_pcb_editor_parent(board=None):
+    """Return the PCB Editor top-level window for parenting plugin dialogs.
+
+    KiCad can run the project manager and PCB Editor in the same wx
+    application. A dialog created with ``parent=None`` may then be attached to
+    the project manager even when the plugin was launched from PCB Editor.
+    """
+    try:
+        active = wx.GetActiveWindow()
+    except Exception:
+        active = None
+
+    def top_level(window):
+        current = window
+        seen = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            try:
+                parent = current.GetParent()
+            except Exception:
+                parent = None
+            if parent is None:
+                break
+            current = parent
+        return current
+
+    active_top = top_level(active)
+    candidates = []
+    try:
+        candidates.extend(list(wx.GetTopLevelWindows()))
+    except Exception:
+        pass
+    if active_top is not None and active_top not in candidates:
+        candidates.append(active_top)
+
+    board_tokens = []
+    if board is not None:
+        try:
+            board_name = os.path.basename(str(board.GetFileName() or "")).lower()
+            board_stem = os.path.splitext(board_name)[0]
+            board_tokens = [token for token in (board_name, board_stem) if token]
+        except Exception:
+            pass
+
+    editor_markers = (
+        "pcb editor", "pcbnew", "pcb_edit_frame", "pcb editor frame",
+        "leiterplatteneditor", "platteneditor",
+    )
+    manager_markers = ("project manager", "projektmanager")
+
+    def window_text(window):
+        parts = [type(window).__name__]
+        for getter_name in ("GetTitle", "GetName", "GetClassName"):
+            try:
+                value = getattr(window, getter_name)()
+                if value:
+                    parts.append(str(value))
+            except Exception:
+                continue
+        try:
+            parts.append(str(window.GetClassInfo().GetClassName()))
+        except Exception:
+            pass
+        return " ".join(parts).lower()
+
+    best = None
+    best_score = -10_000
+    for window in candidates:
+        if window is None:
+            continue
+        try:
+            if hasattr(window, "IsBeingDeleted") and window.IsBeingDeleted():
+                continue
+        except Exception:
+            continue
+        text = window_text(window)
+        score = 100 if window is active_top else 0
+        if any(marker in text for marker in editor_markers):
+            score += 1_000
+        if any(token in text for token in board_tokens):
+            score += 500
+        if any(marker in text for marker in manager_markers):
+            score -= 1_000
+        if score > best_score:
+            best = window
+            best_score = score
+
+    return best if best_score > 0 else active_top
+
+
 def _estimate_simulation_area(board, bbox, settings, power_pads=None, terminals=None):
     """Build a safe rectangular domain around heat sources and current nets."""
     board_x0, board_y0, board_x1, board_y1 = _bbox_bounds_mm(bbox)
@@ -661,6 +751,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self.cancel_token = None
         self.last_artifacts = None
         self.startup_dialog = None
+        self.host_window = None
 
     def _show_startup_progress(self, percent, message):
         """Show immediate feedback while the settings dialog is prepared."""
@@ -670,6 +761,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     "ThermalSim",
                     message,
                     maximum=100,
+                    parent=self.host_window,
                     style=getattr(wx, "PD_APP_MODAL", 0),
                 )
             self.startup_dialog.Update(int(percent), message)
@@ -897,12 +989,19 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
     def RunSafe(self):
         """Main plugin execution logic."""
+        board = pcbnew.GetBoard()
+        # Capture the editor before a progress/dependency dialog can become
+        # wx's active window and obscure the actual plugin host.
+        self.host_window = _find_pcb_editor_parent(board)
+
         if not HAS_LIBS:
             from .capabilities import get_missing_packages
             from .dependency_installer import DependencyInstallDialog
             missing = get_missing_packages()
             if missing:
-                dlg = DependencyInstallDialog(None, missing, [get_pypardiso_optional_dependency()])
+                dlg = DependencyInstallDialog(
+                    self.host_window, missing, [get_pypardiso_optional_dependency()]
+                )
                 dlg.ShowModal()
                 dlg.Destroy()
             else:
@@ -912,7 +1011,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 )
             return
 
-        board = pcbnew.GetBoard()
         self._show_startup_progress(5, "Reading active PCB...")
 
         # Zone filling is intentionally not performed here. It can take
@@ -1020,7 +1118,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         self._show_startup_progress(92, "Creating ThermalSim dialog...")
         dlg = SettingsDialog(
-            None, len(pads_list), suggested_res, layer_names,
+            self.host_window, len(pads_list), suggested_res, layer_names,
             preview_callback=self.generate_preview,
             selection_provider=selection_provider,
             run_callback=run_callback,

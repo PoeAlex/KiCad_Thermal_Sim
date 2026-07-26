@@ -148,10 +148,13 @@ class _WxMock:
 
     class StaticText:
         def __init__(self, parent, label="", size=None, **kwargs):
+            self.parent = parent
             self.label = label
+            self._wrap_width = None
+            self._tooltip = ""
 
         def SetToolTip(self, tip):
-            pass
+            self._tooltip = str(tip)
 
         def SetLabel(self, label):
             self.label = label
@@ -164,6 +167,9 @@ class _WxMock:
 
         def SetFont(self, font):
             pass
+
+        def Wrap(self, width):
+            self._wrap_width = int(width)
 
     class StaticLine:
         def __init__(self, parent, **kwargs):
@@ -362,6 +368,7 @@ class _WxMock:
 
     class Button:
         def __init__(self, parent, id=None, label=""):
+            self.parent = parent
             self.label = label
             self._enabled = True
             self._is_default = False

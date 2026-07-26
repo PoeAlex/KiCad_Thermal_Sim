@@ -693,6 +693,24 @@ class TestSettingsDialogInstantiation:
         assert dlg.btn_run.label == "Run Simulation"
         assert not dlg.btn_run._is_default
 
+    def test_warning_footer_is_separate_from_action_buttons(self):
+        """Long warnings must be wrapped in a panel above the button row."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(None, 0, 0.5, ["F.Cu", "B.Cu"])
+        warning = (
+            "The requested grid contains many millions of nodes and may "
+            "require tens of gigabytes of memory before adaptive reduction."
+        )
+        dlg._set_footer_status("Warning", warning)
+
+        assert dlg.footer_status_panel is not dlg.footer_actions_panel
+        assert dlg.lbl_preflight.parent is dlg.footer_status_panel
+        assert dlg.btn_run.parent is dlg.footer_actions_panel
+        assert dlg.lbl_preflight.GetLabel() == warning
+        assert dlg.lbl_preflight._wrap_width == 700
+        assert dlg.lbl_preflight._tooltip == warning
+
     def test_context_summarizes_constant_and_pwl_heat_sources(self):
         """Heat-source summary should expose count, total power, and PWL use."""
         from ThermalSim.gui_dialogs import summarize_power_pads

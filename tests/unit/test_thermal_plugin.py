@@ -14,6 +14,7 @@ from ThermalSim.thermal_plugin import (
     _build_power_vector,
     _build_sparse_pad_contributions,
     _coarsen_grid_resolution,
+    _find_pcb_editor_parent,
     _resolve_grid_policy,
 )
 from tests.mocks.pcbnew_mock import (
@@ -83,6 +84,60 @@ class TestStartupSafety:
         )
 
         assert descriptors[0]["name"].startswith("U42-7")
+
+    def test_dialog_parent_prefers_pcb_editor_over_project_manager(self, monkeypatch):
+        """Plugin dialogs should remain owned by the PCB Editor frame."""
+        import ThermalSim.thermal_plugin as thermal_plugin_module
+
+        wx_api = thermal_plugin_module.wx
+
+        class Window:
+            def __init__(self, title, parent=None):
+                self.title = title
+                self.parent = parent
+
+            def GetTitle(self):
+                return self.title
+
+            def GetParent(self):
+                return self.parent
+
+        manager = Window("KiCad Project Manager")
+        editor = Window("power_board.kicad_pcb - PCB Editor")
+        toolbar_child = Window("Plugin toolbar", parent=editor)
+        board = MockBoard(filename=r"C:\boards\power_board.kicad_pcb")
+
+        monkeypatch.setattr(wx_api, "GetActiveWindow", lambda: toolbar_child, raising=False)
+        monkeypatch.setattr(
+            wx_api, "GetTopLevelWindows", lambda: [manager, editor], raising=False
+        )
+
+        assert _find_pcb_editor_parent(board) is editor
+
+    def test_dialog_parent_does_not_choose_active_project_manager(self, monkeypatch):
+        """An identifiable editor wins even if the manager is currently active."""
+        import ThermalSim.thermal_plugin as thermal_plugin_module
+
+        wx_api = thermal_plugin_module.wx
+
+        class Window:
+            def __init__(self, title):
+                self.title = title
+
+            def GetTitle(self):
+                return self.title
+
+            def GetParent(self):
+                return None
+
+        manager = Window("KiCad Project Manager")
+        editor = Window("layout - PCB Editor")
+        monkeypatch.setattr(wx_api, "GetActiveWindow", lambda: manager, raising=False)
+        monkeypatch.setattr(
+            wx_api, "GetTopLevelWindows", lambda: [manager, editor], raising=False
+        )
+
+        assert _find_pcb_editor_parent() is editor
 
 
 def _legacy_power_vector(board, copper_ids, pads_list, pad_sources, rows, cols, x_min, y_min, res):
