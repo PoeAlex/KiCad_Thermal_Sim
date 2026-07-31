@@ -512,7 +512,8 @@ def write_html_report(
     snapshot_files=None,
     interactive_heatmap=None,
     electrical_summary=None,
-    joule_map_path=None
+    joule_map_path=None,
+    source_configuration=None,
 ):
     """Generate an HTML report for the thermal simulation."""
     out_dir = out_dir or os.path.dirname(__file__)
@@ -524,6 +525,7 @@ def write_html_report(
     snapshot_debug = snapshot_debug or {}
     interactive_heatmap = interactive_heatmap or {}
     electrical_summary = electrical_summary or {}
+    source_configuration = source_configuration or {}
 
     total_thick_mm = stackup_derived.get("total_thick_mm_used")
     board_thick_mm = stackup_derived.get("stack_board_thick_mm")
@@ -546,8 +548,38 @@ def write_html_report(
     for i, value in enumerate(k_norm_info.get("t_fr4_eff_per_plane_mm") or []):
         fr4_eff_rows.append((layer_names[i] if i < len(layer_names) else f"Layer {i}", _fmt(value, " mm")))
 
-    settings_rows = [(str(key), str(value)) for key, value in settings.items()]
+    project_keys = {"heat_sources", "current_paths", "current_circuits", "power_pads", "current_groups"}
+    settings_rows = [
+        (str(key), str(value)) for key, value in settings.items() if key not in project_keys
+    ]
     pad_rows = [(str(name), _fmt(power, " W")) for name, power in pad_power]
+    source_rows = []
+    for source in source_configuration.get("heat_sources", []) or []:
+        profile = source.get("power_profile", {}) or {}
+        profile_text = (
+            _fmt(profile.get("value_w"), " W")
+            if profile.get("kind") == "constant"
+            else "PWL: " + str(profile.get("path", ""))
+        )
+        source_rows.append((
+            str(source.get("name", "")), profile_text,
+            str(len(source.get("pads", []) or [])),
+            str(source.get("distribution", "")),
+            "Needs repair" if source.get("needs_repair") else ("Enabled" if source.get("enabled", True) else "Disabled"),
+        ))
+    circuits = {
+        item.get("id"): item for item in source_configuration.get("current_circuits", []) or []
+    }
+    configured_path_rows = []
+    for path in source_configuration.get("current_paths", []) or []:
+        circuit = circuits.get(path.get("circuit_id"), {})
+        current = circuit.get("current_a", path.get("current_a"))
+        configured_path_rows.append((
+            str(path.get("name", "")), str(path.get("net_name", "")),
+            _fmt(current, " A"), str(len(path.get("source_pads", []) or [])),
+            str(len(path.get("sink_pads", []) or [])), str(circuit.get("name", "-")),
+            "Needs repair" if path.get("needs_repair") else ("Enabled" if path.get("enabled", True) else "Disabled"),
+        ))
     current_rows = []
     for net_item in electrical_summary.get("nets", []) or []:
         source_current = net_item.get("source_current_a")
@@ -623,6 +655,11 @@ def write_html_report(
         "</div><div>"
         "<h3 class='section-title'>Simulation Inputs</h3>"
         f"{_table_html(['Setting', 'Value'], settings_rows, empty_text='No settings recorded.')}<div class='spacer-sm'></div>"
+        "<h3 class='section-title'>Configured Heat Sources</h3>"
+        f"{_table_html(['Source', 'Total Power', 'Pads', 'Distribution', 'Status'], source_rows, empty_text='No guided heat sources recorded.')}"
+        "<div class='spacer-sm'></div><h3 class='section-title'>Configured Current Paths</h3>"
+        f"{_table_html(['Path', 'Net', 'Current', 'Enters', 'Leaves', 'Circuit', 'Status'], configured_path_rows, empty_text='No guided current paths recorded.')}"
+        "<div class='spacer-sm'></div>"
         "<h3 class='section-title'>Power per Pad</h3>"
         f"{_table_html(['Pad', 'Power'], pad_rows, empty_text='No pad power recorded.')}"
         "<div class='spacer-sm'></div><h3 class='section-title'>Current Heating</h3>"
@@ -643,6 +680,7 @@ def write_html_report(
         f"{_details_block('Solver Normalization and Debug', _mapping_table_html(k_norm_info), open_by_default=False)}"
         f"{_details_block('Snapshot Debug', _mapping_table_html(snapshot_debug), open_by_default=False)}"
         f"{_details_block('Raw Electrical JSON', '<pre>' + _esc(json.dumps(electrical_summary, indent=2, sort_keys=True)) + '</pre>', open_by_default=False)}"
+        f"{_details_block('Raw Source Configuration JSON', '<pre>' + _esc(json.dumps(source_configuration, indent=2, sort_keys=True)) + '</pre>', open_by_default=False)}"
         f"{_details_block('Raw Solver JSON', '<pre>' + _esc(json.dumps(k_norm_info, indent=2, sort_keys=True)) + '</pre>', open_by_default=False)}"
         f"{_details_block('Raw Snapshot JSON', '<pre>' + _esc(json.dumps(snapshot_debug, indent=2, sort_keys=True)) + '</pre>', open_by_default=False)}"
         "</section>"

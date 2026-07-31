@@ -46,6 +46,14 @@ from .thermal_solver import (
     run_simulation_matrix_free,
 )
 from .pwl_parser import parse_pwl_file
+from .source_configuration import (
+    ProjectConfiguration,
+    expand_current_paths,
+    expand_heat_sources,
+    load_project_config,
+    migrate_v2_settings,
+    save_project_config,
+)
 from .visualization import (
     save_snapshot, show_results_top_bot, show_results_all_layers, save_preview_image,
     build_interactive_heatmap_payload, save_joule_loss_map
@@ -83,6 +91,22 @@ class SparsePadContribution:
 
     indices: np.ndarray
     weights: np.ndarray
+
+
+def _safe_board_filename(board):
+    """Return the active board path across KiCad's wxString wrappers.
+
+    KiCad 9 can expose ``BOARD.GetFileName()`` as a wxString-like object
+    whose truth value is false even when its textual value is populated.
+    Converting first avoids treating a saved board as an unsaved board.
+    """
+    try:
+        raw_name = board.GetFileName()
+    except Exception:
+        return ""
+    if raw_name is None:
+        return ""
+    return str(raw_name)
 
 
 def _electrical_net_summary_dict(summary):
@@ -486,7 +510,7 @@ def _find_pcb_editor_parent(board=None):
     board_tokens = []
     if board is not None:
         try:
-            board_name = os.path.basename(str(board.GetFileName() or "")).lower()
+            board_name = os.path.basename(_safe_board_filename(board)).lower()
             board_stem = os.path.splitext(board_name)[0]
             board_tokens = [token for token in (board_name, board_stem) if token]
         except Exception:
@@ -950,7 +974,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             bbox.GetWidth() * 1e-6,
             bbox.GetHeight() * 1e-6,
         )
-        filename = str(board.GetFileName() or "")
+        filename = _safe_board_filename(board)
         try:
             file_identity = (
                 os.path.getsize(filename),
@@ -989,6 +1013,116 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             base_dir = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
         return os.path.join(base_dir, "ThermalSim", "thermal_sim_last_settings.json")
 
+    def _project_settings_path(self, board):
+        """Return the schema-v3 sidecar path for a saved KiCad board."""
+        try:
+            board_path = os.path.abspath(_safe_board_filename(board))
+        except Exception:
+            board_path = ""
+        if not board_path:
+            return ""
+        stem, _ = os.path.splitext(board_path)
+        return stem + ".thermalsim.json"
+
+    def _portable_project_settings(self, settings):
+        """Extract source/path configuration for the project sidecar."""
+        return ProjectConfiguration.from_dict({
+            "schema_version": 3,
+            "heat_sources": settings.get("heat_sources", []),
+            "current_paths": settings.get("current_paths", []),
+            "current_circuits": settings.get("current_circuits", []),
+        })
+
+    def _machine_settings(self, settings):
+        """Remove board-specific source definitions from user preferences."""
+        excluded = {
+            "schema_version", "heat_sources", "current_paths", "current_circuits",
+            "power_pads", "current_groups", "current_enabled",
+        }
+        return {key: value for key, value in dict(settings or {}).items() if key not in excluded}
+
+    def _reconcile_project_pad_refs(self, board, payload):
+        """Mark project sources and paths whose saved pads no longer resolve."""
+        data = dict(payload or {})
+        by_key, by_name = self._build_pad_lookup(board)
+        for source in data.get("heat_sources", []) or []:
+            missing = []
+            for pad_ref in source.get("pads", []) or []:
+                if not self._match_pad_descriptor(by_key, by_name, pad_ref):
+                    missing.append(
+                        pad_ref.get("display_name")
+                        or pad_ref.get("legacy_key")
+                        or pad_ref.get("pad_uuid")
+                        or "<unknown>"
+                    )
+            if missing:
+                source["needs_repair"] = True
+                source["repair_reason"] = (
+                    "Missing board pad reference(s): " + ", ".join(missing)
+                )
+        for path in data.get("current_paths", []) or []:
+            missing = []
+            endpoint_refs = list(path.get("source_pads", []) or []) + list(
+                path.get("sink_pads", []) or []
+            )
+            for pad_ref in endpoint_refs:
+                if not self._match_pad_descriptor(by_key, by_name, pad_ref):
+                    missing.append(
+                        pad_ref.get("display_name")
+                        or pad_ref.get("legacy_key")
+                        or pad_ref.get("pad_uuid")
+                        or "<unknown>"
+                    )
+            if missing:
+                path["needs_repair"] = True
+                path["repair_reason"] = (
+                    "Missing board pad reference(s): " + ", ".join(missing)
+                )
+        return data
+
+    def _load_project_defaults(self, board, last_settings):
+        """Load a sidecar or safely migrate matching legacy last settings."""
+        sidecar = self._project_settings_path(board)
+        if sidecar and os.path.isfile(sidecar):
+            try:
+                return self._reconcile_project_pad_refs(
+                    board, load_project_config(sidecar).to_dict()
+                )
+            except Exception as exc:
+                wx.MessageBox(
+                    f"Project source configuration could not be loaded:\n{sidecar}\n\n{exc}",
+                    "ThermalSim",
+                )
+                return {}
+        legacy = dict(last_settings or {})
+        if not (legacy.get("power_pads") or legacy.get("current_groups")):
+            return {}
+        migrated = migrate_v2_settings(legacy)
+        by_key, by_name = self._build_pad_lookup(board)
+        pad_refs = []
+        for source in migrated.heat_sources:
+            pad_refs.extend(pad.to_dict() for pad in source.pads)
+        for path in migrated.current_paths:
+            pad_refs.extend(pad.to_dict() for pad in path.source_pads + path.sink_pads)
+        if pad_refs and all(self._match_pad_descriptor(by_key, by_name, pad) for pad in pad_refs):
+            return self._reconcile_project_pad_refs(board, migrated.to_dict())
+        return {}
+
+    def _save_project_settings(self, board, settings):
+        """Persist guided source/path definitions beside the active board."""
+        sidecar = self._project_settings_path(board)
+        if not sidecar:
+            return False
+        try:
+            save_project_config(sidecar, self._portable_project_settings(settings))
+            return True
+        except Exception as exc:
+            wx.MessageBox(
+                f"Project source configuration could not be saved:\n{sidecar}\n\n{exc}",
+                "ThermalSim",
+            )
+            return False
+
     def _load_settings(self, path=None):
         """Load settings from a JSON file."""
         settings_path = path or self._settings_path()
@@ -1018,7 +1152,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             if parent_dir:
                 os.makedirs(parent_dir, exist_ok=True)
             payload = dict(settings)
-            payload["schema_version"] = 2
+            payload["schema_version"] = int(payload.get("schema_version", 2) or 2)
             with open(settings_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, sort_keys=True)
             return True
@@ -1087,8 +1221,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         self._show_startup_progress(50, "Measuring board dimensions...")
         try:
             bbox = board.GetBoundingBox()
-        except:
-            bbox = board.ComputeBoundingBox(True)
+            # KiCad 9 may return an empty cached BOX2I until the board
+            # geometry has been computed once.  Use the full-board fallback
+            # instead of presenting a misleading 0 x 0 mm dialog summary.
+            if bbox.GetWidth() <= 0 or bbox.GetHeight() <= 0:
+                bbox = board.ComputeBoundingBox(False)
+        except Exception:
+            bbox = board.ComputeBoundingBox(False)
         w_mm = bbox.GetWidth() * 1e-6
         h_mm = bbox.GetHeight() * 1e-6
         suggested_res = self._calculate_suggested_resolution(w_mm, h_mm, len(copper_ids))
@@ -1113,13 +1252,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         initial_power_pads = self._descriptors_from_selected_pads(
             board, selected_pads
         )
-        board_path = str(board.GetFileName() or "")
+        board_path = _safe_board_filename(board)
         board_dir = os.path.dirname(board_path) if board_path else ""
         default_output_dir = (
             os.path.join(board_dir, "ThermalSim_results")
             if board_dir else os.path.join(os.path.expanduser("~"), "Documents", "ThermalSim_results")
         )
         last_settings = self._load_settings()
+        project_defaults = self._load_project_defaults(board, last_settings)
+        dialog_defaults = dict(last_settings)
+        dialog_defaults.update(project_defaults)
+        if project_defaults.get("current_paths"):
+            dialog_defaults["current_enabled"] = True
         if last_settings.get("output_dir") and os.path.isdir(last_settings.get("output_dir")):
             default_output_dir = last_settings.get("output_dir")
 
@@ -1134,8 +1278,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         def selection_provider():
             return self._get_selected_pad_descriptors(board)
 
+        def pad_catalog_provider():
+            return self._get_all_pad_descriptors(board)
+
         def run_callback(settings):
-            self._save_settings(settings)
+            self._save_settings(self._machine_settings(settings))
+            self._save_project_settings(board, settings)
             power_pads = self._resolve_power_pad_objects(board, settings, legacy_pads=pads_list)
             current_pads = self._resolve_current_pad_objects(board, settings)
             focus_pads = self._unique_pads(power_pads + current_pads)
@@ -1163,21 +1311,26 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         def preflight_callback(settings):
             return self._preflight(board, copper_ids, bbox, settings)
 
+        def project_save_callback(settings):
+            return self._save_project_settings(board, settings)
+
         self._show_startup_progress(92, "Creating ThermalSim dialog...")
         dlg = SettingsDialog(
             self.host_window, len(pads_list), suggested_res, layer_names,
             preview_callback=self.generate_preview,
             selection_provider=selection_provider,
+            pad_catalog_provider=pad_catalog_provider,
             run_callback=run_callback,
             close_callback=close_callback,
             preflight_callback=preflight_callback,
             load_settings_callback=self._load_settings,
             save_settings_callback=self._save_settings,
+            project_save_callback=project_save_callback,
             stackup_details=stackup_details,
             pad_names=pad_names,
             initial_power_pads=initial_power_pads,
             default_output_dir=default_output_dir,
-            defaults=last_settings,
+            defaults=dialog_defaults,
             board_name=os.path.basename(board_path) if board_path else "Unsaved board",
             board_size_mm=(w_mm, h_mm),
             defer_initial_preflight=True,
@@ -1191,7 +1344,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 if dlg.ShowModal() == wx.ID_OK:
                     settings = dlg.get_values()
                     if settings:
-                        self._save_settings(settings)
+                        self._save_settings(self._machine_settings(settings))
+                        self._save_project_settings(board, settings)
                         power_pads = self._resolve_power_pad_objects(board, settings, legacy_pads=pads_list)
                         current_pads = self._resolve_current_pad_objects(board, settings)
                         focus_pads = self._unique_pads(power_pads + current_pads)
@@ -1250,15 +1404,23 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         return suggested_res
 
     def _get_selected_pads(self, board):
-        """Get list of selected pads."""
+        """Get selected pads, including pads of selected footprints."""
         selected_pads = []
+        seen = set()
         try:
             footprints = board.Footprints() if hasattr(board, 'Footprints') else board.GetFootprints()
             for fp in footprints:
+                try:
+                    footprint_selected = bool(fp.IsSelected())
+                except Exception:
+                    footprint_selected = False
                 for pad in fp.Pads():
-                    if pad.IsSelected():
+                    if footprint_selected or pad.IsSelected():
                         name = f"{fp.GetReference()}-{pad.GetNumber()}"
-                        selected_pads.append((name, pad))
+                        ident = id(pad)
+                        if ident not in seen:
+                            selected_pads.append((name, pad))
+                            seen.add(ident)
         except Exception as e:
             wx.MessageBox(f"Error reading pads: {e}", "Error")
             return []
@@ -1266,7 +1428,19 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         return selected_pads
 
     def _pad_key(self, fp_ref, pad):
-        """Build a stable key for a pad in settings."""
+        """Build a stable key for a pad in settings.
+
+        KiCad object UUIDs survive footprint moves, net-code changes, and net
+        renames.  Older ThermalSim releases included position and net code in
+        this key, which made otherwise harmless board edits invalidate saved
+        source definitions.
+        """
+        try:
+            uuid = pad.m_Uuid.AsString()
+            if uuid:
+                return f"uuid:{uuid}"
+        except Exception:
+            pass
         try:
             pos = pad.GetPosition()
             px, py = int(pos.x), int(pos.y)
@@ -1281,6 +1455,36 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         except Exception:
             number = ""
         return f"{fp_ref}:{number}:{net_code}:{px}:{py}"
+
+    def _item_uuid(self, item):
+        """Return a KiCad item UUID string when the SWIG API exposes it."""
+        try:
+            return str(item.m_Uuid.AsString())
+        except Exception:
+            return ""
+
+    def _pad_area_mm2(self, pad):
+        """Estimate the component-side copper contact area of a pad in mm²."""
+        try:
+            layer = pad.GetLayer()
+            polygon = pad.GetEffectivePolygon(layer)
+            area = abs(float(polygon.Area())) * 1e-12
+            if area > 0.0:
+                return area
+        except Exception:
+            pass
+        try:
+            size = pad.GetSize()
+            area = abs(float(size.x) * float(size.y)) * 1e-12
+            if area > 0.0:
+                return area
+        except Exception:
+            pass
+        try:
+            bbox = pad.GetBoundingBox()
+            return abs(float(bbox.GetWidth()) * float(bbox.GetHeight())) * 1e-12
+        except Exception:
+            return 0.0
 
     def _pad_net_name(self, pad):
         """Return the display net name for a pad."""
@@ -1310,35 +1514,84 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         except Exception:
             return str(pad.GetLayer())
 
-    def _pad_descriptor(self, board, fp_ref, pad):
-        """Return a serializable pad descriptor for current groups."""
+    def _pad_descriptor(self, board, fp_ref, pad, footprint=None):
+        """Return a serializable descriptor for guided source/path editing."""
+        if footprint is None:
+            try:
+                footprint = pad.GetParent()
+            except Exception:
+                footprint = None
         try:
             number = pad.GetNumber()
         except Exception:
             number = ""
         name = f"{fp_ref}-{number}"
         net_name = self._pad_net_name(pad)
+        try:
+            pin_function = str(pad.GetPinFunction() or "")
+        except Exception:
+            pin_function = ""
+        try:
+            footprint_value = str(footprint.GetValue() or "") if footprint is not None else ""
+        except Exception:
+            footprint_value = ""
         return {
             "pad_key": self._pad_key(fp_ref, pad),
+            "pad_uuid": self._item_uuid(pad),
+            "footprint_uuid": self._item_uuid(footprint) if footprint is not None else "",
+            "footprint_ref": str(fp_ref),
+            "footprint_value": footprint_value,
+            "pad_number": str(number),
             "name": f"{name} [{net_name}]" if net_name else name,
             "net_name": net_name,
             "net_code": self._pad_net_code(pad),
             "layer": self._pad_layer_name(board, pad),
+            "pin_function": pin_function,
+            "area_mm2": self._pad_area_mm2(pad),
             "current_a": 0.0,
         }
 
     def _get_selected_pad_descriptors(self, board):
-        """Return serializable descriptors for currently selected KiCad pads."""
+        """Return descriptors for selected pads and pads of selected footprints."""
         descriptors = []
+        seen = set()
         try:
             footprints = board.Footprints() if hasattr(board, 'Footprints') else board.GetFootprints()
             for fp in footprints:
                 fp_ref = fp.GetReference()
+                try:
+                    footprint_selected = bool(fp.IsSelected())
+                except Exception:
+                    footprint_selected = False
                 for pad in fp.Pads():
-                    if pad.IsSelected():
-                        descriptors.append(self._pad_descriptor(board, fp_ref, pad))
+                    if footprint_selected or pad.IsSelected():
+                        descriptor = self._pad_descriptor(board, fp_ref, pad, fp)
+                        key = descriptor.get("pad_key")
+                        if key not in seen:
+                            descriptors.append(descriptor)
+                            seen.add(key)
         except Exception:
             return []
+        descriptors.sort(key=lambda item: item.get("name", ""))
+        return descriptors
+
+    def _get_all_pad_descriptors(self, board):
+        """Return a searchable descriptor catalog for every board pad."""
+        descriptors = []
+        try:
+            footprints = board.Footprints() if hasattr(board, 'Footprints') else board.GetFootprints()
+        except Exception:
+            footprints = []
+        for fp in footprints:
+            try:
+                fp_ref = fp.GetReference()
+            except Exception:
+                fp_ref = ""
+            for pad in fp.Pads():
+                try:
+                    descriptors.append(self._pad_descriptor(board, fp_ref, pad, fp))
+                except Exception:
+                    continue
         descriptors.sort(key=lambda item: item.get("name", ""))
         return descriptors
 
@@ -1367,13 +1620,99 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         for fp in footprints:
             fp_ref = fp.GetReference()
             for pad in fp.Pads():
-                descriptor = self._pad_descriptor(board, fp_ref, pad)
-                by_key[descriptor["pad_key"]] = (descriptor, pad)
+                descriptor = self._pad_descriptor(board, fp_ref, pad, fp)
+                match = (descriptor, pad)
+                by_key[descriptor["pad_key"]] = match
+                pad_uuid = descriptor.get("pad_uuid")
+                footprint_uuid = descriptor.get("footprint_uuid")
+                pad_number = descriptor.get("pad_number")
+                if pad_uuid:
+                    by_key[pad_uuid] = match
+                    by_key[f"uuid:{pad_uuid}"] = match
+                if footprint_uuid and pad_number:
+                    by_key[f"fp:{footprint_uuid}:{pad_number}"] = match
+                if fp_ref and pad_number:
+                    ref_key = f"ref:{fp_ref}:{pad_number}"
+                    if ref_key not in by_key:
+                        by_key[ref_key] = match
+                    else:
+                        by_key[ref_key] = None
                 by_name[descriptor["name"]] = (descriptor, pad)
         return by_key, by_name
 
+    def _match_pad_descriptor(self, by_key, by_name, pad_info):
+        """Resolve a serialized pad reference with stable fallbacks."""
+        pad_info = dict(pad_info or {})
+        candidates = []
+        pad_uuid = str(pad_info.get("pad_uuid", pad_info.get("uuid", "")) or "")
+        footprint_uuid = str(pad_info.get("footprint_uuid", "") or "")
+        pad_number = str(pad_info.get("pad_number", "") or "")
+        footprint_ref = str(pad_info.get("footprint_ref", pad_info.get("reference", "")) or "")
+        if pad_uuid:
+            candidates.extend((pad_uuid, f"uuid:{pad_uuid}"))
+        if footprint_uuid and pad_number:
+            candidates.append(f"fp:{footprint_uuid}:{pad_number}")
+        if footprint_ref and pad_number:
+            candidates.append(f"ref:{footprint_ref}:{pad_number}")
+        candidates.append(str(pad_info.get("pad_key", pad_info.get("legacy_key", "")) or ""))
+        for key in candidates:
+            if key and by_key.get(key):
+                return by_key[key]
+        return by_name.get(pad_info.get("name", pad_info.get("display_name")))
+
     def _resolve_power_pad_entries(self, board, settings):
         """Resolve manual power-pad settings to live pad objects and power strings."""
+        if settings.get("heat_sources"):
+            by_key, by_name = self._build_pad_lookup(board)
+            entries = []
+            missing = []
+            live_pad_areas = {}
+            for match in by_key.values():
+                if not match:
+                    continue
+                descriptor, _ = match
+                area = float(descriptor.get("area_mm2", 0.0) or 0.0)
+                if area <= 0.0:
+                    continue
+                pad_uuid = str(descriptor.get("pad_uuid", "") or "")
+                footprint_uuid = str(descriptor.get("footprint_uuid", "") or "")
+                reference = str(descriptor.get("footprint_ref", "") or "")
+                pad_number = str(descriptor.get("pad_number", "") or "")
+                keys = {
+                    descriptor.get("pad_key"),
+                    descriptor.get("name"),
+                    pad_uuid,
+                    f"pad:{pad_uuid}" if pad_uuid else "",
+                    f"footprint:{footprint_uuid}/pad:{pad_number}"
+                    if footprint_uuid and pad_number else "",
+                    f"reference:{reference}/pad:{pad_number}"
+                    if (reference or pad_number) else "",
+                    f"{reference}-{pad_number}" if reference or pad_number else "",
+                }
+                for key in keys:
+                    if key:
+                        live_pad_areas[key] = area
+            for item in expand_heat_sources(
+                settings.get("heat_sources", []), pad_areas=live_pad_areas
+            ):
+                pad_info = item.get("pad_ref", {})
+                match = self._match_pad_descriptor(by_key, by_name, pad_info)
+                if not match:
+                    missing.append(
+                        pad_info.get("display_name")
+                        or pad_info.get("legacy_key")
+                        or pad_info.get("pad_uuid")
+                        or "<unknown>"
+                    )
+                    continue
+                descriptor, pad = match
+                merged = dict(descriptor)
+                merged["heat_source_id"] = item.get("heat_source_id", "")
+                merged["heat_source_name"] = item.get("heat_source_name", "")
+                merged["share"] = float(item.get("share", 0.0) or 0.0)
+                merged["distribution_used"] = item.get("distribution_used", "")
+                entries.append((merged, pad, dict(item.get("profile", {}))))
+            return entries, missing
         raw_power_pads = prepare_power_pads(
             settings.get("power_pads", []),
             settings.get("power_str", "1.0"),
@@ -1384,7 +1723,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         entries = []
         missing = []
         for pad_info in raw_power_pads:
-            match = by_key.get(pad_info.get("pad_key")) or by_name.get(pad_info.get("name"))
+            match = self._match_pad_descriptor(by_key, by_name, pad_info)
             if not match:
                 missing.append(pad_info.get("name", pad_info.get("pad_key", "<unknown>")))
                 continue
@@ -1396,7 +1735,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
     def _resolve_power_pad_objects(self, board, settings, legacy_pads=None):
         """Resolve manual power pads to live pad objects for preview/focus area."""
-        if "power_pads" not in (settings or {}):
+        if not (settings or {}).get("heat_sources") and "power_pads" not in (settings or {}):
             return list(legacy_pads or [])
         entries, _ = self._resolve_power_pad_entries(board, settings)
         return self._unique_pads([pad for _, pad, _ in entries])
@@ -1405,12 +1744,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         """Resolve current-group pad descriptors to live pad objects."""
         if not settings.get("current_enabled"):
             return []
+        if settings.get("current_paths"):
+            try:
+                terminals, _ = self._resolve_current_terminals(board, settings)
+            except ValueError:
+                return []
+            return self._unique_pads([item.pad for item in terminals])
         by_key, by_name = self._build_pad_lookup(board)
         pads = []
         seen = set()
         for group in prepare_current_groups(settings.get("current_groups", [])):
             for pad_info in group.get("pads", []):
-                match = by_key.get(pad_info.get("pad_key")) or by_name.get(pad_info.get("name"))
+                match = self._match_pad_descriptor(by_key, by_name, pad_info)
                 if not match:
                     continue
                 _, pad = match
@@ -1426,12 +1771,36 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         if not settings.get("current_enabled"):
             return terminals, missing
         by_key, by_name = self._build_pad_lookup(board)
+        if settings.get("current_paths"):
+            specs = expand_current_paths(
+                settings.get("current_paths", []), settings.get("current_circuits", [])
+            )
+            for item in specs:
+                pad_info = item.get("pad_ref", {})
+                match = self._match_pad_descriptor(by_key, by_name, pad_info)
+                if not match:
+                    missing.append(
+                        pad_info.get("display_name")
+                        or pad_info.get("legacy_key")
+                        or pad_info.get("pad_uuid")
+                        or "<unknown>"
+                    )
+                    continue
+                descriptor, pad = match
+                terminals.append(CurrentTerminal(
+                    pad=pad,
+                    name=descriptor.get("name", item.get("name", "")),
+                    net_name=descriptor.get("net_name", item.get("net_name", "")),
+                    net_code=int(descriptor.get("net_code", item.get("net_code", 0)) or 0),
+                    current_a=float(item.get("current_a", 0.0) or 0.0),
+                ))
+            return terminals, missing
         for group in prepare_current_groups(settings.get("current_groups", [])):
             for pad_info in group.get("pads", []):
                 current = float(pad_info.get("current_a", 0.0) or 0.0)
                 if abs(current) <= 0.0:
                     continue
-                match = by_key.get(pad_info.get("pad_key")) or by_name.get(pad_info.get("name"))
+                match = self._match_pad_descriptor(by_key, by_name, pad_info)
                 if not match:
                     missing.append(pad_info.get("name", pad_info.get("pad_key", "<unknown>")))
                     continue
@@ -1475,12 +1844,60 @@ class ThermalPlugin(pcbnew.ActionPlugin):
     def _preflight(self, board, copper_ids, bbox, settings):
         """Validate settings and estimate the exact grid before execution."""
         result = PreflightResult()
-        power_entries, missing_power = self._resolve_power_pad_entries(board, settings)
+        for source in settings.get("heat_sources", []) or []:
+            if source.get("needs_repair"):
+                result.errors.append(
+                    f"Heat source {source.get('name', source.get('id', ''))} needs repair."
+                )
+        if settings.get("current_enabled"):
+            for path in settings.get("current_paths", []) or []:
+                if path.get("needs_repair"):
+                    result.errors.append(
+                        f"Current path {path.get('name', path.get('id', ''))} needs repair."
+                    )
+                sources = list(path.get("source_pads", path.get("sources", [])) or [])
+                sinks = list(path.get("sink_pads", path.get("sinks", [])) or [])
+                def endpoint_identity(item):
+                    ref = item.get("pad_ref", item) if isinstance(item, dict) else {}
+                    return (
+                        ref.get("pad_uuid")
+                        or (
+                            f"{ref.get('footprint_uuid')}:{ref.get('pad_number')}"
+                            if ref.get("footprint_uuid") and ref.get("pad_number") else ""
+                        )
+                        or (
+                            f"{ref.get('reference')}:{ref.get('pad_number')}"
+                            if ref.get("reference") and ref.get("pad_number") else ""
+                        )
+                        or ref.get("legacy_key")
+                        or ref.get("display_name")
+                    )
+
+                source_ids = {
+                    identity for identity in (endpoint_identity(item) for item in sources)
+                    if identity
+                }
+                sink_ids = {
+                    identity for identity in (endpoint_identity(item) for item in sinks)
+                    if identity
+                }
+                if source_ids & sink_ids:
+                    result.errors.append(
+                        f"Current path {path.get('name', path.get('id', ''))} uses a pad on both endpoint sides."
+                    )
+        try:
+            power_entries, missing_power = self._resolve_power_pad_entries(board, settings)
+        except ValueError as exc:
+            result.errors.append(str(exc))
+            power_entries, missing_power = [], []
         power_pads = [pad for _, pad, _ in power_entries]
         terminals = []
         missing_current = []
         if settings.get("current_enabled"):
-            terminals, missing_current = self._resolve_current_terminals(board, settings)
+            try:
+                terminals, missing_current = self._resolve_current_terminals(board, settings)
+            except ValueError as exc:
+                result.errors.append(str(exc))
         current_pads = [item.pad for item in terminals]
         focus_pads = self._unique_pads(power_pads + current_pads)
         result.area = _estimate_simulation_area(
@@ -1496,6 +1913,21 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             result.errors.append(f"{len(missing_power)} heat-source pad(s) are missing from the board.")
         has_power = False
         for _, _, entry in power_entries:
+            if isinstance(entry, dict):
+                kind = str(entry.get("kind", "constant") or "constant").lower()
+                if kind == "pwl":
+                    value = str(entry.get("path", "") or "").strip()
+                    scale = float(entry.get("scale", 1.0) or 0.0)
+                    try:
+                        _, pwl_values = parse_pwl_file(value)
+                        has_power = has_power or bool(
+                            np.any(np.asarray(pwl_values) * scale != 0.0)
+                        )
+                    except Exception as exc:
+                        result.errors.append(f"Invalid PWL source '{value}': {exc}")
+                else:
+                    has_power = has_power or abs(float(entry.get("value_w", 0.0) or 0.0)) > 0.0
+                continue
             value = str(entry or "").strip()
             if not value:
                 continue
@@ -1712,6 +2144,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             geometry_state=geometry_state,
             grid_spec=grid,
             adaptive_mesh=preview_adaptive_mesh,
+            heat_source_pads=power_pads,
+            current_terminals=terminals,
         )
         if not output_file:
             wx.MessageBox("Board data missing for preview", "Error")
@@ -1953,9 +2387,29 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         # Parse each entry as constant float or PWL file path
         pad_sources = []  # ('const', float) or ('pwl', (times, powers))
         for entry in entries:
+            if isinstance(entry, dict):
+                kind = str(entry.get("kind", "constant") or "constant").lower()
+                if kind == "pwl":
+                    path = str(entry.get("path", "") or "").strip()
+                    scale = float(entry.get("scale", 1.0) or 0.0)
+                    try:
+                        times_pwl, powers_pwl = parse_pwl_file(path)
+                        pad_sources.append((
+                            'pwl',
+                            (times_pwl, np.asarray(powers_pwl, dtype=np.float64) * scale),
+                        ))
+                    except (FileNotFoundError, ValueError) as exc:
+                        wx.MessageBox(
+                            f"Error reading PWL file:\n{path}\n\n{exc}", "PWL Error"
+                        )
+                        set_dialog_state("failed", "A PWL power profile could not be read.")
+                        return
+                else:
+                    pad_sources.append(('const', float(entry.get("value_w", 0.0) or 0.0)))
+                continue
             try:
                 pad_sources.append(('const', float(entry)))
-            except ValueError:
+            except (TypeError, ValueError):
                 try:
                     times_pwl, powers_pwl = parse_pwl_file(entry)
                     pad_sources.append(('pwl', (times_pwl, powers_pwl)))
@@ -1993,6 +2447,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         electrical_summary = None
         q_joule = None
+        terminals = []
         if settings.get("current_enabled"):
             set_dialog_state("running", "Solving active electrical paths...")
             electrical_start = time.perf_counter()
@@ -2072,6 +2527,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     pad_power.append((name, sval))
                 else:
                     entry_label = entries[i] if i < len(entries) else ""
+                    if isinstance(entry_label, dict):
+                        entry_label = entry_label.get("path", "")
                     pad_power.append((name, f"PWL:{entry_label}"))
             else:
                 pad_power.append((name, None))
@@ -2425,6 +2882,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             open_file=False, out_dir=run_dir,
             geometry_state=geometry_state,
             grid_spec=grid,
+            heat_source_pads=power_pads,
+            current_terminals=terminals,
         )
 
         interactive_heatmap = build_interactive_heatmap_payload(
@@ -2476,7 +2935,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snapshot_files=result.snapshot_files,
             interactive_heatmap=interactive_heatmap,
             electrical_summary=electrical_summary,
-            joule_map_path=joule_map_path
+            joule_map_path=joule_map_path,
+            source_configuration=self._portable_project_settings(settings).to_dict(),
         )
         _write_run_manifest(
             run_dir,

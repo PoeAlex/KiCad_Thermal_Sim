@@ -173,6 +173,54 @@ class TestWriteHtmlReport:
         assert "U1:2" in content
         assert "0.5" in content
 
+    def test_report_contains_guided_source_and_path_configuration(self, basic_report_params):
+        """Guided source/path intent should be visible without opening raw JSON."""
+        params = basic_report_params.copy()
+        params['source_configuration'] = {
+            'schema_version': 3,
+            'heat_sources': [{
+                'id': 'source-1',
+                'name': 'Regulator loss',
+                'power_profile': {'kind': 'constant', 'value_w': 2.5},
+                'distribution': 'area',
+                'pads': [{}, {}],
+                'enabled': True,
+                'needs_repair': False,
+            }],
+            'current_circuits': [{
+                'id': 'circuit-1', 'name': '5 A load loop', 'current_a': 5.0,
+            }],
+            'current_paths': [{
+                'id': 'path-1',
+                'name': 'VIN forward',
+                'net_name': 'VIN',
+                'current_a': 1.0,
+                'circuit_id': 'circuit-1',
+                'source_pads': [{}],
+                'sink_pads': [{}, {}],
+                'enabled': True,
+                'needs_repair': False,
+            }],
+        }
+        params['settings'] = dict(params['settings'])
+        params['settings']['heat_sources'] = params['source_configuration']['heat_sources']
+        params['settings']['current_paths'] = params['source_configuration']['current_paths']
+
+        result = write_html_report(**params)
+
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        assert "Configured Heat Sources" in content
+        assert "Regulator loss" in content
+        assert "2.5000 W" in content
+        assert "Configured Current Paths" in content
+        assert "VIN forward" in content
+        assert "5.0000 A" in content
+        assert "5 A load loop" in content
+        assert "Raw Source Configuration JSON" in content
+        assert "<td>heat_sources</td>" not in content
+
     def test_report_contains_layer_names(self, basic_report_params):
         """Test that report contains layer names."""
         result = write_html_report(**basic_report_params)

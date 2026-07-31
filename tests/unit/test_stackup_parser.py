@@ -204,6 +204,24 @@ class TestParseStackupFromBoardFile:
         assert "error" in result
         assert "filename" in result["error"].lower() or "save" in result["error"].lower()
 
+    def test_falsey_filename_wrapper_is_converted(self, mock_board_with_file):
+        """KiCad wxString paths must not be rejected because of false truthiness."""
+        board = mock_board_with_file(SIMPLE_2_LAYER_STACKUP)
+        path = board.GetFileName()
+
+        class FalseyPath:
+            def __str__(self):
+                return path
+
+            def __bool__(self):
+                return False
+
+        board.GetFileName = lambda: FalseyPath()
+        result = parse_stackup_from_board_file(board)
+
+        assert "error" not in result
+        assert len(result["copper"]) == 2
+
     def test_file_not_found_error(self):
         """Test error when file doesn't exist."""
         from tests.mocks.pcbnew_mock import MockBoard

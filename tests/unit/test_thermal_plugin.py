@@ -8,6 +8,7 @@ for performance, while keeping numerical behavior unchanged.
 import json
 
 import numpy as np
+import pytest
 
 from ThermalSim.geometry_mapper import get_pad_pixels
 from ThermalSim.thermal_plugin import (
@@ -414,6 +415,132 @@ class TestSettingsPersistence:
         settings_path.write_text("{broken json", encoding="utf-8")
 
         assert plugin._load_settings(str(settings_path)) == {}
+
+    def test_project_sidecar_path_and_round_trip(self, tmp_path):
+        """Board-specific sources should persist beside the board as schema v3."""
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        board_path = tmp_path / "controller.kicad_pcb"
+        board_path.write_text("(kicad_pcb)", encoding="utf-8")
+        board = MockBoard(filename=str(board_path))
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        settings = {
+            'heat_sources': [{
+                'id': 'u1', 'name': 'U1 loss',
+                'power_profile': {'kind': 'constant', 'value_w': 2.0},
+                'distribution': 'equal',
+                'pads': [{'legacy_key': 'U1:1:1:0:0', 'display_name': 'U1-1'}],
+            }],
+            'current_paths': [],
+            'current_circuits': [],
+        }
+
+        assert plugin._project_settings_path(board) == str(tmp_path / "controller.thermalsim.json")
+        assert plugin._save_project_settings(board, settings) is True
+        payload = json.loads((tmp_path / "controller.thermalsim.json").read_text(encoding="utf-8"))
+        assert payload['schema_version'] == 3
+        assert payload['heat_sources'][0]['power_profile']['value_w'] == 2.0
+
+        loaded = plugin._load_project_defaults(board, {})
+        assert loaded['heat_sources'][0]['needs_repair'] is True
+        assert "Missing board pad" in loaded['heat_sources'][0]['repair_reason']
+
+
+class TestGuidedConfigurationResolution:
+    """Controller integration for schema-v3 sources and paths."""
+
+    def _board(self):
+        pads = [
+            MockPad(
+                position=VECTOR2I(1_000_000, 1_000_000), layer=F_Cu,
+                bbox=EDA_RECT(500_000, 500_000, 1_000_000, 1_000_000),
+                net_code=7, net_name="VIN", number="1",
+            ),
+            MockPad(
+                position=VECTOR2I(3_000_000, 1_000_000), layer=F_Cu,
+                bbox=EDA_RECT(1_500_000, 500_000, 3_000_000, 1_000_000),
+                net_code=7, net_name="VIN", number="2",
+            ),
+        ]
+        board = MockBoard(
+            footprints=[MockFootprint("U1", pads)],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+        )
+        return board, pads
+
+    def test_total_heat_source_expands_by_pad_area(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        board, pads = self._board()
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        refs = [plugin._pad_descriptor(board, "U1", pad) for pad in pads]
+        # Persisted areas are only hints; expansion should use current board geometry.
+        refs[0]['area_mm2'] = 100.0
+        refs[1]['area_mm2'] = 100.0
+        settings = {
+            'heat_sources': [{
+                'id': 'u1-loss', 'name': 'U1 loss',
+                'power_profile': {'kind': 'constant', 'value_w': 2.0},
+                'distribution': 'area', 'pads': refs,
+            }],
+        }
+
+        entries, missing = plugin._resolve_power_pad_entries(board, settings)
+        objects = plugin._resolve_power_pad_objects(board, settings)
+
+        assert missing == []
+        assert [entry[2]['value_w'] for entry in entries] == pytest.approx([0.5, 1.5])
+        assert sum(entry[2]['value_w'] for entry in entries) == pytest.approx(2.0)
+        assert objects == pads
+
+    def test_guided_path_resolves_exactly_balanced_terminals(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        board, pads = self._board()
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        refs = [plugin._pad_descriptor(board, "U1", pad) for pad in pads]
+        settings = {
+            'current_enabled': True,
+            'current_paths': [{
+                'id': 'vin', 'name': 'VIN path', 'net_name': 'VIN',
+                'net_code': 7, 'current_a': 5.0,
+                'source_pads': [refs[0]], 'sink_pads': [refs[1]],
+            }],
+            'current_circuits': [],
+        }
+
+        terminals, missing = plugin._resolve_current_terminals(board, settings)
+
+        assert missing == []
+        assert [item.current_a for item in terminals] == pytest.approx([5.0, -5.0])
+        assert sum(item.current_a for item in terminals) == pytest.approx(0.0)
+
+    def test_uuid_pad_reference_survives_position_and_net_code_changes(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        class Uuid:
+            def __init__(self, value):
+                self.value = value
+
+            def AsString(self):
+                return self.value
+
+        board, pads = self._board()
+        pads[0].m_Uuid = Uuid("pad-uuid-1")
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        saved = plugin._pad_descriptor(board, "U1", pads[0])
+        pads[0]._position = VECTOR2I(50_000_000, 40_000_000)
+        pads[0]._net_code = 99
+
+        by_key, by_name = plugin._build_pad_lookup(board)
+        match = plugin._match_pad_descriptor(by_key, by_name, saved)
+
+        assert match is not None
+        assert match[1] is pads[0]
 
 
 class TestGridCoarsening:

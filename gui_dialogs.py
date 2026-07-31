@@ -9,6 +9,7 @@ persistent board context, preflight status, and result actions.
 import copy
 import json
 import os
+import uuid
 import wx
 
 try:
@@ -21,6 +22,13 @@ try:
     from .capabilities import HAS_PARDISO
 except ImportError:
     HAS_PARDISO = False
+
+from .source_configuration import (
+    CurrentCircuitDefinition,
+    CurrentPathDefinition,
+    HeatSourceDefinition,
+    ProjectConfiguration,
+)
 
 
 # Tooltip text for every control, keyed by internal name
@@ -144,14 +152,24 @@ def normalize_pad_descriptor(pad):
     """
     pad = dict(pad or {})
     current = _safe_float(pad.get('current_a', pad.get('current', 0.0)))
-    return {
-        'pad_key': str(pad.get('pad_key', pad.get('key', ''))),
-        'name': str(pad.get('name', '')),
+    result = {
+        'pad_key': str(pad.get('pad_key', pad.get('legacy_key', pad.get('key', '')))),
+        'pad_uuid': str(pad.get('pad_uuid', '')),
+        'footprint_uuid': str(pad.get('footprint_uuid', '')),
+        'footprint_ref': str(pad.get('footprint_ref', pad.get('reference', ''))),
+        'footprint_value': str(pad.get('footprint_value', '')),
+        'pad_number': str(pad.get('pad_number', '')),
+        'name': str(pad.get('name', pad.get('display_name', ''))),
         'net_name': str(pad.get('net_name', pad.get('net', ''))),
         'net_code': int(_safe_float(pad.get('net_code', 0), 0)),
         'layer': str(pad.get('layer', '')),
+        'pin_function': str(pad.get('pin_function', '')),
+        'area_mm2': max(0.0, _safe_float(pad.get('area_mm2', 0.0))),
         'current_a': current,
     }
+    if not result['footprint_ref'] and result['name']:
+        result['footprint_ref'] = result['name'].split('-', 1)[0]
+    return result
 
 
 def normalize_power_pad_descriptor(pad, default_power="1.0"):
@@ -174,14 +192,61 @@ def normalize_power_pad_descriptor(pad, default_power="1.0"):
     power = pad.get('power', pad.get('power_str', pad.get('power_w', default_power)))
     if power is None:
         power = default_power
+    normalized = normalize_pad_descriptor(pad)
     return {
         'pad_key': str(pad.get('pad_key', pad.get('key', ''))),
-        'name': str(pad.get('name', '')),
-        'net_name': str(pad.get('net_name', pad.get('net', ''))),
-        'net_code': int(_safe_float(pad.get('net_code', 0), 0)),
-        'layer': str(pad.get('layer', '')),
+        'pad_uuid': normalized.get('pad_uuid', ''),
+        'footprint_uuid': normalized.get('footprint_uuid', ''),
+        'footprint_ref': normalized.get('footprint_ref', ''),
+        'footprint_value': normalized.get('footprint_value', ''),
+        'pad_number': normalized.get('pad_number', ''),
+        'name': normalized.get('name', ''),
+        'net_name': normalized.get('net_name', ''),
+        'net_code': normalized.get('net_code', 0),
+        'layer': normalized.get('layer', ''),
+        'pin_function': normalized.get('pin_function', ''),
+        'area_mm2': normalized.get('area_mm2', 0.0),
         'power': str(power).strip(),
     }
+
+
+def filter_pad_catalog(pads, query="", net_name=""):
+    """Filter a board-pad catalog for the guided selection browser.
+
+    Parameters
+    ----------
+    pads : iterable of dict
+        Pad descriptors supplied by the KiCad host.
+    query : str, optional
+        Case-insensitive free-text query covering reference, pad, value, pin
+        function, net, and layer.
+    net_name : str, optional
+        Exact net filter.  An empty string includes every net.
+
+    Returns
+    -------
+    list of dict
+        Normalized descriptors in stable display order.
+    """
+    needle = str(query or "").strip().casefold()
+    wanted_net = str(net_name or "").strip()
+    matches = []
+    for raw in pads or []:
+        pad = normalize_pad_descriptor(raw)
+        if wanted_net and pad.get('net_name') != wanted_net:
+            continue
+        haystack = " ".join(str(pad.get(key, "")) for key in (
+            'footprint_ref', 'footprint_value', 'pad_number', 'name',
+            'pin_function', 'net_name', 'layer',
+        )).casefold()
+        if needle and needle not in haystack:
+            continue
+        matches.append(pad)
+    matches.sort(key=lambda item: (
+        item.get('footprint_ref', ''), item.get('pad_number', ''),
+        item.get('net_name', ''), item.get('name', ''),
+    ))
+    return matches
 
 
 def prepare_power_pads(pads, power_str="1.0"):
@@ -274,6 +339,22 @@ def summarize_power_pads(power_pads):
     return f"{count_label} / {total:.6g} W"
 
 
+def summarize_heat_sources(heat_sources):
+    """Return count and total power for guided heat sources."""
+    sources = [item for item in (heat_sources or []) if item.get('enabled', True)]
+    if not sources:
+        return "0 heat sources"
+    total = 0.0
+    contains_pwl = False
+    for source in sources:
+        try:
+            total += float(str(source.get('power', '')).strip())
+        except (TypeError, ValueError):
+            contains_pwl = True
+    label = f"{len(sources)} heat source" + ("" if len(sources) == 1 else "s")
+    return f"{label} (contains PWL)" if contains_pwl else f"{label} / {total:.6g} W"
+
+
 def prepare_current_groups(groups):
     """
     Normalize groups and apply their current distribution mode.
@@ -351,6 +432,113 @@ def summarize_current_groups(groups):
     return group_rows, balance_rows
 
 
+class PadBrowserDialog(wx.Dialog):
+    """Search and select pads from a board-wide catalog.
+
+    Parameters
+    ----------
+    parent : wx.Window or None
+        Parent window.
+    pads : iterable of dict
+        Board pad descriptors.
+    title : str, optional
+        Dialog title.
+    net_name : str, optional
+        Locked net name for current-path endpoint selection.
+    """
+
+    def __init__(self, parent, pads, title="Select Board Pads", net_name=""):
+        style = getattr(wx, "DEFAULT_DIALOG_STYLE", 0) | getattr(wx, "RESIZE_BORDER", 0)
+        super().__init__(parent, title=title, style=style)
+        self.all_pads = [normalize_pad_descriptor(item) for item in (pads or [])]
+        self.net_name = str(net_name or "")
+        self.filtered_pads = []
+
+        outer = wx.BoxSizer(wx.VERTICAL)
+        filter_row = wx.BoxSizer(wx.HORIZONTAL)
+        filter_row.Add(wx.StaticText(self, label="Search", size=(70, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.search_input = wx.TextCtrl(self, value="")
+        filter_row.Add(self.search_input, 1, wx.EXPAND | wx.RIGHT, 8)
+        net_label = self.net_name or "All nets"
+        self.lbl_net_filter = wx.StaticText(self, label=f"Net: {net_label}")
+        filter_row.Add(self.lbl_net_filter, 0, wx.ALIGN_CENTER_VERTICAL)
+        outer.Add(filter_row, 0, wx.EXPAND | wx.ALL, 8)
+
+        self.pad_list = wx.ListCtrl(self, style=getattr(wx, "LC_REPORT", 0))
+        for idx, (title_text, width) in enumerate([
+            ("Reference", 85), ("Pad", 55), ("Function", 120),
+            ("Net", 150), ("Layer", 70), ("Area mm²", 75),
+        ]):
+            self.pad_list.InsertColumn(idx, title_text, width=width)
+        self.pad_list.SetMinSize((650, 360))
+        outer.Add(self.pad_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
+
+        actions = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_refresh_filter = wx.Button(self, label="Apply Filter")
+        self.btn_refresh_filter.Bind(wx.EVT_BUTTON, self._on_filter)
+        actions.Add(self.btn_refresh_filter, 0, wx.RIGHT, 5)
+        actions.AddStretchSpacer()
+        self.btn_ok = wx.Button(self, id=wx.ID_OK, label="Add Pads")
+        self.btn_cancel = wx.Button(self, id=wx.ID_CANCEL, label="Cancel")
+        try:
+            self.btn_ok.Bind(wx.EVT_BUTTON, lambda event: self.EndModal(wx.ID_OK))
+            self.btn_cancel.Bind(wx.EVT_BUTTON, lambda event: self.EndModal(wx.ID_CANCEL))
+        except Exception:
+            pass
+        actions.Add(self.btn_ok, 0, wx.RIGHT, 5)
+        actions.Add(self.btn_cancel, 0)
+        outer.Add(actions, 0, wx.EXPAND | wx.ALL, 8)
+        self.SetSizer(outer)
+        self.SetSize((760, 540))
+        self.SetMinSize((620, 420))
+        self._render()
+
+        text_event = getattr(wx, "EVT_TEXT", None)
+        if text_event is not None:
+            self.search_input.Bind(text_event, self._on_filter)
+
+    def _on_filter(self, event):
+        """Apply the current query and net filter."""
+        self._render()
+        try:
+            event.Skip()
+        except Exception:
+            pass
+
+    def _render(self):
+        """Refresh visible catalog rows."""
+        self.filtered_pads = filter_pad_catalog(
+            self.all_pads, self.search_input.GetValue(), self.net_name
+        )
+        self.pad_list.DeleteAllItems()
+        for row_idx, pad in enumerate(self.filtered_pads):
+            values = [
+                pad.get('footprint_ref', ''),
+                pad.get('pad_number', ''),
+                pad.get('pin_function', ''),
+                pad.get('net_name') or "(no net)",
+                pad.get('layer', ''),
+                f"{float(pad.get('area_mm2', 0.0)):.4g}",
+            ]
+            self.pad_list.InsertItem(row_idx, values[0])
+            for col_idx, value in enumerate(values[1:], start=1):
+                self.pad_list.SetItem(row_idx, col_idx, value)
+
+    def get_selected_pads(self):
+        """Return descriptors for the selected visible rows."""
+        selected = []
+        idx = self.pad_list.GetFirstSelected()
+        while idx != -1:
+            if 0 <= idx < len(self.filtered_pads):
+                selected.append(dict(self.filtered_pads[idx]))
+            idx = self.pad_list.GetNextItem(
+                idx,
+                getattr(wx, "LIST_NEXT_ALL", 0),
+                getattr(wx, "LIST_STATE_SELECTED", 0),
+            )
+        return selected
+
+
 class SettingsDialog(wx.Dialog):
     """
     Dialog for configuring thermal simulation parameters.
@@ -398,11 +586,13 @@ class SettingsDialog(wx.Dialog):
         layer_names,
         preview_callback=None,
         selection_provider=None,
+        pad_catalog_provider=None,
         run_callback=None,
         close_callback=None,
         preflight_callback=None,
         load_settings_callback=None,
         save_settings_callback=None,
+        project_save_callback=None,
         stackup_details="",
         pad_names=None,
         initial_power_pads=None,
@@ -423,13 +613,21 @@ class SettingsDialog(wx.Dialog):
         self.board_size_mm = tuple(board_size_mm or ())
         self.preview_callback = preview_callback
         self.selection_provider = selection_provider
+        self.pad_catalog_provider = pad_catalog_provider
         self.run_callback = run_callback
         self.close_callback = close_callback
         self.preflight_callback = preflight_callback
         self.load_settings_callback = load_settings_callback
         self.save_settings_callback = save_settings_callback
+        self.project_save_callback = project_save_callback
+        self.heat_sources = []
+        self.heat_source_index = -1
+        self.current_paths = []
+        self.current_path_index = -1
+        self.current_circuits = []
         self.current_groups = []
         self.current_group_index = -1
+        self._project_dirty = False
         self.power_pads = []
         self.initial_power_pads = [
             normalize_power_pad_descriptor(pad) for pad in (initial_power_pads or [])
@@ -583,6 +781,8 @@ class SettingsDialog(wx.Dialog):
             self.power_pads = prepare_power_pads(self.initial_power_pads, self.power_input.GetValue())
             self._render_power_pads()
             self._render_current_groups()
+            if self.power_pads:
+                self.power_advanced_pane.Expand()
         self._bind_estimate_controls()
         self._refresh_context_summary()
         if defer_initial_preflight:
@@ -725,16 +925,74 @@ class SettingsDialog(wx.Dialog):
         panel.SetSizer(sizer)
 
     def _build_power_tab(self, panel):
-        """Build the manual power-pad tab."""
+        """Build guided heat-source editing with a legacy pad allocation view."""
         sizer = wx.BoxSizer(wx.VERTICAL)
 
         help_text = wx.StaticText(
             panel,
-            label="Configure manual heat sources here. Current-heating terminals are selected separately."
+            label="Enter total component loss. ThermalSim distributes it across the selected pads."
         )
         sizer.Add(help_text, 0, wx.EXPAND | wx.ALL, 5)
 
-        edit_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Heat Sources")
+        guided_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Guided Heat Sources")
+        guided_parent = guided_box.GetStaticBox()
+        source_fields = wx.BoxSizer(wx.HORIZONTAL)
+        source_fields.Add(wx.StaticText(guided_parent, label="Name", size=(50, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.heat_source_name_input = wx.TextCtrl(guided_parent, value="Heat Source 1")
+        source_fields.Add(self.heat_source_name_input, 1, wx.EXPAND | wx.RIGHT, 6)
+        source_fields.Add(wx.StaticText(guided_parent, label="Total W / PWL", size=(85, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.heat_source_profile_input = wx.TextCtrl(guided_parent, value="1.0")
+        source_fields.Add(self.heat_source_profile_input, 1, wx.EXPAND | wx.RIGHT, 6)
+        self.heat_source_distribution_choice = wx.Choice(
+            guided_parent, choices=["By pad area", "Equal", "Custom shares"]
+        )
+        self.heat_source_distribution_choice.SetSelection(0)
+        source_fields.Add(self.heat_source_distribution_choice, 0)
+        guided_box.Add(source_fields, 0, wx.EXPAND | wx.ALL, 3)
+
+        shares_row = wx.BoxSizer(wx.HORIZONTAL)
+        shares_row.Add(
+            wx.StaticText(guided_parent, label="Custom pad shares", size=(115, -1)),
+            0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5,
+        )
+        self.heat_source_shares_input = wx.TextCtrl(guided_parent, value="")
+        self.heat_source_shares_input.SetToolTip(
+            "Comma-separated relative shares in pad order, for example 3, 1."
+        )
+        shares_row.Add(self.heat_source_shares_input, 1, wx.EXPAND)
+        guided_box.Add(shares_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        source_buttons = wx.BoxSizer(wx.HORIZONTAL)
+        btn_source_selected = wx.Button(guided_parent, label="Add KiCad Selection")
+        btn_source_selected.Bind(wx.EVT_BUTTON, self._on_heat_source_add_selection)
+        source_buttons.Add(btn_source_selected, 0, wx.ALL, 2)
+        btn_source_browse = wx.Button(guided_parent, label="Browse Board...")
+        btn_source_browse.Bind(wx.EVT_BUTTON, self._on_heat_source_browse)
+        source_buttons.Add(btn_source_browse, 0, wx.ALL, 2)
+        btn_source_update = wx.Button(guided_parent, label="Update Source")
+        btn_source_update.Bind(wx.EVT_BUTTON, self._on_heat_source_update)
+        source_buttons.Add(btn_source_update, 0, wx.ALL, 2)
+        btn_source_remove = wx.Button(guided_parent, label="Remove Source")
+        btn_source_remove.Bind(wx.EVT_BUTTON, self._on_heat_source_remove)
+        source_buttons.Add(btn_source_remove, 0, wx.ALL, 2)
+        guided_box.Add(source_buttons, 0, wx.EXPAND | wx.ALL, 2)
+
+        self.heat_source_list = wx.ListCtrl(
+            guided_parent, style=getattr(wx, "LC_REPORT", 0) | getattr(wx, "LC_SINGLE_SEL", 0)
+        )
+        for idx, (title, width) in enumerate([
+            ("Source", 150), ("Pads", 55), ("Total W / PWL", 165),
+            ("Distribution", 100), ("Status", 100),
+        ]):
+            self.heat_source_list.InsertColumn(idx, title, width=width)
+        self.heat_source_list.SetMinSize((-1, 145))
+        self.heat_source_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self._on_heat_source_selected)
+        guided_box.Add(self.heat_source_list, 1, wx.EXPAND | wx.ALL, 3)
+        sizer.Add(guided_box, 1, wx.EXPAND | wx.ALL, 5)
+
+        self.power_advanced_pane = wx.CollapsiblePane(panel, label="Advanced Pad Allocation")
+        edit_panel = self.power_advanced_pane.GetPane()
+        edit_box = wx.StaticBoxSizer(wx.VERTICAL, edit_panel, "Resolved Pad Power")
         edit_parent = edit_box.GetStaticBox()
         row_pwr = wx.BoxSizer(wx.HORIZONTAL)
         row_pwr.Add(wx.StaticText(edit_parent, label="Power / PWL", size=(105, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
@@ -779,7 +1037,8 @@ class SettingsDialog(wx.Dialog):
         edit_box.Add(self.power_pad_list, 1, wx.EXPAND | wx.ALL, 3)
         self.lbl_heat_summary = wx.StaticText(edit_parent, label="0 heat sources")
         edit_box.Add(self.lbl_heat_summary, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
-        sizer.Add(edit_box, 1, wx.EXPAND | wx.ALL, 5)
+        edit_panel.SetSizer(edit_box)
+        sizer.Add(self.power_advanced_pane, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
         panel.SetSizer(sizer)
 
@@ -952,9 +1211,63 @@ class SettingsDialog(wx.Dialog):
 
         help_text = wx.StaticText(
             panel,
-            label="Positive currents enter the PCB; negative currents leave it."
+            label="Describe a path with a positive current and choose where it enters and leaves the copper."
         )
         sizer.Add(help_text, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        path_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Guided Current Paths")
+        path_parent = path_box.GetStaticBox()
+        path_fields = wx.BoxSizer(wx.HORIZONTAL)
+        path_fields.Add(wx.StaticText(path_parent, label="Name", size=(45, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.current_path_name_input = wx.TextCtrl(path_parent, value="Current Path 1")
+        path_fields.Add(self.current_path_name_input, 1, wx.EXPAND | wx.RIGHT, 6)
+        path_fields.Add(wx.StaticText(path_parent, label="Path current (A)", size=(95, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.current_path_value_input = wx.SpinCtrlDouble(
+            path_parent, value="1.0", min=0.0, max=10000.0, inc=0.1
+        )
+        self.current_path_value_input.SetDigits(3)
+        path_fields.Add(self.current_path_value_input, 0, wx.RIGHT, 5)
+        btn_path_update = wx.Button(path_parent, label="Update")
+        btn_path_update.Bind(wx.EVT_BUTTON, self._on_current_path_update)
+        path_fields.Add(btn_path_update, 0)
+        path_box.Add(path_fields, 0, wx.EXPAND | wx.ALL, 3)
+
+        path_share_fields = wx.BoxSizer(wx.HORIZONTAL)
+        path_share_fields.Add(wx.StaticText(path_parent, label="Enters shares", size=(85, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.current_source_shares_input = wx.TextCtrl(path_parent, value="")
+        path_share_fields.Add(self.current_source_shares_input, 1, wx.EXPAND | wx.RIGHT, 8)
+        path_share_fields.Add(wx.StaticText(path_parent, label="Leaves shares", size=(85, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.current_sink_shares_input = wx.TextCtrl(path_parent, value="")
+        path_share_fields.Add(self.current_sink_shares_input, 1, wx.EXPAND)
+        path_box.Add(path_share_fields, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        path_buttons = wx.BoxSizer(wx.HORIZONTAL)
+        for label, handler in (
+            ("New Net Path", self._on_current_path_new),
+            ("New DC Circuit", self._on_current_circuit_new),
+            ("Selection Enters", self._on_current_path_add_source),
+            ("Selection Leaves", self._on_current_path_add_sink),
+            ("Browse...", self._on_current_path_browse),
+            ("Remove Selection", self._on_current_path_remove_selection),
+            ("Remove", self._on_current_path_remove),
+        ):
+            button = wx.Button(path_parent, label=label)
+            button.Bind(wx.EVT_BUTTON, handler)
+            path_buttons.Add(button, 0, wx.ALL, 2)
+        path_box.Add(path_buttons, 0, wx.EXPAND | wx.ALL, 2)
+
+        self.current_path_list = wx.ListCtrl(
+            path_parent, style=getattr(wx, "LC_REPORT", 0) | getattr(wx, "LC_SINGLE_SEL", 0)
+        )
+        for idx, (title, width) in enumerate([
+            ("Path", 125), ("Net", 115), ("Current", 65),
+            ("Enters", 55), ("Leaves", 55), ("Circuit", 95), ("Status", 95),
+        ]):
+            self.current_path_list.InsertColumn(idx, title, width=width)
+        self.current_path_list.SetMinSize((-1, 100))
+        self.current_path_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self._on_current_path_selected)
+        path_box.Add(self.current_path_list, 1, wx.EXPAND | wx.ALL, 3)
+        sizer.Add(path_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
         balance_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Net Balance")
         balance_parent = balance_box.GetStaticBox()
@@ -965,9 +1278,13 @@ class SettingsDialog(wx.Dialog):
         balance_box.Add(self.current_balance_text, 0, wx.EXPAND | wx.ALL, 3)
         sizer.Add(balance_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
+        self.current_advanced_pane = wx.CollapsiblePane(
+            panel, label="Advanced Terminal Editor"
+        )
+        advanced_panel = self.current_advanced_pane.GetPane()
         current_content = wx.BoxSizer(wx.HORIZONTAL)
 
-        group_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Current Groups")
+        group_box = wx.StaticBoxSizer(wx.VERTICAL, advanced_panel, "Current Groups")
         group_parent = group_box.GetStaticBox()
         self.current_group_list = wx.ListCtrl(
             group_parent,
@@ -1004,7 +1321,7 @@ class SettingsDialog(wx.Dialog):
         group_box.Add(group_more_buttons, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 3)
         current_content.Add(group_box, 0, wx.EXPAND | wx.RIGHT, 5)
 
-        edit_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Selected Group")
+        edit_box = wx.StaticBoxSizer(wx.VERTICAL, advanced_panel, "Selected Group")
         selected_parent = edit_box.GetStaticBox()
         row_name = wx.BoxSizer(wx.HORIZONTAL)
         row_name.Add(wx.StaticText(selected_parent, label="Name:", size=(105, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
@@ -1069,7 +1386,13 @@ class SettingsDialog(wx.Dialog):
         self.current_pad_list.SetMinSize((-1, 130))
         edit_box.Add(self.current_pad_list, 1, wx.EXPAND | wx.ALL, 3)
         current_content.Add(edit_box, 1, wx.EXPAND)
-        sizer.Add(current_content, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        advanced_panel.SetSizer(current_content)
+        sizer.Add(
+            self.current_advanced_pane,
+            1,
+            wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM,
+            5,
+        )
 
         panel.SetSizer(sizer)
 
@@ -1299,6 +1622,10 @@ class SettingsDialog(wx.Dialog):
         if self.preview_callback:
             settings = self.get_values()
             if settings and self._refresh_preflight(settings):
+                if self.project_save_callback:
+                    saved = self.project_save_callback(settings)
+                    if saved is not False:
+                        self._project_dirty = False
                 self._set_footer_status(
                     "Building preview...",
                     "Extracting and rasterizing board geometry.",
@@ -1331,6 +1658,10 @@ class SettingsDialog(wx.Dialog):
             return
         if not self._refresh_preflight(settings):
             return
+        if self.project_save_callback:
+            saved = self.project_save_callback(settings)
+            if saved is not False:
+                self._project_dirty = False
         if self.run_callback:
             self.set_run_state("running")
             self.run_callback(settings)
@@ -1453,6 +1784,12 @@ class SettingsDialog(wx.Dialog):
 
     def _on_cancel(self, event):
         """Handle Cancel button click."""
+        if self._project_dirty and self.project_save_callback:
+            settings = self.get_values()
+            if settings:
+                saved = self.project_save_callback(settings)
+                if saved is not False:
+                    self._project_dirty = False
         if self.close_callback:
             self.close_callback()
         try:
@@ -1718,9 +2055,23 @@ class SettingsDialog(wx.Dialog):
 
     def _refresh_context_summary(self):
         """Refresh persistent heat-source and current-flow context."""
-        power_text = summarize_power_pads(self.power_pads)
+        power_text = (
+            summarize_heat_sources(self.heat_sources)
+            if self.heat_sources else summarize_power_pads(self.power_pads)
+        )
         if not self.chk_current_enabled.GetValue():
             current_text = "Current heating off"
+        elif self.current_paths:
+            incomplete = any(
+                not path.get('sources') or not path.get('sinks')
+                or self._path_current(path) <= 0.0 or path.get('needs_repair')
+                for path in self.current_paths if path.get('enabled', True)
+            )
+            current_text = (
+                f"{len(self.current_paths)} current path"
+                + ("" if len(self.current_paths) == 1 else "s")
+                + (" / needs setup" if incomplete else " / balanced")
+            )
         else:
             _, balance_rows = summarize_current_groups(self.current_groups)
             if not balance_rows:
@@ -1732,6 +2083,226 @@ class SettingsDialog(wx.Dialog):
         self.lbl_context.SetLabel(f"{power_text} / {current_text}")
         if hasattr(self, "lbl_heat_summary"):
             self.lbl_heat_summary.SetLabel(power_text)
+
+    # ------------------------------------------------------------------
+    # Guided heat-source helpers
+    # ------------------------------------------------------------------
+
+    def _catalog_descriptors(self):
+        """Return the current searchable board-pad catalog."""
+        if not self.pad_catalog_provider:
+            return self._selection_descriptors()
+        try:
+            pads = self.pad_catalog_provider()
+        except Exception:
+            pads = []
+        return [normalize_pad_descriptor(pad) for pad in (pads or [])]
+
+    def _browse_pad_descriptors(self, title, net_name=""):
+        """Open the shared board-pad browser and return selected pads."""
+        dialog = PadBrowserDialog(
+            self, self._catalog_descriptors(), title=title, net_name=net_name
+        )
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return []
+            return dialog.get_selected_pads()
+        finally:
+            dialog.Destroy()
+
+    def _heat_source_shares(self, source):
+        """Return normalized pad shares for a guided heat source."""
+        pads = list(source.get('pads', []) or [])
+        if not pads:
+            return []
+        mode = str(source.get('distribution', 'area') or 'area').lower()
+        if mode == 'custom':
+            raw = [max(0.0, _safe_float(pad.get('share', 0.0))) for pad in pads]
+        elif mode == 'area':
+            raw = [max(0.0, _safe_float(pad.get('area_mm2', 0.0))) for pad in pads]
+        else:
+            raw = [1.0] * len(pads)
+        total = float(sum(raw))
+        if total <= 0.0:
+            raw = [1.0] * len(pads)
+            total = float(len(pads))
+        return [value / total for value in raw]
+
+    def _parse_share_list(self, text, count, label="Pad shares"):
+        """Parse a non-negative comma-separated share list."""
+        value = str(text or "").strip()
+        if not value:
+            return []
+        try:
+            shares = [
+                float(part.strip())
+                for part in value.replace(';', ',').split(',')
+                if part.strip()
+            ]
+        except ValueError:
+            wx.MessageBox(f"{label} must contain only numbers.", "ThermalSim")
+            return None
+        if len(shares) != count or any(item < 0.0 for item in shares) or sum(shares) <= 0.0:
+            wx.MessageBox(
+                f"{label} needs {count} non-negative values with a positive sum.",
+                "ThermalSim",
+            )
+            return None
+        total = float(sum(shares))
+        return [item / total for item in shares]
+
+    def _guided_power_pads(self):
+        """Resolve guided sources to compatibility pad-power descriptors."""
+        resolved = []
+        for source in self.heat_sources:
+            power = str(source.get('power', '0.0')).strip()
+            shares = self._heat_source_shares(source)
+            try:
+                total_w = float(power)
+            except (TypeError, ValueError):
+                total_w = None
+            for pad, share in zip(source.get('pads', []), shares):
+                descriptor = normalize_power_pad_descriptor(pad, default_power="0.0")
+                descriptor['source_id'] = source.get('id', '')
+                descriptor['source_name'] = source.get('name', '')
+                descriptor['share'] = share
+                if total_w is None:
+                    descriptor['power'] = power
+                    descriptor['profile_scale'] = share
+                else:
+                    descriptor['power'] = f"{total_w * share:.12g}"
+                resolved.append(descriptor)
+        return resolved
+
+    def _selected_heat_source_index(self):
+        """Return the selected guided source row."""
+        try:
+            index = self.heat_source_list.GetFirstSelected()
+            return index if 0 <= index < len(self.heat_sources) else -1
+        except Exception:
+            return self.heat_source_index
+
+    def _create_heat_source(self, pads):
+        """Create a guided source from selected pad descriptors."""
+        unique = []
+        seen = set()
+        for raw in pads or []:
+            pad = normalize_pad_descriptor(raw)
+            key = pad.get('pad_key') or pad.get('pad_uuid') or pad.get('name')
+            if key and key not in seen:
+                unique.append(pad)
+                seen.add(key)
+        if not unique:
+            wx.MessageBox("Select one or more pads in KiCad or the board browser first.", "ThermalSim")
+            return
+        mode_index = self.heat_source_distribution_choice.GetSelection()
+        distribution = ['area', 'equal', 'custom'][mode_index] if 0 <= mode_index < 3 else 'area'
+        source = {
+            'id': str(uuid.uuid4()),
+            'name': self.heat_source_name_input.GetValue().strip() or f"Heat Source {len(self.heat_sources) + 1}",
+            'power': self.heat_source_profile_input.GetValue().strip() or '0.0',
+            'distribution': distribution,
+            'pads': unique,
+            'enabled': True,
+            'needs_repair': False,
+        }
+        if distribution == 'custom':
+            shares = self._parse_share_list(
+                self.heat_source_shares_input.GetValue(), len(unique), "Custom pad shares"
+            )
+            if shares is None:
+                return
+            if not shares:
+                shares = [1.0 / len(unique)] * len(unique)
+            for pad, share in zip(source['pads'], shares):
+                pad['share'] = share
+        self.heat_sources.append(source)
+        self.heat_source_index = len(self.heat_sources) - 1
+        self._power_pads_edited = True
+        self._project_dirty = True
+        self._render_heat_sources()
+
+    def _on_heat_source_add_selection(self, event):
+        self._create_heat_source(self._selection_descriptors())
+
+    def _on_heat_source_browse(self, event):
+        self._create_heat_source(self._browse_pad_descriptors("Add Heat Source Pads"))
+
+    def _on_heat_source_selected(self, event):
+        try:
+            self.heat_source_index = int(event.GetIndex())
+        except Exception:
+            self.heat_source_index = self._selected_heat_source_index()
+        if 0 <= self.heat_source_index < len(self.heat_sources):
+            source = self.heat_sources[self.heat_source_index]
+            self.heat_source_name_input.SetValue(source.get('name', ''))
+            self.heat_source_profile_input.SetValue(source.get('power', ''))
+            self.heat_source_distribution_choice.SetSelection(
+                {'area': 0, 'equal': 1, 'custom': 2}.get(source.get('distribution'), 0)
+            )
+            self.heat_source_shares_input.SetValue(
+                ", ".join(f"{share:.6g}" for share in self._heat_source_shares(source))
+                if source.get('distribution') == 'custom' else ""
+            )
+
+    def _on_heat_source_update(self, event):
+        index = self._selected_heat_source_index()
+        if index < 0:
+            return
+        source = self.heat_sources[index]
+        source['name'] = self.heat_source_name_input.GetValue().strip() or source.get('name', 'Heat Source')
+        source['power'] = self.heat_source_profile_input.GetValue().strip() or '0.0'
+        source['distribution'] = ['area', 'equal', 'custom'][
+            max(0, min(2, self.heat_source_distribution_choice.GetSelection()))
+        ]
+        if source['distribution'] == 'custom':
+            shares = self._parse_share_list(
+                self.heat_source_shares_input.GetValue(), len(source.get('pads', [])),
+                "Custom pad shares",
+            )
+            if shares is None:
+                return
+            if not shares and source.get('pads'):
+                shares = [1.0 / len(source['pads'])] * len(source['pads'])
+            for pad, share in zip(source.get('pads', []), shares):
+                pad['share'] = share
+        self._project_dirty = True
+        self._render_heat_sources()
+
+    def _on_heat_source_remove(self, event):
+        index = self._selected_heat_source_index()
+        if index < 0:
+            return
+        del self.heat_sources[index]
+        self.heat_source_index = min(index, len(self.heat_sources) - 1)
+        self._project_dirty = True
+        self._render_heat_sources()
+
+    def _render_heat_sources(self):
+        """Refresh guided source rows and their resolved pad allocations."""
+        if not hasattr(self, 'heat_source_list'):
+            return
+        self.heat_source_list.DeleteAllItems()
+        for row_idx, source in enumerate(self.heat_sources):
+            pads = list(source.get('pads', []) or [])
+            missing = any(not (pad.get('pad_key') or pad.get('pad_uuid')) for pad in pads)
+            status = 'Needs repair' if source.get('needs_repair') or missing else ('OK' if pads else 'No pads')
+            distribution = {
+                'area': 'Pad area', 'equal': 'Equal', 'custom': 'Custom'
+            }.get(source.get('distribution'), 'Pad area')
+            values = [
+                source.get('name', ''), str(len(pads)), source.get('power', ''),
+                distribution, status,
+            ]
+            self.heat_source_list.InsertItem(row_idx, values[0])
+            for col_idx, value in enumerate(values[1:], start=1):
+                self.heat_source_list.SetItem(row_idx, col_idx, value)
+        if 0 <= self.heat_source_index < len(self.heat_sources):
+            self.heat_source_list.Select(self.heat_source_index)
+        if self.heat_sources:
+            self.power_pads = self._guided_power_pads()
+            self.power_input.SetValue(power_pads_to_power_str(self.power_pads, ''))
+        self._render_power_pads()
 
     # ------------------------------------------------------------------
     # Power-pad tab helpers
@@ -1878,6 +2449,299 @@ class SettingsDialog(wx.Dialog):
     # Current-path tab helpers
     # ------------------------------------------------------------------
 
+    def _selected_guided_path_index(self):
+        """Return the selected guided current-path row."""
+        try:
+            index = self.current_path_list.GetFirstSelected()
+            return index if 0 <= index < len(self.current_paths) else -1
+        except Exception:
+            return self.current_path_index
+
+    def _path_current(self, path):
+        """Return the effective current for a path or its linked circuit."""
+        circuit_id = path.get('circuit_id')
+        if circuit_id:
+            for circuit in self.current_circuits:
+                if circuit.get('id') == circuit_id:
+                    return max(0.0, _safe_float(circuit.get('current_a', 0.0)))
+        return max(0.0, _safe_float(path.get('current_a', 0.0)))
+
+    def _path_endpoint_shares(self, pads):
+        """Return normalized current shares for one endpoint side."""
+        pads = list(pads or [])
+        if not pads:
+            return []
+        raw = [max(0.0, _safe_float(pad.get('share', 0.0))) for pad in pads]
+        total = float(sum(raw))
+        if total <= 0.0:
+            return [1.0 / len(pads)] * len(pads)
+        return [value / total for value in raw]
+
+    def _new_guided_path(self, name=None, circuit_id=None):
+        """Append an empty guided current path and return it."""
+        path = {
+            'id': str(uuid.uuid4()),
+            'name': name or self.current_path_name_input.GetValue().strip() or f"Current Path {len(self.current_paths) + 1}",
+            'net_name': '',
+            'net_code': 0,
+            'current_a': max(0.0, float(self.current_path_value_input.GetValue())),
+            'circuit_id': circuit_id,
+            'sources': [],
+            'sinks': [],
+            'enabled': True,
+            'needs_repair': False,
+        }
+        self.current_paths.append(path)
+        self.current_path_index = len(self.current_paths) - 1
+        self.chk_current_enabled.SetValue(True)
+        return path
+
+    def _on_current_path_new(self, event):
+        self._new_guided_path()
+        self._project_dirty = True
+        self._render_current_paths()
+
+    def _on_current_circuit_new(self, event):
+        current = max(0.0, float(self.current_path_value_input.GetValue()))
+        circuit_number = len(self.current_circuits) + 1
+        circuit_id = str(uuid.uuid4())
+        circuit = {
+            'id': circuit_id,
+            'name': f"DC Circuit {circuit_number}",
+            'current_a': current,
+            'path_ids': [],
+            'enabled': True,
+        }
+        forward = self._new_guided_path(f"DC Circuit {circuit_number} - Forward", circuit_id)
+        return_path = self._new_guided_path(f"DC Circuit {circuit_number} - Return", circuit_id)
+        circuit['path_ids'] = [forward['id'], return_path['id']]
+        self.current_circuits.append(circuit)
+        self.current_path_index = len(self.current_paths) - 2
+        self._project_dirty = True
+        self._render_current_paths()
+
+    def _on_current_path_selected(self, event):
+        try:
+            self.current_path_index = int(event.GetIndex())
+        except Exception:
+            self.current_path_index = self._selected_guided_path_index()
+        if 0 <= self.current_path_index < len(self.current_paths):
+            path = self.current_paths[self.current_path_index]
+            self.current_path_name_input.SetValue(path.get('name', ''))
+            self.current_path_value_input.SetValue(self._path_current(path))
+            self.current_source_shares_input.SetValue(
+                ", ".join(f"{value:.6g}" for value in self._path_endpoint_shares(path.get('sources')))
+            )
+            self.current_sink_shares_input.SetValue(
+                ", ".join(f"{value:.6g}" for value in self._path_endpoint_shares(path.get('sinks')))
+            )
+
+    def _on_current_path_update(self, event):
+        index = self._selected_guided_path_index()
+        if index < 0:
+            return
+        path = self.current_paths[index]
+        path['name'] = self.current_path_name_input.GetValue().strip() or path.get('name', 'Current Path')
+        value = max(0.0, float(self.current_path_value_input.GetValue()))
+        if path.get('circuit_id'):
+            for circuit in self.current_circuits:
+                if circuit.get('id') == path.get('circuit_id'):
+                    circuit['current_a'] = value
+                    break
+        else:
+            path['current_a'] = value
+        for role, control, label in (
+            ('sources', self.current_source_shares_input, 'Enters shares'),
+            ('sinks', self.current_sink_shares_input, 'Leaves shares'),
+        ):
+            pads = list(path.get(role, []) or [])
+            if not pads:
+                continue
+            shares = self._parse_share_list(control.GetValue(), len(pads), label)
+            if shares is None:
+                return
+            if not shares:
+                shares = [1.0 / len(pads)] * len(pads)
+            for pad, share in zip(pads, shares):
+                pad['share'] = share
+        self._project_dirty = True
+        self._render_current_paths()
+
+    def _add_path_endpoints(self, role, pads):
+        """Add pads to one side of the selected path with net locking."""
+        index = self._selected_guided_path_index()
+        if index < 0:
+            path = self._new_guided_path()
+            index = self.current_path_index
+        else:
+            path = self.current_paths[index]
+        normalized = [normalize_pad_descriptor(pad) for pad in (pads or [])]
+        if not normalized:
+            wx.MessageBox("Select one or more pads first.", "ThermalSim")
+            return
+        path_net = str(path.get('net_name', '') or '')
+        if not path_net:
+            path_net = str(normalized[0].get('net_name', '') or '')
+            path['net_name'] = path_net
+            path['net_code'] = int(normalized[0].get('net_code', 0) or 0)
+        invalid = [pad for pad in normalized if not pad.get('net_name') or pad.get('net_name') != path_net]
+        if invalid:
+            wx.MessageBox(
+                f"All endpoints of this path must be on net {path_net or '(no net)'}. Access the return conductor as a separate path.",
+                "ThermalSim",
+            )
+            return
+        target_key = 'sources' if role == 'source' else 'sinks'
+        other_key = 'sinks' if role == 'source' else 'sources'
+        other_ids = {
+            pad.get('pad_key') or pad.get('pad_uuid') or pad.get('name')
+            for pad in path.get(other_key, [])
+        }
+        existing = {
+            pad.get('pad_key') or pad.get('pad_uuid') or pad.get('name')
+            for pad in path.get(target_key, [])
+        }
+        for pad in normalized:
+            key = pad.get('pad_key') or pad.get('pad_uuid') or pad.get('name')
+            if key in other_ids:
+                wx.MessageBox("A pad cannot both enter and leave the same current path.", "ThermalSim")
+                continue
+            if key not in existing:
+                path[target_key].append(pad)
+                existing.add(key)
+        self.chk_current_enabled.SetValue(True)
+        self._project_dirty = True
+        self._render_current_paths()
+
+    def _on_current_path_add_source(self, event):
+        self._add_path_endpoints('source', self._selection_descriptors())
+
+    def _on_current_path_add_sink(self, event):
+        self._add_path_endpoints('sink', self._selection_descriptors())
+
+    def _on_current_path_browse(self, event):
+        index = self._selected_guided_path_index()
+        if index < 0:
+            path = None
+        else:
+            path = self.current_paths[index]
+        role = 'source' if path is None or not path.get('sources') else 'sink'
+        verb = 'Enters Copper' if role == 'source' else 'Leaves Copper'
+        pads = self._browse_pad_descriptors(
+            f"Select Pads Where Current {verb}", path.get('net_name', '') if path else ''
+        )
+        if pads:
+            self._add_path_endpoints(role, pads)
+
+    def _on_current_path_remove_selection(self, event):
+        """Remove currently selected KiCad pads from both endpoint sides."""
+        index = self._selected_guided_path_index()
+        if index < 0:
+            return
+        selected = self._selection_descriptors()
+        keys = {
+            pad.get('pad_key') or pad.get('pad_uuid') or pad.get('name')
+            for pad in selected
+        }
+        if not keys:
+            wx.MessageBox("Select endpoint pads in KiCad first.", "ThermalSim")
+            return
+        path = self.current_paths[index]
+        for role in ('sources', 'sinks'):
+            path[role] = [
+                pad for pad in path.get(role, [])
+                if (pad.get('pad_key') or pad.get('pad_uuid') or pad.get('name')) not in keys
+            ]
+        if not path.get('sources') and not path.get('sinks'):
+            path['net_name'] = ''
+            path['net_code'] = 0
+        self._project_dirty = True
+        self._render_current_paths()
+
+    def _on_current_path_remove(self, event):
+        index = self._selected_guided_path_index()
+        if index < 0:
+            return
+        path = self.current_paths.pop(index)
+        circuit_id = path.get('circuit_id')
+        if circuit_id:
+            for circuit in list(self.current_circuits):
+                if circuit.get('id') != circuit_id:
+                    continue
+                circuit['path_ids'] = [item for item in circuit.get('path_ids', []) if item != path.get('id')]
+                if not circuit['path_ids']:
+                    self.current_circuits.remove(circuit)
+                break
+        self.current_path_index = min(index, len(self.current_paths) - 1)
+        self._project_dirty = True
+        self._render_current_paths()
+
+    def _guided_current_groups(self):
+        """Expand balanced guided paths into legacy terminal groups."""
+        groups = []
+        for path in self.current_paths:
+            if not path.get('enabled', True) or path.get('needs_repair'):
+                continue
+            current = self._path_current(path)
+            sources = list(path.get('sources', []) or [])
+            sinks = list(path.get('sinks', []) or [])
+            if current <= 0.0 or not sources or not sinks:
+                continue
+            pads = []
+            source_shares = self._path_endpoint_shares(sources)
+            sink_shares = self._path_endpoint_shares(sinks)
+            for raw, share in zip(sources, source_shares):
+                pad = normalize_pad_descriptor(raw)
+                pad['current_a'] = current * share
+                pads.append(pad)
+            for raw, share in zip(sinks, sink_shares):
+                pad = normalize_pad_descriptor(raw)
+                pad['current_a'] = -current * share
+                pads.append(pad)
+            groups.append({
+                'name': path.get('name', 'Current Path'),
+                'mode': 'per_pad',
+                'total_current_a': 0.0,
+                'pads': pads,
+                'path_id': path.get('id', ''),
+                'circuit_id': path.get('circuit_id'),
+            })
+        return prepare_current_groups(groups)
+
+    def _render_current_paths(self):
+        """Refresh guided current paths and compatibility balance data."""
+        if not hasattr(self, 'current_path_list'):
+            return
+        circuit_names = {item.get('id'): item.get('name', '') for item in self.current_circuits}
+        self.current_path_list.DeleteAllItems()
+        for row_idx, path in enumerate(self.current_paths):
+            sources = list(path.get('sources', []) or [])
+            sinks = list(path.get('sinks', []) or [])
+            nets = {pad.get('net_name') for pad in sources + sinks if pad.get('net_name')}
+            if path.get('needs_repair'):
+                status = 'Needs repair'
+            elif len(nets) > 1:
+                status = 'Mixed nets'
+            elif not sources or not sinks:
+                status = 'Add endpoints'
+            elif self._path_current(path) <= 0.0:
+                status = 'Set current'
+            else:
+                status = 'Balanced'
+            values = [
+                path.get('name', ''), path.get('net_name', '') or '-',
+                f"{self._path_current(path):.6g} A", str(len(sources)), str(len(sinks)),
+                circuit_names.get(path.get('circuit_id'), '-'), status,
+            ]
+            self.current_path_list.InsertItem(row_idx, values[0])
+            for col_idx, value in enumerate(values[1:], start=1):
+                self.current_path_list.SetItem(row_idx, col_idx, value)
+        if 0 <= self.current_path_index < len(self.current_paths):
+            self.current_path_list.Select(self.current_path_index)
+        if self.current_paths:
+            self.current_groups = self._guided_current_groups()
+            self._render_current_groups()
+
     def _selection_descriptors(self):
         """Return live pad descriptors from the host plugin."""
         if not self.selection_provider:
@@ -1994,6 +2858,47 @@ class SettingsDialog(wx.Dialog):
     # Settings I/O
     # ------------------------------------------------------------------
 
+    def _project_configuration_dict(self):
+        """Return guided sources and paths in canonical schema-v3 form."""
+        heat_sources = []
+        for raw in self.heat_sources:
+            power = str(raw.get('power', '')).strip()
+            try:
+                profile = {'kind': 'constant', 'value_w': float(power)}
+            except (TypeError, ValueError):
+                profile = {'kind': 'pwl', 'path': power}
+            pads = list(raw.get('pads', []) or [])
+            data = {
+                'id': raw.get('id', ''),
+                'name': raw.get('name', ''),
+                'enabled': raw.get('enabled', True),
+                'needs_repair': raw.get('needs_repair', False),
+                'repair_reason': raw.get('repair_reason', ''),
+                'power_profile': profile,
+                'distribution': raw.get('distribution', 'area'),
+                'pads': pads,
+                'custom_shares': [pad.get('share', 0.0) for pad in pads],
+                'metadata': raw.get('metadata', {}),
+            }
+            heat_sources.append(HeatSourceDefinition.from_dict(data))
+
+        current_paths = []
+        for raw in self.current_paths:
+            data = dict(raw)
+            sources = list(raw.get('sources', []) or [])
+            sinks = list(raw.get('sinks', []) or [])
+            data['source_pads'] = sources
+            data['sink_pads'] = sinks
+            data['source_shares'] = [pad.get('share', 1.0) for pad in sources]
+            data['sink_shares'] = [pad.get('share', 1.0) for pad in sinks]
+            current_paths.append(CurrentPathDefinition.from_dict(data))
+        circuits = [CurrentCircuitDefinition.from_dict(item) for item in self.current_circuits]
+        return ProjectConfiguration(
+            heat_sources=heat_sources,
+            current_paths=current_paths,
+            current_circuits=circuits,
+        ).normalized().to_dict()
+
     def get_values(self):
         """
         Extract all settings from the dialog.
@@ -2039,6 +2944,9 @@ class SettingsDialog(wx.Dialog):
         """
         try:
             self._sync_current_group_from_fields()
+            if self.heat_sources:
+                self.power_pads = self._guided_power_pads()
+                self._power_pads_edited = True
             if not self._power_pads_edited:
                 legacy_pads = []
                 for pad in (self.power_pads or self.initial_power_pads):
@@ -2049,7 +2957,10 @@ class SettingsDialog(wx.Dialog):
                     legacy_pads.append(item)
                 self.power_pads = prepare_power_pads(legacy_pads, self.power_input.GetValue())
             power_pads = prepare_power_pads(self.power_pads, self.power_input.GetValue())
-            current_groups = prepare_current_groups(self.current_groups)
+            current_groups = (
+                self._guided_current_groups()
+                if self.current_paths else prepare_current_groups(self.current_groups)
+            )
             power_str = power_pads_to_power_str(power_pads, self.power_input.GetValue())
             detail_idx = self.grid_detail_choice.GetSelection()
             if 0 <= detail_idx < len(GRID_DETAIL_VALUES):
@@ -2094,9 +3005,12 @@ class SettingsDialog(wx.Dialog):
                 if 0 <= mesh_idx < len(mesh_modes)
                 else "adaptive"
             )
+            project_config = self._project_configuration_dict()
             return {
                 'power_str': power_str,
                 'power_pads': power_pads,
+                'schema_version': 3,
+                'heat_sources': project_config['heat_sources'],
                 'time': float(self.time_input.GetValue()),
                 'amb': float(self.amb_input.GetValue()),
                 'thick': float(self.thick_input.GetValue()),
@@ -2128,6 +3042,8 @@ class SettingsDialog(wx.Dialog):
                 'time_stepping': time_stepping,
                 'current_enabled': self.chk_current_enabled.GetValue(),
                 'current_groups': current_groups,
+                'current_paths': project_config['current_paths'],
+                'current_circuits': project_config['current_circuits'],
             }
         except ValueError:
             return None
@@ -2246,20 +3162,88 @@ class SettingsDialog(wx.Dialog):
                 self.grid_node_budget_input.SetValue(GRID_DETAIL_PRESETS[detail][0])
             self.grid_node_budget_input.Enable(detail == 'custom')
 
-            if 'power_pads' in defaults:
+            self.heat_sources = []
+            for raw_source in defaults.get('heat_sources', []) or []:
+                source = copy.deepcopy(dict(raw_source))
+                profile = source.get('power_profile', source.get('profile')) or {}
+                if 'power' not in source:
+                    if str(profile.get('kind', '')).lower() == 'pwl':
+                        source['power'] = str(profile.get('path', ''))
+                    else:
+                        source['power'] = str(profile.get('value_w', profile.get('value', '0.0')))
+                source.setdefault('id', str(uuid.uuid4()))
+                source.setdefault('name', f"Heat Source {len(self.heat_sources) + 1}")
+                source.setdefault('distribution', 'area')
+                source.setdefault('enabled', True)
+                source.setdefault('needs_repair', False)
+                shares = list(source.get('custom_shares', []) or [])
+                normalized_pads = []
+                for pad_index, raw_pad in enumerate(source.get('pads', []) or []):
+                    entry = dict(raw_pad or {})
+                    pad = normalize_pad_descriptor(entry.get('pad_ref', entry.get('pad', entry)))
+                    if 'share' in entry:
+                        pad['share'] = _safe_float(entry.get('share'))
+                    elif pad_index < len(shares):
+                        pad['share'] = _safe_float(shares[pad_index])
+                    normalized_pads.append(pad)
+                source['pads'] = normalized_pads
+                self.heat_sources.append(source)
+            self.heat_source_index = 0 if self.heat_sources else -1
+
+            if self.heat_sources:
+                self.power_pads = self._guided_power_pads()
+                self._power_pads_edited = True
+            elif 'power_pads' in defaults:
                 self.power_pads = prepare_power_pads(defaults.get('power_pads', []), self.power_input.GetValue())
                 self._power_pads_edited = True
             else:
                 self.power_pads = prepare_power_pads(self.initial_power_pads, self.power_input.GetValue())
                 self._power_pads_edited = False
             self._render_power_pads()
+            self._render_heat_sources()
+            if self.power_pads and not self.heat_sources:
+                self.power_advanced_pane.Expand()
 
             self.chk_current_enabled.SetValue(
                 bool(defaults.get('current_enabled', self.chk_current_enabled.GetValue()))
             )
-            self.current_groups = prepare_current_groups(defaults.get('current_groups', []))
+            self.current_circuits = [copy.deepcopy(dict(item)) for item in (defaults.get('current_circuits', []) or [])]
+            self.current_paths = []
+            for raw_path in defaults.get('current_paths', []) or []:
+                path = copy.deepcopy(dict(raw_path))
+                path.setdefault('id', str(uuid.uuid4()))
+                path.setdefault('name', f"Current Path {len(self.current_paths) + 1}")
+                path.setdefault('current_a', 0.0)
+                path.setdefault('circuit_id', None)
+                path.setdefault('enabled', True)
+                path.setdefault('needs_repair', False)
+                for role, standard_key, shares_key in (
+                    ('sources', 'source_pads', 'source_shares'),
+                    ('sinks', 'sink_pads', 'sink_shares'),
+                ):
+                    normalized = []
+                    raw_pads = path.get(role, path.get(standard_key, [])) or []
+                    shares = list(path.get(shares_key, []) or [])
+                    for pad_index, raw_pad in enumerate(raw_pads):
+                        entry = dict(raw_pad or {})
+                        pad = normalize_pad_descriptor(entry.get('pad_ref', entry.get('pad', entry)))
+                        if 'share' in entry:
+                            pad['share'] = _safe_float(entry.get('share'))
+                        elif pad_index < len(shares):
+                            pad['share'] = _safe_float(shares[pad_index])
+                        normalized.append(pad)
+                    path[role] = normalized
+                self.current_paths.append(path)
+            self.current_path_index = 0 if self.current_paths else -1
+            self.current_groups = (
+                self._guided_current_groups()
+                if self.current_paths else prepare_current_groups(defaults.get('current_groups', []))
+            )
             self.current_group_index = 0 if self.current_groups else -1
             self._render_current_groups()
+            self._render_current_paths()
+            if self.current_groups and not self.current_paths:
+                self.current_advanced_pane.Expand()
             if self.chk_heatsink.GetValue():
                 self.thermal_pad_pane.Expand()
             if (

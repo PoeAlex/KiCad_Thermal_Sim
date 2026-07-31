@@ -8,6 +8,9 @@ import os
 import pytest
 import numpy as np
 import tempfile
+from types import SimpleNamespace
+
+from matplotlib.axes import Axes
 
 from ThermalSim.visualization import (
     save_stackup_plot,
@@ -15,6 +18,15 @@ from ThermalSim.visualization import (
     show_results_top_bot,
     show_results_all_layers,
     build_interactive_heatmap_payload,
+    save_preview_image,
+)
+from tests.mocks.pcbnew_mock import (
+    B_Cu,
+    EDA_RECT,
+    F_Cu,
+    MockBoard,
+    MockPad,
+    VECTOR2I,
 )
 
 from tests.fixtures.temperature_arrays import (
@@ -407,6 +419,65 @@ class TestVisualizationEdgeCases:
         save_stackup_plot(T, H, amb=25.0, layer_names=[], fname=fname)
 
         assert os.path.exists(fname)
+
+
+class TestGeometryPreviewRoles:
+    """Tests for guided heat/current role overlays in the preview."""
+
+    def test_preview_marks_entering_and_leaving_current(self, temp_dir, monkeypatch):
+        """Positive and negative terminals should use distinct directional markers."""
+        heat_pad = MockPad(position=VECTOR2I(2_000_000, 2_000_000), number="1")
+        source_pad = MockPad(position=VECTOR2I(4_000_000, 4_000_000), number="2")
+        sink_pad = MockPad(position=VECTOR2I(6_000_000, 6_000_000), number="3")
+        board = MockBoard(layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"})
+        bbox = EDA_RECT(0, 0, 10_000_000, 10_000_000)
+
+        scatter_calls = []
+        original_scatter = Axes.scatter
+
+        def recording_scatter(axis, *args, **kwargs):
+            scatter_calls.append((kwargs.get('marker'), kwargs.get('c')))
+            return original_scatter(axis, *args, **kwargs)
+
+        monkeypatch.setattr(Axes, 'scatter', recording_scatter)
+
+        def create_maps(*args, **kwargs):
+            return (
+                np.ones((2, 14, 14), dtype=float),
+                np.ones((14, 14), dtype=float),
+                np.zeros((14, 14), dtype=float),
+            )
+
+        def derive_stackup(*args, **kwargs):
+            return {'copper_thickness_mm_used': [0.035, 0.035]}
+
+        def pad_pixels(pad, rows, cols, x_min, y_min, res):
+            pos = pad.GetPosition()
+            return [(int(pos.y * 1e-6 / res), int(pos.x * 1e-6 / res))]
+
+        result = save_preview_image(
+            board=board,
+            copper_ids=[F_Cu, B_Cu],
+            bbox=bbox,
+            pads_list=[heat_pad, source_pad, sink_pad],
+            settings={'res': 1.0, 'use_heatsink': False, 'output_dir': temp_dir},
+            layer_names=['F.Cu', 'B.Cu'],
+            stack_info={},
+            get_pad_pixels_func=pad_pixels,
+            create_maps_func=create_maps,
+            derive_stackup_func=derive_stackup,
+            out_dir=temp_dir,
+            heat_source_pads=[heat_pad],
+            current_terminals=[
+                SimpleNamespace(pad=source_pad, current_a=5.0, name='J1-1'),
+                SimpleNamespace(pad=sink_pad, current_a=-5.0, name='J2-1'),
+            ],
+        )
+
+        assert result is not None
+        assert os.path.exists(result)
+        assert ('^', '#d62728') in scatter_calls
+        assert ('v', '#1f77b4') in scatter_calls
 
 
 class TestBuildInteractiveHeatmapPayload:

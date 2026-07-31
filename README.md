@@ -71,9 +71,9 @@ Run the plugin in PCB Editor via **Tools -> External Plugins -> 2.5D Thermal Sim
 1. Open your PCB in **KiCad PCB Editor**.
 2. Select one or more pads if you want to pre-fill manual heat sources.
 3. Run **Tools -> External Plugins -> 2.5D Thermal Sim**.
-4. Use **Heat Sources** to add pads that dissipate manual power, then enter constant W values or PWL file paths.
+4. In **Heat Sources**, create one named source from the KiCad selection or the searchable board-pad browser. Enter its total loss in watts (or a total-power PWL file) and choose how it is split across its pads.
 5. Set **Duration**, **Ambient**, and **Resolution** on the **Overview** tab.
-6. Optionally use **Current Heating** to add source/sink pads and per-pad currents for copper `I^2R` heating.
+6. Optionally use **Current Heating** to create a net path, select where current enters and leaves that net, and enter the positive path current. Use **New DC Circuit** for linked forward and return paths with one shared current value.
 7. Optionally use **Advanced** for the simulation area, thermal pad, convection, and solver settings.
 8. Click **Preview** to check the mapped geometry, then **Run**.
 
@@ -129,36 +129,26 @@ The live estimate shows requested versus actual cell size, grid dimensions, tota
 - **Load Settings...** - load a JSON settings file from any folder and apply it to the open dialog.
 - **Save Settings...** - save the current dialog values as a JSON settings file.
 
-ThermalSim also keeps using `thermal_sim_last_settings.json` in the plugin folder for automatic last-used settings. Manual load/save files use the same JSON structure and can be stored per project or per experiment.
+ThermalSim separates machine preferences from board-specific electrical intent:
+
+- `thermal_sim_last_settings.json` keeps last-used simulation, output, mesh, and solver preferences.
+- `<board-name>.thermalsim.json`, next to the `.kicad_pcb` file, keeps schema-v3 heat sources, current paths, and DC circuits for that board. It is updated on Preview, Run, and when a changed dialog is closed.
+- **Load Settings...** and **Save Settings...** remain available for explicit experiment files.
+
+Pad references prefer KiCad UUIDs and retain footprint/pad fallbacks, so moving a pad or changing its net code does not normally break the project configuration. Missing schema-v3 references are shown as needing repair and block execution. Older schema-v2 settings are promoted automatically only when all referenced pads can be resolved; otherwise the legacy entries remain available in the advanced editor and are never silently rebound to a different pad.
 
 ### Heat Sources Tab
 
-Manual pad power is configured separately from current-flow terminals.
+Manual component/package loss is configured separately from current-flow terminals. A heat source owns one total power profile and one or more pads:
 
-1. Select pads in KiCad.
-2. Click **Add Selected**.
-3. Enter a power value or PWL file path in **Power / PWL**.
-4. Use **Apply** to write the value to selected table rows. If no row is selected, a comma-separated list is applied in table order.
+1. Enter a source name and a total constant loss or PWL path.
+2. Choose **By pad area**, **Equal**, or **Custom shares**.
+3. Click **Add KiCad Selection**, or use **Browse Board** to search every board pad by reference, pad number, pin function, net, layer, or area.
+4. Select a source row to edit its name, total profile, distribution, or custom shares.
 
-The Heat Sources table is:
+For example, a `2 W` source assigned to two pads with normalized area shares `0.25 / 0.75` injects `0.5 W / 1.5 W`; the source total is never multiplied by the number of pads. A PWL file is likewise interpreted as the source's total time-varying power and scaled by the same shares.
 
-| Column | Meaning |
-|--------|---------|
-| Pad | Footprint/pad name |
-| Net | KiCad net name |
-| Layer | Pad layer |
-| Power W/PWL | Constant W value or PWL file path |
-
-Accepted power entries:
-
-| Entry | Meaning |
-|-------|---------|
-| `1.0` | 1 W constant on selected/listed power pads |
-| `1.0, 0.5, 2.0` | Per-pad constant power in table order |
-| `C:\sim\ramp.pwl` | Same PWL profile for selected/listed pads |
-| `1.0, C:\sim\ramp.pwl` | Pad 1 = 1 W constant, Pad 2 = PWL file |
-
-For backward compatibility, pads selected before opening the dialog pre-fill the Heat Sources table when no saved `power_pads` setting exists.
+**Advanced Pad Allocation** retains the earlier per-pad editor for imported or unusual configurations. Existing schema-v2 `power_pads` settings are converted into named sources when they can be resolved safely.
 
 #### PWL File Format
 
@@ -181,12 +171,16 @@ PWL files are LTspice-style text files with two columns:
 
 ### Current Heating Tab
 
-Enable current heating to calculate copper losses from DC current flow.
+Enable current heating to calculate copper losses from DC current flow. The guided editor uses a positive path current; signed per-pad terminals are generated automatically:
 
-1. Select source/sink pads in KiCad.
-2. Add them to a current group.
-3. Enter positive current for source pads and negative current for sink pads.
-4. Make sure every active KiCad net balances to `0 A`.
+1. Click **New Net Path** and enter the path current.
+2. Select pads and click **Selection Enters**, then select the opposite endpoints and click **Selection Leaves**. **Browse Board** offers the same searchable pad list and locks to the first selected net.
+3. Keep equal sharing or enter custom comma-separated shares for either endpoint side.
+4. For a complete loop, click **New DC Circuit**. The linked forward and return paths share one current value but may use different KiCad nets.
+
+Every individual path is restricted to one net. The same pad cannot be on both endpoint sides, and ThermalSim normalizes the shares so the generated terminals balance exactly. A `5 A` path with one entering pad and two equally shared leaving pads becomes `+5 A, -2.5 A, -2.5 A` internally. Incomplete paths remain visible with **Needs setup/repair** status and block Run rather than being guessed.
+
+**Advanced Terminal Editor** retains direct signed per-pad entry for specialist and migrated configurations.
 
 Current heating is additive with **Heat Sources**:
 
@@ -236,7 +230,7 @@ nodes, reduction factor, PCG iterations, and residual.
 
 ## Preview
 
-The **Preview** button generates a geometry visualization showing copper distribution, power/current pad locations, via regions, and the effective simulation-area boundary on each layer. Its header reports the cropped dimensions and percentage of the board.
+The **Preview** button generates a geometry visualization showing copper distribution, via regions, and the effective simulation-area boundary on each layer. Pad roles use a consistent legend: heat sources are yellow, current entering copper is red with an upward triangle, and current leaving copper is blue with a downward triangle. Its header reports the cropped dimensions and percentage of the board.
 
 ThermalSim uses the copper-zone fills already stored by KiCad. If zones are
 stale or unfilled, press **B** in PCB Editor before Preview or Run. The plugin
@@ -303,6 +297,7 @@ The plugin is split into focused modules:
 | `geometry_mapper.py` | Accurately rasterize tracks, arcs, pads, vias, and filled zones |
 | `adaptive_mesh.py` | Build conservative adaptive meshes and multigrid operators |
 | `electrical_solver.py` | Solve DC current flow and convert copper losses to heat sources |
+| `source_configuration.py` | Persist schema-v3 projects, resolve stable pad references, migrate legacy settings, and expand sources/paths |
 | `thermal_solver.py` | Legacy sparse and matrix-free PCG/BDF2 thermal solvers |
 | `native_core.py` | Load the optional Windows x64 C++/OpenMP CPU core |
 | `pwl_parser.py` | Parse LTspice-style PWL power profiles |
@@ -335,7 +330,7 @@ The plugin is split into focused modules:
 5. Check the effective board percentage; active current nets are always included completely.
 6. Tune **Target Cell Size** until hotspots and current-path metrics are stable. Try 0.5 mm, then 0.3 mm.
 7. Increase the **Compute Budget** only after checking the live node, memory, and runtime estimate.
-8. Save JSON settings for repeatable project comparisons.
+8. Commit the board's `.thermalsim.json` sidecar with the KiCad project for repeatable comparisons; use **Save Settings...** for experiment-specific copies.
 9. Compare layout variants using the same settings.
 10. Validate important designs with measurement or a full 3D thermal workflow.
 

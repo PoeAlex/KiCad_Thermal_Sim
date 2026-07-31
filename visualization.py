@@ -15,7 +15,8 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch, Rectangle
 
 import pcbnew
 
@@ -500,6 +501,8 @@ def save_preview_image(
     geometry_state=None,
     grid_spec=None,
     adaptive_mesh=None,
+    heat_source_pads=None,
+    current_terminals=None,
 ):
     """
     Save a geometry preview image showing copper, vias, and heat sources.
@@ -530,6 +533,13 @@ def save_preview_image(
         Whether to open the file in default viewer.
     out_dir : str, optional
         Output directory.
+    heat_source_pads : list, optional
+        Pads that receive explicit heat-source power.  When omitted, all
+        ``pads_list`` entries retain the legacy heat-source highlighting.
+    current_terminals : list, optional
+        Current-terminal objects with ``pad``, ``current_a``, and ``name``
+        attributes. Positive current is shown as entering copper and negative
+        current as leaving copper.
 
     Returns
     -------
@@ -593,10 +603,31 @@ def save_preview_image(
             prefix = "Limited simulation area" if settings.get("_preview_area_limited") else "Full simulation area"
             fig.suptitle(f"{prefix}: {area_summary}", fontsize=11)
 
-        # Build pad masks per layer
+        # Build role-specific pad masks per layer.  A pad can legitimately be
+        # both a heat source and a current terminal, so the overlays are kept
+        # independent instead of assigning one exclusive role.
         pad_masks = [np.zeros((rows, cols), dtype=bool) for _ in range(count)]
+        current_source_masks = [np.zeros((rows, cols), dtype=bool) for _ in range(count)]
+        current_sink_masks = [np.zeros((rows, cols), dtype=bool) for _ in range(count)]
         pad_labels = []
+        terminal_labels = []
         label_limit = 10
+        heat_source_pads = pads_list if heat_source_pads is None else heat_source_pads
+        heat_pad_ids = {id(pad) for pad in (heat_source_pads or [])}
+        terminal_by_pad = {}
+        for terminal in current_terminals or []:
+            if isinstance(terminal, dict):
+                terminal_pad = terminal.get("pad")
+                current_a = float(terminal.get("current_a", 0.0) or 0.0)
+                terminal_name = str(terminal.get("name", "") or "")
+            else:
+                terminal_pad = getattr(terminal, "pad", None)
+                current_a = float(getattr(terminal, "current_a", 0.0) or 0.0)
+                terminal_name = str(getattr(terminal, "name", "") or "")
+            if terminal_pad is not None:
+                terminal_by_pad.setdefault(id(terminal_pad), []).append(
+                    (current_a, terminal_name)
+                )
 
         for pad in pads_list or []:
             pad_lid = pad.GetLayer()
@@ -611,11 +642,17 @@ def save_preview_image(
 
             pixels = get_pad_pixels_func(pad, rows, cols, x_min, y_min, res)
             if pixels:
+                pad_terminals = terminal_by_pad.get(id(pad), [])
                 for idx in target_indices:
                     for r, c in pixels:
                         if r < rows and c < cols:
-                            pad_masks[idx][r, c] = True
-                if len(pad_labels) < label_limit:
+                            if id(pad) in heat_pad_ids:
+                                pad_masks[idx][r, c] = True
+                            if any(current > 0.0 for current, _ in pad_terminals):
+                                current_source_masks[idx][r, c] = True
+                            if any(current < 0.0 for current, _ in pad_terminals):
+                                current_sink_masks[idx][r, c] = True
+                if id(pad) in heat_pad_ids and len(pad_labels) < label_limit:
                     try:
                         pos = pad.GetPosition()
                         cx = int((pos.x * 1e-6 - x_min) / res)
@@ -625,6 +662,19 @@ def save_preview_image(
                     if cx is not None and cy is not None:
                         label = pad.GetNumber() if hasattr(pad, "GetNumber") else ""
                         pad_labels.append((target_indices[0], cx, cy, label))
+                if pad_terminals:
+                    try:
+                        pos = pad.GetPosition()
+                        cx = int((pos.x * 1e-6 - x_min) / res)
+                        cy = int((pos.y * 1e-6 - y_min) / res)
+                    except Exception:
+                        cx, cy = None, None
+                    if cx is not None and cy is not None:
+                        for current_a, terminal_name in pad_terminals:
+                            for layer_idx in target_indices:
+                                terminal_labels.append(
+                                    (layer_idx, cx, cy, current_a, terminal_name)
+                                )
 
         for i in range(count):
             ax = axes[i]
@@ -681,6 +731,32 @@ def save_preview_image(
                     if layer_idx == i:
                         ax.text(cx, cy, str(label), color='black', fontsize=8, ha='center', va='center')
 
+            source_mask = current_source_masks[i]
+            if np.any(source_mask):
+                ax.imshow(
+                    np.ma.masked_where(~source_mask, source_mask),
+                    cmap='Reds', origin='upper', alpha=0.46, interpolation='none'
+                )
+            sink_mask = current_sink_masks[i]
+            if np.any(sink_mask):
+                ax.imshow(
+                    np.ma.masked_where(~sink_mask, sink_mask),
+                    cmap='Blues', origin='upper', alpha=0.46, interpolation='none'
+                )
+            for layer_idx, cx, cy, current_a, terminal_name in terminal_labels:
+                if layer_idx != i:
+                    continue
+                if current_a == 0.0:
+                    continue
+                marker = '^' if current_a > 0.0 else 'v'
+                color = '#d62728' if current_a > 0.0 else '#1f77b4'
+                ax.scatter(
+                    [cx], [cy], marker=marker, s=58, c=color,
+                    edgecolors='white', linewidths=0.8,
+                )
+                if terminal_name:
+                    ax.text(cx + 1.2, cy + 1.2, terminal_name, color=color, fontsize=7)
+
             if settings.get("_preview_area_limited"):
                 ax.add_patch(Rectangle(
                     (-0.5, -0.5), cols, rows,
@@ -692,7 +768,26 @@ def save_preview_image(
         for j in range(count, len(axes)):
             axes[j].axis('off')
 
-        plt.tight_layout(rect=(0, 0, 1, 0.96) if area_summary else None)
+        legend_handles = []
+        if heat_pad_ids:
+            legend_handles.append(Patch(facecolor='#ffb000', alpha=0.65, label='Heat source'))
+        if any(np.any(mask) for mask in current_source_masks):
+            legend_handles.append(Line2D(
+                [0], [0], marker='^', color='none', markerfacecolor='#d62728',
+                markeredgecolor='white', markersize=8, label='Current enters copper'
+            ))
+        if any(np.any(mask) for mask in current_sink_masks):
+            legend_handles.append(Line2D(
+                [0], [0], marker='v', color='none', markerfacecolor='#1f77b4',
+                markeredgecolor='white', markersize=8, label='Current leaves copper'
+            ))
+        if legend_handles:
+            fig.legend(
+                handles=legend_handles, loc='upper center', ncol=len(legend_handles),
+                bbox_to_anchor=(0.5, 0.965 if area_summary else 0.995), fontsize=8,
+            )
+        top = 0.90 if area_summary and legend_handles else (0.94 if area_summary or legend_handles else 1.0)
+        plt.tight_layout(rect=(0, 0, 1, top))
         plt.savefig(output_file, dpi=120)
         plt.close()
 

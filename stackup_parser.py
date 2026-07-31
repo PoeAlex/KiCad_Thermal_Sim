@@ -146,7 +146,10 @@ def parse_stackup_from_board_file(board):
     """
     fn = ""
     try:
-        fn = board.GetFileName()
+        raw_filename = board.GetFileName()
+        # KiCad 9 may return a wxString wrapper with false truthiness even
+        # when its textual value contains the saved board path.
+        fn = "" if raw_filename is None else str(raw_filename)
     except Exception:
         fn = ""
     if not fn:

@@ -662,6 +662,120 @@ class TestTooltipTexts:
             assert value == value.strip(), f"Tooltip '{key}' has extra whitespace"
 
 
+class TestGuidedSourceAndPathEditing:
+    """Tests for the simplified source/path workflow."""
+
+    @staticmethod
+    def _pad(key, name, net="VIN", area=1.0):
+        reference, number = name.split("-", 1)
+        return {
+            'pad_key': key,
+            'pad_uuid': key,
+            'footprint_uuid': f'fp-{reference}',
+            'footprint_ref': reference,
+            'pad_number': number,
+            'name': f'{name} [{net}]',
+            'net_name': net,
+            'net_code': 7,
+            'layer': 'F.Cu',
+            'pin_function': net,
+            'area_mm2': area,
+        }
+
+    def test_board_pad_catalog_filters_reference_pin_and_net(self):
+        from ThermalSim.gui_dialogs import filter_pad_catalog
+
+        pads = [
+            self._pad('a', 'U1-1', 'VIN'),
+            self._pad('b', 'U2-2', 'GND'),
+        ]
+
+        assert [item['pad_uuid'] for item in filter_pad_catalog(pads, 'u1')] == ['a']
+        assert [item['pad_uuid'] for item in filter_pad_catalog(pads, 'gnd')] == ['b']
+        assert [item['pad_uuid'] for item in filter_pad_catalog(pads, net_name='VIN')] == ['a']
+
+    def test_total_heat_source_is_area_split_without_multiplying_total(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        pads = [
+            self._pad('a', 'U1-1', area=1.0),
+            self._pad('b', 'U1-2', area=3.0),
+        ]
+        dlg = SettingsDialog(
+            None, 0, 0.5, ["F.Cu", "B.Cu"], selection_provider=lambda: pads
+        )
+        dlg.heat_source_name_input.SetValue("U1 loss")
+        dlg.heat_source_profile_input.SetValue("2.0")
+
+        dlg._on_heat_source_add_selection(None)
+        values = dlg.get_values()
+
+        assert values['heat_sources'][0]['power_profile']['value_w'] == 2.0
+        assert values['heat_sources'][0]['distribution'] == 'area'
+        assert sum(float(item['power']) for item in values['power_pads']) == pytest.approx(2.0)
+        assert [float(item['power']) for item in values['power_pads']] == pytest.approx([0.5, 1.5])
+        assert dlg.lbl_context.GetLabel().startswith("1 heat source / 2 W")
+
+    def test_guided_path_creates_balanced_signed_legacy_terminals(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        live = [self._pad('source', 'J1-1')]
+        dlg = SettingsDialog(
+            None, 0, 0.5, ["F.Cu", "B.Cu"], selection_provider=lambda: live
+        )
+        dlg.current_path_value_input.SetValue(5.0)
+        dlg._on_current_path_new(None)
+        dlg._on_current_path_add_source(None)
+        live[:] = [self._pad('sink-a', 'U1-1'), self._pad('sink-b', 'U1-2')]
+        dlg._on_current_path_add_sink(None)
+
+        values = dlg.get_values()
+        path = values['current_paths'][0]
+        currents = [
+            pad['current_a']
+            for group in values['current_groups']
+            for pad in group['pads']
+        ]
+
+        assert path['current_a'] == 5.0
+        assert len(path['source_pads']) == 1
+        assert len(path['sink_pads']) == 2
+        assert currents == pytest.approx([5.0, -2.5, -2.5])
+        assert sum(currents) == pytest.approx(0.0)
+
+    def test_dc_circuit_keeps_forward_and_return_current_synchronized(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(None, 0, 0.5, ["F.Cu", "B.Cu"])
+        dlg.current_path_value_input.SetValue(3.0)
+        dlg._on_current_circuit_new(None)
+        dlg.current_path_value_input.SetValue(4.0)
+        dlg._on_current_path_update(None)
+
+        assert len(dlg.current_paths) == 2
+        assert dlg.current_circuits[0]['current_a'] == 4.0
+        assert [dlg._path_current(path) for path in dlg.current_paths] == [4.0, 4.0]
+
+    def test_changed_project_configuration_is_saved_when_dialog_closes(self):
+        """Closing should persist guided edits without requiring Preview or Run."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        saved = []
+        dlg = SettingsDialog(
+            None, 0, 0.5, ["F.Cu", "B.Cu"],
+            selection_provider=lambda: [self._pad('a', 'U1-1')],
+            project_save_callback=lambda settings: saved.append(settings),
+        )
+        dlg.heat_source_profile_input.SetValue("1.25")
+        dlg._on_heat_source_add_selection(None)
+
+        dlg._on_cancel(None)
+
+        assert len(saved) == 1
+        assert saved[0]['schema_version'] == 3
+        assert saved[0]['heat_sources'][0]['power_profile']['value_w'] == 1.25
+
+
 class TestSettingsDialogInstantiation:
     """Tests for SettingsDialog creation with mock wx."""
 
