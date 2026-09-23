@@ -138,6 +138,23 @@ class TestWriteHtmlReport:
 
         assert result is not None
         assert os.path.exists(result)
+
+    def test_report_labels_simulation_only_copper_override(self, basic_report_params):
+        """Reports must distinguish the board stackup from simulated copper."""
+        basic_report_params['stackup_derived'].update({
+            'copper_thickness_mm_board': [0.035, 0.105],
+            'copper_thickness_mm_used': [0.035, 0.070],
+            'copper_thickness_override_active': [False, True],
+        })
+
+        result = write_html_report(**basic_report_params)
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        assert "Simulation thickness" in content
+        assert "Override" in content
+        assert "0.1050 mm" in content
+        assert "0.0700 mm" in content
         assert result.endswith(".html")
 
     def test_report_contains_title(self, basic_report_params):
@@ -528,6 +545,12 @@ class TestWriteHtmlReport:
                     'edge_count': 820,
                     'via_edge_count': 0,
                     'connected_component_count': 3,
+                    'raw_net_names': ['PWR<main>', 'GND'],
+                    'diagonal_edge_count': 12,
+                    'rejected_diagonal_candidate_count': 4,
+                    'net_tie_edge_count': 1,
+                    'component_count_before_ties': 4,
+                    'component_count_after_ties': 3,
                     'terminal_diagnostics': [
                         {
                             'name': 'U1<1>',
@@ -579,6 +602,10 @@ class TestWriteHtmlReport:
         assert "default grid limits" in content
         assert "Grid resolution was auto-coarsened" in content
         assert "Mapped KiCad Primitives" in content
+        assert "Raw Nets" in content
+        assert "PWR&lt;main&gt;, GND" in content
+        assert "Rejected Diagonals" in content
+        assert "Components Before/After Ties" in content
         assert "joule_loss_map.png" in content
         assert "PWR&lt;main&gt;" in content
         assert "U1&lt;1&gt;" in content

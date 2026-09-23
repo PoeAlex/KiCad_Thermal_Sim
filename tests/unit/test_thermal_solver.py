@@ -298,6 +298,32 @@ class TestBuildStiffnessMatrix:
 
         assert norm_cu > norm_fr4, "Copper should increase matrix norm"
 
+    def test_copper_lateral_conductance_scales_with_thickness(self, simple_setup):
+        """Both thermal backends must use the same thickness-scaled copper edge."""
+        setup = simple_setup.copy()
+        setup['copper_mask'] = np.zeros_like(setup['copper_mask'])
+        setup['copper_mask'][0] = True
+        thin = setup.copy()
+        thin['t_cu'] = np.array([35e-6, 35e-6])
+        thick = setup.copy()
+        thick['t_cu'] = np.array([105e-6, 35e-6])
+        index = 0
+        neighbor = 1
+
+        thin_matrix, _, _, _ = build_stiffness_matrix(**thin)
+        thick_matrix, _, _, _ = build_stiffness_matrix(**thick)
+        np.testing.assert_allclose(
+            thick_matrix[index, neighbor] / thin_matrix[index, neighbor], 3.0, rtol=1e-12,
+        )
+
+        thin_operator, _, _, _ = build_structured_operator(**thin)
+        thick_operator, _, _, _ = build_structured_operator(**thick)
+        basis = np.zeros(thin_matrix.shape[0])
+        basis[neighbor] = 1.0
+        np.testing.assert_allclose(
+            thick_operator.dot(basis)[index] / thin_operator.dot(basis)[index], 3.0, rtol=1e-12,
+        )
+
     def test_matches_reference_assembly(self, simple_setup):
         """Preallocated COO assembly should match the legacy reference implementation."""
         K_ref, b_ref, hA_ref, diag_ref = _build_stiffness_matrix_reference(**simple_setup)

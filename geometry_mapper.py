@@ -789,6 +789,24 @@ def _state_fill_zone(state, l_idx, lid, zone):
         state.copper_mask[l_idx, rs:re, cs:ce] |= zone_mask
 
 
+def _pad_copper_layer_ids(pad, copper_ids):
+    """Return copper layer IDs occupied by a pad."""
+    try:
+        layer_set = pad.GetLayerSet()
+        layer_ids = [lid for lid in copper_ids if layer_set.Contains(lid)]
+        if layer_ids:
+            return layer_ids
+    except Exception:
+        pass
+    try:
+        layer_id = pad.GetLayer()
+        if layer_id in copper_ids:
+            return [layer_id]
+    except Exception:
+        pass
+    return []
+
+
 def build_geometry_state(
     board,
     copper_ids,
@@ -950,9 +968,13 @@ def build_geometry_state(
                     except Exception:
                         _state_fill_via(state, bbox, via_factor)
                 else:
-                    layer_idx = lid_to_idx.get(pad.GetLayer())
-                    if layer_idx is not None:
-                        _state_fill_pad(state, [layer_idx], pad)
+                    pad_layers = [
+                        lid_to_idx[layer_id]
+                        for layer_id in _pad_copper_layer_ids(pad, copper_ids)
+                        if layer_id in lid_to_idx
+                    ]
+                    if pad_layers:
+                        _state_fill_pad(state, pad_layers, pad)
 
         for zone in zones:
             if hasattr(zone, "IsFilled") and not zone.IsFilled():

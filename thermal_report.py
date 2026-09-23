@@ -432,6 +432,11 @@ def _build_current_path_diagnostics(electrical_summary, k_norm_info, joule_map_p
             net.get("edge_count", ""),
             net.get("via_edge_count", ""),
             net.get("connected_component_count", ""),
+            ", ".join(net.get("raw_net_names", []) or []),
+            net.get("diagonal_edge_count", ""),
+            net.get("rejected_diagonal_candidate_count", ""),
+            net.get("net_tie_edge_count", ""),
+            f"{net.get('component_count_before_ties', '')} / {net.get('component_count_after_ties', '')}",
         ))
 
     terminal_rows = []
@@ -489,7 +494,7 @@ def _build_current_path_diagnostics(electrical_summary, k_norm_info, joule_map_p
         f"{cards}<div class='spacer-sm'></div>"
         f"{_build_warning_block(_current_path_warnings(electrical_summary, k_norm_info))}"
         "<h3 class='section-title'>Net Path Metrics</h3>"
-        f"{_table_html(['Net', 'Terminals', 'Source/Sink', 'Balance', 'Loss', 'R_eff', 'V_eq', 'Pad R', 'Cells', 'Edges', 'Via Edges', 'Islands'], net_rows, empty_text='No net path metrics recorded.')}"
+        f"{_table_html(['Net', 'Terminals', 'Source/Sink', 'Balance', 'Loss', 'R_eff', 'V_eq', 'Pad R', 'Cells', 'Edges', 'Via Edges', 'Islands', 'Raw Nets', 'Diagonal Edges', 'Rejected Diagonals', 'Tie Edges', 'Components Before/After Ties'], net_rows, empty_text='No net path metrics recorded.')}"
         "<div class='spacer-sm'></div><h3 class='section-title'>Current Terminals</h3>"
         f"{_table_html(['Pad', 'Net', 'Current', 'Layer', 'Position', 'BBox', 'Cells', 'Island', 'Potential'], terminal_rows, empty_text='No terminal diagnostics recorded.')}"
         "<div class='spacer-sm'></div><h3 class='section-title'>Mapped KiCad Primitives</h3>"
@@ -527,7 +532,9 @@ def write_html_report(
 
     total_thick_mm = stackup_derived.get("total_thick_mm_used")
     board_thick_mm = stackup_derived.get("stack_board_thick_mm")
+    board_copper_thicknesses = stackup_derived.get("copper_thickness_mm_board", [])
     copper_thicknesses = stackup_derived.get("copper_thickness_mm_used", [])
+    copper_overrides = stackup_derived.get("copper_thickness_override_active", [])
     gaps_used = stackup_derived.get("gap_mm_used", [])
     gap_fallback_used = stackup_derived.get("gap_fallback_used", False)
     snapshot_items = _build_snapshot_items(out_dir, snapshot_files)
@@ -536,7 +543,14 @@ def write_html_report(
 
     copper_rows = []
     for i, thickness in enumerate(copper_thicknesses):
-        copper_rows.append((layer_names[i] if i < len(layer_names) else f"Layer {i}", _fmt(thickness, " mm")))
+        board_thickness = board_copper_thicknesses[i] if i < len(board_copper_thicknesses) else thickness
+        overridden = bool(copper_overrides[i]) if i < len(copper_overrides) else False
+        copper_rows.append((
+            layer_names[i] if i < len(layer_names) else f"Layer {i}",
+            _fmt(board_thickness, " mm"),
+            _fmt(thickness, " mm"),
+            "Override" if overridden else "KiCad stackup",
+        ))
     gap_rows = []
     for i, gap in enumerate(gaps_used):
         src = layer_names[i] if i < len(layer_names) else f"Layer {i}"
@@ -571,6 +585,7 @@ def write_html_report(
         ("Board thickness (stackup)", _fmt(board_thick_mm, " mm")),
         ("Total thickness used", _fmt(total_thick_mm, " mm")),
         ("Uniform gap fallback used", str(bool(gap_fallback_used))),
+        ("Copper thickness overrides active", str(any(copper_overrides))),
         ("Layer names", ", ".join(layer_names) if layer_names else "n/a"),
     ]
 
@@ -616,7 +631,7 @@ def write_html_report(
         "<div class='details-grid'><div>"
         "<h3 class='section-title'>Stackup</h3>"
         f"{_table_html(['Metric', 'Value'], thickness_summary_rows)}<div class='spacer-sm'></div>"
-        f"{_table_html(['Layer', 'Thickness'], copper_rows)}<div class='spacer-sm'></div>"
+        f"{_table_html(['Layer', 'KiCad thickness', 'Simulation thickness', 'Source'], copper_rows)}<div class='spacer-sm'></div>"
         f"{_table_html(['Interface', 'Gap'], gap_rows)}<div class='spacer-sm'></div>"
         "<h3 class='section-title'>Effective Dielectric Thickness</h3>"
         f"{_table_html(['Plane', 't_fr4_eff'], fr4_eff_rows)}"

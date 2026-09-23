@@ -13,9 +13,12 @@ from ThermalSim.geometry_mapper import get_pad_pixels
 from ThermalSim.thermal_plugin import (
     _build_power_vector,
     _build_sparse_pad_contributions,
+    _build_heat_capacity_array,
     _coarsen_grid_resolution,
+    _effective_copper_thickness_mm,
     _effective_fr4_control_volume_thicknesses,
     _find_pcb_editor_parent,
+    _pad_target_layer_index,
     _resolve_grid_policy,
 )
 from tests.mocks.pcbnew_mock import (
@@ -27,6 +30,7 @@ from tests.mocks.pcbnew_mock import (
     EDA_RECT,
     F_Cu,
     B_Cu,
+    In1_Cu,
 )
 
 
@@ -175,6 +179,54 @@ class TestFr4ControlVolumes:
         np.testing.assert_allclose(thicknesses, [1.6e-3])
 
 
+class TestCopperThicknessOverrides:
+    """Simulation-only copper thickness selection."""
+
+    def test_override_is_validated_per_layer_without_changing_stackup(self):
+        settings = {'copper_thickness_overrides_mm': {str(In1_Cu): 0.070}}
+
+        assert _effective_copper_thickness_mm(0.105, F_Cu, settings) == (0.105, False)
+        assert _effective_copper_thickness_mm(0.105, In1_Cu, settings) == (0.070, True)
+
+    def test_invalid_override_uses_board_thickness(self):
+        settings = {'copper_thickness_overrides_mm': {str(F_Cu): 0.0}}
+
+        assert _effective_copper_thickness_mm(0.035, F_Cu, settings) == (0.035, False)
+
+    def test_derived_stackup_keeps_board_and_effective_values(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        board = MockBoard(layer_names={F_Cu: 'F.Cu', In1_Cu: 'In1.Cu'})
+        stack_info = {
+            'board_thickness_mm': 1.6,
+            'copper': [
+                {'layer_id': F_Cu, 'name': 'F.Cu', 'thickness_mm': 0.035},
+                {'layer_id': In1_Cu, 'name': 'In1.Cu', 'thickness_mm': 0.105},
+            ],
+            'dielectric_gaps_mm': [1.4],
+        }
+        derived = ThermalPlugin()._derive_stackup_thicknesses(
+            board, [F_Cu, In1_Cu], stack_info,
+            {'thick': 1.6, 'copper_thickness_overrides_mm': {str(In1_Cu): 0.07}},
+        )
+
+        assert derived['copper_thickness_mm_board'] == [0.035, 0.105]
+        assert derived['copper_thickness_mm_used'] == [0.035, 0.07]
+        assert derived['copper_thickness_override_active'] == [False, True]
+        assert derived['gap_mm_used'] == [1.4]
+
+    def test_copper_thermal_mass_scales_with_effective_thickness(self):
+        mask = np.ones((1, 1, 1), dtype=bool)
+        common = dict(
+            copper_mask=mask, t_fr4_eff=np.array([1e-3]), pixel_area=1e-6,
+            rho_cu=8960.0, cp_cu=385.0, rho_fr4=0.0, cp_fr4=1100.0,
+        )
+        thick = _build_heat_capacity_array(t_cu=np.array([105e-6]), **common)
+        thin = _build_heat_capacity_array(t_cu=np.array([35e-6]), **common)
+
+        np.testing.assert_allclose(thick / thin, 3.0)
+
+
 def _legacy_power_vector(board, copper_ids, pads_list, pad_sources, rows, cols, x_min, y_min, res):
     """Reference implementation matching the legacy dense-Q setup."""
     rc = rows * cols
@@ -231,6 +283,17 @@ def _legacy_power_vector(board, copper_ids, pads_list, pad_sources, rows, cols, 
 
 class TestPowerVectorHelpers:
     """Tests for sparse pad power helper functions."""
+
+    def test_inner_layer_pad_power_targets_first_copper_layer_set_member(self):
+        """Power from an inner-layer pad must use its actual copper layer."""
+        pad = MockPad(layer=F_Cu, layers=[In1_Cu])
+        board = MockBoard(layer_names={F_Cu: "F.Cu", In1_Cu: "In1.Cu"})
+
+        target = _pad_target_layer_index(
+            board, [F_Cu, In1_Cu], pad, {F_Cu: 0, In1_Cu: 1}
+        )
+
+        assert target == 1
 
     def _board_and_pads(self):
         board = MockBoard(layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"})

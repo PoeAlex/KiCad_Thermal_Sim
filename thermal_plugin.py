@@ -32,8 +32,11 @@ from .gui_dialogs import (
 from .electrical_solver import (
     CurrentTerminal,
     ElectricalConfig,
+    build_electrical_supernet_map,
+    build_electrical_connectivity_report,
     net_key_from_obj,
     net_key_from_values,
+    prepare_electrical_geometry,
     solve_electrical_heating,
 )
 from .adaptive_mesh import build_adaptive_mesh, build_adaptive_system
@@ -48,7 +51,8 @@ from .thermal_solver import (
 from .pwl_parser import parse_pwl_file
 from .visualization import (
     save_snapshot, show_results_top_bot, show_results_all_layers, save_preview_image,
-    build_interactive_heatmap_payload, save_joule_loss_map
+    build_interactive_heatmap_payload, save_joule_loss_map,
+    save_electrical_connectivity_preview,
 )
 from .thermal_report import write_html_report
 from .workflow import (
@@ -73,6 +77,22 @@ GRID_DETAIL_PRESETS = {
     "detailed": (1_600_000, 800_000),
     "very_detailed": (3_000_000, 1_500_000),
 }
+
+COPPER_THICKNESS_MIN_MM = 0.001
+COPPER_THICKNESS_MAX_MM = 1.0
+
+
+def _effective_copper_thickness_mm(board_thickness_mm, layer_id, settings):
+    """Return the simulation copper thickness and whether it is overridden."""
+    overrides = settings.get("copper_thickness_overrides_mm", {}) if isinstance(settings, dict) else {}
+    value = overrides.get(str(layer_id)) if isinstance(overrides, dict) else None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float(board_thickness_mm), False
+    if math.isfinite(value) and COPPER_THICKNESS_MIN_MM <= value <= COPPER_THICKNESS_MAX_MM:
+        return value, True
+    return float(board_thickness_mm), False
 DEFAULT_GRID_DETAIL = "balanced"
 DEFAULT_GRID_NODE_BUDGET = GRID_DETAIL_PRESETS[DEFAULT_GRID_DETAIL][0]
 
@@ -136,6 +156,24 @@ def _bbox_to_power_indices(bbox, target_idx, rows, cols, x_min, y_min, res, rc):
     return target_idx * rc + (row_offsets[:, None] + col_offsets[None, :]).ravel(order="C")
 
 
+def _pad_copper_layer_ids(pad, copper_ids):
+    """Return copper layer IDs occupied by a pad."""
+    try:
+        layer_set = pad.GetLayerSet()
+        layer_ids = [lid for lid in copper_ids if layer_set.Contains(lid)]
+        if layer_ids:
+            return layer_ids
+    except Exception:
+        pass
+    try:
+        layer_id = pad.GetLayer()
+        if layer_id in copper_ids:
+            return [layer_id]
+    except Exception:
+        pass
+    return []
+
+
 def _pad_target_layer_index(board, copper_ids, pad, lid_to_idx):
     """
     Resolve the solver layer index for a pad.
@@ -156,12 +194,14 @@ def _pad_target_layer_index(board, copper_ids, pad, lid_to_idx):
     int
         Target copper layer index for the pad.
     """
-    pad_lid = pad.GetLayer()
-    target_idx = lid_to_idx.get(pad_lid)
-    if target_idx is not None:
-        return target_idx
+    layer_ids = _pad_copper_layer_ids(pad, copper_ids)
+    if layer_ids:
+        target_idx = lid_to_idx.get(layer_ids[0])
+        if target_idx is not None:
+            return target_idx
 
     try:
+        pad_lid = pad.GetLayer()
         lname = board.GetLayerName(pad_lid).upper()
     except Exception:
         lname = ""
@@ -436,6 +476,27 @@ def _effective_fr4_control_volume_thicknesses(
     return np.clip(thicknesses, 1e-6, 5e-3)
 
 
+def _build_heat_capacity_array(
+    copper_mask, t_cu, t_fr4_eff, pixel_area, rho_cu, cp_cu,
+    rho_fr4, cp_fr4, heatsink_mask=None, pad_cap_areal=0.0,
+):
+    """Build per-cell thermal capacitance from effective layer thicknesses."""
+    layer_count, rows, cols = copper_mask.shape
+    capacities = np.empty((layer_count, rows, cols), dtype=np.float64)
+    for layer in range(layer_count):
+        copper_volume = pixel_area * t_cu[layer]
+        fr4_volume = pixel_area * t_fr4_eff[layer]
+        mask = copper_mask[layer]
+        capacity = np.where(
+            mask, rho_cu * cp_cu * copper_volume, rho_fr4 * cp_fr4 * fr4_volume
+        )
+        capacity += mask * (rho_fr4 * cp_fr4 * fr4_volume)
+        capacities[layer] = capacity
+    if pad_cap_areal > 0.0 and heatsink_mask is not None and np.any(heatsink_mask):
+        capacities[-1] += pad_cap_areal * pixel_area * heatsink_mask
+    return capacities.reshape(-1)
+
+
 def _bbox_bounds_mm(bbox):
     """Return a KiCad rectangle as absolute millimetre bounds."""
     x_min = float(bbox.GetX()) * 1e-6
@@ -538,7 +599,9 @@ def _find_pcb_editor_parent(board=None):
     return best if best_score > 0 else active_top
 
 
-def _estimate_simulation_area(board, bbox, settings, power_pads=None, terminals=None):
+def _estimate_simulation_area(
+    board, bbox, settings, power_pads=None, terminals=None, electrical_supernets=None
+):
     """Build a safe rectangular domain around heat sources and current nets."""
     board_x0, board_y0, board_x1, board_y1 = _bbox_bounds_mm(bbox)
     board_w = max(0.0, board_x1 - board_x0)
@@ -553,13 +616,17 @@ def _estimate_simulation_area(board, bbox, settings, power_pads=None, terminals=
     active_terms = [
         item for item in (terminals or []) if abs(float(getattr(item, "current_a", 0.0))) > 0.0
     ]
-    active_keys = {
-        net_key_from_values(item.net_code, item.net_name) for item in active_terms
-    }
-    active_names = tuple(sorted({
-        str(item.net_name or net_key_from_values(item.net_code, item.net_name))
-        for item in active_terms
-    }))
+    electrical_supernets = electrical_supernets or build_electrical_supernet_map(board)
+    active_keys = set()
+    active_names = set()
+    for item in active_terms:
+        raw_key = net_key_from_values(item.net_code, item.net_name)
+        supernet = electrical_supernets.get(raw_key)
+        active_keys.update(supernet.member_keys if supernet else (raw_key,))
+        active_names.update(
+            supernet.member_names if supernet else (str(item.net_name or raw_key),)
+        )
+    active_names = tuple(sorted(active_names))
 
     if mode == "full":
         return AreaEstimate(
@@ -929,7 +996,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     rect = pad.GetBoundingBox()
                     row = [
                         "pad", reference, pad.GetNumber(), pos.x, pos.y,
-                        pad.GetLayer(), rect.GetX(), rect.GetY(),
+                        tuple(_pad_copper_layer_ids(pad, copper_ids)), rect.GetX(), rect.GetY(),
                         rect.GetWidth(), rect.GetHeight(),
                     ]
                     for getter in ("GetShape", "GetSize", "GetOrientationDegrees"):
@@ -976,7 +1043,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         for pad in pads or []:
             try:
                 pos = pad.GetPosition()
-                pad_keys.append((pad.GetNumber(), pad.GetLayer(), pos.x, pos.y))
+                layer_ids = tuple(_pad_copper_layer_ids(pad, copper_ids))
+                pad_keys.append((pad.GetNumber(), layer_ids, pos.x, pos.y))
             except Exception:
                 pad_keys.append(id(pad))
         return geometry_cache_key(snapshot, grid, settings, pad_keys)
@@ -1122,6 +1190,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         last_settings = self._load_settings()
         if last_settings.get("output_dir") and os.path.isdir(last_settings.get("output_dir")):
             default_output_dir = last_settings.get("output_dir")
+        dialog_stackup = self._derive_stackup_thicknesses(
+            board, copper_ids, stack_info, last_settings
+        )
+        copper_layers = [
+            {
+                "layer_id": lid,
+                "name": layer_names[index] if index < len(layer_names) else str(lid),
+                "board_thickness_mm": dialog_stackup["copper_thickness_mm_board"][index],
+            }
+            for index, lid in enumerate(copper_ids)
+        ]
+        electrical_supernets = build_electrical_supernet_map(board)
 
         if self.settings_dialog is not None:
             try:
@@ -1167,6 +1247,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         dlg = SettingsDialog(
             self.host_window, len(pads_list), suggested_res, layer_names,
             preview_callback=self.generate_preview,
+            electrical_preview_callback=self.generate_electrical_preview,
             selection_provider=selection_provider,
             run_callback=run_callback,
             close_callback=close_callback,
@@ -1180,6 +1261,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             defaults=last_settings,
             board_name=os.path.basename(board_path) if board_path else "Unsaved board",
             board_size_mm=(w_mm, h_mm),
+            electrical_supernets=electrical_supernets,
+            copper_layers=copper_layers,
             defer_initial_preflight=True,
         )
         self.settings_dialog = dlg
@@ -1304,7 +1387,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 return 0
 
     def _pad_layer_name(self, board, pad):
-        """Return the KiCad layer name for a pad."""
+        """Return the KiCad copper layer name for a pad."""
+        layer_ids = _pad_copper_layer_ids(pad, self.copper_ids)
+        if layer_ids:
+            return " / ".join(board.GetLayerName(lid) for lid in layer_ids)
         try:
             return board.GetLayerName(pad.GetLayer())
         except Exception:
@@ -1484,7 +1570,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         current_pads = [item.pad for item in terminals]
         focus_pads = self._unique_pads(power_pads + current_pads)
         result.area = _estimate_simulation_area(
-            board, bbox, settings, power_pads=power_pads, terminals=terminals
+            board, bbox, settings, power_pads=power_pads, terminals=terminals,
+            electrical_supernets=build_electrical_supernet_map(board),
         )
         result.grid = _estimate_solver_grid(
             bbox, float(settings.get("res", 0.5)), settings, len(copper_ids),
@@ -1513,11 +1600,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             if missing_current:
                 result.errors.append(f"{len(missing_current)} current-terminal pad(s) are missing from the board.")
             has_current = any(abs(float(item.current_a)) > 0.0 for item in terminals)
+            supernets = build_electrical_supernet_map(board)
             totals = {}
+            labels = {}
             for item in terminals:
-                net = item.net_name or f"net:{item.net_code}"
-                totals[net] = totals.get(net, 0.0) + float(item.current_a)
-            unbalanced = [name for name, total in totals.items() if abs(total) > 1e-9]
+                raw_key = net_key_from_values(item.net_code, item.net_name)
+                supernet = supernets.get(raw_key)
+                key = supernet.key if supernet else raw_key
+                totals[key] = totals.get(key, 0.0) + float(item.current_a)
+                labels[key] = supernet.display_name if supernet else (item.net_name or key)
+            unbalanced = [labels[key] for key, total in totals.items() if abs(total) > 1e-9]
             if unbalanced:
                 result.errors.append("Current is not balanced for: " + ", ".join(unbalanced[:3]))
 
@@ -1567,15 +1659,23 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 if isinstance(name, str):
                     copper_thickness_by_name[name] = th
 
+        copper_thickness_mm_board = []
         copper_thickness_mm_used = []
+        copper_thickness_override_active = []
         for lid in copper_ids:
             th = copper_thickness_by_id.get(lid)
             if th is None:
                 lname = board.GetLayerName(lid)
                 th = copper_thickness_by_name.get(lname)
-            if not isinstance(th, (int, float)) or th <= 0:
+            if not isinstance(th, (int, float)) or not math.isfinite(th) or th <= 0:
                 th = 0.035
-            copper_thickness_mm_used.append(th)
+            board_thickness = float(th)
+            effective_thickness, overridden = _effective_copper_thickness_mm(
+                board_thickness, lid, settings
+            )
+            copper_thickness_mm_board.append(board_thickness)
+            copper_thickness_mm_used.append(effective_thickness)
+            copper_thickness_override_active.append(overridden)
 
         total_thick_mm_used = settings['thick']
         if isinstance(stack_board_thick, (int, float)) and stack_board_thick > 0:
@@ -1599,7 +1699,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         return {
             "total_thick_mm_used": total_thick_mm_used,
             "stack_board_thick_mm": stack_board_thick,
+            "copper_thickness_mm_board": copper_thickness_mm_board,
             "copper_thickness_mm_used": copper_thickness_mm_used,
+            "copper_thickness_override_active": copper_thickness_override_active,
             "gap_mm_used": gap_mm_used,
             "gap_fallback_used": use_uniform_gap,
         }
@@ -1681,9 +1783,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
                     target_layers = range(len(self.copper_ids))
                 else:
-                    try:
-                        target_layers = [self.copper_ids.index(pad.GetLayer())]
-                    except ValueError:
+                    target_layers = [
+                        self.copper_ids.index(layer_id)
+                        for layer_id in _pad_copper_layer_ids(
+                            pad, self.copper_ids
+                        )
+                    ]
+                    if not target_layers:
                         target_layers = [0]
                 for layer_idx in target_layers:
                     for row, col in pixels:
@@ -1717,6 +1823,53 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             wx.MessageBox("Board data missing for preview", "Error")
         return output_file
 
+    def generate_electrical_preview(self, settings, layer_names):
+        """Render active electrical nets from the solver's prepared rasters."""
+        if not self._require_filled_zones(self.board):
+            return None
+        terminals, missing = self._resolve_current_terminals(self.board, settings)
+        if missing:
+            wx.MessageBox("Current terminals missing from board:\n" + "\n".join(missing), "ThermalSim")
+            return None
+        if not terminals:
+            wx.MessageBox("Configure active current terminals to preview electrical connectivity.", "ThermalSim")
+            return None
+        power_pads = self._resolve_power_pad_objects(self.board, settings, legacy_pads=self.pads_list)
+        focus_pads = self._unique_pads(power_pads + [item.pad for item in terminals])
+        area = _estimate_simulation_area(
+            self.board, self.bbox, settings, power_pads=power_pads, terminals=terminals,
+            electrical_supernets=build_electrical_supernet_map(self.board),
+        )
+        grid = _estimate_solver_grid(
+            self.bbox, float(settings["res"]), settings, len(self.copper_ids),
+            focus_pads, area=area,
+        )
+        stack_info = self.stack_info if self.stack_info is not None else parse_stackup_from_board_file(self.board)
+        thickness = self._derive_stackup_thicknesses(
+            self.board, self.copper_ids, stack_info, settings
+        )["copper_thickness_mm_used"]
+        config = ElectricalConfig(
+            copper_ids=list(self.copper_ids), rows=grid.rows, cols=grid.cols,
+            x_min=grid.x_min_mm, y_min=grid.y_min_mm, res=grid.actual_res_mm,
+            t_cu=np.asarray([max(1e-9, value * 1e-3) for value in thickness]),
+            layer_names={lid: layer_names[idx] for idx, lid in enumerate(self.copper_ids)
+                         if idx < len(layer_names)},
+        )
+        prepared = prepare_electrical_geometry(self.board, terminals, config)
+        out_dir = settings.get("output_dir") or os.path.dirname(__file__)
+        path = save_electrical_connectivity_preview(
+            prepared, config, terminals, layer_names, out_dir=out_dir, open_file=True,
+            connectivity_report=build_electrical_connectivity_report(
+                prepared, terminals, config
+            ),
+        )
+        if prepared.collision_count:
+            wx.MessageBox(
+                f"The electrical solver would reject {prepared.collision_count} cells where unrelated active nets overlap.",
+                "Electrical Preview Diagnostic",
+            )
+        return path
+
     def _run_simulation(self, board, copper_ids, layer_names, bbox, pads_list,
                         settings, stack_info, pad_names, zone_refill_s=0.0,
                         focus_pads=None):
@@ -1749,6 +1902,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             board, bbox, settings,
             power_pads=area_power_pads,
             terminals=area_terminals,
+            electrical_supernets=build_electrical_supernet_map(board),
         )
         # Derive thicknesses
         stackup_derived = self._derive_stackup_thicknesses(board, copper_ids, stack_info, settings)
@@ -1907,18 +2061,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         if operator_cache_hit:
             C, K_matrix, b, hA = cached_operator
         else:
-            C_layers = np.empty((layer_count, rows, cols), dtype=np.float64)
-            for l in range(layer_count):
-                V_cu = pixel_area * t_cu[l]
-                V_fr4 = pixel_area * t_fr4_eff[l]
-                mask = copper_mask[l]
-                C_layer = np.where(mask, rho_cu * cp_cu * V_cu, rho_fr4 * cp_fr4 * V_fr4)
-                C_layer += mask * (rho_fr4 * cp_fr4 * V_fr4)
-                C_layers[l] = C_layer
-            if pad_cap_areal > 0.0 and np.any(H_map):
-                pad_cap_per_cell = pad_cap_areal * pixel_area
-                C_layers[-1] += pad_cap_per_cell * H_map
-            C = C_layers.reshape(-1)
+            C = _build_heat_capacity_array(
+                copper_mask, t_cu, t_fr4_eff, pixel_area, rho_cu, cp_cu,
+                rho_fr4, cp_fr4, H_map, pad_cap_areal,
+            )
         init_timings["capacity_build_s"] = time.perf_counter() - capacity_start
         init_timings["operator_cache_hit"] = operator_cache_hit
 
@@ -2020,6 +2166,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 electrical_key = stable_fingerprint({
                     "geometry": cache_key,
                     "copper_thickness_m": [float(value) for value in t_cu],
+                    "supernets": sorted(
+                        (
+                            raw_key,
+                            supernet.key,
+                            supernet.member_keys,
+                            supernet.member_names,
+                        )
+                        for raw_key, supernet in build_electrical_supernet_map(board).items()
+                    ),
                     "terminals": [
                         (item.name, item.net_name, int(item.net_code), float(item.current_a))
                         for item in terminals

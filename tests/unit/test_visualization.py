@@ -5,6 +5,7 @@ This module tests the Matplotlib-based plotting functions.
 """
 
 import os
+import json
 import pytest
 import numpy as np
 import tempfile
@@ -15,6 +16,7 @@ from ThermalSim.visualization import (
     show_results_top_bot,
     show_results_all_layers,
     build_interactive_heatmap_payload,
+    save_electrical_connectivity_preview,
 )
 
 from tests.fixtures.temperature_arrays import (
@@ -37,6 +39,7 @@ class TestSaveStackupPlot:
         save_stackup_plot(T, H, amb=25.0, layer_names=["F.Cu", "B.Cu"], fname=fname)
 
         assert os.path.exists(fname)
+
 
     def test_png_file_valid(self, temp_dir):
         """Test that created file has valid PNG signature."""
@@ -479,3 +482,41 @@ class TestBuildInteractiveHeatmapPayload:
         )
 
         assert payload["layers"][0]["data"] == [25.0, 30.0, 35.0, 40.0]
+
+
+def test_electrical_preview_renders_prepared_solver_geometry(temp_dir):
+    """Electrical preview consumes the prepared raster without rebuilding board geometry."""
+    from ThermalSim.electrical_solver import (
+        CurrentTerminal, ElectricalConfig, prepare_electrical_geometry,
+    )
+    from tests.mocks.pcbnew_mock import (
+        EDA_RECT, F_Cu, MockBoard, MockFootprint, MockPad, MockTrack, VECTOR2I,
+    )
+
+    source = MockPad(VECTOR2I(250000, 250000), F_Cu,
+                     bbox=EDA_RECT(200000, 200000, 100000, 100000),
+                     net_code=1, net_name="P")
+    sink = MockPad(VECTOR2I(2250000, 250000), F_Cu,
+                   bbox=EDA_RECT(2200000, 200000, 100000, 100000),
+                   net_code=1, net_name="P")
+    track = MockTrack(
+        F_Cu, EDA_RECT(250000, 250000, 2000000, 100000),
+        VECTOR2I(250000, 250000), VECTOR2I(2250000, 250000), 100000, 1, "P",
+    )
+    board = MockBoard(footprints=[MockFootprint(pads=[source, sink])], tracks=[track])
+    config = ElectricalConfig([F_Cu], 4, 4, 0.0, 0.0, 1.0, np.array([35e-6]))
+    terminals = [CurrentTerminal(source, "J1-1", "P", 1, 1.0),
+                 CurrentTerminal(sink, "J2-1", "P", 1, -1.0)]
+    prepared = prepare_electrical_geometry(board, terminals, config)
+    from ThermalSim.electrical_solver import build_electrical_connectivity_report
+
+    image_path = save_electrical_connectivity_preview(
+        prepared, config, terminals, ["F.Cu"], out_dir=temp_dir,
+        connectivity_report=build_electrical_connectivity_report(prepared, terminals, config),
+    )
+
+    assert os.path.exists(image_path)
+    with open(os.path.join(temp_dir, "electrical_connectivity_report.json"), encoding="utf-8") as report_file:
+        report = json.load(report_file)
+    assert report["nets"][0]["terminals_connected"]
+    assert report["nets"][0]["components"][0]["terminals"] == ["J1-1", "J2-1"]
