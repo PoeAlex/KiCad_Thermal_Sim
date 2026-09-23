@@ -53,6 +53,7 @@ class SolverConfig:
     snapshots_enabled: bool = False
     snap_times: List[float] = None
     time_stepping: str = "multi_phase"
+    simulation_mode: str = "transient"
 
     def __post_init__(self):
         if self.snap_times is None:
@@ -61,6 +62,12 @@ class SolverConfig:
         if mode not in {"auto", "multi_phase", "two_phase", "uniform"}:
             mode = "multi_phase"
         self.time_stepping = mode
+        self.simulation_mode = (
+            "steady_state"
+            if str(self.simulation_mode or "transient").strip().lower()
+            in {"steady", "steady_state", "steady-state"}
+            else "transient"
+        )
 
 
 def _build_phase_plan(config: SolverConfig, node_count: int, use_pardiso: bool):
@@ -695,6 +702,159 @@ def _solve_pcg(
         np.linalg.norm(residual) / max(np.linalg.norm(rhs), 1e-30)
     )
     return solution, iterations, retried, relative_residual
+
+
+def _steady_state_result(
+    temperature, aborted, solve_time, factor_time, factor_count, iterations,
+    residual, backend, Q, hA, amb, layer_count, rows, cols,
+):
+    """Build a solver result and energy-balance diagnostics for equilibrium."""
+    theta = np.asarray(temperature, dtype=np.float64) - amb
+    pin = float(np.sum(Q))
+    pout = float(np.sum(hA * theta))
+    balance_error = abs(pin - pout) / max(abs(pin), 1e-9)
+    return SolverResult(
+        T=np.asarray(temperature).reshape(layer_count, rows, cols),
+        aborted=aborted,
+        step_counter=0 if aborted else 1,
+        total_solve_time=solve_time,
+        total_factor_time=factor_time,
+        factor_count=factor_count,
+        snapshot_stats=[],
+        snapshot_files=[],
+        phase_metrics=[{
+            "phase": "steady_state", "steps": 0 if aborted else 1,
+            "avg_solve_s": solve_time, "iterations": iterations,
+            "backend": backend,
+        }],
+        balance_history=[],
+        k_norm_info={
+            "strategy": "steady_state_fvm",
+            "backend": backend,
+            "simulation_mode": "steady_state",
+            "N": int(np.asarray(temperature).size),
+            "steps_total": 0 if aborted else 1,
+            "factorization_s": factor_time,
+            "factorizations": factor_count,
+            "pcg_iterations": iterations,
+            "relative_residual": residual,
+            "convergence_tolerance": 1e-6,
+            "converged": not aborted,
+            "pin_w": pin,
+            "pout_final_w": pout,
+            "steady_rel_diff": balance_error,
+            "energy_balance_warning": balance_error > 0.01,
+        },
+    )
+
+
+def _validate_steady_state_inputs(Q, hA):
+    """Reject a powered steady-state model with no heat sink."""
+    if float(np.sum(Q)) > 1e-12 and not np.any(np.abs(hA) > 1e-30):
+        raise ValueError(
+            "Steady-state solution requires at least one thermal path to ambient."
+        )
+
+
+def run_steady_state(
+    config: SolverConfig,
+    K: sp.csr_matrix,
+    Q: np.ndarray,
+    hA: np.ndarray,
+    layer_count: int,
+    rows: int,
+    cols: int,
+    progress_callback: Optional[Callable[[int, int], bool]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> SolverResult:
+    """Solve the shared thermal conductance system at equilibrium."""
+    Q = np.asarray(Q, dtype=np.float64)
+    hA = np.asarray(hA, dtype=np.float64)
+    _validate_steady_state_inputs(Q, hA)
+    ambient = float(config.amb)
+    if not np.any(np.abs(Q) > 1e-30):
+        return _steady_state_result(
+            np.full(Q.size, ambient), False, 0.0, 0.0, 0, 0, 0.0,
+            "Steady-State (zero power)", Q, hA, ambient, layer_count, rows, cols,
+        )
+    if (cancel_check and cancel_check()) or (
+        progress_callback is not None and not progress_callback(0, 1)
+    ):
+        return _steady_state_result(
+            np.full(Q.size, ambient), True, 0.0, 0.0, 0, 0, None,
+            "Steady-State", Q, hA, ambient, layer_count, rows, cols,
+        )
+    factor_started = time.perf_counter()
+    solver, owner, backend, _ = _factor_linear_system(K, config.use_pardiso)
+    factor_time = time.perf_counter() - factor_started
+    try:
+        solve_started = time.perf_counter()
+        theta = solver(Q)
+        solve_time = time.perf_counter() - solve_started
+    finally:
+        _release_linear_solver(owner)
+    residual = float(np.linalg.norm(K.dot(theta) - Q) / max(np.linalg.norm(Q), 1e-30))
+    if residual > 1e-6:
+        raise RuntimeError(
+            f"Steady-state direct solve residual {residual:g} exceeds tolerance 1e-6."
+        )
+    if progress_callback:
+        progress_callback(1, 1)
+    return _steady_state_result(
+        ambient + theta, False, solve_time, factor_time, 1, 0, residual,
+        backend, Q, hA, ambient, layer_count, rows, cols,
+    )
+
+
+def run_steady_state_matrix_free(
+    config: SolverConfig,
+    operator: StructuredThermalOperator,
+    Q: np.ndarray,
+    hA: np.ndarray,
+    progress_callback: Optional[Callable[[int, int], bool]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> SolverResult:
+    """Solve equilibrium with the existing matrix-free PCG infrastructure."""
+    Q = np.asarray(Q, dtype=np.float64)
+    hA = np.asarray(hA, dtype=np.float64)
+    _validate_steady_state_inputs(Q, hA)
+    ambient = float(config.amb)
+    if not np.any(np.abs(Q) > 1e-30):
+        return _steady_state_result(
+            np.full(Q.size, ambient), False, 0.0, 0.0, 0, 0, 0.0,
+            "MatrixFree-PCG (zero power)", Q, hA, ambient,
+            operator.layer_count, operator.rows, operator.cols,
+        )
+    if (cancel_check and cancel_check()) or (
+        progress_callback is not None and not progress_callback(0, 1)
+    ):
+        return _steady_state_result(
+            np.full(Q.size, ambient), True, 0.0, 0.0, 0, 0, None,
+            "MatrixFree-PCG", Q, hA, ambient,
+            operator.layer_count, operator.rows, operator.cols,
+        )
+    system, preconditioner = operator.implicit_linear_operator(
+        np.zeros_like(Q), 0.0
+    )
+    solve_started = time.perf_counter()
+    try:
+        theta, iterations, _, residual = _solve_pcg(
+            system, preconditioner, Q, np.zeros_like(Q), cancel_check=cancel_check,
+        )
+    except _CancelledIterativeSolve:
+        return _steady_state_result(
+            np.full(Q.size, ambient), True, 0.0, 0.0, 0, 0, None,
+            "MatrixFree-PCG", Q, hA, ambient,
+            operator.layer_count, operator.rows, operator.cols,
+        )
+    solve_time = time.perf_counter() - solve_started
+    if progress_callback:
+        progress_callback(1, 1)
+    return _steady_state_result(
+        ambient + theta, False, solve_time, 0.0, 0, iterations, residual,
+        "MatrixFree-PCG", Q, hA, ambient,
+        operator.layer_count, operator.rows, operator.cols,
+    )
 
 
 def run_simulation_matrix_free(

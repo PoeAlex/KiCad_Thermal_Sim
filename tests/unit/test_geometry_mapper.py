@@ -664,3 +664,34 @@ class TestCreateMultilayerMaps:
         assert mask[2, 2]
         assert not mask[4, 4]
         assert not mask[0, 0]
+
+
+def test_inner_layer_smd_pad_uses_its_copper_layer_set():
+    """Inner-layer SMD pads must not be rasterized on their fallback layer."""
+    pad = MockPad(
+        position=VECTOR2I(1_500_000, 1_500_000),
+        layer=F_Cu,
+        layers=[In1_Cu],
+        bbox=EDA_RECT(1_000_000, 1_000_000, 1_000_000, 1_000_000),
+    )
+    board = MockBoard(footprints=[MockFootprint(pads=[pad])])
+
+    state = build_geometry_state(
+        board=board,
+        copper_ids=[F_Cu, In1_Cu],
+        rows=4,
+        cols=4,
+        x_min=0.0,
+        y_min=0.0,
+        res=1.0,
+        settings={
+            "ignore_traces": False,
+            "ignore_polygons": False,
+            "use_heatsink": False,
+        },
+        via_factor=1300.0,
+        pads_list=[],
+    )
+
+    assert not state.copper_mask[0].any()
+    assert state.copper_mask[1].any()

@@ -75,7 +75,8 @@ Run the plugin in PCB Editor via **Tools -> External Plugins -> 2.5D Thermal Sim
 5. Set **Duration**, **Ambient**, and **Resolution** on the **Overview** tab.
 6. Optionally use **Current Heating** to add source/sink pads and per-pad currents for copper `I^2R` heating.
 7. Optionally use **Advanced** for the simulation area, thermal pad, convection, and solver settings.
-8. Click **Preview** to check the mapped geometry, then **Run**.
+8. If current heating is enabled, click **Electrical Preview** to check current-net connectivity.
+9. Click **Thermal Geometry Preview** to check the mapped board area, then **Run Simulation**.
 
 ![GUI overview tab](docs/images/gui_sim.png "Overview tab")
 
@@ -96,7 +97,7 @@ The resizable dialog keeps board context and live preflight status visible above
 - **Current Heating** - DC current source/sink terminals for Joule heating.
 - **Advanced** - collapsible simulation-area, thermal-pad, and solver settings.
 
-The header summarizes the board, copper-layer count, heat sources, and current-balance state. The fixed footer shows the requested versus actual grid, readiness warnings, and the main **Preview** and **Run Simulation** actions. Help and settings import/export are available from **More**. After a successful run, the dialog retains maximum temperature, elapsed time, and shortcuts to the report and output folder.
+The header summarizes the board, copper-layer count, heat sources, and current-balance state. The fixed footer shows the requested versus actual grid, readiness warnings, and the **Electrical Preview**, **Thermal Geometry Preview**, and **Run Simulation** actions. Electrical Preview is enabled when current heating has active terminals. Help and settings import/export are available from **More**. After a successful run, the dialog retains maximum temperature, elapsed time, and shortcuts to the report and output folder.
 
 ### Overview Tab
 
@@ -234,16 +235,17 @@ nodes, reduction factor, PCG iterations, and residual.
 
 ---
 
-## Preview
+## Previews
 
-The **Preview** button generates a geometry visualization showing copper distribution, power/current pad locations, via regions, and the effective simulation-area boundary on each layer. Its header reports the cropped dimensions and percentage of the board.
+**Electrical Preview** checks active current-net connectivity and shows the solver's topology, graph raster, and copper occupancy. Use it before running current heating; it is enabled only when current heating has active terminals. It produces `electrical_connectivity_preview.png`, `electrical_graph_raster_preview.png`, and `electrical_copper_occupancy_preview.png`.
 
-ThermalSim uses the copper-zone fills already stored by KiCad. If zones are
-stale or unfilled, press **B** in PCB Editor before Preview or Run. The plugin
-does not refill zones automatically because this can block the interface for
-minutes on large boards and is unstable in some KiCad builds.
+The synthetic regression board is available at `tests/demo/synthetic_electrical_connectivity_demo.kicad_pcb`.
 
-![Preview](docs/images/preview.png "KiCad editor with geometry preview")
+**Thermal Geometry Preview** maps copper, power/current pads, vias, and the effective thermal simulation area. It does not run the thermal solver or show temperatures. Its header reports the cropped dimensions and percentage of the board.
+
+Both previews use the copper-zone fills already stored by KiCad. If zones are stale or unfilled, press **B** in PCB Editor before previewing or running. The plugin does not refill zones automatically because this can block the interface for minutes on large boards and is unstable in some KiCad builds.
+
+![Thermal geometry preview](docs/images/preview.png "KiCad editor with thermal geometry preview")
 
 ---
 

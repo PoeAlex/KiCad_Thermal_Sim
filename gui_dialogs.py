@@ -8,6 +8,7 @@ persistent board context, preflight status, and result actions.
 
 import copy
 import json
+import math
 import os
 import wx
 
@@ -22,6 +23,8 @@ try:
 except ImportError:
     HAS_PARDISO = False
 
+from .electrical_solver import net_key_from_values
+
 
 # Tooltip text for every control, keyed by internal name
 TOOLTIP_TEXTS = {
@@ -32,6 +35,7 @@ TOOLTIP_TEXTS = {
     'power_apply': "Apply the Power field to selected power-pad rows. If no row is selected, it is applied to all rows.",
     'power_list': "Apply comma-separated power values in the same order as the power-pad table.",
     'browse_pwl': "Select a Piecewise-Linear (.pwl/.csv/.txt) file for time-varying power.",
+    'simulation_mode': "Steady state calculates thermal equilibrium directly; transient advances through time.",
     'duration': "Total simulation time in seconds. Longer durations approach steady-state.",
     'ambient': "Surrounding air temperature in \u00b0C. Typical lab conditions: 25 \u00b0C.",
     'resolution': "Desired grid cell size in mm. The compute budget may use a coarser actual size.",
@@ -59,7 +63,7 @@ TOOLTIP_TEXTS = {
     'grid_target_cells': "Legacy coarsening target retained for settings compatibility.",
     'capabilities': "Detected solver backends. PyPardiso accelerates large grids significantly.",
     'help': "Open the ThermalSim documentation in your web browser.",
-    'preview': "Generate a geometry preview image without running the simulation.",
+    'preview': "Map copper, pads, vias, and the simulation area without running the thermal solver.",
     'load_settings': "Load simulation settings from a JSON file.",
     'save_settings': "Save the current simulation settings to a JSON file.",
     'current_enable': "Enable DC current-flow simulation for Joule heating in traces and copper pours.",
@@ -67,6 +71,7 @@ TOOLTIP_TEXTS = {
     'current_total': "Total current for the selected group. In distribution mode it is split evenly across all pads.",
     'current_per_pad': "Current value applied to selected pad rows in per-pad mode. If no row is selected, it is applied to all pads in the group.",
     'current_pad_list': "Comma-separated per-pad currents in the same order as the pad table, for example: +6, -4, -2.",
+    'copper_thickness': "Simulation-only copper thickness. It does not modify the KiCad board stackup.",
 }
 
 
@@ -309,7 +314,7 @@ def prepare_current_groups(groups):
     return prepared
 
 
-def summarize_current_groups(groups):
+def summarize_current_groups(groups, supernet_map=None):
     """
     Build user-readable group and net balance summaries.
 
@@ -317,6 +322,8 @@ def summarize_current_groups(groups):
     ----------
     groups : list of dict
         Current groups.
+    supernet_map : dict, optional
+        Raw-net to declared electrical-supernet mapping.
 
     Returns
     -------
@@ -342,7 +349,9 @@ def summarize_current_groups(groups):
             f"{total_current:.6g} A",
         ))
         for pad in group.get('pads', []):
-            net = pad.get('net_name') or "(no net)"
+            raw_key = net_key_from_values(pad.get('net_code'), pad.get('net_name'))
+            supernet = (supernet_map or {}).get(raw_key)
+            net = supernet.display_name if supernet else (pad.get('net_name') or "(no net)")
             net_totals[net] = net_totals.get(net, 0.0) + float(pad.get('current_a', 0.0))
     balance_rows = []
     for net, total in sorted(net_totals.items()):
@@ -381,6 +390,8 @@ class SettingsDialog(wx.Dialog):
         Default values to pre-fill in the dialog.
     defer_initial_preflight : bool, optional
         Schedule the first board scan after the dialog becomes visible.
+    electrical_supernets : dict, optional
+        Declared net-tie supernets used for the current-balance display.
 
     Attributes
     ----------
@@ -411,6 +422,9 @@ class SettingsDialog(wx.Dialog):
         board_name="",
         board_size_mm=None,
         defer_initial_preflight=False,
+        electrical_supernets=None,
+        copper_layers=None,
+        electrical_preview_callback=None,
     ):
         dialog_style = (
             getattr(wx, "DEFAULT_DIALOG_STYLE", 0)
@@ -422,12 +436,16 @@ class SettingsDialog(wx.Dialog):
         self.board_name = str(board_name or "Unsaved board")
         self.board_size_mm = tuple(board_size_mm or ())
         self.preview_callback = preview_callback
+        self.electrical_preview_callback = electrical_preview_callback
         self.selection_provider = selection_provider
         self.run_callback = run_callback
         self.close_callback = close_callback
         self.preflight_callback = preflight_callback
         self.load_settings_callback = load_settings_callback
         self.save_settings_callback = save_settings_callback
+        self.electrical_supernets = electrical_supernets or {}
+        self.copper_layers = self._prepare_copper_layers(copper_layers, layer_names)
+        self.copper_thickness_rows = []
         self.current_groups = []
         self.current_group_index = -1
         self.power_pads = []
@@ -544,7 +562,19 @@ class SettingsDialog(wx.Dialog):
         self.btn_more.Bind(wx.EVT_BUTTON, self._on_more)
         footer.Add(self.btn_more, 0, wx.ALL, 4)
 
-        self.btn_preview = wx.Button(self.footer_actions_panel, label="Preview")
+        self.btn_electrical_preview = wx.Button(
+            self.footer_actions_panel, label="Electrical Preview"
+        )
+        self.btn_electrical_preview.Bind(wx.EVT_BUTTON, self._on_electrical_preview)
+        self.btn_electrical_preview.Enable(bool(self.electrical_preview_callback))
+        self.btn_electrical_preview.SetToolTip(
+            "Show the electrical raster and directional connections used by current heating."
+        )
+        footer.Add(self.btn_electrical_preview, 0, wx.ALL, 4)
+
+        self.btn_preview = wx.Button(
+            self.footer_actions_panel, label="Thermal Geometry Preview"
+        )
         self.btn_preview.Bind(wx.EVT_BUTTON, self._on_preview)
         self.btn_preview.SetToolTip(TOOLTIP_TEXTS['preview'])
         footer.Add(self.btn_preview, 0, wx.ALL, 4)
@@ -600,6 +630,28 @@ class SettingsDialog(wx.Dialog):
     # Tab builders
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _prepare_copper_layers(copper_layers, layer_names):
+        """Normalize optional board copper data for the override controls."""
+        prepared = []
+        for index, item in enumerate(copper_layers or []):
+            if not isinstance(item, dict):
+                continue
+            thickness = _safe_float(item.get('board_thickness_mm'), 0.035)
+            if not math.isfinite(thickness) or thickness <= 0.0:
+                thickness = 0.035
+            prepared.append({
+                'layer_id': item.get('layer_id', index),
+                'name': str(item.get('name') or f"Layer {index}"),
+                'board_thickness_mm': thickness,
+            })
+        if prepared:
+            return prepared
+        return [
+            {'layer_id': index, 'name': str(name), 'board_thickness_mm': 0.035}
+            for index, name in enumerate(layer_names or [])
+        ]
+
     def _build_simulation_tab(self, panel, layer_names, stackup_details,
                               pad_names, suggested_res, default_output_dir):
         """Build the compact Overview tab contents."""
@@ -630,6 +682,24 @@ class SettingsDialog(wx.Dialog):
         # --- Parameters ---
         box_params = wx.StaticBoxSizer(wx.VERTICAL, panel, "Simulation")
         params_parent = box_params.GetStaticBox()
+
+        mode_row = wx.BoxSizer(wx.HORIZONTAL)
+        mode_row.Add(
+            wx.StaticText(params_parent, label="Simulation Mode", size=(160, -1)),
+            0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5,
+        )
+        self.simulation_mode_choice = wx.Choice(
+            params_parent, choices=["Steady State", "Transient"]
+        )
+        self.simulation_mode_choice.SetSelection(1)
+        self.simulation_mode_choice.SetToolTip(TOOLTIP_TEXTS['simulation_mode'])
+        self.simulation_mode_choice.Bind(wx.EVT_CHOICE, self._on_simulation_mode_changed)
+        mode_row.Add(self.simulation_mode_choice, 1, wx.EXPAND)
+        box_params.Add(mode_row, 0, wx.EXPAND | wx.ALL, 2)
+        self.lbl_simulation_mode = wx.StaticText(
+            params_parent, label="Transient thermal solution"
+        )
+        box_params.Add(self.lbl_simulation_mode, 0, wx.EXPAND | wx.LEFT | wx.BOTTOM, 2)
 
         # Duration
         self.time_input = self._add_spin_field(
@@ -787,6 +857,65 @@ class SettingsDialog(wx.Dialog):
         """Build the Advanced tab contents."""
         sizer = wx.BoxSizer(wx.VERTICAL)
 
+        # --- Copper Thickness ---
+        self.copper_thickness_pane = wx.CollapsiblePane(
+            panel, label="Copper Thickness (simulation only)"
+        )
+        copper_panel = self.copper_thickness_pane.GetPane()
+        copper_sizer = wx.BoxSizer(wx.VERTICAL)
+        copper_sizer.Add(
+            wx.StaticText(
+                copper_panel,
+                label="Overrides affect electrical loss, heat spreading, and thermal mass; the board is unchanged.",
+            ),
+            0, wx.EXPAND | wx.ALL, 3,
+        )
+        header = wx.BoxSizer(wx.HORIZONTAL)
+        for label, width in (("Layer", 130), ("KiCad (µm)", 100), ("Simulation (µm)", 130), ("Override", 85)):
+            header.Add(wx.StaticText(copper_panel, label=label, size=(width, -1)), 0, wx.RIGHT, 4)
+        copper_sizer.Add(header, 0, wx.EXPAND | wx.ALL, 3)
+        for layer in self.copper_layers:
+            row_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            row_sizer.Add(wx.StaticText(copper_panel, label=layer['name'], size=(130, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+            row_sizer.Add(
+                wx.StaticText(copper_panel, label=f"{layer['board_thickness_mm'] * 1000.0:g}", size=(100, -1)),
+                0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4,
+            )
+            thickness = wx.SpinCtrlDouble(
+                copper_panel, value=str(layer['board_thickness_mm'] * 1000.0),
+                min=1.0, max=1000.0, inc=1.0,
+            )
+            thickness.SetDigits(1)
+            thickness.SetToolTip(TOOLTIP_TEXTS['copper_thickness'])
+            row_sizer.Add(thickness, 0, wx.RIGHT, 4)
+            enabled = wx.CheckBox(copper_panel, label="Use")
+            enabled.SetToolTip(TOOLTIP_TEXTS['copper_thickness'])
+            enabled.Bind(wx.EVT_CHECKBOX, self._on_copper_override_changed)
+            row_sizer.Add(enabled, 0, wx.ALIGN_CENTER_VERTICAL)
+            self.copper_thickness_rows.append({
+                **layer, 'thickness': thickness, 'enabled': enabled,
+            })
+            copper_sizer.Add(row_sizer, 0, wx.EXPAND | wx.ALL, 2)
+
+        actions = wx.BoxSizer(wx.HORIZONTAL)
+        actions.Add(wx.StaticText(copper_panel, label="Set all (µm)"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.copper_set_all_input = wx.SpinCtrlDouble(
+            copper_panel, value="35", min=1.0, max=1000.0, inc=1.0,
+        )
+        self.copper_set_all_input.SetDigits(1)
+        actions.Add(self.copper_set_all_input, 0, wx.RIGHT, 4)
+        set_all = wx.Button(copper_panel, label="Set all copper layers")
+        set_all.Bind(wx.EVT_BUTTON, self._on_set_all_copper_thickness)
+        actions.Add(set_all, 0, wx.RIGHT, 4)
+        reset = wx.Button(copper_panel, label="Reset to KiCad stackup")
+        reset.Bind(wx.EVT_BUTTON, self._on_reset_copper_thickness)
+        actions.Add(reset, 0)
+        copper_sizer.Add(actions, 0, wx.EXPAND | wx.ALL, 3)
+        self.lbl_copper_thickness_status = wx.StaticText(copper_panel, label="Using KiCad copper thicknesses")
+        copper_sizer.Add(self.lbl_copper_thickness_status, 0, wx.EXPAND | wx.ALL, 3)
+        copper_panel.SetSizer(copper_sizer)
+        sizer.Add(self.copper_thickness_pane, 0, wx.EXPAND | wx.ALL, 5)
+
         # --- Geometry Filters ---
         self.geometry_pane = wx.CollapsiblePane(panel, label="Geometry")
         self.geometry_pane.Expand()
@@ -935,10 +1064,58 @@ class SettingsDialog(wx.Dialog):
 
         pane_event = getattr(wx, "EVT_COLLAPSIBLEPANE_CHANGED", None)
         if pane_event is not None:
-            for pane in (self.geometry_pane, self.thermal_pad_pane, self.solver_pane):
+            for pane in (
+                self.copper_thickness_pane, self.geometry_pane,
+                self.thermal_pad_pane, self.solver_pane,
+            ):
                 pane.Bind(pane_event, self._on_advanced_pane_changed)
 
         panel.SetSizer(sizer)
+
+    def _refresh_copper_thickness_status(self):
+        """Show whether this simulation differs from the KiCad stackup."""
+        count = sum(row['enabled'].GetValue() for row in self.copper_thickness_rows)
+        label = (
+            f"Copper thickness overrides active ({count})"
+            if count else "Using KiCad copper thicknesses"
+        )
+        self.lbl_copper_thickness_status.SetLabel(label)
+
+    def _on_copper_override_changed(self, event):
+        """Refresh the override status after a row is enabled or disabled."""
+        self._refresh_copper_thickness_status()
+        if event is not None and hasattr(event, 'Skip'):
+            event.Skip()
+
+    def _on_set_all_copper_thickness(self, event):
+        """Apply one simulation-only copper thickness to every layer."""
+        value = float(self.copper_set_all_input.GetValue())
+        if not math.isfinite(value) or not 1.0 <= value <= 1000.0:
+            wx.MessageBox("Copper thickness must be between 1 and 1000 µm.", "ThermalSim")
+            return
+        for row in self.copper_thickness_rows:
+            row['thickness'].SetValue(value)
+            row['enabled'].SetValue(True)
+        self._refresh_copper_thickness_status()
+
+    def _on_reset_copper_thickness(self, event):
+        """Remove all copper overrides and restore displayed board values."""
+        for row in self.copper_thickness_rows:
+            row['thickness'].SetValue(row['board_thickness_mm'] * 1000.0)
+            row['enabled'].SetValue(False)
+        self._refresh_copper_thickness_status()
+
+    def _copper_thickness_overrides(self):
+        """Return validated simulation-only copper overrides in millimeters."""
+        overrides = {}
+        for row in self.copper_thickness_rows:
+            if not row['enabled'].GetValue():
+                continue
+            thickness_um = float(row['thickness'].GetValue())
+            if not math.isfinite(thickness_um) or not 1.0 <= thickness_um <= 1000.0:
+                raise ValueError("Copper thickness must be between 1 and 1000 µm.")
+            overrides[str(row['layer_id'])] = thickness_um * 1e-3
+        return overrides
 
     def _build_current_tab(self, panel):
         """Build the current-path/Joule-heating tab."""
@@ -1295,33 +1472,43 @@ class SettingsDialog(wx.Dialog):
             pass
 
     def _on_preview(self, event):
-        """Handle Preview button click."""
-        if self.preview_callback:
-            settings = self.get_values()
-            if settings and self._refresh_preflight(settings):
+        """Handle Thermal Geometry Preview button click."""
+        self._run_preview(self.preview_callback, self.btn_preview, "thermal geometry")
+
+    def _on_electrical_preview(self, event):
+        """Handle the electrical connectivity preview action."""
+        self._run_preview(
+            self.electrical_preview_callback,
+            self.btn_electrical_preview,
+            "electrical",
+        )
+
+    def _run_preview(self, callback, button, kind):
+        if not callback:
+            return
+        settings = self.get_values()
+        if not settings or not self._refresh_preflight(settings):
+            return
+        self._set_footer_status(f"Building {kind} preview...", f"Preparing {kind} geometry.")
+        button.Enable(False)
+        try:
+            output_path = callback(settings, self.layer_names)
+            if output_path:
                 self._set_footer_status(
-                    "Building preview...",
-                    "Extracting and rasterizing board geometry.",
+                    f"{kind.capitalize()} preview ready", os.path.basename(output_path)
                 )
-                self.btn_preview.Enable(False)
-                try:
-                    output_path = self.preview_callback(settings, self.layer_names)
-                    if output_path:
-                        self._set_footer_status(
-                            "Preview ready", os.path.basename(output_path)
-                        )
-                    else:
-                        self._set_footer_status(
-                            "Preview failed", "No preview image was created."
-                        )
-                except Exception:
-                    self._set_footer_status(
-                        "Preview failed",
-                        "The geometry preview could not be created.",
-                    )
-                    wx.MessageBox("Geometry preview failed.", "ThermalSim")
-                finally:
-                    self.btn_preview.Enable(True)
+            else:
+                self._set_footer_status(
+                    f"{kind.capitalize()} preview failed", "No preview image was created."
+                )
+        except Exception:
+            self._set_footer_status(
+                f"{kind.capitalize()} preview failed",
+                f"The {kind} preview could not be created.",
+            )
+            wx.MessageBox(f"{kind.capitalize()} preview failed.", "ThermalSim")
+        finally:
+            button.Enable(True)
 
     def _on_run(self, event):
         """Handle Run button click for modal and modeless workflows."""
@@ -1472,7 +1659,24 @@ class SettingsDialog(wx.Dialog):
 
     def _on_snapshots_toggle(self, event):
         """Handle Snapshots checkbox toggle."""
-        self.snap_count_input.Enable(self.chk_snapshots.GetValue())
+        self.snap_count_input.Enable(
+            self.chk_snapshots.GetValue()
+            and self.simulation_mode_choice.GetSelection() != 0
+        )
+        self._refresh_preflight()
+
+    def _on_simulation_mode_changed(self, event):
+        """Disable transient-only controls for an equilibrium solve."""
+        steady_state = self.simulation_mode_choice.GetSelection() == 0
+        self.time_input.Enable(not steady_state)
+        self.chk_snapshots.Enable(not steady_state)
+        self.snap_count_input.Enable(
+            not steady_state and self.chk_snapshots.GetValue()
+        )
+        self.lbl_simulation_mode.SetLabel(
+            "Steady-state thermal solution" if steady_state
+            else "Transient thermal solution"
+        )
         self._refresh_preflight()
 
     def _on_heatsink_toggle(self, event):
@@ -1719,10 +1923,20 @@ class SettingsDialog(wx.Dialog):
     def _refresh_context_summary(self):
         """Refresh persistent heat-source and current-flow context."""
         power_text = summarize_power_pads(self.power_pads)
+        active_current = any(
+            abs(float(pad.get("current_a", 0.0) or 0.0)) > 0.0
+            for group in self.current_groups
+            for pad in group.get("pads", [])
+        )
+        self.btn_electrical_preview.Enable(
+            bool(self.electrical_preview_callback)
+            and self.chk_current_enabled.GetValue()
+            and active_current
+        )
         if not self.chk_current_enabled.GetValue():
             current_text = "Current heating off"
         else:
-            _, balance_rows = summarize_current_groups(self.current_groups)
+            _, balance_rows = summarize_current_groups(self.current_groups, self.electrical_supernets)
             if not balance_rows:
                 current_text = "Current heating on / no terminals"
             elif any(status != "OK" for _, _, status in balance_rows):
@@ -1922,7 +2136,7 @@ class SettingsDialog(wx.Dialog):
             self.current_group_index = 0
         try:
             self.current_group_list.DeleteAllItems()
-            rows, balance_rows = summarize_current_groups(self.current_groups)
+            rows, balance_rows = summarize_current_groups(self.current_groups, self.electrical_supernets)
             for row_idx, row in enumerate(rows):
                 self.current_group_list.InsertItem(row_idx, row[0])
                 for col_idx, value in enumerate(row[1:], start=1):
@@ -1930,7 +2144,7 @@ class SettingsDialog(wx.Dialog):
             if 0 <= self.current_group_index < len(self.current_groups):
                 self.current_group_list.Select(self.current_group_index)
         except Exception:
-            _, balance_rows = summarize_current_groups(self.current_groups)
+            _, balance_rows = summarize_current_groups(self.current_groups, self.electrical_supernets)
 
         lines = []
         for net, total, status in balance_rows:
@@ -2036,6 +2250,7 @@ class SettingsDialog(wx.Dialog):
         - compute_engine : str
         - mesh_mode : str
         - adaptive_max_cell_ratio : int
+        - copper_thickness_overrides_mm : dict
         """
         try:
             self._sync_current_group_from_fields()
@@ -2094,9 +2309,15 @@ class SettingsDialog(wx.Dialog):
                 if 0 <= mesh_idx < len(mesh_modes)
                 else "adaptive"
             )
+            copper_thickness_overrides_mm = self._copper_thickness_overrides()
             return {
                 'power_str': power_str,
                 'power_pads': power_pads,
+                'simulation_mode': (
+                    'steady_state'
+                    if self.simulation_mode_choice.GetSelection() == 0
+                    else 'transient'
+                ),
                 'time': float(self.time_input.GetValue()),
                 'amb': float(self.amb_input.GetValue()),
                 'thick': float(self.thick_input.GetValue()),
@@ -2128,6 +2349,7 @@ class SettingsDialog(wx.Dialog):
                 'time_stepping': time_stepping,
                 'current_enabled': self.chk_current_enabled.GetValue(),
                 'current_groups': current_groups,
+                'copper_thickness_overrides_mm': copper_thickness_overrides_mm,
             }
         except ValueError:
             return None
@@ -2148,6 +2370,10 @@ class SettingsDialog(wx.Dialog):
 
             if 'time' in defaults:
                 self.time_input.SetValue(float(defaults['time']))
+            simulation_mode = str(defaults.get('simulation_mode', 'transient')).lower()
+            self.simulation_mode_choice.SetSelection(
+                0 if simulation_mode in {'steady', 'steady_state', 'steady-state'} else 1
+            )
             if 'amb' in defaults:
                 self.amb_input.SetValue(float(defaults['amb']))
             if 'thick' in defaults:
@@ -2163,7 +2389,16 @@ class SettingsDialog(wx.Dialog):
             )
             if 'snap_count' in defaults:
                 self.snap_count_input.SetValue(int(defaults['snap_count']))
-            self.snap_count_input.Enable(self.chk_snapshots.GetValue())
+            steady_state = self.simulation_mode_choice.GetSelection() == 0
+            self.time_input.Enable(not steady_state)
+            self.chk_snapshots.Enable(not steady_state)
+            self.snap_count_input.Enable(
+                not steady_state and self.chk_snapshots.GetValue()
+            )
+            self.lbl_simulation_mode.SetLabel(
+                "Steady-state thermal solution" if steady_state
+                else "Transient thermal solution"
+            )
 
             out_dir = defaults.get('output_dir')
             if out_dir:
@@ -2198,6 +2433,21 @@ class SettingsDialog(wx.Dialog):
 
             if 'h_conv' in defaults:
                 self.h_conv_input.SetValue(float(defaults['h_conv']))
+
+            saved_overrides = defaults.get('copper_thickness_overrides_mm', {})
+            if isinstance(saved_overrides, dict):
+                for row in self.copper_thickness_rows:
+                    value = saved_overrides.get(str(row['layer_id']))
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(value) and 0.001 <= value <= 1.0:
+                        row['thickness'].SetValue(value * 1000.0)
+                        row['enabled'].SetValue(True)
+            self._refresh_copper_thickness_status()
+            if any(row['enabled'].GetValue() for row in self.copper_thickness_rows):
+                self.copper_thickness_pane.Expand()
 
             compute_engine = str(defaults.get('compute_engine', 'auto')).lower()
             compute_engine_idx = {

@@ -22,6 +22,8 @@ from ThermalSim.thermal_solver import (
     build_structured_operator,
     run_simulation,
     run_simulation_matrix_free,
+    run_steady_state,
+    run_steady_state_matrix_free,
 )
 
 
@@ -298,6 +300,32 @@ class TestBuildStiffnessMatrix:
 
         assert norm_cu > norm_fr4, "Copper should increase matrix norm"
 
+    def test_copper_lateral_conductance_scales_with_thickness(self, simple_setup):
+        """Both thermal backends must use the same thickness-scaled copper edge."""
+        setup = simple_setup.copy()
+        setup['copper_mask'] = np.zeros_like(setup['copper_mask'])
+        setup['copper_mask'][0] = True
+        thin = setup.copy()
+        thin['t_cu'] = np.array([35e-6, 35e-6])
+        thick = setup.copy()
+        thick['t_cu'] = np.array([105e-6, 35e-6])
+        index = 0
+        neighbor = 1
+
+        thin_matrix, _, _, _ = build_stiffness_matrix(**thin)
+        thick_matrix, _, _, _ = build_stiffness_matrix(**thick)
+        np.testing.assert_allclose(
+            thick_matrix[index, neighbor] / thin_matrix[index, neighbor], 3.0, rtol=1e-12,
+        )
+
+        thin_operator, _, _, _ = build_structured_operator(**thin)
+        thick_operator, _, _, _ = build_structured_operator(**thick)
+        basis = np.zeros(thin_matrix.shape[0])
+        basis[neighbor] = 1.0
+        np.testing.assert_allclose(
+            thick_operator.dot(basis)[index] / thin_operator.dot(basis)[index], 3.0, rtol=1e-12,
+        )
+
     def test_matches_reference_assembly(self, simple_setup):
         """Preallocated COO assembly should match the legacy reference implementation."""
         K_ref, b_ref, hA_ref, diag_ref = _build_stiffness_matrix_reference(**simple_setup)
@@ -478,6 +506,51 @@ class TestRunSimulation:
         np.testing.assert_allclose(fast.T, reference.T, rtol=5e-5, atol=1e-3)
         assert fast.k_norm_info["factorizations"] == 0
         assert fast.k_norm_info["backend"] == "MatrixFree-PCG"
+
+
+class TestSteadyState:
+    """Direct equilibrium solves using the existing thermal operators."""
+
+    def test_sparse_equilibrium_uses_conductance_not_capacity(self):
+        config = SolverConfig(20.0, 25.0, 1.0, 20, simulation_mode="steady_state")
+        result = run_steady_state(
+            config, sp.diags([2.0, 2.0], format="csr"),
+            np.array([2.0, 4.0]), np.array([2.0, 2.0]), 1, 1, 2,
+        )
+
+        np.testing.assert_allclose(result.T.ravel(), [26.0, 27.0])
+        assert result.step_counter == 1
+        assert result.k_norm_info["simulation_mode"] == "steady_state"
+        assert result.k_norm_info["steady_rel_diff"] < 1e-12
+
+    def test_matrix_free_equilibrium_matches_sparse_operator(self):
+        setup = TestBuildStiffnessMatrix().simple_setup.__wrapped__(
+            TestBuildStiffnessMatrix()
+        )
+        matrix, _, h_area, _ = build_stiffness_matrix(**setup)
+        operator, _, fast_h_area, _ = build_structured_operator(**setup)
+        power = np.zeros(matrix.shape[0])
+        power[matrix.shape[0] // 2] = 1.0
+        config = SolverConfig(1.0, 25.0, 0.1, 10, simulation_mode="steady_state")
+
+        sparse = run_steady_state(
+            config, matrix, power, h_area,
+            setup["layer_count"], setup["rows"], setup["cols"],
+        )
+        matrix_free = run_steady_state_matrix_free(
+            config, operator, power, fast_h_area,
+        )
+
+        np.testing.assert_allclose(matrix_free.T, sparse.T, rtol=1e-5, atol=1e-5)
+        assert matrix_free.k_norm_info["pcg_iterations"] > 0
+
+    def test_powered_model_without_sink_is_rejected(self):
+        config = SolverConfig(1.0, 25.0, 0.1, 10, simulation_mode="steady_state")
+        with pytest.raises(ValueError, match="thermal path to ambient"):
+            run_steady_state(
+                config, sp.eye(1, format="csr"), np.array([1.0]),
+                np.zeros(1), 1, 1, 1,
+            )
 
 
 class TestPhysicsValidation:
