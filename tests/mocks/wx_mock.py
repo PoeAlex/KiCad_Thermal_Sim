@@ -98,7 +98,7 @@ class _WxMock:
             self._shown = True
 
         def SetSizer(self, sizer):
-            pass
+            self._sizer = sizer
 
         def SetToolTip(self, tip):
             pass
@@ -128,12 +128,13 @@ class _WxMock:
 
         def __init__(self, orient=0):
             self.orient = orient
+            self.items = []
 
         def Add(self, *args, **kwargs):
-            pass
+            self.items.append(args[0])
 
         def AddStretchSpacer(self):
-            pass
+            self.items.append(None)
 
         def ShowItems(self, show=True):
             self._shown = bool(show)

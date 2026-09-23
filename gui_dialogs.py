@@ -22,6 +22,8 @@ try:
 except ImportError:
     HAS_PARDISO = False
 
+from .electrical_solver import net_key_from_values
+
 
 # Tooltip text for every control, keyed by internal name
 TOOLTIP_TEXTS = {
@@ -59,7 +61,7 @@ TOOLTIP_TEXTS = {
     'grid_target_cells': "Legacy coarsening target retained for settings compatibility.",
     'capabilities': "Detected solver backends. PyPardiso accelerates large grids significantly.",
     'help': "Open the ThermalSim documentation in your web browser.",
-    'preview': "Generate a geometry preview image without running the simulation.",
+    'preview': "Map copper, pads, vias, and the simulation area without running the thermal solver.",
     'load_settings': "Load simulation settings from a JSON file.",
     'save_settings': "Save the current simulation settings to a JSON file.",
     'current_enable': "Enable DC current-flow simulation for Joule heating in traces and copper pours.",
@@ -309,7 +311,7 @@ def prepare_current_groups(groups):
     return prepared
 
 
-def summarize_current_groups(groups):
+def summarize_current_groups(groups, supernet_map=None):
     """
     Build user-readable group and net balance summaries.
 
@@ -317,6 +319,8 @@ def summarize_current_groups(groups):
     ----------
     groups : list of dict
         Current groups.
+    supernet_map : dict, optional
+        Raw-net to declared electrical-supernet mapping.
 
     Returns
     -------
@@ -342,7 +346,9 @@ def summarize_current_groups(groups):
             f"{total_current:.6g} A",
         ))
         for pad in group.get('pads', []):
-            net = pad.get('net_name') or "(no net)"
+            raw_key = net_key_from_values(pad.get('net_code'), pad.get('net_name'))
+            supernet = (supernet_map or {}).get(raw_key)
+            net = supernet.display_name if supernet else (pad.get('net_name') or "(no net)")
             net_totals[net] = net_totals.get(net, 0.0) + float(pad.get('current_a', 0.0))
     balance_rows = []
     for net, total in sorted(net_totals.items()):
@@ -381,6 +387,8 @@ class SettingsDialog(wx.Dialog):
         Default values to pre-fill in the dialog.
     defer_initial_preflight : bool, optional
         Schedule the first board scan after the dialog becomes visible.
+    electrical_supernets : dict, optional
+        Declared net-tie supernets used for the current-balance display.
 
     Attributes
     ----------
@@ -411,6 +419,8 @@ class SettingsDialog(wx.Dialog):
         board_name="",
         board_size_mm=None,
         defer_initial_preflight=False,
+        electrical_supernets=None,
+        electrical_preview_callback=None,
     ):
         dialog_style = (
             getattr(wx, "DEFAULT_DIALOG_STYLE", 0)
@@ -422,12 +432,14 @@ class SettingsDialog(wx.Dialog):
         self.board_name = str(board_name or "Unsaved board")
         self.board_size_mm = tuple(board_size_mm or ())
         self.preview_callback = preview_callback
+        self.electrical_preview_callback = electrical_preview_callback
         self.selection_provider = selection_provider
         self.run_callback = run_callback
         self.close_callback = close_callback
         self.preflight_callback = preflight_callback
         self.load_settings_callback = load_settings_callback
         self.save_settings_callback = save_settings_callback
+        self.electrical_supernets = electrical_supernets or {}
         self.current_groups = []
         self.current_group_index = -1
         self.power_pads = []
@@ -544,7 +556,19 @@ class SettingsDialog(wx.Dialog):
         self.btn_more.Bind(wx.EVT_BUTTON, self._on_more)
         footer.Add(self.btn_more, 0, wx.ALL, 4)
 
-        self.btn_preview = wx.Button(self.footer_actions_panel, label="Preview")
+        self.btn_electrical_preview = wx.Button(
+            self.footer_actions_panel, label="Electrical Preview"
+        )
+        self.btn_electrical_preview.Bind(wx.EVT_BUTTON, self._on_electrical_preview)
+        self.btn_electrical_preview.Enable(bool(self.electrical_preview_callback))
+        self.btn_electrical_preview.SetToolTip(
+            "Show the electrical raster and directional connections used by current heating."
+        )
+        footer.Add(self.btn_electrical_preview, 0, wx.ALL, 4)
+
+        self.btn_preview = wx.Button(
+            self.footer_actions_panel, label="Thermal Geometry Preview"
+        )
         self.btn_preview.Bind(wx.EVT_BUTTON, self._on_preview)
         self.btn_preview.SetToolTip(TOOLTIP_TEXTS['preview'])
         footer.Add(self.btn_preview, 0, wx.ALL, 4)
@@ -1295,33 +1319,43 @@ class SettingsDialog(wx.Dialog):
             pass
 
     def _on_preview(self, event):
-        """Handle Preview button click."""
-        if self.preview_callback:
-            settings = self.get_values()
-            if settings and self._refresh_preflight(settings):
+        """Handle Thermal Geometry Preview button click."""
+        self._run_preview(self.preview_callback, self.btn_preview, "thermal geometry")
+
+    def _on_electrical_preview(self, event):
+        """Handle the electrical connectivity preview action."""
+        self._run_preview(
+            self.electrical_preview_callback,
+            self.btn_electrical_preview,
+            "electrical",
+        )
+
+    def _run_preview(self, callback, button, kind):
+        if not callback:
+            return
+        settings = self.get_values()
+        if not settings or not self._refresh_preflight(settings):
+            return
+        self._set_footer_status(f"Building {kind} preview...", f"Preparing {kind} geometry.")
+        button.Enable(False)
+        try:
+            output_path = callback(settings, self.layer_names)
+            if output_path:
                 self._set_footer_status(
-                    "Building preview...",
-                    "Extracting and rasterizing board geometry.",
+                    f"{kind.capitalize()} preview ready", os.path.basename(output_path)
                 )
-                self.btn_preview.Enable(False)
-                try:
-                    output_path = self.preview_callback(settings, self.layer_names)
-                    if output_path:
-                        self._set_footer_status(
-                            "Preview ready", os.path.basename(output_path)
-                        )
-                    else:
-                        self._set_footer_status(
-                            "Preview failed", "No preview image was created."
-                        )
-                except Exception:
-                    self._set_footer_status(
-                        "Preview failed",
-                        "The geometry preview could not be created.",
-                    )
-                    wx.MessageBox("Geometry preview failed.", "ThermalSim")
-                finally:
-                    self.btn_preview.Enable(True)
+            else:
+                self._set_footer_status(
+                    f"{kind.capitalize()} preview failed", "No preview image was created."
+                )
+        except Exception:
+            self._set_footer_status(
+                f"{kind.capitalize()} preview failed",
+                f"The {kind} preview could not be created.",
+            )
+            wx.MessageBox(f"{kind.capitalize()} preview failed.", "ThermalSim")
+        finally:
+            button.Enable(True)
 
     def _on_run(self, event):
         """Handle Run button click for modal and modeless workflows."""
@@ -1719,10 +1753,20 @@ class SettingsDialog(wx.Dialog):
     def _refresh_context_summary(self):
         """Refresh persistent heat-source and current-flow context."""
         power_text = summarize_power_pads(self.power_pads)
+        active_current = any(
+            abs(float(pad.get("current_a", 0.0) or 0.0)) > 0.0
+            for group in self.current_groups
+            for pad in group.get("pads", [])
+        )
+        self.btn_electrical_preview.Enable(
+            bool(self.electrical_preview_callback)
+            and self.chk_current_enabled.GetValue()
+            and active_current
+        )
         if not self.chk_current_enabled.GetValue():
             current_text = "Current heating off"
         else:
-            _, balance_rows = summarize_current_groups(self.current_groups)
+            _, balance_rows = summarize_current_groups(self.current_groups, self.electrical_supernets)
             if not balance_rows:
                 current_text = "Current heating on / no terminals"
             elif any(status != "OK" for _, _, status in balance_rows):
@@ -1922,7 +1966,7 @@ class SettingsDialog(wx.Dialog):
             self.current_group_index = 0
         try:
             self.current_group_list.DeleteAllItems()
-            rows, balance_rows = summarize_current_groups(self.current_groups)
+            rows, balance_rows = summarize_current_groups(self.current_groups, self.electrical_supernets)
             for row_idx, row in enumerate(rows):
                 self.current_group_list.InsertItem(row_idx, row[0])
                 for col_idx, value in enumerate(row[1:], start=1):
@@ -1930,7 +1974,7 @@ class SettingsDialog(wx.Dialog):
             if 0 <= self.current_group_index < len(self.current_groups):
                 self.current_group_list.Select(self.current_group_index)
         except Exception:
-            _, balance_rows = summarize_current_groups(self.current_groups)
+            _, balance_rows = summarize_current_groups(self.current_groups, self.electrical_supernets)
 
         lines = []
         for net, total, status in balance_rows:

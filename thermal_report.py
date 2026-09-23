@@ -432,6 +432,11 @@ def _build_current_path_diagnostics(electrical_summary, k_norm_info, joule_map_p
             net.get("edge_count", ""),
             net.get("via_edge_count", ""),
             net.get("connected_component_count", ""),
+            ", ".join(net.get("raw_net_names", []) or []),
+            net.get("diagonal_edge_count", ""),
+            net.get("rejected_diagonal_candidate_count", ""),
+            net.get("net_tie_edge_count", ""),
+            f"{net.get('component_count_before_ties', '')} / {net.get('component_count_after_ties', '')}",
         ))
 
     terminal_rows = []
@@ -489,7 +494,7 @@ def _build_current_path_diagnostics(electrical_summary, k_norm_info, joule_map_p
         f"{cards}<div class='spacer-sm'></div>"
         f"{_build_warning_block(_current_path_warnings(electrical_summary, k_norm_info))}"
         "<h3 class='section-title'>Net Path Metrics</h3>"
-        f"{_table_html(['Net', 'Terminals', 'Source/Sink', 'Balance', 'Loss', 'R_eff', 'V_eq', 'Pad R', 'Cells', 'Edges', 'Via Edges', 'Islands'], net_rows, empty_text='No net path metrics recorded.')}"
+        f"{_table_html(['Net', 'Terminals', 'Source/Sink', 'Balance', 'Loss', 'R_eff', 'V_eq', 'Pad R', 'Cells', 'Edges', 'Via Edges', 'Islands', 'Raw Nets', 'Diagonal Edges', 'Rejected Diagonals', 'Tie Edges', 'Components Before/After Ties'], net_rows, empty_text='No net path metrics recorded.')}"
         "<div class='spacer-sm'></div><h3 class='section-title'>Current Terminals</h3>"
         f"{_table_html(['Pad', 'Net', 'Current', 'Layer', 'Position', 'BBox', 'Cells', 'Island', 'Potential'], terminal_rows, empty_text='No terminal diagnostics recorded.')}"
         "<div class='spacer-sm'></div><h3 class='section-title'>Mapped KiCad Primitives</h3>"

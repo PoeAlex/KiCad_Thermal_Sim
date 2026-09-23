@@ -16,6 +16,7 @@ from ThermalSim.thermal_plugin import (
     _coarsen_grid_resolution,
     _effective_fr4_control_volume_thicknesses,
     _find_pcb_editor_parent,
+    _pad_target_layer_index,
     _resolve_grid_policy,
 )
 from tests.mocks.pcbnew_mock import (
@@ -27,6 +28,7 @@ from tests.mocks.pcbnew_mock import (
     EDA_RECT,
     F_Cu,
     B_Cu,
+    In1_Cu,
 )
 
 
@@ -231,6 +233,17 @@ def _legacy_power_vector(board, copper_ids, pads_list, pad_sources, rows, cols, 
 
 class TestPowerVectorHelpers:
     """Tests for sparse pad power helper functions."""
+
+    def test_inner_layer_pad_power_targets_first_copper_layer_set_member(self):
+        """Power from an inner-layer pad must use its actual copper layer."""
+        pad = MockPad(layer=F_Cu, layers=[In1_Cu])
+        board = MockBoard(layer_names={F_Cu: "F.Cu", In1_Cu: "In1.Cu"})
+
+        target = _pad_target_layer_index(
+            board, [F_Cu, In1_Cu], pad, {F_Cu: 0, In1_Cu: 1}
+        )
+
+        assert target == 1
 
     def _board_and_pads(self):
         board = MockBoard(layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"})

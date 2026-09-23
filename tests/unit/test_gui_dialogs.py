@@ -466,6 +466,26 @@ class TestCurrentGroupSettings:
 
         assert balance_rows == [('PWR', '0 A', 'OK')]
 
+    def test_summarize_current_groups_uses_net_tie_supernet_balance(self):
+        from ThermalSim.electrical_solver import ElectricalSupernet
+        from ThermalSim.gui_dialogs import summarize_current_groups
+
+        supernet = ElectricalSupernet("C:1", ("C:1", "C:2"), ("IN", "OUT"))
+        groups = [{
+            'name': 'Net tie path',
+            'mode': 'per_pad',
+            'pads': [
+                {'pad_key': 'a', 'name': 'J1-1', 'net_name': 'IN', 'net_code': 1, 'current_a': 1.0},
+                {'pad_key': 'b', 'name': 'J2-1', 'net_name': 'OUT', 'net_code': 2, 'current_a': -1.0},
+            ],
+        }]
+
+        _, balance_rows = summarize_current_groups(
+            groups, {"C:1": supernet, "C:2": supernet}
+        )
+
+        assert balance_rows == [('IN + OUT', '0 A', 'OK')]
+
     def test_default_mode_is_per_pad_for_new_groups(self):
         from ThermalSim.gui_dialogs import prepare_current_groups
 
@@ -994,3 +1014,42 @@ class TestSimulationDetailSettings:
         assert values['area_mode'] == 'active'
         assert values['area_margin_mm'] == 15.0
         assert values['limit_area'] is True
+
+
+class TestPreviewActions:
+    """Tests for the dialog's preview labels and workflow."""
+
+    def test_electrical_preview_precedes_thermal_geometry_preview(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(
+            None, 0, 0.5, ["F.Cu", "B.Cu"],
+            preview_callback=lambda *_: None,
+            electrical_preview_callback=lambda *_: None,
+        )
+        buttons = [
+            item for item in dlg.footer_actions_panel._sizer.items
+            if item is not None
+        ]
+
+        assert [button.label for button in buttons] == [
+            "More", "Electrical Preview", "Thermal Geometry Preview",
+            "Run Simulation", "Close",
+        ]
+
+    def test_electrical_preview_requires_enabled_current_and_active_terminals(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(
+            None, 0, 0.5, ["F.Cu", "B.Cu"],
+            electrical_preview_callback=lambda *_: None,
+        )
+        assert not dlg.btn_electrical_preview.IsEnabled()
+
+        dlg.current_groups = [{"pads": [{"current_a": 1.0}]}]
+        dlg._refresh_context_summary()
+        assert not dlg.btn_electrical_preview.IsEnabled()
+
+        dlg.chk_current_enabled.SetValue(True)
+        dlg._refresh_context_summary()
+        assert dlg.btn_electrical_preview.IsEnabled()

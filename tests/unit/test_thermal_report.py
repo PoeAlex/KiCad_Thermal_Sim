@@ -528,6 +528,12 @@ class TestWriteHtmlReport:
                     'edge_count': 820,
                     'via_edge_count': 0,
                     'connected_component_count': 3,
+                    'raw_net_names': ['PWR<main>', 'GND'],
+                    'diagonal_edge_count': 12,
+                    'rejected_diagonal_candidate_count': 4,
+                    'net_tie_edge_count': 1,
+                    'component_count_before_ties': 4,
+                    'component_count_after_ties': 3,
                     'terminal_diagnostics': [
                         {
                             'name': 'U1<1>',
@@ -579,6 +585,10 @@ class TestWriteHtmlReport:
         assert "default grid limits" in content
         assert "Grid resolution was auto-coarsened" in content
         assert "Mapped KiCad Primitives" in content
+        assert "Raw Nets" in content
+        assert "PWR&lt;main&gt;, GND" in content
+        assert "Rejected Diagonals" in content
+        assert "Components Before/After Ties" in content
         assert "joule_loss_map.png" in content
         assert "PWR&lt;main&gt;" in content
         assert "U1&lt;1&gt;" in content
