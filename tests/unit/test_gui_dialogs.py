@@ -994,3 +994,88 @@ class TestSimulationDetailSettings:
         assert values['area_mode'] == 'active'
         assert values['area_margin_mm'] == 15.0
         assert values['limit_area'] is True
+
+
+class TestPreflightDebounce:
+    """Tests for preflight timer debouncing and fallback behavior."""
+
+    def test_estimate_input_changed_refreshes_immediately_under_wx_mock(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+        from ThermalSim.workflow import GridEstimate, PreflightResult
+
+        calls = []
+        grid = GridEstimate(0.5, 0.5, 0, 0, 10, 10, 24, 24, 2, False, False, 200000, 100000)
+
+        def preflight(settings):
+            calls.append(settings["res"])
+            return PreflightResult(grid=grid)
+
+        dlg = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            preflight_callback=preflight,
+        )
+        assert len(calls) >= 1
+        assert dlg._preflight_timer is None
+        calls.clear()
+
+        dlg.res_input.SetValue(0.25)
+        dlg._on_estimate_input_changed(None)
+        assert calls == [0.25]
+
+    def test_estimate_input_changed_debounces_with_wx_timer_and_stops_on_cancel(self, monkeypatch):
+        import ThermalSim.gui_dialogs as gui_mod
+        from ThermalSim.workflow import GridEstimate, PreflightResult
+
+        class FakeTimer:
+            instances = []
+
+            def __init__(self, owner):
+                self.owner = owner
+                self.started_ms = []
+                self.stop_calls = 0
+                FakeTimer.instances.append(self)
+
+            def StartOnce(self, ms):
+                self.started_ms.append(ms)
+                return True
+
+            def Stop(self):
+                self.stop_calls += 1
+
+        monkeypatch.setattr(gui_mod.wx, "Timer", FakeTimer, raising=False)
+        monkeypatch.setattr(gui_mod.wx, "EVT_TIMER", "EVT_TIMER", raising=False)
+
+        calls = []
+        grid = GridEstimate(0.5, 0.5, 0, 0, 10, 10, 24, 24, 2, False, False, 200000, 100000)
+
+        def preflight(settings):
+            calls.append(settings["res"])
+            return PreflightResult(grid=grid)
+
+        dlg = gui_mod.SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            preflight_callback=preflight,
+        )
+        assert len(calls) >= 1
+        assert len(FakeTimer.instances) == 1
+        timer = FakeTimer.instances[0]
+        assert dlg._preflight_timer is timer
+        calls.clear()
+
+        # Rapid edits should debounce without running preflight immediately
+        dlg.res_input.SetValue(0.4)
+        dlg._on_estimate_input_changed(None)
+        dlg.res_input.SetValue(0.3)
+        dlg._on_estimate_input_changed(None)
+        assert calls == []
+        assert timer.started_ms == [150, 150]
+
+        # Timer firing triggers a single preflight refresh with the latest value
+        dlg._on_preflight_timer(None)
+        assert calls == [0.3]
+
+        # Closing stops and clears the timer
+        stops_before = timer.stop_calls
+        dlg._on_cancel(None)
+        assert timer.stop_calls == stops_before + 1
+        assert dlg._preflight_timer is None

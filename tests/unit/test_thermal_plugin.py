@@ -20,11 +20,14 @@ from ThermalSim.thermal_plugin import (
 )
 from tests.mocks.pcbnew_mock import (
     MockBoard,
+    MockDrawing,
     MockFootprint,
     MockPad,
+    MockTrack,
     MockZone,
     VECTOR2I,
     EDA_RECT,
+    Eco1_User,
     F_Cu,
     B_Cu,
 )
@@ -348,6 +351,136 @@ class TestPowerVectorHelpers:
 
         assert plugin._resolve_power_pad_objects(board, settings) == [power_pad]
         assert plugin._resolve_current_pad_objects(board, settings) == [current_pad]
+
+    def test_preflight_scans_board_footprints_only_once(self, tmp_path):
+        """Preflight should reuse a single pad lookup across power and current resolution."""
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        power_pad = MockPad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        sink_pad = MockPad(
+            position=VECTOR2I(7_000_000, 5_000_000),
+            layer=F_Cu,
+            net_code=1,
+            net_name="VIN",
+            number="2",
+        )
+
+        class CountingBoard(MockBoard):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.footprint_scans = 0
+
+            def Footprints(self):
+                self.footprint_scans += 1
+                return super().Footprints()
+
+            def GetFootprints(self):
+                self.footprint_scans += 1
+                return super().GetFootprints()
+
+        board = CountingBoard(
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+            footprints=[MockFootprint("J1", [power_pad, sink_pad])],
+        )
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        d1 = plugin._pad_descriptor(board, "J1", power_pad)
+        d2 = plugin._pad_descriptor(board, "J1", sink_pad)
+        settings = {
+            "res": 0.5,
+            "output_dir": str(tmp_path),
+            "power_pads": [{**d1, "power": "1.5"}],
+            "current_enabled": True,
+            "current_groups": [{
+                "name": "Rail",
+                "mode": "per_pad",
+                "pads": [
+                    {**d1, "current_a": 2.0},
+                    {**d2, "current_a": -2.0},
+                ],
+            }],
+        }
+        board.footprint_scans = 0
+        result = plugin._preflight(
+            board,
+            [F_Cu, B_Cu],
+            EDA_RECT(0, 0, 20_000_000, 20_000_000),
+            settings,
+        )
+
+        assert result.ready is True
+        assert board.footprint_scans == 1
+
+
+class TestBoardSnapshotCompleteness:
+    """Tests for _capture_board_snapshot Eco1 drawings and KiCad 10 via safety."""
+
+    def test_snapshot_includes_eco1_drawings_and_invalidates_on_move(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        bbox = EDA_RECT(0, 0, 20_000_000, 20_000_000)
+
+        board_a = MockBoard(
+            drawings=[MockDrawing(layer=Eco1_User, bbox=EDA_RECT(1_000_000, 1_000_000, 5_000_000, 5_000_000))]
+        )
+        board_b = MockBoard(
+            drawings=[MockDrawing(layer=Eco1_User, bbox=EDA_RECT(4_000_000, 2_000_000, 5_000_000, 5_000_000))]
+        )
+        board_other_layer = MockBoard(
+            drawings=[
+                MockDrawing(layer=Eco1_User, bbox=EDA_RECT(1_000_000, 1_000_000, 5_000_000, 5_000_000)),
+                MockDrawing(layer=F_Cu, bbox=EDA_RECT(8_000_000, 8_000_000, 2_000_000, 2_000_000)),
+            ]
+        )
+
+        snap_a = plugin._capture_board_snapshot(board_a, [F_Cu, B_Cu], bbox)
+        snap_b = plugin._capture_board_snapshot(board_b, [F_Cu, B_Cu], bbox)
+        snap_other = plugin._capture_board_snapshot(board_other_layer, [F_Cu, B_Cu], bbox)
+
+        assert snap_a.fingerprint != snap_b.fingerprint
+        assert snap_a.fingerprint == snap_other.fingerprint
+
+    def test_snapshot_via_uses_layer_arg_and_avoids_zero_arg_get_width(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        class KiCad10PCB_VIA(MockTrack):
+            def __init__(self):
+                super().__init__(layer=F_Cu, bbox=EDA_RECT(2_000_000, 2_000_000, 600_000, 600_000))
+                self.called_layers = []
+
+            def GetWidth(self, layer=None):
+                if layer is None:
+                    raise AssertionError("PCB_VIA.GetWidth() called without layer argument")
+                self.called_layers.append(layer)
+                return 600_000
+
+        via = KiCad10PCB_VIA()
+        board = MockBoard(tracks=[via])
+        plugin = ThermalPlugin()
+        plugin.defaults()
+
+        snap = plugin._capture_board_snapshot(
+            board, [F_Cu, B_Cu], EDA_RECT(0, 0, 10_000_000, 10_000_000)
+        )
+
+        assert snap.track_count == 1
+        assert via.called_layers == [F_Cu]
+
+        # Also safe when copper_ids is empty (never calls zero-arg GetWidth)
+        via_empty = KiCad10PCB_VIA()
+        snap_empty = plugin._capture_board_snapshot(
+            MockBoard(tracks=[via_empty]), [], EDA_RECT(0, 0, 10_000_000, 10_000_000)
+        )
+        assert snap_empty.track_count == 1
+        assert via_empty.called_layers == []
 
 
 class TestSettingsPersistence:

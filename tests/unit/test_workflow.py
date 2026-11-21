@@ -182,9 +182,109 @@ def test_geometry_cache_prunes_old_files(tmp_path):
     cache.put("first", {"data": b"x" * 400})
     cache.put("second", {"data": b"y" * 400})
 
-    files = list((tmp_path / "geometry-cache").glob("*.pickle"))
+    files = list((tmp_path / "geometry-cache").glob("*.json"))
     assert len(files) == 1
-    assert files[0].name == "second.pickle"
+    assert files[0].name == "second.json"
+
+
+def test_geometry_cache_persists_geometry_state_as_npz(tmp_path):
+    from ThermalSim.geometry_mapper import GeometryState
+
+    cache_dir = tmp_path / "geometry-cache"
+    first = GeometryCache(
+        persistent=True,
+        max_bytes=10 * 1024 * 1024,
+        cache_dir=str(cache_dir),
+    )
+    state = GeometryState(
+        copper_mask=np.array([[[True, False], [False, True]], [[False, True], [True, False]]], dtype=bool),
+        via_map=np.array([[1.0, 0.0], [0.0, 2.5]], dtype=np.float64),
+        heatsink_mask=np.array([[True, True], [False, False]], dtype=bool),
+        area_mask=np.array([[True, True], [True, False]], dtype=bool),
+        x_min=1.25,
+        y_min=-3.5,
+        res=0.25,
+        rows=2,
+        cols=2,
+        x_centers_iu=np.array([1_375_000, 1_625_000], dtype=np.int64),
+        y_centers_iu=np.array([-3_375_000, -3_125_000], dtype=np.int64),
+    )
+    first.put("geom_with_area", state)
+
+    state_no_area = GeometryState(
+        copper_mask=state.copper_mask,
+        via_map=state.via_map,
+        heatsink_mask=state.heatsink_mask,
+        area_mask=None,
+        x_min=0.0,
+        y_min=0.0,
+        res=0.5,
+        rows=2,
+        cols=2,
+        x_centers_iu=state.x_centers_iu,
+        y_centers_iu=state.y_centers_iu,
+    )
+    first.put("geom_no_area", state_no_area)
+
+    assert (cache_dir / "geom_with_area.npz").is_file()
+    assert (cache_dir / "geom_no_area.npz").is_file()
+    assert list(cache_dir.glob("*.pickle")) == []
+
+    second = GeometryCache(
+        persistent=True,
+        max_bytes=10 * 1024 * 1024,
+        cache_dir=str(cache_dir),
+    )
+    loaded = second.get("geom_with_area")
+    assert isinstance(loaded, GeometryState)
+    np.testing.assert_array_equal(loaded.copper_mask, state.copper_mask)
+    np.testing.assert_array_equal(loaded.via_map, state.via_map)
+    np.testing.assert_array_equal(loaded.heatsink_mask, state.heatsink_mask)
+    np.testing.assert_array_equal(loaded.area_mask, state.area_mask)
+    np.testing.assert_array_equal(loaded.x_centers_iu, state.x_centers_iu)
+    np.testing.assert_array_equal(loaded.y_centers_iu, state.y_centers_iu)
+    assert loaded.x_min == state.x_min
+    assert loaded.y_min == state.y_min
+    assert loaded.res == state.res
+    assert loaded.rows == state.rows
+    assert loaded.cols == state.cols
+
+    loaded_no_area = second.get("geom_no_area")
+    assert isinstance(loaded_no_area, GeometryState)
+    assert loaded_no_area.area_mask is None
+
+
+def test_geometry_cache_never_loads_legacy_pickle_and_prunes_it(tmp_path):
+    cache_dir = tmp_path / "geometry-cache"
+    cache_dir.mkdir()
+    legacy_pickle = cache_dir / "legacy_key.pickle"
+    legacy_pickle.write_bytes(b"x" * 500)
+
+    cache = GeometryCache(
+        persistent=True,
+        max_bytes=600,
+        cache_dir=str(cache_dir),
+    )
+    assert cache.get("legacy_key") is None
+
+    cache.put("fresh_key", {"data": "y" * 400})
+    assert not legacy_pickle.exists()
+    assert (cache_dir / "fresh_key.json").is_file()
+
+
+def test_geometry_cache_removes_corrupt_files(tmp_path):
+    cache_dir = tmp_path / "geometry-cache"
+    cache_dir.mkdir()
+    bad_npz = cache_dir / "bad_npz.npz"
+    bad_npz.write_bytes(b"not a valid zip archive")
+    bad_json = cache_dir / "bad_json.json"
+    bad_json.write_text("{corrupt", encoding="utf-8")
+
+    cache = GeometryCache(persistent=True, cache_dir=str(cache_dir))
+    assert cache.get("bad_npz") is None
+    assert not bad_npz.exists()
+    assert cache.get("bad_json") is None
+    assert not bad_json.exists()
 
 
 def test_thermal_operator_cache_reuses_only_matching_key():
@@ -221,7 +321,49 @@ def test_cancellation_token_is_thread_safe_signal():
 
 def test_process_memory_probe_is_safe():
     value = get_process_memory_mb()
+    peak = get_process_memory_mb(peak=True)
     assert value is None or value > 0.0
+    assert peak is None or peak > 0.0
+
+
+def test_process_memory_linux_proc_status(monkeypatch):
+    import io
+    import ThermalSim.workflow as workflow_mod
+
+    status_content = "Name:\tpython\nVmHWM:\t  20480 kB\nVmRSS:\t  10240 kB\n"
+    monkeypatch.setattr(workflow_mod.os, "name", "posix")
+    monkeypatch.setattr("builtins.open", lambda path, *a, **kw: io.StringIO(status_content))
+
+    assert workflow_mod.get_process_memory_mb(peak=False) == 10.0
+    assert workflow_mod.get_process_memory_mb(peak=True) == 20.0
+
+
+def test_process_memory_rusage_fallback_darwin_and_posix(monkeypatch):
+    import types
+    import ThermalSim.workflow as workflow_mod
+
+    monkeypatch.setattr(workflow_mod.os, "name", "posix")
+
+    def fail_open(path, *args, **kwargs):
+        raise OSError("no /proc")
+
+    monkeypatch.setattr("builtins.open", fail_open)
+
+    fake_resource = types.SimpleNamespace(
+        RUSAGE_SELF=0,
+        getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=64 * 1024 * 1024),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "resource", fake_resource)
+    monkeypatch.setattr(workflow_mod.sys, "platform", "darwin")
+    assert workflow_mod.get_process_memory_mb(peak=True) == 64.0
+
+    fake_resource_linux = types.SimpleNamespace(
+        RUSAGE_SELF=0,
+        getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=32 * 1024),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "resource", fake_resource_linux)
+    monkeypatch.setattr(workflow_mod.sys, "platform", "linux")
+    assert workflow_mod.get_process_memory_mb(peak=True) == 32.0
 
 
 def test_preflight_status_prioritizes_errors():

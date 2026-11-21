@@ -140,11 +140,16 @@ def build_zip(version, output_dir):
             arc_name = f"plugins/{filename}"
             zf.write(src_path, arc_name)
 
-        native_dll = os.path.join(
-            script_dir, "native", "bin", "thermalsim_core.dll"
-        )
-        if os.path.isfile(native_dll):
-            zf.write(native_dll, "plugins/thermalsim_core.dll")
+        for binary_name in (
+            "thermalsim_core.dll",
+            "libthermalsim_core.so",
+            "libthermalsim_core.dylib",
+        ):
+            native_bin = os.path.join(
+                script_dir, "native", "bin", binary_name
+            )
+            if os.path.isfile(native_bin):
+                zf.write(native_bin, f"plugins/{binary_name}")
 
     return zip_path
 

@@ -417,3 +417,35 @@ class TestFindPython:
             with patch('os.path.isfile', return_value=False):
                 result = _find_python()
         assert result == r"C:\Program Files\KiCad\bin\kicad.exe"
+
+    def test_returns_posix_python3_sys_executable(self):
+        """Test that _find_python returns sys.executable on Linux/macOS when it is python3."""
+        from ThermalSim.dependency_installer import _find_python
+
+        with patch('ThermalSim.dependency_installer.sys') as mock_sys:
+            mock_sys.executable = "/usr/bin/python3"
+            mock_sys.prefix = "/usr"
+            result = _find_python()
+        assert result == "/usr/bin/python3"
+
+    def test_finds_python3_in_posix_exe_dir(self):
+        """Test that _find_python finds python3 alongside kicad on POSIX."""
+        from ThermalSim.dependency_installer import _find_python
+
+        with patch('ThermalSim.dependency_installer.sys') as mock_sys:
+            mock_sys.executable = "/usr/bin/kicad"
+            mock_sys.prefix = "/usr"
+            with patch('os.path.isfile', side_effect=lambda path: path == "/usr/bin/python3"):
+                result = _find_python()
+        assert result == "/usr/bin/python3"
+
+    def test_finds_python3_in_posix_sys_prefix_bin(self):
+        """Test that _find_python checks sys.prefix/bin/python3 on Linux/macOS."""
+        from ThermalSim.dependency_installer import _find_python
+
+        with patch('ThermalSim.dependency_installer.sys') as mock_sys:
+            mock_sys.executable = "/opt/kicad/bin/kicad"
+            mock_sys.prefix = "/usr/local"
+            with patch('os.path.isfile', side_effect=lambda path: path == "/usr/local/bin/python3"):
+                result = _find_python()
+        assert result == "/usr/local/bin/python3"

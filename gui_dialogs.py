@@ -438,6 +438,9 @@ class SettingsDialog(wx.Dialog):
         self.last_report_path = None
         self.last_run_dir = None
         self.last_run_status = "idle"
+        self._preflight_debounce_ms = 150
+        self._preflight_timer = None
+        self._init_preflight_timer()
 
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
@@ -1340,8 +1343,59 @@ class SettingsDialog(wx.Dialog):
             except Exception:
                 pass
 
+    def _init_preflight_timer(self):
+        """Initialize a wx.Timer for debouncing preflight updates when available."""
+        timer_cls = getattr(wx, "Timer", None)
+        timer_event = getattr(wx, "EVT_TIMER", None)
+        if timer_cls is None or timer_event is None:
+            self._preflight_timer = None
+            return
+        try:
+            timer = timer_cls(self)
+            if hasattr(timer, "StartOnce") or hasattr(timer, "Start"):
+                self.Bind(timer_event, self._on_preflight_timer, timer)
+                self._preflight_timer = timer
+            else:
+                self._preflight_timer = None
+        except Exception:
+            self._preflight_timer = None
+
+    def _stop_preflight_timer(self):
+        """Stop any pending debounced preflight timer."""
+        timer = getattr(self, "_preflight_timer", None)
+        if timer is not None:
+            try:
+                timer.Stop()
+            except Exception:
+                pass
+
+    def _schedule_preflight_refresh(self):
+        """Debounce preflight refresh via wx.Timer or run synchronously if unavailable."""
+        timer = getattr(self, "_preflight_timer", None)
+        if timer is not None:
+            try:
+                if hasattr(timer, "Stop"):
+                    timer.Stop()
+                if hasattr(timer, "StartOnce"):
+                    started = timer.StartOnce(self._preflight_debounce_ms)
+                    if started is not False:
+                        return
+                elif hasattr(timer, "Start"):
+                    one_shot = getattr(wx, "TIMER_ONE_SHOT", True)
+                    started = timer.Start(self._preflight_debounce_ms, one_shot)
+                    if started is not False:
+                        return
+            except Exception:
+                pass
+        self._refresh_preflight()
+
+    def _on_preflight_timer(self, event):
+        """Execute the debounced preflight refresh."""
+        self._refresh_preflight()
+
     def _refresh_preflight(self, settings=None):
         """Refresh the permanent readiness summary and Run availability."""
+        self._stop_preflight_timer()
         settings = settings if settings is not None else self.get_values()
         if settings is None:
             self._set_footer_status(
@@ -1453,6 +1507,8 @@ class SettingsDialog(wx.Dialog):
 
     def _on_cancel(self, event):
         """Handle Cancel button click."""
+        self._stop_preflight_timer()
+        self._preflight_timer = None
         if self.close_callback:
             self.close_callback()
         try:
@@ -1499,7 +1555,7 @@ class SettingsDialog(wx.Dialog):
 
     def _on_estimate_input_changed(self, event):
         """Refresh area and grid estimates after a numeric input changes."""
-        self._refresh_preflight()
+        self._schedule_preflight_refresh()
         try:
             event.Skip()
         except Exception:

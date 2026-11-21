@@ -14,15 +14,22 @@ including:
 import pytest
 import numpy as np
 import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 
+from ThermalSim import thermal_solver
 from ThermalSim.thermal_solver import (
     SolverConfig,
     SolverResult,
+    _assemble_structured_csc,
+    _build_phase_plan,
+    _coarsen_structured_operator,
+    _solve_pcg,
     build_stiffness_matrix,
     build_structured_operator,
     run_simulation,
     run_simulation_matrix_free,
 )
+from ThermalSim.workflow import ThermalFactorizationCache
 
 
 def _build_stiffness_matrix_reference(
@@ -1085,3 +1092,331 @@ class TestEdgeCases:
 
         assert result.step_counter > 0, "Should complete at least one step"
         assert not result.aborted, "Short simulation should complete normally"
+
+
+class TestAutoTimeSteppingAndFactorizationCache:
+    """Tests for large-grid SciPy auto single-factorization and cache lifecycle."""
+
+    def test_large_auto_scipy_plan_uses_single_uniform_phase(self):
+        """SciPy auto should switch to single-factorization uniform at >=100k nodes."""
+        config = SolverConfig(
+            1.0, 25.0, 1.0 / 120.0, 120, use_pardiso=False, time_stepping="auto"
+        )
+        mode_small, plan_small = _build_phase_plan(config, 99_999, False)
+        assert mode_small == "multi_phase"
+        assert [item[0]["name"] for item in plan_small] == ["A", "B", "C"]
+
+        mode_large, plan_large = _build_phase_plan(config, 100_000, False)
+        assert mode_large == "uniform"
+        assert len(plan_large) == 1
+        assert plan_large[0][2] == 95
+        assert plan_large[0][0]["derivative_start"] is True
+
+        # PARDISO threshold stays at 250k nodes
+        pardiso_cfg = SolverConfig(
+            1.0, 25.0, 1.0 / 120.0, 120, use_pardiso=True, time_stepping="auto"
+        )
+        mode_p_mid, _ = _build_phase_plan(pardiso_cfg, 200_000, True)
+        assert mode_p_mid == "multi_phase"
+        mode_p_large, plan_p_large = _build_phase_plan(pardiso_cfg, 250_000, True)
+        assert mode_p_large == "uniform"
+        assert plan_p_large[0][0]["derivative_start"] is True
+
+    def test_scipy_auto_single_factorization_matches_multi_phase(self, monkeypatch):
+        """Derivative-start uniform auto uses 1 factorization and matches multi-phase."""
+        layer_count, rows, cols = 2, 16, 16
+        N = layer_count * rows * cols
+        copper_mask = np.zeros((layer_count, rows, cols), dtype=bool)
+        copper_mask[0, 5:11, 4:12] = True
+        V_map = np.ones((rows, cols))
+        V_map[7:9, 7:9] = 20.0
+        H_map = np.zeros((rows, cols))
+        H_map[10:, 10:] = 1.0
+        settings = {"h_conv": 10.0, "pad_th": 1.0, "pad_k": 3.0}
+        K, b, hA, _ = build_stiffness_matrix(
+            layer_count, rows, cols, copper_mask,
+            np.full(layer_count, 35e-6), np.full(layer_count, 0.8e-3),
+            390.0, 0.3, 0.5e-3, 0.5e-3, V_map, [1.5e-3], H_map, settings, 25.0,
+        )
+        C = np.full(N, 0.002, dtype=np.float64)
+        Q = np.zeros(N, dtype=np.float64)
+        Q[7 * cols + 7] = 0.5
+
+        multi_cfg = SolverConfig(
+            sim_time=2.0, amb=25.0, dt_base=0.05, steps_target=40,
+            use_pardiso=False, time_stepping="multi_phase",
+        )
+        ref = run_simulation(
+            multi_cfg, K, C, Q, b, hA, layer_count, rows, cols
+        )
+        assert ref.factor_count == 6
+
+        # Trigger the >=100k SciPy auto single-factorization plan on this grid
+        orig_plan = _build_phase_plan
+
+        def forced_large_plan(cfg, _node_count, use_pardiso):
+            return orig_plan(cfg, 120_000, use_pardiso)
+
+        monkeypatch.setattr(thermal_solver, "_build_phase_plan", forced_large_plan)
+        auto_cfg = SolverConfig(
+            sim_time=2.0, amb=25.0, dt_base=0.05, steps_target=40,
+            use_pardiso=False, time_stepping="auto",
+        )
+        fast = run_simulation(
+            auto_cfg, K, C, Q, b, hA, layer_count, rows, cols
+        )
+
+        assert fast.factor_count == 1
+        assert fast.k_norm_info["time_stepping"] == "uniform"
+        assert fast.phase_metrics[0]["startup"] == "derivative_bdf2"
+        np.testing.assert_allclose(fast.T, ref.T, rtol=1e-2, atol=0.1)
+
+    def test_factorization_cache_does_not_free_newly_cached_owner(self, monkeypatch):
+        """Storing a newly factored solver in factorization_cache must not free it."""
+        layer_count, rows, cols = 1, 8, 8
+        N = rows * cols
+        K = sp.diags(np.full(N, 0.05), format="csr")
+        C = np.full(N, 0.01, dtype=np.float64)
+        Q = np.zeros(N, dtype=np.float64)
+        Q[N // 2] = 0.1
+        b = np.full(N, 0.05 * 25.0, dtype=np.float64)
+        hA = np.full(N, 0.05, dtype=np.float64)
+
+        created_owners = []
+
+        class SpyOwner:
+            def __init__(self, lu):
+                self._lu = lu
+                self.free_calls = 0
+
+            def solve(self, rhs):
+                assert self.free_calls == 0, "Cached solver was freed before reuse!"
+                return self._lu.solve(rhs)
+
+            def free_memory(self, everything=True):
+                self.free_calls += 1
+
+        def fake_factor(A, use_pardiso):
+            owner = SpyOwner(spla.splu(A.tocsc()))
+            created_owners.append(owner)
+            return owner.solve, owner, "SpyBackend", None
+
+        orig_plan = _build_phase_plan
+
+        def forced_large_plan(cfg, _node_count, use_pardiso):
+            return orig_plan(cfg, 120_000, use_pardiso)
+
+        monkeypatch.setattr(thermal_solver, "_factor_linear_system", fake_factor)
+        monkeypatch.setattr(thermal_solver, "_build_phase_plan", forced_large_plan)
+
+        config = SolverConfig(
+            sim_time=0.5, amb=25.0, dt_base=0.05, steps_target=10,
+            use_pardiso=False, time_stepping="auto",
+        )
+        cache = ThermalFactorizationCache()
+
+        # Run 1: cache miss -> factored and stored; owner must NOT be freed!
+        res1 = run_simulation(
+            config, K, C, Q, b, hA, layer_count, rows, cols,
+            factorization_cache=cache,
+            factorization_cache_key="grid-key-1",
+        )
+        assert res1.factor_count == 1
+        assert res1.k_norm_info["factorization_cache_hit"] is False
+        assert len(created_owners) == 1
+        assert created_owners[0].free_calls == 0
+
+        # Run 2: cache hit -> reuses live owner without re-factoring or freeing!
+        res2 = run_simulation(
+            config, K, C, Q, b, hA, layer_count, rows, cols,
+            factorization_cache=cache,
+            factorization_cache_key="grid-key-1",
+        )
+        assert res2.factor_count == 0
+        assert res2.k_norm_info["factorization_cache_hit"] is True
+        assert len(created_owners) == 1
+        assert created_owners[0].free_calls == 0
+        np.testing.assert_allclose(res2.T, res1.T, rtol=1e-12, atol=1e-12)
+
+        # Clearing the cache releases the cached owner exactly once
+        cache.clear()
+        assert created_owners[0].free_calls == 1
+
+        # Without a cache, the newly factored owner IS released at end of run
+        res3 = run_simulation(
+            config, K, C, Q, b, hA, layer_count, rows, cols,
+            factorization_cache=None,
+            factorization_cache_key=None,
+        )
+        assert res3.factor_count == 1
+        assert len(created_owners) == 2
+        assert created_owners[1].free_calls == 1
+
+
+class TestStructuredMultigridPreconditioner:
+    """Tests for structured geometric multigrid V-cycle preconditioner."""
+
+    @staticmethod
+    def _build_pcb_problem(layers=2, rows=64, cols=64, res_mm=0.25):
+        yy, xx = np.ogrid[:rows, :cols]
+        copper = np.zeros((layers, rows, cols), dtype=bool)
+        for layer_idx in range(layers):
+            horiz = np.mod(yy + 7 * layer_idx, 19) < 2
+            vert = np.mod(xx + 11 * layer_idx, 23) < 2
+            plane = (
+                (xx > cols // 5) & (xx < 4 * cols // 5)
+                & (yy > rows // 5) & (yy < 4 * rows // 5)
+            )
+            copper[layer_idx] = horiz | vert | plane
+        via_map = np.ones((rows, cols), dtype=np.float64)
+        via_map[(np.mod(yy, 16) < 2) & (np.mod(xx, 16) < 2)] = 50.0
+        heatsink = np.zeros((rows, cols), dtype=np.float64)
+        heatsink[rows // 3: 2 * rows // 3, cols // 3: 2 * cols // 3] = 1.0
+        settings = {"h_conv": 10.0, "pad_th": 1.0, "pad_k": 3.0}
+        t_cu = np.full(layers, 35e-6)
+        t_fr4 = np.full(layers, 1.6e-3 / max(layers, 1))
+        gaps = [1.6e-3 / max(layers - 1, 1)] * max(0, layers - 1)
+        dx = dy = res_mm * 1e-3
+        args = (
+            layers, rows, cols, copper, t_cu, t_fr4,
+            390.0, 0.3, dx, dy, via_map, gaps, heatsink, settings, 25.0,
+        )
+        pixel_area = dx * dy
+        cap = np.empty_like(copper, dtype=np.float64)
+        for layer_idx in range(layers):
+            c_cu = 8960.0 * 385.0 * pixel_area * t_cu[layer_idx]
+            c_fr4 = 1850.0 * 1100.0 * pixel_area * t_fr4[layer_idx]
+            cap[layer_idx] = np.where(copper[layer_idx], c_cu + c_fr4, c_fr4)
+        capacity = cap.reshape(-1)
+        power = np.zeros(copper.size, dtype=np.float64)
+        r0, c0 = rows // 2, cols // 2
+        power[r0 * cols + c0] = 2.0
+        return args, capacity, power
+
+    @pytest.mark.parametrize("shape", [(2, 16, 16), (2, 15, 17), (1, 13, 14)])
+    def test_coarsen_operator_matches_galerkin_triple_product(self, shape):
+        """Structured 2x2 coarsening must equal ``P^T K P`` exactly."""
+        layers, rows, cols = shape
+        args, _, _ = self._build_pcb_problem(layers=layers, rows=rows, cols=cols)
+        K_fine, _, _, _ = build_stiffness_matrix(*args)
+        op_fine, _, _, _ = build_structured_operator(*args)
+        op_coarse = _coarsen_structured_operator(op_fine)
+        K_coarse = _assemble_structured_csc(
+            op_coarse, np.zeros(op_coarse.shape[0], dtype=np.float64)
+        )
+
+        # Build explicit piecewise-constant prolongation matrix P
+        r_c = (rows + 1) // 2
+        c_c = (cols + 1) // 2
+        rc_f = rows * cols
+        rc_c = r_c * c_c
+        fine_idx = np.arange(layers * rc_f, dtype=np.int64)
+        l_idx = fine_idx // rc_f
+        rem = fine_idx % rc_f
+        r_idx = rem // cols
+        c_idx = rem % cols
+        coarse_idx = l_idx * rc_c + (r_idx // 2) * c_c + (c_idx // 2)
+        P = sp.csr_matrix(
+            (np.ones(fine_idx.size, dtype=np.float64), (fine_idx, coarse_idx)),
+            shape=(layers * rc_f, layers * rc_c),
+        )
+        expected = (P.T @ K_fine @ P).toarray()
+        np.testing.assert_allclose(K_coarse.toarray(), expected, rtol=1e-12, atol=1e-12)
+
+    def test_multigrid_preconditioner_is_spd_and_beats_jacobi(self):
+        """MG V-cycle is SPD, uses far fewer PCG iterations than Jacobi, and matches direct solve."""
+        args, capacity, power = self._build_pcb_problem(layers=2, rows=64, cols=64)
+        K, b, _, _ = build_stiffness_matrix(*args)
+        op, fast_b, _, _ = build_structured_operator(*args)
+
+        dt = 5.0
+        scale = 1.5 / dt
+        A_op, M_mg = op.implicit_linear_operator(capacity, scale)
+
+        # Check symmetry and positive definiteness of M_mg on random vectors
+        rng = np.random.default_rng(42)
+        x = rng.standard_normal(op.shape[0])
+        y = rng.standard_normal(op.shape[0])
+        Mx = M_mg.matvec(x)
+        My = M_mg.matvec(y)
+        assert float(np.dot(x, Mx)) > 0.0
+        np.testing.assert_allclose(np.dot(x, My), np.dot(y, Mx), rtol=1e-10, atol=1e-12)
+
+        # Compare MG PCG vs diagonal Jacobi PCG and direct sparse solve
+        rhs = (scale * capacity) * 25.0 + power + fast_b
+        initial = np.full(op.shape[0], 25.0, dtype=np.float64)
+        sol_mg, iters_mg, _, rel_mg = _solve_pcg(A_op, M_mg, rhs, initial)
+        assert iters_mg < 35, f"Expected MG PCG to converge in <35 iters, got {iters_mg}"
+        assert rel_mg <= 1e-6
+
+        # Diagonal Jacobi on the same stiff problem takes >100 iterations (or fails past 300)
+        diag = op.stiffness_diag + scale * capacity
+        inv_diag = np.divide(1.0, diag, out=np.zeros_like(diag), where=np.abs(diag) > 1e-30)
+        M_jacobi = spla.LinearOperator(
+            op.shape, matvec=lambda v: inv_diag * v, dtype=np.float64
+        )
+        try:
+            _, iters_jacobi, _, _ = _solve_pcg(A_op, M_jacobi, rhs, initial)
+            assert iters_jacobi > 100, f"Expected Jacobi to take >100 iters, got {iters_jacobi}"
+            assert iters_mg * 4 < iters_jacobi
+        except RuntimeError:
+            # Jacobi failing past 300 iterations on this stiff system also proves MG's advantage
+            pass
+
+        # Verify numerical accuracy against exact direct sparse solve
+        A_sparse = K + sp.diags(scale * capacity, format="csr")
+        sol_direct = spla.spsolve(A_sparse, rhs)
+        np.testing.assert_allclose(sol_mg, sol_direct, rtol=1e-4, atol=1e-4)
+
+    def test_multigrid_odd_grid_matches_direct_simulation(self):
+        """Transient matrix-free MG PCG matches direct solver on odd grid dimensions."""
+        args, capacity, power = self._build_pcb_problem(layers=2, rows=35, cols=41)
+        K, b, hA, _ = build_stiffness_matrix(*args)
+        op, fast_b, fast_hA, _ = build_structured_operator(*args)
+        config = SolverConfig(
+            sim_time=2.0, amb=25.0, dt_base=0.2, steps_target=10,
+            use_multi_phase=False, time_stepping="uniform",
+        )
+        direct = run_simulation(config, K, capacity, power, b, hA, 2, 35, 41)
+        mg_res = run_simulation_matrix_free(config, op, capacity, power, fast_b, fast_hA)
+
+        np.testing.assert_allclose(mg_res.T, direct.T, rtol=1e-4, atol=1e-3)
+        assert mg_res.k_norm_info["avg_pcg_iterations"] < 30
+
+    def test_multigrid_hierarchy_cached_by_derivative_scale(self):
+        """MG preconditioner caches by derivative_scale and shares coarse geometry."""
+        args, capacity, _ = self._build_pcb_problem(layers=2, rows=32, cols=32)
+        op, _, _, _ = build_structured_operator(*args)
+
+        op.implicit_linear_operator(capacity, 1.0)
+        mg_first = op._preconditioner_cache[1.0][1]
+        coarse_ops_ref = op._coarse_operators
+        assert coarse_ops_ref is not None and len(coarse_ops_ref) >= 2
+
+        op.implicit_linear_operator(capacity, 1.0)
+        assert op._preconditioner_cache[1.0][1] is mg_first
+
+        op.implicit_linear_operator(capacity, 1.5)
+        mg_second = op._preconditioner_cache[1.5][1]
+        assert mg_second is not mg_first
+        assert mg_second.operators is coarse_ops_ref
+
+    @pytest.mark.parametrize("shape", [(2, 6, 12), (2, 12, 6)])
+    def test_small_grid_uses_jacobi_fallback(self, shape):
+        """Grids with rows < 8 or cols < 8 fall back to diagonal Jacobi."""
+        layers, rows, cols = shape
+        args, capacity, power = self._build_pcb_problem(layers=layers, rows=rows, cols=cols)
+        K, b, hA, _ = build_stiffness_matrix(*args)
+        op, fast_b, fast_hA, _ = build_structured_operator(*args)
+
+        op.implicit_linear_operator(capacity, 1.5)
+        assert op._preconditioner_cache == {}
+        assert op._coarse_operators is None
+
+        config = SolverConfig(
+            sim_time=0.4, amb=25.0, dt_base=0.04, steps_target=10,
+            use_multi_phase=False, time_stepping="uniform",
+        )
+        direct = run_simulation(config, K, capacity, power, b, hA, layers, rows, cols)
+        fast = run_simulation_matrix_free(config, op, capacity, power, fast_b, fast_hA)
+        np.testing.assert_allclose(fast.T, direct.T, rtol=5e-5, atol=1e-3)

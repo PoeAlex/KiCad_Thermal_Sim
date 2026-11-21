@@ -70,10 +70,14 @@ def _build_phase_plan(config: SolverConfig, node_count: int, use_pardiso: bool):
     if not config.use_multi_phase:
         mode = "uniform"
     elif mode == "auto":
-        # Large PARDISO systems pay a high price for every distinct matrix
-        # factorization. Uniform BDF2 needs only the BE bootstrap and one BDF2
-        # factorization and uses a smaller maximum dt than the legacy plan.
-        auto_large = use_pardiso and node_count >= 250_000
+        # Large direct-solver systems pay a high price for every distinct
+        # matrix factorization (6 factorizations for 3-phase BE+BDF2 vs 1 for
+        # derivative-start uniform BDF2). SciPy SuperLU hits this penalty
+        # earlier than PARDISO, so switch to single-factorization uniform BDF2
+        # at 100k nodes for SciPy and 250k nodes for PARDISO.
+        auto_large = (
+            node_count >= 250_000 if use_pardiso else node_count >= 100_000
+        )
         mode = "uniform" if auto_large else "multi_phase"
 
     if mode == "multi_phase":
@@ -166,6 +170,271 @@ class CachedLinearSolver:
         self.owner = None
 
 
+def _restrict_2x2(array: np.ndarray) -> np.ndarray:
+    """Conservatively sum 2x2 spatial blocks on a ``(layers, rows, cols)`` array."""
+    layers, rows, cols = array.shape
+    coarse_rows = (rows + 1) // 2
+    coarse_cols = (cols + 1) // 2
+    even_rows = (rows // 2) * 2
+    if rows == even_rows:
+        row_sum = array[:, 0::2, :] + array[:, 1::2, :]
+    else:
+        row_sum = np.empty((layers, coarse_rows, cols), dtype=np.float64)
+        if even_rows > 0:
+            row_sum[:, :-1, :] = (
+                array[:, 0:even_rows:2, :] + array[:, 1:even_rows:2, :]
+            )
+        row_sum[:, -1, :] = array[:, -1, :]
+
+    even_cols = (cols // 2) * 2
+    if cols == even_cols:
+        return row_sum[:, :, 0::2] + row_sum[:, :, 1::2]
+    out = np.empty((layers, coarse_rows, coarse_cols), dtype=np.float64)
+    if even_cols > 0:
+        out[:, :, :-1] = (
+            row_sum[:, :, 0:even_cols:2] + row_sum[:, :, 1:even_cols:2]
+        )
+    out[:, :, -1] = row_sum[:, :, -1]
+    return out
+
+
+def _coarsen_structured_operator(
+    operator: "StructuredThermalOperator",
+) -> "StructuredThermalOperator":
+    """Return the exact Galerkin 2x2 spatial coarsening ``P^T K P``."""
+    layers = operator.layer_count
+    rows = operator.rows
+    cols = operator.cols
+    coarse_rows = (rows + 1) // 2
+    coarse_cols = (cols + 1) // 2
+    even_rows = (rows // 2) * 2
+    even_cols = (cols // 2) * 2
+
+    if coarse_cols > 1:
+        gx_odd = operator.gx[:, :, 1::2]
+        if rows == even_rows:
+            gx_c = gx_odd[:, 0::2, :] + gx_odd[:, 1::2, :]
+        else:
+            gx_c = np.empty((layers, coarse_rows, coarse_cols - 1), dtype=np.float64)
+            if even_rows > 0:
+                gx_c[:, :-1, :] = (
+                    gx_odd[:, 0:even_rows:2, :] + gx_odd[:, 1:even_rows:2, :]
+                )
+            gx_c[:, -1, :] = gx_odd[:, -1, :]
+    else:
+        gx_c = np.empty((layers, coarse_rows, 0), dtype=np.float64)
+
+    if coarse_rows > 1:
+        gy_odd = operator.gy[:, 1::2, :]
+        if cols == even_cols:
+            gy_c = gy_odd[:, :, 0::2] + gy_odd[:, :, 1::2]
+        else:
+            gy_c = np.empty((layers, coarse_rows - 1, coarse_cols), dtype=np.float64)
+            if even_cols > 0:
+                gy_c[:, :, :-1] = (
+                    gy_odd[:, :, 0:even_cols:2] + gy_odd[:, :, 1:even_cols:2]
+                )
+            gy_c[:, :, -1] = gy_odd[:, :, -1]
+    else:
+        gy_c = np.empty((layers, 0, coarse_cols), dtype=np.float64)
+
+    if layers > 1 and operator.gz.size:
+        gz_c = _restrict_2x2(operator.gz)
+    else:
+        gz_c = np.empty((0, coarse_rows, coarse_cols), dtype=np.float64)
+
+    boundary_c = _restrict_2x2(
+        operator.boundary_diag.reshape(layers, rows, cols)
+    ).reshape(-1)
+    diagonal_view = boundary_c.reshape(layers, coarse_rows, coarse_cols).copy()
+    if coarse_cols > 1:
+        diagonal_view[:, :, :-1] += gx_c
+        diagonal_view[:, :, 1:] += gx_c
+    if coarse_rows > 1:
+        diagonal_view[:, :-1, :] += gy_c
+        diagonal_view[:, 1:, :] += gy_c
+    if layers > 1 and gz_c.size:
+        diagonal_view[:-1, :, :] += gz_c
+        diagonal_view[1:, :, :] += gz_c
+
+    return StructuredThermalOperator(
+        layer_count=layers,
+        rows=coarse_rows,
+        cols=coarse_cols,
+        gx=np.ascontiguousarray(gx_c, dtype=np.float64),
+        gy=np.ascontiguousarray(gy_c, dtype=np.float64),
+        gz=np.ascontiguousarray(gz_c, dtype=np.float64),
+        boundary_diag=np.ascontiguousarray(boundary_c, dtype=np.float64),
+        stiffness_diag=np.ascontiguousarray(diagonal_view.reshape(-1), dtype=np.float64),
+    )
+
+
+def _assemble_structured_csc(
+    operator: "StructuredThermalOperator",
+    scaled_capacity: np.ndarray,
+) -> sp.csc_matrix:
+    """Assemble ``K + diag(scaled_capacity)`` on a coarse structured grid."""
+    layers = operator.layer_count
+    rows = operator.rows
+    cols = operator.cols
+    plane_cells = rows * cols
+    node_count = layers * plane_cells
+    diagonal = operator.stiffness_diag + scaled_capacity
+
+    row_parts = [np.arange(node_count, dtype=np.int64)]
+    col_parts = [np.arange(node_count, dtype=np.int64)]
+    data_parts = [diagonal]
+
+    if cols > 1:
+        layer_base = np.arange(layers, dtype=np.int64)[:, None, None] * plane_cells
+        row_base = np.arange(rows, dtype=np.int64)[None, :, None] * cols
+        col_base = np.arange(cols - 1, dtype=np.int64)[None, None, :]
+        left = (layer_base + row_base + col_base).reshape(-1)
+        right = left + 1
+        conductance = -operator.gx.reshape(-1)
+        row_parts.extend((left, right))
+        col_parts.extend((right, left))
+        data_parts.extend((conductance, conductance))
+
+    if rows > 1:
+        layer_base = np.arange(layers, dtype=np.int64)[:, None, None] * plane_cells
+        row_base = np.arange(rows - 1, dtype=np.int64)[None, :, None] * cols
+        col_base = np.arange(cols, dtype=np.int64)[None, None, :]
+        upper = (layer_base + row_base + col_base).reshape(-1)
+        lower = upper + cols
+        conductance = -operator.gy.reshape(-1)
+        row_parts.extend((upper, lower))
+        col_parts.extend((lower, upper))
+        data_parts.extend((conductance, conductance))
+
+    if layers > 1 and operator.gz.size:
+        plane_idx = np.arange(plane_cells, dtype=np.int64)[None, :]
+        top = (
+            np.arange(layers - 1, dtype=np.int64)[:, None] * plane_cells + plane_idx
+        ).reshape(-1)
+        bottom = top + plane_cells
+        conductance = -operator.gz.reshape(-1)
+        row_parts.extend((top, bottom))
+        col_parts.extend((bottom, top))
+        data_parts.extend((conductance, conductance))
+
+    return sp.coo_matrix(
+        (
+            np.concatenate(data_parts),
+            (np.concatenate(row_parts), np.concatenate(col_parts)),
+        ),
+        shape=(node_count, node_count),
+        dtype=np.float64,
+    ).tocsc()
+
+
+class _StructuredGeometricMultigrid:
+    """Symmetric V-cycle geometric multigrid preconditioner for regular 3D grids."""
+
+    def __init__(
+        self,
+        operators: List["StructuredThermalOperator"],
+        capacity: np.ndarray,
+        derivative_scale: float,
+        omega: float = 0.72,
+        smooth_steps: int = 2,
+    ):
+        self.operators = operators
+        self.omega = float(omega)
+        self.smooth_steps = int(smooth_steps)
+        self.diag_masses: List[np.ndarray] = []
+        self.omega_inv_diags: List[np.ndarray] = []
+
+        scaled_capacity = np.ascontiguousarray(
+            float(derivative_scale) * capacity, dtype=np.float64
+        ).reshape(-1)
+
+        for level_idx, level_op in enumerate(self.operators):
+            if level_idx > 0:
+                prev_op = self.operators[level_idx - 1]
+                scaled_capacity = np.ascontiguousarray(
+                    _restrict_2x2(
+                        scaled_capacity.reshape(
+                            prev_op.layer_count, prev_op.rows, prev_op.cols
+                        )
+                    ).reshape(-1),
+                    dtype=np.float64,
+                )
+            diag_mass = np.ascontiguousarray(
+                level_op.boundary_diag + scaled_capacity, dtype=np.float64
+            )
+            diagonal = level_op.stiffness_diag + scaled_capacity
+            inv_diag = np.divide(
+                1.0,
+                diagonal,
+                out=np.zeros_like(diagonal),
+                where=np.abs(diagonal) > 1e-30,
+            )
+            self.diag_masses.append(diag_mass)
+            self.omega_inv_diags.append(
+                np.ascontiguousarray(self.omega * inv_diag, dtype=np.float64)
+            )
+
+        coarse_matrix = _assemble_structured_csc(self.operators[-1], scaled_capacity)
+        try:
+            self.coarse_solver = spla.factorized(coarse_matrix)
+        except Exception:
+            coarse_diag = self.operators[-1].stiffness_diag + scaled_capacity
+            coarse_inv = np.divide(
+                1.0,
+                coarse_diag,
+                out=np.zeros_like(coarse_diag),
+                where=np.abs(coarse_diag) > 1e-30,
+            )
+            self.coarse_solver = lambda rhs, _inv=coarse_inv: _inv * rhs
+
+    def _cycle(self, level: int, rhs: np.ndarray) -> np.ndarray:
+        if level == len(self.operators) - 1:
+            return np.asarray(self.coarse_solver(rhs), dtype=np.float64)
+
+        op = self.operators[level]
+        diag_mass = self.diag_masses[level]
+        omega_inv = self.omega_inv_diags[level]
+
+        # Pre-smoothing starting from zero avoids an unnecessary matvec on step 1.
+        value = omega_inv * rhs
+        for _ in range(self.smooth_steps - 1):
+            residual = rhs - op._apply_with_diagonal(diag_mass, value)
+            residual *= omega_inv
+            value += residual
+
+        residual = rhs - op._apply_with_diagonal(diag_mass, value)
+        coarse_rhs = _restrict_2x2(
+            residual.reshape(op.layer_count, op.rows, op.cols)
+        ).reshape(-1)
+        coarse_correction = self._cycle(level + 1, coarse_rhs)
+
+        coarse_op = self.operators[level + 1]
+        coarse_view = coarse_correction.reshape(
+            coarse_op.layer_count, coarse_op.rows, coarse_op.cols
+        )
+        value_view = value.reshape(op.layer_count, op.rows, op.cols)
+        value_view[:, 0::2, 0::2] += coarse_view
+        if op.cols > 1:
+            value_view[:, 0::2, 1::2] += coarse_view[:, :, : op.cols // 2]
+        if op.rows > 1:
+            value_view[:, 1::2, 0::2] += coarse_view[:, : op.rows // 2, :]
+        if op.rows > 1 and op.cols > 1:
+            value_view[:, 1::2, 1::2] += coarse_view[
+                :, : op.rows // 2, : op.cols // 2
+            ]
+
+        for _ in range(self.smooth_steps):
+            residual = rhs - op._apply_with_diagonal(diag_mass, value)
+            residual *= omega_inv
+            value += residual
+        return value
+
+    def solve(self, rhs: np.ndarray) -> np.ndarray:
+        """Apply one symmetric V-cycle."""
+        return self._cycle(0, np.asarray(rhs, dtype=np.float64).reshape(-1))
+
+
 @dataclass
 class StructuredThermalOperator:
     """Matrix-free thermal operator for the regular multilayer grid."""
@@ -179,6 +448,10 @@ class StructuredThermalOperator:
     boundary_diag: np.ndarray
     stiffness_diag: np.ndarray
 
+    def __post_init__(self):
+        self._coarse_operators = None
+        self._preconditioner_cache = {}
+
     @property
     def shape(self):
         """Return the equivalent square matrix shape."""
@@ -191,9 +464,18 @@ class StructuredThermalOperator:
         edge_count = self.gx.size + self.gy.size + self.gz.size
         return int(self.shape[0] + 2 * edge_count)
 
-    def dot(self, vector):
-        """Apply the stiffness operator without assembling a sparse matrix."""
-        flat_vector = np.ascontiguousarray(vector, dtype=np.float64).reshape(-1)
+    def _apply_with_diagonal(self, diag_mass: np.ndarray, vector) -> np.ndarray:
+        """Apply conduction fluxes plus an arbitrary diagonal mass term."""
+        if (
+            isinstance(vector, np.ndarray)
+            and vector.dtype == np.float64
+            and vector.ndim == 1
+            and vector.flags.c_contiguous
+        ):
+            flat_vector = vector
+        else:
+            flat_vector = np.ascontiguousarray(vector, dtype=np.float64).reshape(-1)
+
         if HAS_NATIVE_CORE:
             native_result = apply_structured_native(
                 self.layer_count,
@@ -202,15 +484,14 @@ class StructuredThermalOperator:
                 self.gx,
                 self.gy,
                 self.gz,
-                self.boundary_diag,
+                diag_mass,
                 flat_vector,
             )
             if native_result is not None:
                 return native_result
-        values = np.asarray(vector, dtype=np.float64).reshape(
-            self.layer_count, self.rows, self.cols
-        )
-        result = self.boundary_diag.reshape(values.shape) * values
+
+        values = flat_vector.reshape(self.layer_count, self.rows, self.cols)
+        result = diag_mass.reshape(values.shape) * values
 
         if self.cols > 1:
             difference = values[:, :, :-1] - values[:, :, 1:]
@@ -229,25 +510,74 @@ class StructuredThermalOperator:
             result[1:, :, :] -= flux
         return result.reshape(-1)
 
+    def dot(self, vector):
+        """Apply the stiffness operator without assembling a sparse matrix."""
+        return self._apply_with_diagonal(self.boundary_diag, vector)
+
+    def _get_multigrid_operators(
+        self, coarse_max_nodes: int = 1024, max_levels: int = 10
+    ) -> List["StructuredThermalOperator"]:
+        """Build and cache the coarsened stiffness operator hierarchy."""
+        if self._coarse_operators is not None:
+            return self._coarse_operators
+        levels = [self]
+        current = self
+        for level_idx in range(max_levels - 1):
+            if level_idx > 0 and current.shape[0] <= coarse_max_nodes:
+                break
+            if current.rows <= 2 and current.cols <= 2:
+                break
+            current = _coarsen_structured_operator(current)
+            levels.append(current)
+        self._coarse_operators = levels
+        return levels
+
     def implicit_linear_operator(self, capacity, derivative_scale):
         """Return ``K + derivative_scale * C`` as a SciPy LinearOperator."""
-        capacity = np.asarray(capacity, dtype=np.float64)
-        diagonal = self.stiffness_diag + derivative_scale * capacity
+        capacity = np.ascontiguousarray(capacity, dtype=np.float64).reshape(-1)
+        scale = float(derivative_scale)
+        scaled_capacity = scale * capacity
+        diag_mass = np.ascontiguousarray(
+            self.boundary_diag + scaled_capacity, dtype=np.float64
+        )
         shape = self.shape
 
         def matvec(vector):
-            return self.dot(vector) + derivative_scale * capacity * vector
+            return self._apply_with_diagonal(diag_mass, vector)
 
         operator = spla.LinearOperator(shape, matvec=matvec, dtype=np.float64)
-        inverse_diagonal = np.divide(
-            1.0,
-            diagonal,
-            out=np.zeros_like(diagonal),
-            where=np.abs(diagonal) > 1e-30,
-        )
+
+        if self.rows < 8 or self.cols < 8:
+            diagonal = self.stiffness_diag + scaled_capacity
+            inverse_diagonal = np.divide(
+                1.0,
+                diagonal,
+                out=np.zeros_like(diagonal),
+                where=np.abs(diagonal) > 1e-30,
+            )
+            preconditioner = spla.LinearOperator(
+                shape,
+                matvec=lambda vector: inverse_diagonal * vector,
+                dtype=np.float64,
+            )
+            return operator, preconditioner
+
+        cached = self._preconditioner_cache.get(scale)
+        if cached is not None and np.array_equal(cached[0], capacity):
+            multigrid = cached[1]
+        else:
+            multigrid = _StructuredGeometricMultigrid(
+                self._get_multigrid_operators(),
+                capacity,
+                scale,
+            )
+            if len(self._preconditioner_cache) >= 4:
+                self._preconditioner_cache.clear()
+            self._preconditioner_cache[scale] = (capacity.copy(), multigrid)
+
         preconditioner = spla.LinearOperator(
             shape,
-            matvec=lambda vector: inverse_diagonal * vector,
+            matvec=multigrid.solve,
             dtype=np.float64,
         )
         return operator, preconditioner
@@ -650,7 +980,7 @@ def _solve_pcg(
     cancel_check=None,
     relative_tolerance=1e-6,
 ):
-    """Solve one implicit step with Jacobi-preconditioned conjugate gradients."""
+    """Solve one implicit step with preconditioned conjugate gradients."""
     iterations = 0
 
     def callback(_value):
@@ -813,10 +1143,13 @@ def run_simulation_matrix_free(
         phase_iterations = 0
         phase_steps_done = 0
         derivative_start = (
-            time_stepping_used == "uniform"
-            and (
-                node_count >= 250_000
-                or bool(getattr(operator, "prefer_derivative_start", False))
+            bool(phase_definition.get("derivative_start"))
+            or (
+                time_stepping_used == "uniform"
+                and (
+                    node_count >= 250_000
+                    or bool(getattr(operator, "prefer_derivative_start", False))
+                )
             )
         )
 
@@ -1168,8 +1501,8 @@ def run_simulation(
         two_D = 2.0 * D
         half_D = 0.5 * D
         rhs_workspace = np.empty(N, dtype=np.float64)
-        A_be = K + sp.diags(D, format="csr")
         A_bdf2 = K + sp.diags(1.5 * D, format="csr")
+        A_be = None if pdef.get("derivative_start") else (K + sp.diags(D, format="csr"))
         assembly_time = time.perf_counter() - assembly_start
 
         def build_bdf2_rhs(q_value):
@@ -1183,14 +1516,14 @@ def run_simulation(
         if pdef.get("derivative_start"):
             # A derivative-consistent fictitious T(-dt) gives BDF2 its
             # second-order startup without a separate one-shot BE matrix.
-            # This is used only by Auto on large uniform PARDISO systems.
-            del A_be
+            # This is used by Auto on large uniform direct-solver systems.
             Q_current = Q_func(current_time) if Q_func is not None else Q
             pin = float(np.sum(Q_current))
             derivative0 = (Q_current + b - K.dot(Tn)) / C
             Tnm1 = Tn - phase_dt * derivative0
 
             factor_cache_hit = False
+            factor_cached = False
             cached_factor = (
                 factorization_cache.get(factorization_cache_key)
                 if factorization_cache is not None and factorization_cache_key
@@ -1203,6 +1536,7 @@ def run_simulation(
                 spd_residual = cached_factor.spd_residual
                 factor_time = 0.0
                 factor_cache_hit = True
+                factor_cached = True
                 factorization_cache_used = True
             else:
                 factor_start = time.perf_counter()
@@ -1217,6 +1551,7 @@ def run_simulation(
                         factorization_cache_key,
                         CachedLinearSolver(solve_bdf2, bdf_owner, phase_backend, spd_residual),
                     )
+                    factor_cached = True
             backend_modes.append(phase_backend)
             if spd_residual is not None:
                 spd_residuals.append(spd_residual)
@@ -1244,7 +1579,7 @@ def run_simulation(
                         record_snapshot(config.snap_times[next_snap_idx])
                         next_snap_idx += 1
 
-            if not factor_cache_hit:
+            if not factor_cached:
                 _release_linear_solver(bdf_owner)
             del solve_bdf2, bdf_owner, A_bdf2
             phase_metrics.append({

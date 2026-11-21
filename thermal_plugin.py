@@ -885,13 +885,58 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         row.extend((getter, int(point.x), int(point.y)))
                     except Exception:
                         continue
+                is_via = "VIA" in type(item).__name__.upper()
                 try:
-                    row.extend(("width", int(item.GetWidth())))
+                    if is_via:
+                        if copper_ids:
+                            try:
+                                width_val = int(item.GetWidth(int(copper_ids[0])))
+                            except TypeError:
+                                width_val = int(item.GetWidth())
+                        else:
+                            width_val = int(rect.GetWidth())
+                    else:
+                        width_val = int(item.GetWidth())
+                    row.extend(("width", width_val))
                 except Exception:
                     pass
                 primitive_rows.append(tuple(row))
             except Exception:
                 continue
+        try:
+            drawings = list(board.GetDrawings() if hasattr(board, "GetDrawings") else [])
+        except Exception:
+            drawings = []
+        eco1_layer = getattr(pcbnew, "Eco1_User", None)
+        if eco1_layer is not None:
+            eco1_layer_id = int(eco1_layer)
+            for drawing in drawings:
+                try:
+                    layer = int(drawing.GetLayer())
+                    if layer != eco1_layer_id:
+                        continue
+                    rect = drawing.GetBoundingBox()
+                    drawing_row = [
+                        "drawing",
+                        type(drawing).__name__,
+                        layer,
+                        rect.GetX(),
+                        rect.GetY(),
+                        rect.GetWidth(),
+                        rect.GetHeight(),
+                    ]
+                    for getter in ("GetShape", "GetStart", "GetEnd", "GetCenter", "GetPosition"):
+                        try:
+                            value = getattr(drawing, getter)()
+                            if hasattr(value, "x") and hasattr(value, "y"):
+                                drawing_row.extend((getter, int(value.x), int(value.y)))
+                            else:
+                                drawing_row.extend((getter, str(value)))
+                        except Exception:
+                            continue
+                    primitive_rows.append(tuple(drawing_row))
+                except Exception:
+                    continue
         for zone in zones:
             try:
                 rect = zone.GetBoundingBox()
@@ -1136,8 +1181,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         def run_callback(settings):
             self._save_settings(settings)
-            power_pads = self._resolve_power_pad_objects(board, settings, legacy_pads=pads_list)
-            current_pads = self._resolve_current_pad_objects(board, settings)
+            pad_lookup = self._maybe_build_pad_lookup(board, settings)
+            power_pads = self._resolve_power_pad_objects(
+                board, settings, legacy_pads=pads_list, pad_lookup=pad_lookup
+            )
+            current_pads = self._resolve_current_pad_objects(
+                board, settings, pad_lookup=pad_lookup
+            )
             focus_pads = self._unique_pads(power_pads + current_pads)
             try:
                 self._run_simulation(
@@ -1192,8 +1242,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     settings = dlg.get_values()
                     if settings:
                         self._save_settings(settings)
-                        power_pads = self._resolve_power_pad_objects(board, settings, legacy_pads=pads_list)
-                        current_pads = self._resolve_current_pad_objects(board, settings)
+                        pad_lookup = self._maybe_build_pad_lookup(board, settings)
+                        power_pads = self._resolve_power_pad_objects(
+                            board, settings, legacy_pads=pads_list, pad_lookup=pad_lookup
+                        )
+                        current_pads = self._resolve_current_pad_objects(
+                            board, settings, pad_lookup=pad_lookup
+                        )
                         focus_pads = self._unique_pads(power_pads + current_pads)
                         self._run_simulation(
                             board, copper_ids, layer_names, bbox, pads_list,
@@ -1372,7 +1427,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 by_name[descriptor["name"]] = (descriptor, pad)
         return by_key, by_name
 
-    def _resolve_power_pad_entries(self, board, settings):
+    def _maybe_build_pad_lookup(self, board, settings):
+        """Build a shared pad lookup once when settings require pad resolution."""
+        cfg = settings or {}
+        needs_power = bool(cfg.get("power_pads"))
+        needs_current = bool(cfg.get("current_enabled"))
+        if not needs_power and not needs_current:
+            return None
+        return self._build_pad_lookup(board)
+
+    def _resolve_power_pad_entries(self, board, settings, pad_lookup=None):
         """Resolve manual power-pad settings to live pad objects and power strings."""
         raw_power_pads = prepare_power_pads(
             settings.get("power_pads", []),
@@ -1380,7 +1444,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         )
         if not raw_power_pads:
             return [], []
-        by_key, by_name = self._build_pad_lookup(board)
+        by_key, by_name = (
+            pad_lookup if pad_lookup is not None else self._build_pad_lookup(board)
+        )
         entries = []
         missing = []
         for pad_info in raw_power_pads:
@@ -1394,18 +1460,20 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             entries.append((merged, pad, merged["power"]))
         return entries, missing
 
-    def _resolve_power_pad_objects(self, board, settings, legacy_pads=None):
+    def _resolve_power_pad_objects(self, board, settings, legacy_pads=None, pad_lookup=None):
         """Resolve manual power pads to live pad objects for preview/focus area."""
         if "power_pads" not in (settings or {}):
             return list(legacy_pads or [])
-        entries, _ = self._resolve_power_pad_entries(board, settings)
+        entries, _ = self._resolve_power_pad_entries(board, settings, pad_lookup=pad_lookup)
         return self._unique_pads([pad for _, pad, _ in entries])
 
-    def _resolve_current_pad_objects(self, board, settings):
+    def _resolve_current_pad_objects(self, board, settings, pad_lookup=None):
         """Resolve current-group pad descriptors to live pad objects."""
         if not settings.get("current_enabled"):
             return []
-        by_key, by_name = self._build_pad_lookup(board)
+        by_key, by_name = (
+            pad_lookup if pad_lookup is not None else self._build_pad_lookup(board)
+        )
         pads = []
         seen = set()
         for group in prepare_current_groups(settings.get("current_groups", [])):
@@ -1419,13 +1487,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     seen.add(id(pad))
         return pads
 
-    def _resolve_current_terminals(self, board, settings):
+    def _resolve_current_terminals(self, board, settings, pad_lookup=None):
         """Resolve current-group settings into CurrentTerminal objects."""
         terminals = []
         missing = []
         if not settings.get("current_enabled"):
             return terminals, missing
-        by_key, by_name = self._build_pad_lookup(board)
+        by_key, by_name = (
+            pad_lookup if pad_lookup is not None else self._build_pad_lookup(board)
+        )
         for group in prepare_current_groups(settings.get("current_groups", [])):
             for pad_info in group.get("pads", []):
                 current = float(pad_info.get("current_a", 0.0) or 0.0)
@@ -1475,12 +1545,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
     def _preflight(self, board, copper_ids, bbox, settings):
         """Validate settings and estimate the exact grid before execution."""
         result = PreflightResult()
-        power_entries, missing_power = self._resolve_power_pad_entries(board, settings)
+        pad_lookup = self._maybe_build_pad_lookup(board, settings)
+        power_entries, missing_power = self._resolve_power_pad_entries(
+            board, settings, pad_lookup=pad_lookup
+        )
         power_pads = [pad for _, pad, _ in power_entries]
         terminals = []
         missing_current = []
         if settings.get("current_enabled"):
-            terminals, missing_current = self._resolve_current_terminals(board, settings)
+            terminals, missing_current = self._resolve_current_terminals(
+                board, settings, pad_lookup=pad_lookup
+            )
         current_pads = [item.pad for item in terminals]
         focus_pads = self._unique_pads(power_pads + current_pads)
         result.area = _estimate_simulation_area(
@@ -1621,8 +1696,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         if not self._require_filled_zones(self.board):
             return None
         preview_status("Resolving heat sources and simulation area...")
-        power_pads = self._resolve_power_pad_objects(self.board, settings, legacy_pads=self.pads_list)
-        terminals, _ = self._resolve_current_terminals(self.board, settings)
+        pad_lookup = self._maybe_build_pad_lookup(self.board, settings)
+        power_pads = self._resolve_power_pad_objects(
+            self.board, settings, legacy_pads=self.pads_list, pad_lookup=pad_lookup
+        )
+        terminals, _ = self._resolve_current_terminals(
+            self.board, settings, pad_lookup=pad_lookup
+        )
         current_pads = [item.pad for item in terminals]
         preview_pads = self._unique_pads(power_pads + current_pads)
         effective_settings = dict(settings)
@@ -1739,12 +1819,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             return
 
         focus_pads = focus_pads if focus_pads is not None else pads_list
+        pad_lookup = self._maybe_build_pad_lookup(board, settings)
         area_power_pads = self._resolve_power_pad_objects(
-            board, settings, legacy_pads=pads_list
+            board, settings, legacy_pads=pads_list, pad_lookup=pad_lookup
         )
         area_terminals = []
         if settings.get("current_enabled"):
-            area_terminals, _ = self._resolve_current_terminals(board, settings)
+            area_terminals, _ = self._resolve_current_terminals(
+                board, settings, pad_lookup=pad_lookup
+            )
         area = _estimate_simulation_area(
             board, bbox, settings,
             power_pads=area_power_pads,
@@ -1930,7 +2013,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         has_power_pad_settings = "power_pads" in settings
         missing_power_pads = []
         if has_power_pad_settings:
-            power_pad_entries, missing_power_pads = self._resolve_power_pad_entries(board, settings)
+            power_pad_entries, missing_power_pads = self._resolve_power_pad_entries(
+                board, settings, pad_lookup=pad_lookup
+            )
             power_pads = [pad for _, pad, _ in power_pad_entries]
             power_pad_names = [descriptor.get("name", "") for descriptor, _, _ in power_pad_entries]
             entries = [power for _, _, power in power_pad_entries if str(power).strip()]
@@ -1997,7 +2082,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             set_dialog_state("running", "Solving active electrical paths...")
             electrical_start = time.perf_counter()
             electrical_cache_hit = False
-            terminals, missing_pads = self._resolve_current_terminals(board, settings)
+            terminals, missing_pads = self._resolve_current_terminals(
+                board, settings, pad_lookup=pad_lookup
+            )
             if missing_pads:
                 wx.MessageBox(
                     "Current simulation references pads that were not found on the board:\n"

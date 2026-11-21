@@ -479,3 +479,117 @@ class TestBuildInteractiveHeatmapPayload:
         )
 
         assert payload["layers"][0]["data"] == [25.0, 30.0, 35.0, 40.0]
+        assert payload["downsampled"] is False
+        assert payload["downsample_stride"] == 1
+        assert payload["original_rows"] == 2
+        assert payload["original_cols"] == 2
+        assert payload["original_res_mm"] == 0.1
+
+    def test_payload_downsamples_large_grid_and_preserves_hotspots(self):
+        """Large grids should be block-max downsampled while preserving peaks and mm metadata."""
+        import json
+
+        T = np.full((2, 500, 500), 30.0, dtype=np.float64)
+        T[0, 317, 429] = 123.456
+        T[1, 10, 15] = 99.5
+
+        payload = build_interactive_heatmap_payload(
+            T,
+            amb=25.0,
+            layer_names=["F.Cu", "B.Cu"],
+            res_mm=0.1,
+            x_min_mm=5.0,
+            y_min_mm=10.0,
+            show_all=True,
+        )
+
+        assert payload["downsampled"] is True
+        assert payload["downsample_stride"] == 2
+        assert payload["original_rows"] == 500
+        assert payload["original_cols"] == 500
+        assert payload["original_res_mm"] == 0.1
+        assert payload["res_mm"] == 0.2
+        assert payload["x_min_mm"] == 5.0
+        assert payload["y_min_mm"] == 10.0
+
+        top = payload["layers"][0]
+        bot = payload["layers"][1]
+        assert top["rows"] == 250
+        assert top["cols"] == 250
+        assert max(top["rows"], top["cols"]) <= 320
+        assert len(top["data"]) == 250 * 250
+        assert top["min_c"] == 30.0
+        assert top["max_c"] == 123.456
+        assert max(top["data"]) == 123.456
+        assert top["data"][(317 // 2) * 250 + (429 // 2)] == 123.456
+        assert bot["max_c"] == 99.5
+        assert bot["data"][(10 // 2) * 250 + (15 // 2)] == 99.5
+
+        full_payload = build_interactive_heatmap_payload(
+            T,
+            amb=25.0,
+            layer_names=["F.Cu", "B.Cu"],
+            res_mm=0.1,
+            x_min_mm=5.0,
+            y_min_mm=10.0,
+            show_all=True,
+            max_dim=None,
+        )
+        assert full_payload["downsampled"] is False
+        assert len(json.dumps(payload, separators=(",", ":"))) < len(json.dumps(full_payload, separators=(",", ":"))) / 3
+
+    def test_payload_downsamples_non_divisible_edge_blocks(self):
+        """Non-divisible grids should preserve hotspots in partial trailing blocks."""
+        T = np.full((1, 5, 7), 25.0, dtype=np.float64)
+        T[0, 4, 6] = 88.8
+
+        payload = build_interactive_heatmap_payload(
+            T,
+            amb=25.0,
+            layer_names=["F.Cu"],
+            res_mm=0.2,
+            max_dim=3,
+        )
+
+        assert payload["downsampled"] is True
+        assert payload["downsample_stride"] == 3
+        assert payload["original_rows"] == 5
+        assert payload["original_cols"] == 7
+        assert payload["res_mm"] == 0.6
+        layer = payload["layers"][0]
+        assert layer["rows"] == 2
+        assert layer["cols"] == 3
+        assert layer["data"][1 * 3 + 2] == 88.8
+
+    def test_payload_handles_nan_and_inf_in_vectorized_and_downsampled_paths(self):
+        """Non-finite values should become None and not poison finite block-max values."""
+        T_small = np.array([[[25.1234, np.nan], [np.inf, -np.inf]]], dtype=np.float64)
+        payload_small = build_interactive_heatmap_payload(
+            T_small,
+            amb=20.0,
+            layer_names=["F.Cu"],
+            res_mm=0.5,
+        )
+        assert payload_small["downsampled"] is False
+        assert payload_small["layers"][0]["min_c"] == 25.123
+        assert payload_small["layers"][0]["max_c"] == 25.123
+        assert payload_small["layers"][0]["data"] == [25.123, None, None, None]
+
+        T_pool = np.array([[
+            [np.nan, 45.5, np.nan, np.inf],
+            [30.0, -np.inf, -np.inf, np.nan],
+            [-15.0, np.nan, 10.0, 20.0],
+            [np.nan, np.nan, 15.0, 18.0],
+        ]], dtype=np.float64)
+        payload_pool = build_interactive_heatmap_payload(
+            T_pool,
+            amb=20.0,
+            layer_names=["F.Cu"],
+            res_mm=0.5,
+            max_dim=2,
+        )
+        assert payload_pool["downsampled"] is True
+        assert payload_pool["downsample_stride"] == 2
+        assert payload_pool["layers"][0]["rows"] == 2
+        assert payload_pool["layers"][0]["cols"] == 2
+        assert payload_pool["layers"][0]["data"] == [45.5, None, -15.0, 20.0]

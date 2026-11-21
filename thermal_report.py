@@ -37,7 +37,7 @@ REPORT_STYLE = """
 
 REPORT_SCRIPT = """
 <script>
-(()=>{function c(v,min,max){return Math.max(min,Math.min(max,v));}function l(a,b,t){return a+(b-a)*t;}function h(hex){hex=hex.replace('#','');return{r:parseInt(hex.slice(0,2),16),g:parseInt(hex.slice(2,4),16),b:parseInt(hex.slice(4,6),16)};}function color(val,vmin,vmax){if(val===null||val===undefined||!isFinite(val))return{r:220,g:226,b:232,a:255};const stops=[{t:0,c:h('#0b0c32')},{t:.18,c:h('#420a68')},{t:.36,c:h('#781c6d')},{t:.56,c:h('#bb3754')},{t:.76,c:h('#ec6824')},{t:1,c:h('#f6d645')}];const norm=vmax<=vmin?0:c((val-vmin)/(vmax-vmin),0,1);for(let i=1;i<stops.length;i++){if(norm<=stops[i].t){const p=stops[i-1],n=stops[i],t=(norm-p.t)/Math.max(n.t-p.t,1e-9);return{r:Math.round(l(p.c.r,n.c.r,t)),g:Math.round(l(p.c.g,n.c.g,t)),b:Math.round(l(p.c.b,n.c.b,t)),a:255};}}const end=stops[stops.length-1].c;return{r:end.r,g:end.g,b:end.b,a:255};}function fmt(v,d){if(v===null||v===undefined||!isFinite(v))return'n/a';return Number(v).toFixed(d);}function rect(a,b,layer){if(!a||!b||!layer)return null;return{col0:c(Math.min(a.col,b.col),0,layer.cols-1),col1:c(Math.max(a.col,b.col),0,layer.cols-1),row0:c(Math.min(a.row,b.row),0,layer.rows-1),row1:c(Math.max(a.row,b.row),0,layer.rows-1)};}
+(()=>{function c(v,min,max){return Math.max(min,Math.min(max,v));}function l(a,b,t){return a+(b-a)*t;}function h(hex){hex=hex.replace('#','');return{r:parseInt(hex.slice(0,2),16),g:parseInt(hex.slice(2,4),16),b:parseInt(hex.slice(4,6),16)};}function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&#34;',"'":'&#39;'})[ch]);}function color(val,vmin,vmax){if(val===null||val===undefined||!isFinite(val))return{r:220,g:226,b:232,a:255};const stops=[{t:0,c:h('#0b0c32')},{t:.18,c:h('#420a68')},{t:.36,c:h('#781c6d')},{t:.56,c:h('#bb3754')},{t:.76,c:h('#ec6824')},{t:1,c:h('#f6d645')}];const norm=vmax<=vmin?0:c((val-vmin)/(vmax-vmin),0,1);for(let i=1;i<stops.length;i++){if(norm<=stops[i].t){const p=stops[i-1],n=stops[i],t=(norm-p.t)/Math.max(n.t-p.t,1e-9);return{r:Math.round(l(p.c.r,n.c.r,t)),g:Math.round(l(p.c.g,n.c.g,t)),b:Math.round(l(p.c.b,n.c.b,t)),a:255};}}const end=stops[stops.length-1].c;return{r:end.r,g:end.g,b:end.b,a:255};}function fmt(v,d){if(v===null||v===undefined||!isFinite(v))return'n/a';return Number(v).toFixed(d);}function rect(a,b,layer){if(!a||!b||!layer)return null;return{col0:c(Math.min(a.col,b.col),0,layer.cols-1),col1:c(Math.max(a.col,b.col),0,layer.cols-1),row0:c(Math.min(a.row,b.row),0,layer.rows-1),row1:c(Math.max(a.row,b.row),0,layer.rows-1)};}
 document.addEventListener('DOMContentLoaded',()=>{const node=document.getElementById('interactive-heatmap-data');if(!node)return;let payload=null;try{payload=JSON.parse(node.textContent);}catch(err){console.error('Failed to parse interactive heatmap payload',err);return;}if(!payload||!payload.layers||!payload.layers.length)return;
 const sel=document.getElementById('heatmap-layer-select'),canvas=document.getElementById('heatmap-canvas'),overlay=document.getElementById('roi-overlay'),tip=document.getElementById('heatmap-tooltip'),tbody=document.getElementById('roi-table-body'),empty=document.getElementById('roi-empty-state'),clearCurrent=document.getElementById('clear-current-rois'),clearAll=document.getElementById('clear-all-rois'),active=document.getElementById('active-layer-name'),legendMin=document.getElementById('legend-min'),legendMax=document.getElementById('legend-max'),roiToggle=document.getElementById('roi-apply-all-layers');
 const state={rois:[],dragStart:null,dragCurrent:null,dragLayerIndex:null,nextRoiId:1,currentLayerIndex:payload.layers[0].index,applyToAllLayers:roiToggle?roiToggle.checked:true};const ctx=canvas.getContext('2d'),octx=overlay.getContext('2d');
@@ -45,12 +45,12 @@ function getLayer(idx){return payload.layers.find(layer=>layer.index===idx)||pay
 function buildOptions(){sel.innerHTML='';payload.layers.forEach(layer=>{const opt=document.createElement('option');opt.value=String(layer.index);opt.textContent=layer.name;if(layer.index===state.currentLayerIndex)opt.selected=true;sel.appendChild(opt);});}
 function drawHeatmap(){const layer=currentLayer();setSizes(layer);const img=ctx.createImageData(layer.cols,layer.rows);for(let i=0;i<layer.data.length;i++){const rgba=color(layer.data[i],payload.vmin_c,payload.vmax_c),off=i*4;img.data[off]=rgba.r;img.data[off+1]=rgba.g;img.data[off+2]=rgba.b;img.data[off+3]=rgba.a;}ctx.putImageData(img,0,0);active.textContent=layer.name;legendMin.textContent=fmt(payload.vmin_c,1)+' C';legendMax.textContent=fmt(payload.vmax_c,1)+' C';drawOverlay();}
 function canvasCell(evt){const layer=currentLayer(),r=canvas.getBoundingClientRect();if(!r.width||!r.height)return null;const x=c(evt.clientX-r.left,0,r.width-.0001),y=c(evt.clientY-r.top,0,r.height-.0001);return{col:c(Math.floor(x/r.width*layer.cols),0,layer.cols-1),row:c(Math.floor(y/r.height*layer.rows),0,layer.rows-1)};}
-function showTip(evt,cell){const layer=currentLayer();if(!cell){tip.style.display='none';return;}const value=cellValue(layer,cell.row,cell.col),xMm=payload.x_min_mm+cell.col*payload.res_mm,yMm=payload.y_min_mm+cell.row*payload.res_mm;tip.innerHTML='<strong>'+layer.name+'</strong><br>Temp: '+fmt(value,2)+' C<br>Row/Col: '+cell.row+' / '+cell.col+'<br>X/Y: '+fmt(xMm,3)+' / '+fmt(yMm,3)+' mm';tip.style.left=(evt.clientX+16)+'px';tip.style.top=(evt.clientY+16)+'px';tip.style.display='block';}
+function showTip(evt,cell){const layer=currentLayer();if(!cell){tip.style.display='none';return;}const value=cellValue(layer,cell.row,cell.col),xMm=payload.x_min_mm+cell.col*payload.res_mm,yMm=payload.y_min_mm+cell.row*payload.res_mm;tip.innerHTML='<strong>'+esc(layer.name)+'</strong><br>Temp: '+fmt(value,2)+' C<br>Row/Col: '+cell.row+' / '+cell.col+'<br>X/Y: '+fmt(xMm,3)+' / '+fmt(yMm,3)+' mm';tip.style.left=(evt.clientX+16)+'px';tip.style.top=(evt.clientY+16)+'px';tip.style.display='block';}
 function drawRect(r,stroke,fill,dashed){const w=r.col1-r.col0+1,h=r.row1-r.row0+1;octx.save();octx.strokeStyle=stroke;octx.fillStyle=fill;octx.lineWidth=1.25;octx.setLineDash(dashed?[3,2]:[]);octx.fillRect(r.col0,r.row0,w,h);octx.strokeRect(r.col0+.5,r.row0+.5,Math.max(w-1,1),Math.max(h-1,1));octx.restore();}
 function roiMatchesLayer(roi,layerIndex){return roi.mode==='all_layers'||roi.layerIndex===layerIndex;}
 function drawOverlay(){const layer=currentLayer();octx.clearRect(0,0,overlay.width,overlay.height);state.rois.forEach(roi=>{if(!roiMatchesLayer(roi,layer.index))return;drawRect(roi,'rgba(12,92,152,.95)','rgba(31,95,139,.18)',false);});if(state.dragStart&&state.dragCurrent&&state.dragLayerIndex===layer.index){const draft=rect(state.dragStart,state.dragCurrent,layer);if(draft)drawRect(draft,'rgba(155,44,44,.95)','rgba(155,44,44,.16)',true);}}
 function stats(layer,roi){let min=Infinity,max=-Infinity,sum=0,count=0;for(let row=roi.row0;row<=roi.row1;row++){for(let col=roi.col0;col<=roi.col1;col++){const value=cellValue(layer,row,col);if(value===null||value===undefined||!isFinite(value))continue;min=Math.min(min,value);max=Math.max(max,value);sum+=value;count++;}}return{min:count?min:null,max:count?max:null,avg:count?sum/count:null,cells:count};}
-function renderTable(){tbody.innerHTML='';if(!state.rois.length){empty.style.display='block';return;}empty.style.display='none';state.rois.forEach((roi,index)=>{const layers=roi.mode==='all_layers'?payload.layers:[getLayer(roi.layerIndex)];layers.forEach((layer,layerPos)=>{const s=stats(layer,roi),row=document.createElement('tr');if(layerPos===0)row.classList.add('roi-table__group-start');row.innerHTML='<td>ROI '+(index+1)+(roi.mode==='all_layers'?' (all layers)':'')+'</td><td>'+layer.name+'</td><td>'+roi.col0+', '+roi.row0+'</td><td>'+roi.col1+', '+roi.row1+'</td><td>'+(roi.col1-roi.col0+1)+' x '+(roi.row1-roi.row0+1)+'</td><td>'+s.cells+'</td><td>'+fmt(s.min,2)+' C</td><td>'+fmt(s.max,2)+' C</td><td>'+fmt(s.avg,2)+' C</td><td class=\"roi-action-col print-hide-col\"><button class=\"delete-btn\" data-roi-id=\"'+roi.id+'\">Delete</button></td>';tbody.appendChild(row);});});}
+function renderTable(){tbody.innerHTML='';if(!state.rois.length){empty.style.display='block';return;}empty.style.display='none';state.rois.forEach((roi,index)=>{const layers=roi.mode==='all_layers'?payload.layers:[getLayer(roi.layerIndex)];layers.forEach((layer,layerPos)=>{const s=stats(layer,roi),row=document.createElement('tr');if(layerPos===0)row.classList.add('roi-table__group-start');row.innerHTML='<td>ROI '+(index+1)+(roi.mode==='all_layers'?' (all layers)':'')+'</td><td>'+esc(layer.name)+'</td><td>'+roi.col0+', '+roi.row0+'</td><td>'+roi.col1+', '+roi.row1+'</td><td>'+(roi.col1-roi.col0+1)+' x '+(roi.row1-roi.row0+1)+'</td><td>'+s.cells+'</td><td>'+fmt(s.min,2)+' C</td><td>'+fmt(s.max,2)+' C</td><td>'+fmt(s.avg,2)+' C</td><td class=\"roi-action-col print-hide-col\"><button class=\"delete-btn\" data-roi-id=\"'+roi.id+'\">Delete</button></td>';tbody.appendChild(row);});});}
 function finishDrag(){if(!state.dragStart||!state.dragCurrent){state.dragStart=null;state.dragCurrent=null;state.dragLayerIndex=null;drawOverlay();return;}const layer=getLayer(state.dragLayerIndex),r=rect(state.dragStart,state.dragCurrent,layer);if(r){r.id=state.nextRoiId++;r.mode=state.applyToAllLayers?'all_layers':'single_layer';r.layerIndex=state.applyToAllLayers?null:layer.index;state.rois.push(r);renderTable();}state.dragStart=null;state.dragCurrent=null;state.dragLayerIndex=null;drawOverlay();}
 sel.addEventListener('change',()=>{state.currentLayerIndex=parseInt(sel.value,10);drawHeatmap();});if(roiToggle){roiToggle.addEventListener('change',()=>{state.applyToAllLayers=roiToggle.checked;});}canvas.addEventListener('mousedown',evt=>{const cell=canvasCell(evt);state.dragStart=cell;state.dragCurrent=cell;state.dragLayerIndex=state.currentLayerIndex;drawOverlay();});canvas.addEventListener('mousemove',evt=>{const cell=canvasCell(evt);showTip(evt,cell);if(!state.dragStart)return;state.dragCurrent=cell;drawOverlay();});canvas.addEventListener('mouseleave',()=>{tip.style.display='none';});window.addEventListener('mouseup',()=>{if(state.dragStart)finishDrag();});tbody.addEventListener('click',evt=>{if(!evt.target.classList.contains('delete-btn'))return;const roiId=parseInt(evt.target.getAttribute('data-roi-id'),10);state.rois=state.rois.filter(roi=>roi.id!==roiId);renderTable();drawOverlay();});clearCurrent.addEventListener('click',()=>{state.rois=state.rois.filter(roi=>roi.mode==='all_layers'||roi.layerIndex!==state.currentLayerIndex);renderTable();drawOverlay();});clearAll.addEventListener('click',()=>{state.rois=[];renderTable();drawOverlay();});buildOptions();drawHeatmap();renderTable();});})();
 </script>
@@ -73,7 +73,12 @@ def _esc(text):
 
 def _json_for_script(data):
     """Serialize JSON for safe embedding in a script tag."""
-    return json.dumps(data, separators=(",", ":"), ensure_ascii=True).replace("</", "<\\/")
+    return (
+        json.dumps(data, separators=(",", ":"), ensure_ascii=True)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
 
 
 def _table_html(headers, rows, empty_text="n/a", table_class=""):
@@ -145,8 +150,12 @@ def _build_summary_metrics(settings, interactive_heatmap, k_norm_info, snapshot_
     overall_peak = max(layer_max_values) if layer_max_values else None
     grid_label = "n/a"
     if layers:
-        grid_label = f"{layers[0].get('rows', 0)} x {layers[0].get('cols', 0)}"
+        grid_rows = (interactive_heatmap or {}).get("original_rows", layers[0].get("rows", 0))
+        grid_cols = (interactive_heatmap or {}).get("original_cols", layers[0].get("cols", 0))
+        grid_label = f"{grid_rows} x {grid_cols}"
     actual_res = (k_norm_info or {}).get("grid_res_mm")
+    if actual_res is None:
+        actual_res = (interactive_heatmap or {}).get("original_res_mm")
     if actual_res is None:
         actual_res = (interactive_heatmap or {}).get("res_mm")
     requested_res = (k_norm_info or {}).get("grid_requested_res_mm", settings.get("res"))
@@ -261,6 +270,20 @@ def _build_interactive_viewer(interactive_heatmap):
     if not interactive_heatmap or not interactive_heatmap.get("layers"):
         return "<div class='empty-state'>Interactive heatmap data is not available for this run.</div>"
     payload_json = _json_for_script(interactive_heatmap)
+    downsample_note_html = ""
+    if interactive_heatmap.get("downsampled"):
+        first_layer = interactive_heatmap["layers"][0]
+        stride = int(interactive_heatmap.get("downsample_stride", 1) or 1)
+        disp_rows = int(first_layer.get("rows", 0))
+        disp_cols = int(first_layer.get("cols", 0))
+        orig_rows = int(interactive_heatmap.get("original_rows", disp_rows))
+        orig_cols = int(interactive_heatmap.get("original_cols", disp_cols))
+        note_text = (
+            f"Interactive preview downsampled {stride}x "
+            f"({disp_rows}x{disp_cols} from {orig_rows}x{orig_cols}, "
+            "hotspot-preserving peak pooling) for browser responsiveness."
+        )
+        downsample_note_html = f"<p class='viewer-help viewer-downsample-note'>{_esc(note_text)}</p>"
     return (
         "<div class='viewer-shell'>"
         "<div class='viewer-panel interactive-heatmap-panel'>"
@@ -275,6 +298,7 @@ def _build_interactive_viewer(interactive_heatmap):
         "<button id='clear-all-rois' type='button'>Clear all</button>"
         "</div>"
         "<p class='viewer-help'>Hover to inspect cell temperature. Drag to create ROI rectangles. With the checkbox enabled, the same ROI is evaluated on every visible layer.</p>"
+        f"{downsample_note_html}"
         "<div class='legend-row'><div class='legend-bar' aria-hidden='true'></div>"
         "<div class='legend-labels'><span id='legend-min'>n/a</span><span id='legend-max'>n/a</span></div></div>"
         "<div class='viewer-canvas-wrap'><canvas id='heatmap-canvas'></canvas><canvas id='roi-overlay'></canvas></div>"

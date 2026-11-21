@@ -666,3 +666,120 @@ class TestWriteHtmlReportEdgeCases:
         # Special chars should be escaped
         assert '&lt;special&gt;' in content
         assert 'R&amp;D' in content
+
+    def test_js_escapes_special_chars_in_layer_names(self, temp_dir):
+        """Interactive report JS should HTML-escape layer names in innerHTML sinks."""
+        evil_names = [
+            "F.Cu<img src=x onerror=alert(1)>",
+            "B&Cu\"'<script>evil()</script>",
+        ]
+        interactive_heatmap = build_interactive_heatmap_payload(
+            create_uniform_temperature(2, 4, 4, temperature=50.0),
+            amb=25.0,
+            layer_names=evil_names,
+            res_mm=0.5,
+            show_all=True,
+        )
+        result = write_html_report(
+            settings={'time': 10.0, 'amb': 25.0, 'res': 0.5},
+            stack_info={},
+            stackup_derived={
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035, 0.035],
+                'gap_mm_used': [1.53],
+                'gap_fallback_used': False,
+            },
+            pad_power=[],
+            layer_names=evil_names,
+            preview_path=None,
+            heatmap_path=None,
+            out_dir=temp_dir,
+            interactive_heatmap=interactive_heatmap,
+        )
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Static HTML escapes layer names; embedded JSON escapes closing script tag
+        assert "<script>evil()</script>" not in content
+        assert "<img src=x onerror=alert(1)>" not in content
+        assert "&lt;img src=x onerror=alert(1)&gt;" in content
+        assert "B&amp;Cu" in content
+
+        # Embedded JSON remains parseable and preserves original names as data
+        payload = _extract_embedded_heatmap_json(content)
+        assert [layer["name"] for layer in payload["layers"]] == evil_names
+
+        # JS viewer defines esc() and uses it in both showTip and renderTable innerHTML sinks
+        assert "function esc(s)" in content
+        assert "<strong>'+esc(layer.name)+'</strong>" in content
+        assert "<td>'+esc(layer.name)+'</td>" in content
+        assert "+layer.name+" not in content
+
+    def test_downsampling_notice_shown_for_large_grid_and_omitted_for_small_grid(self, temp_dir):
+        """Report should display downsampling notice only when interactive payload is downsampled."""
+        T_large = create_uniform_temperature(2, 500, 500, temperature=40.0)
+        T_large[0, 100, 200] = 95.0
+        large_payload = build_interactive_heatmap_payload(
+            T_large,
+            amb=25.0,
+            layer_names=['F.Cu', 'B.Cu'],
+            res_mm=0.1,
+            show_all=True,
+        )
+        result_large = write_html_report(
+            settings={'time': 10.0, 'amb': 25.0, 'res': 0.1},
+            stack_info={},
+            stackup_derived={
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035, 0.035],
+                'gap_mm_used': [1.53],
+                'gap_fallback_used': False,
+            },
+            pad_power=[],
+            layer_names=['F.Cu', 'B.Cu'],
+            preview_path=None,
+            heatmap_path=None,
+            out_dir=temp_dir,
+            interactive_heatmap=large_payload,
+        )
+        with open(result_large, 'r', encoding='utf-8') as f:
+            large_html = f.read()
+
+        assert (
+            "Interactive preview downsampled 2x (250x250 from 500x500, "
+            "hotspot-preserving peak pooling) for browser responsiveness."
+        ) in large_html
+        # Summary card still reports original simulation dimensions and resolution
+        assert "500 x 500" in large_html
+        assert "0.100 mm" in large_html
+
+        small_payload = build_interactive_heatmap_payload(
+            create_uniform_temperature(2, 6, 8, temperature=40.0),
+            amb=25.0,
+            layer_names=['F.Cu', 'B.Cu'],
+            res_mm=0.5,
+            show_all=True,
+        )
+        result_small = write_html_report(
+            settings={'time': 10.0, 'amb': 25.0, 'res': 0.5},
+            stack_info={},
+            stackup_derived={
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035, 0.035],
+                'gap_mm_used': [1.53],
+                'gap_fallback_used': False,
+            },
+            pad_power=[],
+            layer_names=['F.Cu', 'B.Cu'],
+            preview_path=None,
+            heatmap_path=None,
+            out_dir=temp_dir,
+            interactive_heatmap=small_payload,
+        )
+        with open(result_small, 'r', encoding='utf-8') as f:
+            small_html = f.read()
+
+        assert "Interactive preview downsampled" not in small_html

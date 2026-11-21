@@ -1,13 +1,15 @@
 """Shared workflow models for responsive ThermalSim jobs."""
 
 from dataclasses import dataclass, field
+import base64
 import ctypes
 import hashlib
 import json
 import os
-import pickle
+import sys
 import tempfile
 import threading
+import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -49,6 +51,33 @@ def get_process_memory_mb(peak=False):
                 return float(value) / (1024.0 ** 2)
         except (AttributeError, OSError, ValueError):
             return None
+
+    # Linux: /proc/self/status reports VmHWM (peak RSS) and VmRSS (current RSS) in kB
+    target_key = "VmHWM:" if peak else "VmRSS:"
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as stream:
+            for line in stream:
+                if line.startswith(target_key):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return float(parts[1]) / 1024.0
+                    break
+    except (OSError, ValueError):
+        pass
+
+    # POSIX / macOS fallback via resource.getrusage (bytes on macOS, KiB on Linux/BSD)
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        maxrss = float(usage.ru_maxrss)
+        if maxrss > 0.0:
+            if sys.platform == "darwin":
+                return maxrss / (1024.0 ** 2)
+            return maxrss / 1024.0
+    except (ImportError, AttributeError, OSError, ValueError):
+        pass
+
     return None
 
 
@@ -253,8 +282,60 @@ class SimulationArtifacts:
     max_temp_c: Optional[float] = None
 
 
+_GEOMETRY_STATE_FIELDS = (
+    "copper_mask",
+    "via_map",
+    "heatsink_mask",
+    "area_mask",
+    "x_min",
+    "y_min",
+    "res",
+    "rows",
+    "cols",
+    "x_centers_iu",
+    "y_centers_iu",
+)
+
+
+def _is_geometry_state_like(value) -> bool:
+    """Return whether value exposes the GeometryState array and grid interface."""
+    return all(hasattr(value, field_name) for field_name in _GEOMETRY_STATE_FIELDS)
+
+
+def _encode_json_safe(value):
+    """Encode nested JSON-compatible structures with tagged base64 for bytes."""
+    if isinstance(value, bytes):
+        return {"__thermalsim_bytes_b64__": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, dict):
+        return {str(k): _encode_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_encode_json_safe(item) for item in value]
+    return value
+
+
+def _decode_json_safe(value):
+    """Decode structures produced by ``_encode_json_safe``."""
+    if isinstance(value, dict):
+        if len(value) == 1 and "__thermalsim_bytes_b64__" in value:
+            return base64.b64decode(value["__thermalsim_bytes_b64__"].encode("ascii"))
+        return {k: _decode_json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_decode_json_safe(item) for item in value]
+    return value
+
+
+def _import_numpy():
+    try:
+        import numpy as np
+        return np
+    except ImportError:
+        return None
+
+
 class GeometryCache:
-    """Geometry cache with optional persistent local-disk reuse."""
+    """Geometry cache with optional safe persistent local-disk reuse (.npz/.json)."""
+
+    _CACHE_EXTENSIONS = (".npz", ".json", ".pickle")
 
     def __init__(self, persistent=False, max_bytes=4 * 1024 ** 3, cache_dir=None):
         self.key = None
@@ -269,8 +350,19 @@ class GeometryCache:
             default_root, "ThermalSim", "cache", "geometry-v1"
         )
 
-    def _path(self, key):
-        return os.path.join(self.cache_dir, f"{key}.pickle")
+    def _path(self, key, ext=".npz"):
+        return os.path.join(self.cache_dir, f"{key}{ext}")
+
+    def _remove_stale_variants(self, key, keep_ext):
+        for ext in self._CACHE_EXTENSIONS:
+            if ext == keep_ext:
+                continue
+            other_path = self._path(key, ext)
+            try:
+                if os.path.exists(other_path):
+                    os.remove(other_path)
+            except OSError:
+                continue
 
     def _prune(self, keep_path=None):
         if not self.persistent or self.max_bytes <= 0:
@@ -278,12 +370,12 @@ class GeometryCache:
         try:
             entries = [
                 item for item in os.scandir(self.cache_dir)
-                if item.is_file() and item.name.endswith(".pickle")
+                if item.is_file() and item.name.endswith(self._CACHE_EXTENSIONS)
             ]
             total = sum(item.stat().st_size for item in entries)
             if total <= self.max_bytes:
                 return
-            entries.sort(key=lambda item: item.stat().st_mtime)
+            entries.sort(key=lambda item: item.stat().st_mtime_ns)
             for item in entries:
                 if keep_path and os.path.normcase(item.path) == os.path.normcase(keep_path):
                     continue
@@ -298,46 +390,180 @@ class GeometryCache:
         except OSError:
             return
 
+    def _load_npz(self, path):
+        np_mod = _import_numpy()
+        if np_mod is None:
+            return None
+        with np_mod.load(path, allow_pickle=False) as archive:
+            meta_bytes = bytes(archive["__meta__"].tobytes())
+            meta = json.loads(meta_bytes.decode("utf-8"))
+            fmt = meta.get("format")
+            if fmt == "geometry_state_v1":
+                from .geometry_mapper import GeometryState
+
+                area_mask = archive["area_mask"] if meta.get("has_area_mask") else None
+                return GeometryState(
+                    copper_mask=archive["copper_mask"],
+                    via_map=archive["via_map"],
+                    heatsink_mask=archive["heatsink_mask"],
+                    area_mask=area_mask,
+                    x_min=float(meta["x_min"]),
+                    y_min=float(meta["y_min"]),
+                    res=float(meta["res"]),
+                    rows=int(meta["rows"]),
+                    cols=int(meta["cols"]),
+                    x_centers_iu=archive["x_centers_iu"],
+                    y_centers_iu=archive["y_centers_iu"],
+                )
+            if fmt == "dict_v1":
+                result = _decode_json_safe(meta.get("json_items", {}))
+                for key_str, arr_name in meta.get("array_keys", {}).items():
+                    result[key_str] = archive[arr_name]
+                return result
+            raise ValueError(f"Unsupported geometry cache format: {fmt}")
+
+    def _load_json(self, path):
+        with open(path, "r", encoding="utf-8") as stream:
+            return _decode_json_safe(json.load(stream))
+
+    def _build_npz_payload(self, value, np_mod):
+        if _is_geometry_state_like(value):
+            arrays = {
+                "copper_mask": np_mod.asarray(value.copper_mask),
+                "via_map": np_mod.asarray(value.via_map),
+                "heatsink_mask": np_mod.asarray(value.heatsink_mask),
+                "x_centers_iu": np_mod.asarray(value.x_centers_iu),
+                "y_centers_iu": np_mod.asarray(value.y_centers_iu),
+            }
+            has_area_mask = value.area_mask is not None
+            if has_area_mask:
+                arrays["area_mask"] = np_mod.asarray(value.area_mask)
+            meta = {
+                "format": "geometry_state_v1",
+                "x_min": float(value.x_min),
+                "y_min": float(value.y_min),
+                "res": float(value.res),
+                "rows": int(value.rows),
+                "cols": int(value.cols),
+                "has_area_mask": has_area_mask,
+            }
+            arrays["__meta__"] = np_mod.frombuffer(
+                json.dumps(meta, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+                dtype=np_mod.uint8,
+            )
+            return arrays
+
+        if isinstance(value, dict) and any(
+            isinstance(item, np_mod.ndarray) for item in value.values()
+        ):
+            arrays = {}
+            array_keys = {}
+            json_items = {}
+            for idx, (item_key, item_val) in enumerate(value.items()):
+                key_str = str(item_key)
+                if isinstance(item_val, np_mod.ndarray):
+                    arr_name = f"arr_{idx}"
+                    arrays[arr_name] = item_val
+                    array_keys[key_str] = arr_name
+                else:
+                    json_items[key_str] = _encode_json_safe(item_val)
+            meta = {
+                "format": "dict_v1",
+                "array_keys": array_keys,
+                "json_items": json_items,
+            }
+            arrays["__meta__"] = np_mod.frombuffer(
+                json.dumps(meta, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+                dtype=np_mod.uint8,
+            )
+            return arrays
+
+        return None
+
     def get(self, key):
         if key == self.key:
             return self.value
         if not self.persistent:
             return None
-        path = self._path(key)
-        try:
-            with open(path, "rb") as stream:
-                value = pickle.load(stream)
-            os.utime(path, None)
-            self.key = key
-            self.value = value
-            return value
-        except (OSError, EOFError, pickle.PickleError, AttributeError, ValueError):
+
+        npz_path = self._path(key, ".npz")
+        if os.path.isfile(npz_path):
             try:
-                os.remove(path)
-            except OSError:
-                pass
-            return None
+                value = self._load_npz(npz_path)
+                if value is not None:
+                    os.utime(npz_path, None)
+                    self.key = key
+                    self.value = value
+                    return value
+            except (
+                OSError,
+                EOFError,
+                KeyError,
+                AttributeError,
+                ValueError,
+                TypeError,
+                zipfile.BadZipFile,
+                json.JSONDecodeError,
+            ):
+                try:
+                    os.remove(npz_path)
+                except OSError:
+                    pass
+                return None
+
+        json_path = self._path(key, ".json")
+        if os.path.isfile(json_path):
+            try:
+                value = self._load_json(json_path)
+                os.utime(json_path, None)
+                self.key = key
+                self.value = value
+                return value
+            except (OSError, EOFError, ValueError, TypeError, json.JSONDecodeError):
+                try:
+                    os.remove(json_path)
+                except OSError:
+                    pass
+                return None
+
+        return None
 
     def put(self, key, value):
         self.key = key
         self.value = value
         if not self.persistent:
             return
-        path = self._path(key)
+
+        np_mod = _import_numpy()
+        npz_payload = None
+        if np_mod is not None:
+            try:
+                npz_payload = self._build_npz_payload(value, np_mod)
+            except (TypeError, ValueError, AttributeError):
+                npz_payload = None
+
+        ext = ".npz" if npz_payload is not None else ".json"
+        path = self._path(key, ext)
         try:
             os.makedirs(self.cache_dir, exist_ok=True)
             handle, temp_path = tempfile.mkstemp(
                 prefix=f"{key}.", suffix=".tmp", dir=self.cache_dir
             )
             try:
-                with os.fdopen(handle, "wb") as stream:
-                    pickle.dump(value, stream, protocol=pickle.HIGHEST_PROTOCOL)
+                if npz_payload is not None:
+                    with os.fdopen(handle, "wb") as stream:
+                        np_mod.savez_compressed(stream, **npz_payload)
+                else:
+                    encoded = _encode_json_safe(value)
+                    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                        json.dump(encoded, stream, sort_keys=True, separators=(",", ":"))
                 os.replace(temp_path, path)
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
+            self._remove_stale_variants(key, keep_ext=ext)
             self._prune(keep_path=path)
-        except (OSError, pickle.PickleError, AttributeError, TypeError):
+        except (OSError, AttributeError, TypeError, ValueError):
             return
 
     def clear(self):

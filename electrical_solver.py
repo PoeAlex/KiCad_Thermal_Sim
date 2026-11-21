@@ -16,7 +16,18 @@ from scipy.sparse.csgraph import connected_components
 
 import pcbnew
 
+from .capabilities import HAS_PARDISO
 from .geometry_mapper import _fill_zone_mask_polygons
+
+if HAS_PARDISO:
+    import pypardiso
+else:
+    pypardiso = None
+
+_ELECTRICAL_ITERATIVE_NODE_THRESHOLD = 150_000
+_ELECTRICAL_ITERATIVE_RTOL = 1e-8
+_ELECTRICAL_ITERATIVE_MAXITER = 4000
+_ELECTRICAL_PARDISO_RESIDUAL_TOL = 1e-8
 
 
 @dataclass
@@ -434,7 +445,7 @@ def _solve_one_net(
         try:
             sub_lap = lap[solve_nodes][:, solve_nodes]
             sub_rhs = rhs[solve_nodes]
-            potentials[solve_nodes] = spla.spsolve(sub_lap, sub_rhs)
+            potentials[solve_nodes] = _solve_electrical_system(sub_lap, sub_rhs)
         except Exception as exc:
             errors.append(f"Electrical solve failed for net {net_name}: {exc}")
             return ElectricalResult(q_full, [], warnings, errors)
@@ -545,6 +556,152 @@ def _solve_one_net(
     return ElectricalResult(q_full, [summary], warnings, errors)
 
 
+def _release_pardiso_solver(owner: Any) -> None:
+    """Release native memory associated with a temporary PyPardiso solver."""
+    if owner is not None and hasattr(owner, "free_memory"):
+        try:
+            owner.free_memory(everything=True)
+        except Exception:
+            pass
+
+
+def _relative_residual(
+    matrix: sp.csr_matrix,
+    solution: np.ndarray,
+    rhs: np.ndarray,
+    rhs_norm: Optional[float] = None,
+) -> float:
+    """Compute the relative 2-norm residual ``||A x - b|| / ||b||``."""
+    norm_b = float(np.linalg.norm(rhs)) if rhs_norm is None else float(rhs_norm)
+    if norm_b <= 0.0:
+        return 0.0
+    residual = matrix.dot(solution) - rhs
+    return float(np.linalg.norm(residual) / max(norm_b, 1e-30))
+
+
+def _solve_electrical_system(
+    sub_lap: sp.spmatrix,
+    sub_rhs: np.ndarray,
+    *,
+    iterative_threshold: Optional[int] = None,
+) -> np.ndarray:
+    """Solve one grounded connected-component Laplacian system ``A x = b``.
+
+    The grounded copper-network Laplacian is symmetric positive definite.
+    Solver selection order:
+    1. PyPardiso SPD (``mtype=2`` on upper-triangular CSR) with residual check,
+       falling back to generic ``pypardiso.spsolve`` if available.
+    2. For large systems (``N >= iterative_threshold``) without PyPardiso,
+       Jacobi-preconditioned Conjugate Gradients (``spla.cg``) verified against
+       a tight relative residual (``<= 1e-8``).
+    3. Direct SciPy SuperLU (``spla.spsolve``) on a CSC matrix as default for
+       smaller systems and safe fallback.
+    """
+    rhs = np.asarray(sub_rhs, dtype=np.float64).reshape(-1)
+    n_nodes = int(sub_lap.shape[0])
+    if n_nodes == 0:
+        return np.empty(0, dtype=np.float64)
+
+    rhs_norm = float(np.linalg.norm(rhs))
+    if rhs_norm == 0.0:
+        return np.zeros(n_nodes, dtype=np.float64)
+
+    sub_lap_csr = (
+        sub_lap if getattr(sub_lap, "format", None) == "csr" else sub_lap.tocsr()
+    )
+
+    if HAS_PARDISO and pypardiso is not None:
+        if hasattr(pypardiso, "PyPardisoSolver"):
+            spd_owner = None
+            try:
+                spd_matrix = sp.triu(sub_lap_csr, format="csr")
+                spd_owner = pypardiso.PyPardisoSolver(mtype=2)
+                solution = np.asarray(
+                    spd_owner.solve(spd_matrix, rhs), dtype=np.float64
+                ).reshape(-1)
+                if (
+                    solution.shape == (n_nodes,)
+                    and np.all(np.isfinite(solution))
+                    and _relative_residual(sub_lap_csr, solution, rhs, rhs_norm)
+                    <= _ELECTRICAL_PARDISO_RESIDUAL_TOL
+                ):
+                    return solution
+            except Exception:
+                pass
+            finally:
+                _release_pardiso_solver(spd_owner)
+
+        if hasattr(pypardiso, "spsolve"):
+            try:
+                solution = np.asarray(
+                    pypardiso.spsolve(sub_lap_csr, rhs), dtype=np.float64
+                ).reshape(-1)
+                if (
+                    solution.shape == (n_nodes,)
+                    and np.all(np.isfinite(solution))
+                    and _relative_residual(sub_lap_csr, solution, rhs, rhs_norm)
+                    <= _ELECTRICAL_PARDISO_RESIDUAL_TOL
+                ):
+                    return solution
+            except Exception:
+                pass
+
+    threshold = (
+        _ELECTRICAL_ITERATIVE_NODE_THRESHOLD
+        if iterative_threshold is None
+        else int(iterative_threshold)
+    )
+    if n_nodes >= threshold:
+        try:
+            diag = np.asarray(sub_lap_csr.diagonal(), dtype=np.float64)
+            inv_diag = np.divide(
+                1.0,
+                diag,
+                out=np.zeros_like(diag),
+                where=np.abs(diag) > 1e-30,
+            )
+            preconditioner = spla.LinearOperator(
+                sub_lap_csr.shape,
+                matvec=lambda vec: inv_diag * vec,
+                dtype=np.float64,
+            )
+            cg_rtol = min(_ELECTRICAL_ITERATIVE_RTOL * 0.1, 1e-9)
+            try:
+                solution, info = spla.cg(
+                    sub_lap_csr,
+                    rhs,
+                    M=preconditioner,
+                    rtol=cg_rtol,
+                    atol=0.0,
+                    maxiter=_ELECTRICAL_ITERATIVE_MAXITER,
+                )
+            except TypeError:
+                solution, info = spla.cg(
+                    sub_lap_csr,
+                    rhs,
+                    M=preconditioner,
+                    tol=cg_rtol,
+                    atol=0.0,
+                    maxiter=_ELECTRICAL_ITERATIVE_MAXITER,
+                )
+            solution = np.asarray(solution, dtype=np.float64).reshape(-1)
+            if (
+                info == 0
+                and solution.shape == (n_nodes,)
+                and np.all(np.isfinite(solution))
+                and _relative_residual(sub_lap_csr, solution, rhs, rhs_norm)
+                <= _ELECTRICAL_ITERATIVE_RTOL
+            ):
+                return solution
+        except Exception:
+            pass
+
+    sub_lap_csc = (
+        sub_lap if getattr(sub_lap, "format", None) == "csc" else sub_lap_csr.tocsc()
+    )
+    return np.asarray(spla.spsolve(sub_lap_csc, rhs), dtype=np.float64).reshape(-1)
+
+
 def _build_relevant_net_masks(
     board: Any,
     config: ElectricalConfig,
@@ -595,29 +752,35 @@ def _build_relevant_net_masks(
         key, _, _ = net_key_from_obj(obj)
         if key not in net_masks:
             return 0
+        bbox_obj = bbox if bbox is not None else obj.GetBoundingBox()
+        rs, re, cs, ce = _bbox_indices(bbox_obj, config)
+        if rs >= re or cs >= ce:
+            return 0
         mapped_cells = 0
         if as_via:
-            bbox_obj = bbox or obj.GetBoundingBox()
-            before_via = int(np.count_nonzero(via_masks[key]))
+            via_slice = via_masks[key][rs:re, cs:ce]
+            before_via = int(np.count_nonzero(via_slice))
             _fill_bbox_2d(via_masks[key], bbox_obj, config)
-            mapped_cells += int(np.count_nonzero(via_masks[key])) - before_via
+            mapped_cells += int(np.count_nonzero(via_slice)) - before_via
             for lid in layer_ids:
                 layer_idx = lid_to_idx.get(lid)
                 if layer_idx is not None:
-                    before = int(np.count_nonzero(net_masks[key][layer_idx]))
+                    layer_slice = net_masks[key][layer_idx, rs:re, cs:ce]
+                    before = int(np.count_nonzero(layer_slice))
                     _fill_bbox_3d(net_masks[key], layer_idx, bbox_obj, config)
-                    mapped_cells += int(np.count_nonzero(net_masks[key][layer_idx])) - before
+                    mapped_cells += int(np.count_nonzero(layer_slice)) - before
             return mapped_cells
         for lid in layer_ids:
             layer_idx = lid_to_idx.get(lid)
             if layer_idx is None:
                 continue
-            before = int(np.count_nonzero(net_masks[key][layer_idx]))
+            layer_slice = net_masks[key][layer_idx, rs:re, cs:ce]
+            before = int(np.count_nonzero(layer_slice))
             if use_track_shape:
                 _fill_track(net_masks[key], layer_idx, obj, config)
             else:
-                _fill_bbox_3d(net_masks[key], layer_idx, bbox or obj.GetBoundingBox(), config)
-            mapped_cells += int(np.count_nonzero(net_masks[key][layer_idx])) - before
+                _fill_bbox_3d(net_masks[key], layer_idx, bbox_obj, config)
+            mapped_cells += int(np.count_nonzero(layer_slice)) - before
         return mapped_cells
 
     try:
@@ -669,7 +832,7 @@ def _build_relevant_net_masks(
             )
         else:
             layer_id = track.GetLayer()
-            mapped_cells = fill_for_obj(track, [layer_id], use_track_shape=True)
+            mapped_cells = fill_for_obj(track, [layer_id], bbox=bbox, use_track_shape=True)
             record_primitive(
                 key,
                 "Track",
@@ -691,12 +854,18 @@ def _build_relevant_net_masks(
         if hasattr(zone, "IsFilled") and not zone.IsFilled():
             continue
         bbox = zone.GetBoundingBox()
+        rs, re, cs, ce = _bbox_indices(bbox, config)
+        has_bbox_overlap = rs < re and cs < ce
         for lid in _zone_layer_ids(zone, config.copper_ids):
             layer_idx = lid_to_idx.get(lid)
             if layer_idx is not None:
-                before = int(np.count_nonzero(net_masks[key][layer_idx]))
-                _fill_zone(net_masks[key], layer_idx, lid, zone, config)
-                mapped_cells = int(np.count_nonzero(net_masks[key][layer_idx])) - before
+                if has_bbox_overlap:
+                    layer_slice = net_masks[key][layer_idx, rs:re, cs:ce]
+                    before = int(np.count_nonzero(layer_slice))
+                    _fill_zone(net_masks[key], layer_idx, lid, zone, config)
+                    mapped_cells = int(np.count_nonzero(layer_slice)) - before
+                else:
+                    mapped_cells = 0
                 record_primitive(
                     key, "Zone", _layer_label(lid, config), bbox,
                     mapped_cells=max(0, mapped_cells)
