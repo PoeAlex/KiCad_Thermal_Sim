@@ -18,9 +18,10 @@ except ImportError:
     _HAS_WX_ADV = False
 
 try:
-    from .capabilities import HAS_PARDISO
+    from .capabilities import HAS_NATIVE_CORE, HAS_NATIVE_MG
 except ImportError:
-    HAS_PARDISO = False
+    HAS_NATIVE_CORE = False
+    HAS_NATIVE_MG = False
 
 
 # Tooltip text for every control, keyed by internal name
@@ -33,6 +34,7 @@ TOOLTIP_TEXTS = {
     'power_list': "Apply comma-separated power values in the same order as the power-pad table.",
     'browse_pwl': "Select a Piecewise-Linear (.pwl/.csv/.txt) file for time-varying power.",
     'duration': "Total simulation time in seconds. Longer durations approach steady-state.",
+    'steady_state': "Solve directly for the final steady-state temperature (much faster than transient stepping for constant heat sources).",
     'ambient': "Surrounding air temperature in \u00b0C. Typical lab conditions: 25 \u00b0C.",
     'resolution': "Desired grid cell size in mm. The compute budget may use a coarser actual size.",
     'show_all': "Show every copper layer in the heatmap (vs. only top and bottom).",
@@ -57,7 +59,7 @@ TOOLTIP_TEXTS = {
     'grid_expert_limits': "Legacy expert-grid setting; loaded as a Custom compute budget.",
     'grid_max_cells': "Legacy 2D cell threshold retained for settings compatibility.",
     'grid_target_cells': "Legacy coarsening target retained for settings compatibility.",
-    'capabilities': "Detected solver backends. PyPardiso accelerates large grids significantly.",
+    'capabilities': "Detected thermal solver engine and math backends.",
     'help': "Open the ThermalSim documentation in your web browser.",
     'preview': "Generate a geometry preview image without running the simulation.",
     'load_settings': "Load simulation settings from a JSON file.",
@@ -81,12 +83,13 @@ DEFAULT_GRID_TARGET_CELLS = 100000
 GRID_DETAIL_LABELS = ["Fast", "Balanced", "Detailed", "Very detailed", "Custom"]
 GRID_DETAIL_VALUES = ["fast", "balanced", "detailed", "very_detailed", "custom"]
 GRID_DETAIL_PRESETS = {
-    "fast": (300000, 150000),
-    "balanced": (800000, 400000),
-    "detailed": (1600000, 800000),
-    "very_detailed": (3000000, 1500000),
+    "fast": (500_000, 425_000),
+    "balanced": (1_200_000, 1_020_000),
+    "detailed": (3_000_000, 2_550_000),
+    "very_detailed": (6_000_000, 5_100_000),
 }
-DEFAULT_GRID_NODE_BUDGET = GRID_DETAIL_PRESETS["balanced"][0]
+DEFAULT_GRID_DETAIL = "balanced"
+DEFAULT_GRID_NODE_BUDGET = GRID_DETAIL_PRESETS[DEFAULT_GRID_DETAIL][0]
 MAX_CUSTOM_GRID_NODES = 100_000_000
 
 
@@ -641,6 +644,14 @@ class SettingsDialog(wx.Dialog):
             tooltip_key='duration'
         )
 
+        self.chk_steady_state = wx.CheckBox(
+            params_parent, label="Steady-state (final temperature)"
+        )
+        self.chk_steady_state.SetValue(False)
+        self.chk_steady_state.SetToolTip(TOOLTIP_TEXTS['steady_state'])
+        self.chk_steady_state.Bind(wx.EVT_CHECKBOX, self._on_steady_state_toggle)
+        box_params.Add(self.chk_steady_state, 0, wx.ALL, 3)
+
         # Ambient Temperature
         self.amb_input = self._add_spin_field(
             box_params, params_parent, "Ambient (\u00b0C)", 25.0,
@@ -895,7 +906,7 @@ class SettingsDialog(wx.Dialog):
         )
         self.mesh_mode_choice = wx.Choice(
             solver_panel,
-            choices=["Adaptive", "Uniform"],
+            choices=["Auto", "Uniform", "Adaptive"],
         )
         self.mesh_mode_choice.SetSelection(0)
         mesh_row.Add(self.mesh_mode_choice, 1, wx.EXPAND)
@@ -905,17 +916,6 @@ class SettingsDialog(wx.Dialog):
             box_solver, solver_panel, "Adaptive max cell ratio", 8,
             min_val=2, max_val=16, inc=1, digits=0,
         )
-
-        backend_row = wx.BoxSizer(wx.HORIZONTAL)
-        backend_row.Add(wx.StaticText(solver_panel, label="Linear solver", size=(165, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
-        backend_choices = ["Auto"]
-        if HAS_PARDISO:
-            backend_choices.append("PyPardiso")
-        backend_choices.append("SciPy / SuperLU")
-        self.solver_backend_choice = wx.Choice(solver_panel, choices=backend_choices)
-        self.solver_backend_choice.SetSelection(0)
-        backend_row.Add(self.solver_backend_choice, 1, wx.EXPAND)
-        box_solver.Add(backend_row, 0, wx.EXPAND | wx.ALL, 3)
 
         stepping_row = wx.BoxSizer(wx.HORIZONTAL)
         stepping_row.Add(wx.StaticText(solver_panel, label="Time stepping", size=(165, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
@@ -931,10 +931,15 @@ class SettingsDialog(wx.Dialog):
         sizer.Add(self.solver_pane, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
         # --- Capabilities (read-only) ---
-        solver_str = "Solver: SciPy + PyPardiso" if HAS_PARDISO else "Solver: SciPy"
-        lbl_cap = wx.StaticText(panel, label=solver_str)
-        lbl_cap.SetToolTip(TOOLTIP_TEXTS['capabilities'])
-        sizer.Add(lbl_cap, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        if HAS_NATIVE_MG:
+            engine_str = "Engine: Native C++/OpenMP + SciPy"
+        elif HAS_NATIVE_CORE:
+            engine_str = "Engine: Native C++ + SciPy"
+        else:
+            engine_str = "Engine: NumPy + SciPy"
+        self.lbl_capabilities = wx.StaticText(panel, label=engine_str)
+        self.lbl_capabilities.SetToolTip(TOOLTIP_TEXTS['capabilities'])
+        sizer.Add(self.lbl_capabilities, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
         pane_event = getattr(wx, "EVT_COLLAPSIBLEPANE_CHANGED", None)
         if pane_event is not None:
@@ -1526,9 +1531,23 @@ class SettingsDialog(wx.Dialog):
             self.geometry_pane.Expand()
         self._refresh_preflight()
 
+    def _apply_steady_state_controls(self):
+        """Enable or disable transient-only controls based on steady-state mode."""
+        steady = self.chk_steady_state.GetValue()
+        self.time_input.Enable(not steady)
+        self.chk_snapshots.Enable(not steady)
+        self.snap_count_input.Enable((not steady) and self.chk_snapshots.GetValue())
+
+    def _on_steady_state_toggle(self, event):
+        """Handle Steady-state checkbox toggle."""
+        self._apply_steady_state_controls()
+        self._refresh_preflight()
+
     def _on_snapshots_toggle(self, event):
         """Handle Snapshots checkbox toggle."""
-        self.snap_count_input.Enable(self.chk_snapshots.GetValue())
+        self.snap_count_input.Enable(
+            self.chk_snapshots.GetValue() and not self.chk_steady_state.GetValue()
+        )
         self._refresh_preflight()
 
     def _on_heatsink_toggle(self, event):
@@ -2066,6 +2085,7 @@ class SettingsDialog(wx.Dialog):
         - power_str : str
         - power_pads : list
         - time : float
+        - steady_state : bool
         - amb : float
         - thick : float
         - res : float
@@ -2120,19 +2140,12 @@ class SettingsDialog(wx.Dialog):
                     or grid_node_budget > MAX_CUSTOM_GRID_NODES
                 ):
                     raise ValueError
-                target_nodes = grid_node_budget // 2
+                target_nodes = max(25_000, int(grid_node_budget * 0.85))
             else:
                 grid_node_budget, target_nodes = GRID_DETAIL_PRESETS[grid_detail_level]
             layer_count = max(1, len(self.layer_names))
             grid_max_cells = max(1000, grid_node_budget // layer_count)
             grid_target_cells = max(1000, min(grid_max_cells, target_nodes // layer_count))
-            backend_label = self.solver_backend_choice.GetStringSelection().lower()
-            if "pardiso" in backend_label:
-                solver_backend = "pardiso"
-            elif "scipy" in backend_label:
-                solver_backend = "scipy"
-            else:
-                solver_backend = "auto"
             stepping_modes = ["auto", "multi_phase", "two_phase", "uniform"]
             stepping_idx = self.time_stepping_choice.GetSelection()
             time_stepping = stepping_modes[stepping_idx] if 0 <= stepping_idx < len(stepping_modes) else "auto"
@@ -2143,17 +2156,18 @@ class SettingsDialog(wx.Dialog):
                 if 0 <= engine_idx < len(engine_modes)
                 else "auto"
             )
-            mesh_modes = ["adaptive", "uniform"]
+            mesh_modes = ["auto", "uniform", "adaptive"]
             mesh_idx = self.mesh_mode_choice.GetSelection()
             mesh_mode = (
                 mesh_modes[mesh_idx]
                 if 0 <= mesh_idx < len(mesh_modes)
-                else "adaptive"
+                else "auto"
             )
             return {
                 'power_str': power_str,
                 'power_pads': power_pads,
                 'time': float(self.time_input.GetValue()),
+                'steady_state': self.chk_steady_state.GetValue(),
                 'amb': float(self.amb_input.GetValue()),
                 'thick': float(self.thick_input.GetValue()),
                 'res': float(self.res_input.GetValue()),
@@ -2180,7 +2194,6 @@ class SettingsDialog(wx.Dialog):
                 'compute_engine': compute_engine,
                 'mesh_mode': mesh_mode,
                 'adaptive_max_cell_ratio': int(self.adaptive_ratio_input.GetValue()),
-                'solver_backend': solver_backend,
                 'time_stepping': time_stepping,
                 'current_enabled': self.chk_current_enabled.GetValue(),
                 'current_groups': current_groups,
@@ -2219,7 +2232,10 @@ class SettingsDialog(wx.Dialog):
             )
             if 'snap_count' in defaults:
                 self.snap_count_input.SetValue(int(defaults['snap_count']))
-            self.snap_count_input.Enable(self.chk_snapshots.GetValue())
+            self.chk_steady_state.SetValue(
+                bool(defaults.get('steady_state', False))
+            )
+            self._apply_steady_state_controls()
 
             out_dir = defaults.get('output_dir')
             if out_dir:
@@ -2263,20 +2279,13 @@ class SettingsDialog(wx.Dialog):
             }.get(compute_engine, 0)
             self.compute_engine_choice.SetSelection(compute_engine_idx)
 
-            mesh_mode = str(defaults.get('mesh_mode', 'adaptive')).lower()
-            self.mesh_mode_choice.SetSelection(1 if mesh_mode == 'uniform' else 0)
+            mesh_mode = str(defaults.get('mesh_mode', 'auto') or 'auto').lower()
+            mesh_mode_idx = {'auto': 0, 'uniform': 1, 'adaptive': 2}.get(mesh_mode, 0)
+            self.mesh_mode_choice.SetSelection(mesh_mode_idx)
             if 'adaptive_max_cell_ratio' in defaults:
                 self.adaptive_ratio_input.SetValue(
                     min(16, max(2, int(defaults['adaptive_max_cell_ratio'])))
                 )
-
-            backend = str(defaults.get('solver_backend', 'auto')).lower()
-            if backend == 'pardiso' and HAS_PARDISO:
-                self.solver_backend_choice.SetSelection(1)
-            elif backend == 'scipy':
-                self.solver_backend_choice.SetSelection(2 if HAS_PARDISO else 1)
-            else:
-                self.solver_backend_choice.SetSelection(0)
 
             stepping = str(defaults.get('time_stepping', 'auto')).lower()
             stepping_idx = {'auto': 0, 'multi_phase': 1, 'two_phase': 2, 'uniform': 3}.get(stepping, 0)
@@ -2319,10 +2328,9 @@ class SettingsDialog(wx.Dialog):
             if self.chk_heatsink.GetValue():
                 self.thermal_pad_pane.Expand()
             if (
-                str(defaults.get('compute_engine', 'auto')).lower() != 'auto'
-                or str(defaults.get('mesh_mode', 'adaptive')).lower() != 'adaptive'
-                or str(defaults.get('solver_backend', 'auto')).lower() != 'auto'
-                or str(defaults.get('time_stepping', 'auto')).lower() != 'auto'
+                str(defaults.get('compute_engine', 'auto') or 'auto').lower() != 'auto'
+                or str(defaults.get('mesh_mode', 'auto') or 'auto').lower() != 'auto'
+                or str(defaults.get('time_stepping', 'auto') or 'auto').lower() != 'auto'
                 or float(defaults.get('h_conv', 10.0)) != 10.0
                 or float(defaults.get('thick', 1.6)) != 1.6
             ):

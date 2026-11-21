@@ -566,7 +566,7 @@ class TestGridCoarsening:
         assert expert is True
         assert max_nodes == 100_000_000
         assert max_cells == 25_000_000
-        assert target_cells == 12_500_000
+        assert target_cells == 21_250_000
 
     def test_custom_node_budget_is_clamped_at_one_hundred_million(self):
         """Imported settings must not bypass the 100 million-node safety cap."""
@@ -580,7 +580,175 @@ class TestGridCoarsening:
 
         assert max_nodes == 100_000_000
         assert max_cells == 50_000_000
-        assert target_cells == 25_000_000
+        assert target_cells == 42_500_000
+
+    def test_named_presets_resolve_to_updated_budgets_and_85pct_targets(self):
+        """Fast/Balanced/Detailed/Very detailed presets use 500k/1.2M/3M/6M with 85% target."""
+        expected = {
+            "fast": (500_000, 425_000),
+            "balanced": (1_200_000, 1_020_000),
+            "detailed": (3_000_000, 2_550_000),
+            "very_detailed": (6_000_000, 5_100_000),
+        }
+        for name, (exp_max, exp_target) in expected.items():
+            detail, expert, max_cells, target_cells, max_nodes = _resolve_grid_policy(
+                {"grid_detail_level": name}, layer_count=4
+            )
+            assert detail == name
+            assert expert is False
+            assert max_nodes == exp_max
+            assert max_cells == exp_max // 4
+            assert target_cells == exp_target // 4
+
+    def test_auto_fast_engine_threshold_and_mesh_mode_resolution(self, monkeypatch):
+        """Auto engine threshold and Auto mesh mode follow HAS_NATIVE_MG."""
+        import ThermalSim.thermal_plugin as plugin_mod
+
+        monkeypatch.setattr(plugin_mod, "HAS_NATIVE_MG", True)
+        assert plugin_mod._auto_fast_engine_threshold() == 50_000
+        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "auto"}, True, 1_000_000) == "uniform"
+        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "auto"}, True, 5_000_000) == "uniform"
+        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "auto"}, True, 5_000_001) == "adaptive"
+        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "adaptive"}, True, 100_000) == "adaptive"
+        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "uniform"}, True, 10_000_000) == "uniform"
+        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "adaptive"}, False, 100_000) == "uniform"
+
+        monkeypatch.setattr(plugin_mod, "HAS_NATIVE_MG", False)
+        assert plugin_mod._auto_fast_engine_threshold() == 250_000
+        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "auto"}, True, 1_000_000) == "adaptive"
+        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "uniform"}, True, 1_000_000) == "uniform"
+
+    def test_estimate_solver_cost_reflects_native_mg_and_ignores_legacy_backend(self, monkeypatch):
+        """Native MG cost model uses calibrated RAM/runtime thresholds and ignores legacy backend."""
+        import ThermalSim.thermal_plugin as plugin_mod
+
+        monkeypatch.setattr(plugin_mod, "HAS_NATIVE_MG", True)
+        low, high, runtime = plugin_mod._estimate_solver_cost(
+            3_000_000, {"compute_engine": "auto"}
+        )
+        assert low == 750
+        assert high == 1500
+        assert runtime == "Slow"
+
+        _, _, rt_fast = plugin_mod._estimate_solver_cost(500_000, {"compute_engine": "auto"})
+        _, _, rt_mod = plugin_mod._estimate_solver_cost(1_200_000, {"compute_engine": "auto"})
+        _, _, rt_vslow = plugin_mod._estimate_solver_cost(9_000_000, {"compute_engine": "auto"})
+        assert (rt_fast, rt_mod, rt_vslow) == ("Fast", "Moderate", "Very slow")
+
+        # Below 50k threshold uses legacy direct estimates; legacy backend key ignored
+        legacy_val = "par" + "diso"
+        c_plain = plugin_mod._estimate_solver_cost(40_000, {"compute_engine": "auto"})
+        c_legacy = plugin_mod._estimate_solver_cost(
+            40_000, {"compute_engine": "auto", "solver_backend": legacy_val}
+        )
+        assert c_plain == c_legacy
+
+        monkeypatch.setattr(plugin_mod, "HAS_NATIVE_MG", False)
+        low_no_mg, high_no_mg, rt_no_mg = plugin_mod._estimate_solver_cost(
+            1_000_000, {"compute_engine": "fast_native"}
+        )
+        assert low_no_mg == 120
+        assert high_no_mg == 450
+        assert rt_no_mg == "Moderate"
+
+    def test_preflight_ignores_legacy_backend_setting(self, tmp_path):
+        """Old JSON settings containing deprecated solver_backend must not fail preflight."""
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        pad = MockPad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        board = MockBoard(
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+            footprints=[MockFootprint("U1", [pad])],
+        )
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        desc = plugin._pad_descriptor(board, "U1", pad)
+        legacy_val = "par" + "diso"
+        result = plugin._preflight(
+            board,
+            [F_Cu, B_Cu],
+            EDA_RECT(0, 0, 20_000_000, 20_000_000),
+            {
+                "res": 0.5,
+                "output_dir": str(tmp_path),
+                "solver_backend": legacy_val,
+                "power_pads": [{**desc, "power": "1.5"}],
+            },
+        )
+        assert result.ready is True
+        assert result.errors == []
+
+    def test_generate_preview_respects_resolved_auto_mesh_mode(self, tmp_path, monkeypatch):
+        """Preview should only build adaptive overlay when resolved mesh mode is adaptive."""
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        pad = MockPad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(4_500_000, 4_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        board = MockBoard(
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+            footprints=[MockFootprint("U1", [pad])],
+        )
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        plugin.board = board
+        plugin.copper_ids = [F_Cu, B_Cu]
+        plugin.bbox = EDA_RECT(0, 0, 10_000_000, 10_000_000)
+        plugin.pads_list = [pad]
+        plugin.stack_info = {}
+
+        adaptive_calls = []
+        preview_meshes = []
+
+        def fake_build_adaptive_mesh(*args, **kwargs):
+            adaptive_calls.append(True)
+            return "fake-adaptive-mesh"
+
+        def fake_save_preview_image(*args, **kwargs):
+            preview_meshes.append(kwargs.get("adaptive_mesh"))
+            return str(tmp_path / "preview.png")
+
+        monkeypatch.setattr(plugin_mod, "build_adaptive_mesh", fake_build_adaptive_mesh)
+        monkeypatch.setattr(plugin_mod, "save_preview_image", fake_save_preview_image)
+        monkeypatch.setattr(plugin_mod, "HAS_NATIVE_MG", True)
+
+        # Auto mesh mode with native MG and small grid resolves to uniform -> no adaptive overlay
+        plugin.generate_preview(
+            {
+                "res": 2.0,
+                "compute_engine": "fast_native",
+                "mesh_mode": "auto",
+                "output_dir": str(tmp_path),
+            },
+            ["F.Cu", "B.Cu"],
+        )
+        assert adaptive_calls == []
+        assert preview_meshes == [None]
+
+        # Explicit adaptive mesh mode with fast engine builds adaptive overlay
+        plugin.generate_preview(
+            {
+                "res": 2.0,
+                "compute_engine": "fast_native",
+                "mesh_mode": "adaptive",
+                "output_dir": str(tmp_path),
+            },
+            ["F.Cu", "B.Cu"],
+        )
+        assert len(adaptive_calls) == 1
+        assert preview_meshes == [None, "fake-adaptive-mesh"]
 
     def test_default_coarsening_matches_legacy_formula(self):
         """Without expert settings, the historic 200k/100k limits apply."""
@@ -634,3 +802,306 @@ class TestGridCoarsening:
         assert expert is True
         assert max_cells == 3000000
         assert target_cells == 1000000
+
+
+class TestSteadyStatePluginWiring:
+    """Tests for steady-state preflight warning and solver config wiring."""
+
+    def test_preflight_warns_when_steady_state_used_with_pwl(self, tmp_path):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        pwl_file = tmp_path / "pulse.pwl"
+        pwl_file.write_text("0.0 0.0\n1.0 2.5\n2.0 2.5\n", encoding="utf-8")
+
+        pad = MockPad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        board = MockBoard(
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+            footprints=[MockFootprint("U1", [pad])],
+        )
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        desc = plugin._pad_descriptor(board, "U1", pad)
+
+        settings = {
+            "res": 0.5,
+            "output_dir": str(tmp_path),
+            "steady_state": True,
+            "power_pads": [{**desc, "power": str(pwl_file)}],
+        }
+        result = plugin._preflight(
+            board,
+            [F_Cu, B_Cu],
+            EDA_RECT(0, 0, 20_000_000, 20_000_000),
+            settings,
+        )
+
+        expected_warning = (
+            "Steady-state mode ignores PWL time variation; "
+            "disable Steady-state for time-varying PWL profiles."
+        )
+        assert result.ready is True
+        assert expected_warning in result.warnings
+
+        # Constant power should not produce the PWL steady-state warning
+        settings_const = {
+            "res": 0.5,
+            "output_dir": str(tmp_path),
+            "steady_state": True,
+            "power_pads": [{**desc, "power": "2.0"}],
+        }
+        result_const = plugin._preflight(
+            board,
+            [F_Cu, B_Cu],
+            EDA_RECT(0, 0, 20_000_000, 20_000_000),
+            settings_const,
+        )
+        assert result_const.ready is True
+        assert expected_warning not in result_const.warnings
+
+    def test_run_simulation_wires_steady_state_config_and_progress_message(
+        self, tmp_path, monkeypatch
+    ):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_plugin import ThermalPlugin
+        from ThermalSim.thermal_solver import SolverResult
+
+        pad = MockPad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(4_500_000, 4_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        board = MockBoard(
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+            footprints=[MockFootprint("U1", [pad])],
+        )
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        desc = plugin._pad_descriptor(board, "U1", pad)
+
+        captured_configs = []
+        progress_messages = []
+
+        class RecordingConfig:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+                captured_configs.append(kwargs)
+
+        class RecordingProgressDialog:
+            def __init__(self, title, message, maximum=100, **kwargs):
+                progress_messages.append(message)
+
+            def Update(self, value, newmsg=""):
+                if newmsg:
+                    progress_messages.append(newmsg)
+                return (True, False)
+
+            def WasCancelled(self):
+                return False
+
+            def Hide(self):
+                pass
+
+            def Destroy(self):
+                pass
+
+        def fake_run_simulation(
+            config, K, C, Q, b, hA, layer_count, rows, cols, *args, **kwargs
+        ):
+            return SolverResult(
+                T=np.full((layer_count, rows, cols), 40.0),
+                k_norm_info={},
+                step_counter=1,
+                total_solve_time=0.01,
+                total_factor_time=0.01,
+                factor_count=1,
+            )
+
+        monkeypatch.setattr(plugin_mod, "SolverConfig", RecordingConfig)
+        monkeypatch.setattr(plugin_mod, "run_simulation", fake_run_simulation)
+        monkeypatch.setattr(
+            plugin_mod.wx, "ProgressDialog", RecordingProgressDialog, raising=False
+        )
+        monkeypatch.setattr(plugin_mod.wx, "GetApp", lambda: None, raising=False)
+        monkeypatch.setattr(
+            plugin_mod, "show_results_all_layers", lambda *a, **k: str(tmp_path / "hm.png")
+        )
+        monkeypatch.setattr(
+            plugin_mod, "save_preview_image", lambda *a, **k: str(tmp_path / "prev.png")
+        )
+        monkeypatch.setattr(
+            plugin_mod, "write_html_report", lambda *a, **k: str(tmp_path / "rep.html")
+        )
+
+        settings = {
+            "res": 2.0,
+            "time": 20.0,
+            "amb": 25.0,
+            "thick": 1.6,
+            "h_conv": 10.0,
+            "pad_th": 1.0,
+            "pad_k": 3.0,
+            "show_all": True,
+            "snapshots": True,
+            "snap_count": 3,
+            "steady_state": True,
+            "compute_engine": "legacy",
+            "output_dir": str(tmp_path),
+            "power_pads": [{**desc, "power": "2.0"}],
+        }
+        plugin._run_simulation(
+            board,
+            [F_Cu, B_Cu],
+            ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad],
+            settings,
+            {},
+            ["U1-1"],
+        )
+
+        assert len(captured_configs) == 1
+        assert captured_configs[0]["steady_state"] is True
+        assert captured_configs[0]["snapshots_enabled"] is False
+        assert captured_configs[0]["snap_times"] == []
+        assert "Solving steady-state thermal model..." in progress_messages
+
+        # With PWL power source (Q_func is not None), steady_state must be False
+        pwl_file = tmp_path / "ramp.pwl"
+        pwl_file.write_text("0.0 0.0\n10.0 2.0\n", encoding="utf-8")
+        captured_configs.clear()
+        progress_messages.clear()
+        settings_pwl = {
+            **settings,
+            "power_pads": [{**desc, "power": str(pwl_file)}],
+        }
+        plugin._run_simulation(
+            board,
+            [F_Cu, B_Cu],
+            ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad],
+            settings_pwl,
+            {},
+            ["U1-1"],
+        )
+
+        assert len(captured_configs) == 1
+        assert captured_configs[0]["steady_state"] is False
+        assert "Solving steady-state thermal model..." not in progress_messages
+
+    def test_run_simulation_fallback_config_preserves_steady_state(
+        self, tmp_path, monkeypatch
+    ):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_plugin import ThermalPlugin
+        from ThermalSim.thermal_solver import SolverResult
+
+        pad = MockPad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(4_500_000, 4_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        board = MockBoard(
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+            footprints=[MockFootprint("U1", [pad])],
+        )
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        desc = plugin._pad_descriptor(board, "U1", pad)
+
+        captured_configs = []
+
+        class RecordingConfig:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+                captured_configs.append(kwargs)
+
+        def failing_fast_solver(*args, **kwargs):
+            raise RuntimeError("simulated fast solver failure")
+
+        def fake_legacy_solver(
+            config, K, C, Q, b, hA, layer_count, rows, cols, *args, **kwargs
+        ):
+            return SolverResult(
+                T=np.full((layer_count, rows, cols), 42.0),
+                k_norm_info={},
+                step_counter=1,
+                total_solve_time=0.01,
+                total_factor_time=0.01,
+                factor_count=1,
+            )
+
+        class DummyProgressDialog:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def Update(self, value, newmsg=""):
+                return (True, False)
+
+            def WasCancelled(self):
+                return False
+
+            def Hide(self):
+                pass
+
+            def Destroy(self):
+                pass
+
+        monkeypatch.setattr(plugin_mod, "SolverConfig", RecordingConfig)
+        monkeypatch.setattr(plugin_mod, "run_simulation_matrix_free", failing_fast_solver)
+        monkeypatch.setattr(plugin_mod, "run_simulation", fake_legacy_solver)
+        monkeypatch.setattr(
+            plugin_mod.wx, "ProgressDialog", DummyProgressDialog, raising=False
+        )
+        monkeypatch.setattr(plugin_mod.wx, "GetApp", lambda: None, raising=False)
+        monkeypatch.setattr(
+            plugin_mod, "show_results_all_layers", lambda *a, **k: str(tmp_path / "hm.png")
+        )
+        monkeypatch.setattr(
+            plugin_mod, "save_preview_image", lambda *a, **k: str(tmp_path / "prev.png")
+        )
+        monkeypatch.setattr(
+            plugin_mod, "write_html_report", lambda *a, **k: str(tmp_path / "rep.html")
+        )
+
+        settings = {
+            "res": 2.0,
+            "time": 20.0,
+            "amb": 25.0,
+            "thick": 1.6,
+            "h_conv": 10.0,
+            "pad_th": 1.0,
+            "pad_k": 3.0,
+            "show_all": True,
+            "snapshots": False,
+            "steady_state": True,
+            "compute_engine": "fast_native",
+            "output_dir": str(tmp_path),
+            "power_pads": [{**desc, "power": "2.0"}],
+        }
+        plugin._run_simulation(
+            board,
+            [F_Cu, B_Cu],
+            ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad],
+            settings,
+            {},
+            ["U1-1"],
+        )
+
+        assert len(captured_configs) == 2
+        assert captured_configs[0]["steady_state"] is True
+        assert captured_configs[1]["steady_state"] is True

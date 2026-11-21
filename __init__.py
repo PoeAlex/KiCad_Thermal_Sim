@@ -41,7 +41,7 @@ if not _HEADLESS:
 
             def Run(self):
                 import wx
-                from .capabilities import get_missing_packages, get_pypardiso_optional_dependency
+                from .capabilities import get_missing_packages
 
                 missing = get_missing_packages()
                 if not missing:
@@ -52,11 +52,7 @@ if not _HEADLESS:
                     return
                 from .dependency_installer import DependencyInstallDialog
 
-                dialog = DependencyInstallDialog(
-                    None,
-                    missing,
-                    [get_pypardiso_optional_dependency()],
-                )
+                dialog = DependencyInstallDialog(None, missing)
                 dialog.ShowModal()
                 dialog.Destroy()
 

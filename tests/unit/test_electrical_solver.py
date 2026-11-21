@@ -498,100 +498,10 @@ def test_local_bbox_mapped_cell_counts_exact_for_all_primitives(monkeypatch):
     assert actual_total_cells == expected_total_cells
 
 
-def test_solve_electrical_system_pypardiso_spd_and_fallbacks(monkeypatch):
-    """_solve_electrical_system prefers PyPardiso SPD, falls back to spsolve then SciPy."""
-    sub_lap, sub_rhs = _build_grid_laplacian(rows=6, cols=8)
-    expected = spla.spsolve(sub_lap.tocsc(), sub_rhs)
-
-    # 1) PyPardiso SPD (mtype=2) path succeeds and releases memory
-    spd_calls = []
-
-    class FakeSpdSolver:
-        def __init__(self, mtype=11):
-            self.mtype = mtype
-            self.freed = False
-            spd_calls.append(self)
-
-        def solve(self, matrix, rhs):
-            assert self.mtype == 2
-            assert matrix.format == "csr"
-            assert sp.tril(matrix, k=-1).nnz == 0
-            return expected.copy()
-
-        def free_memory(self, everything=False):
-            self.freed = everything
-
-    fake_pypardiso = SimpleNamespace(
-        PyPardisoSolver=FakeSpdSolver,
-        spsolve=lambda a, b: (_ for _ in ()).throw(AssertionError("should not fallback")),
-    )
-    monkeypatch.setattr(electrical_solver, "HAS_PARDISO", True)
-    monkeypatch.setattr(electrical_solver, "pypardiso", fake_pypardiso)
-
-    sol_spd = _solve_electrical_system(sub_lap, sub_rhs)
-    np.testing.assert_allclose(sol_spd, expected, rtol=1e-12, atol=1e-12)
-    assert len(spd_calls) == 1
-    assert spd_calls[0].freed is True
-
-    # 2) PyPardiso SPD fails residual check -> falls back to pypardiso.spsolve
-    fallback_called = []
-
-    class BadSpdSolver:
-        def __init__(self, mtype=11):
-            self.freed = False
-            spd_calls.append(self)
-
-        def solve(self, matrix, rhs):
-            return np.zeros_like(rhs)
-
-        def free_memory(self, everything=False):
-            self.freed = everything
-
-    def fake_pardiso_spsolve(matrix, rhs):
-        assert matrix.format == "csr"
-        fallback_called.append(True)
-        return expected.copy()
-
-    monkeypatch.setattr(
-        electrical_solver,
-        "pypardiso",
-        SimpleNamespace(PyPardisoSolver=BadSpdSolver, spsolve=fake_pardiso_spsolve),
-    )
-    sol_pardiso_fallback = _solve_electrical_system(sub_lap, sub_rhs)
-    np.testing.assert_allclose(sol_pardiso_fallback, expected, rtol=1e-12, atol=1e-12)
-    assert fallback_called == [True]
-    assert spd_calls[-1].freed is True
-
-    # 3) Both PyPardiso paths raise -> falls back cleanly to SciPy CSC spsolve with no warning
-    class BrokenSolver:
-        def __init__(self, mtype=11):
-            pass
-
-        def solve(self, matrix, rhs):
-            raise RuntimeError("mkl error")
-
-    monkeypatch.setattr(
-        electrical_solver,
-        "pypardiso",
-        SimpleNamespace(
-            PyPardisoSolver=BrokenSolver,
-            spsolve=lambda a, b: (_ for _ in ()).throw(RuntimeError("spsolve error")),
-        ),
-    )
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        sol_scipy_fallback = _solve_electrical_system(sub_lap, sub_rhs)
-    np.testing.assert_allclose(sol_scipy_fallback, expected, rtol=1e-12, atol=1e-12)
-    assert not any(issubclass(w.category, sp.SparseEfficiencyWarning) for w in caught)
-
-
 def test_solve_electrical_system_iterative_pcg_and_fallback(monkeypatch):
-    """Large systems without PyPardiso use PCG and fall back to CSC spsolve on failure."""
+    """Large systems use PCG and fall back to CSC spsolve on failure."""
     sub_lap, sub_rhs = _build_grid_laplacian(rows=8, cols=10)
     expected = spla.spsolve(sub_lap.tocsc(), sub_rhs)
-
-    monkeypatch.setattr(electrical_solver, "HAS_PARDISO", False)
-    monkeypatch.setattr(electrical_solver, "pypardiso", None)
 
     # 1) Small system (< threshold) uses CSC spsolve directly without calling cg or warnings
     cg_calls = []
@@ -671,9 +581,6 @@ def test_end_to_end_joule_loss_matches_between_direct_and_pcg(monkeypatch):
         CurrentTerminal(pad_b, "J2-1", "PWR", 1, -2.5),
     ]
     config = _config()
-
-    monkeypatch.setattr(electrical_solver, "HAS_PARDISO", False)
-    monkeypatch.setattr(electrical_solver, "pypardiso", None)
 
     monkeypatch.setattr(electrical_solver, "_ELECTRICAL_ITERATIVE_NODE_THRESHOLD", 100_000)
     res_direct = solve_electrical_heating(board, terminals, config)

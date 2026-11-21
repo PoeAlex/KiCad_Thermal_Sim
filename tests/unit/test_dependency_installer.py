@@ -52,13 +52,13 @@ class TestDependencyInstallDialogCreation:
         dlg = DependencyInstallDialog(None, [("numpy", "numpy")])
         assert dlg._status_text.label == STATUS_READY
 
-    def test_compatible_pypardiso_checkbox_checked(self):
-        """Test that compatible PyPardiso option is enabled and checked."""
+    def test_compatible_optional_package_checkbox_checked(self):
+        """Test that a supported optional package option is enabled and checked."""
         from ThermalSim.dependency_installer import DependencyInstallDialog
         optional = [{
-            "import_name": "pypardiso",
-            "pip_name": "pypardiso",
-            "label": "Install PyPardiso accelerator",
+            "import_name": "dummy_accel",
+            "pip_name": "dummy-accel",
+            "label": "Install optional accelerator",
             "enabled": True,
             "default_selected": True,
             "status": "Recommended accelerator for large simulations.",
@@ -68,13 +68,13 @@ class TestDependencyInstallDialogCreation:
         assert chk.IsEnabled() is True
         assert chk.GetValue() is True
 
-    def test_unsupported_pypardiso_checkbox_disabled(self):
-        """Test that unsupported PyPardiso option is disabled and unchecked."""
+    def test_unsupported_optional_package_checkbox_disabled(self):
+        """Test that an unsupported optional package option is disabled and unchecked."""
         from ThermalSim.dependency_installer import DependencyInstallDialog
         optional = [{
-            "import_name": "pypardiso",
-            "pip_name": "pypardiso",
-            "label": "Install PyPardiso accelerator",
+            "import_name": "dummy_accel",
+            "pip_name": "dummy-accel",
+            "label": "Install optional accelerator",
             "enabled": False,
             "default_selected": False,
             "status": "Unavailable on this platform; using SciPy solver fallback.",
@@ -136,9 +136,9 @@ class TestInstallLogic:
         """Test that optional package controls are locked while installing."""
         from ThermalSim.dependency_installer import DependencyInstallDialog
         optional = [{
-            "import_name": "pypardiso",
-            "pip_name": "pypardiso",
-            "label": "Install PyPardiso accelerator",
+            "import_name": "dummy_accel",
+            "pip_name": "dummy-accel",
+            "label": "Install optional accelerator",
             "enabled": True,
             "default_selected": True,
             "status": "Recommended accelerator for large simulations.",
@@ -237,9 +237,9 @@ class TestCallbackHandlers:
         """Test that retry restores enabled optional controls."""
         from ThermalSim.dependency_installer import DependencyInstallDialog
         optional = [{
-            "import_name": "pypardiso",
-            "pip_name": "pypardiso",
-            "label": "Install PyPardiso accelerator",
+            "import_name": "dummy_accel",
+            "pip_name": "dummy-accel",
+            "label": "Install optional accelerator",
             "enabled": True,
             "default_selected": True,
             "status": "Recommended accelerator for large simulations.",
@@ -308,13 +308,13 @@ class TestPipCommand:
         assert "scipy" in captured_cmd
         assert "matplotlib" in captured_cmd
 
-    def test_unchecked_pypardiso_excluded_from_install(self):
-        """Test that unchecked PyPardiso is excluded from the pip command."""
+    def test_unchecked_optional_package_excluded_from_install(self):
+        """Test that an unchecked optional package is excluded from the pip command."""
         from ThermalSim.dependency_installer import DependencyInstallDialog
         optional = [{
-            "import_name": "pypardiso",
-            "pip_name": "pypardiso",
-            "label": "Install PyPardiso accelerator",
+            "import_name": "dummy_accel",
+            "pip_name": "dummy-accel",
+            "label": "Install optional accelerator",
             "enabled": True,
             "default_selected": True,
             "status": "Recommended accelerator for large simulations.",
@@ -335,15 +335,15 @@ class TestPipCommand:
             dlg._on_install(None)
 
         assert "numpy" in captured_cmd
-        assert "pypardiso" not in captured_cmd
+        assert "dummy-accel" not in captured_cmd
 
-    def test_checked_pypardiso_included_with_required_packages(self):
-        """Test that checked PyPardiso is included alongside required packages."""
+    def test_checked_optional_package_included_with_required_packages(self):
+        """Test that a checked optional package is included alongside required packages."""
         from ThermalSim.dependency_installer import DependencyInstallDialog
         optional = [{
-            "import_name": "pypardiso",
-            "pip_name": "pypardiso",
-            "label": "Install PyPardiso accelerator",
+            "import_name": "dummy_accel",
+            "pip_name": "dummy-accel",
+            "label": "Install optional accelerator",
             "enabled": True,
             "default_selected": True,
             "status": "Recommended accelerator for large simulations.",
@@ -363,7 +363,7 @@ class TestPipCommand:
             dlg._on_install(None)
 
         assert "numpy" in captured_cmd
-        assert "pypardiso" in captured_cmd
+        assert "dummy-accel" in captured_cmd
 
 
 class TestFindPython:

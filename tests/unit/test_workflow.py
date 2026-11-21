@@ -121,7 +121,7 @@ def test_current_zone_covering_board_reports_little_area_saving():
 
 
 def test_balanced_detail_budget_is_layer_aware():
-    """Four layers should map the Balanced node budget to legacy defaults."""
+    """Four layers should map the Balanced node budget (1.2M / 1.02M) across layers."""
     _, _, expert, max_cells, target_cells = _coarsen_grid_resolution(
         300.0,
         75.0,
@@ -131,8 +131,8 @@ def test_balanced_detail_budget_is_layer_aware():
     )
 
     assert expert is False
-    assert max_cells == 200000
-    assert target_cells == 100000
+    assert max_cells == 300_000
+    assert target_cells == 255_000
 
 
 def test_geometry_cache_key_ignores_non_geometry_settings():
@@ -386,9 +386,9 @@ def test_simulation_artifacts_carry_compact_result_summary():
     assert artifacts.max_temp_c == 56.3
 
 
-def test_large_auto_pardiso_plan_uses_single_uniform_phase():
-    config = SolverConfig(1.0, 25.0, 1.0 / 120.0, 120, use_pardiso=True, time_stepping="auto")
-    mode, plan = _build_phase_plan(config, 600000, True)
+def test_large_auto_plan_uses_single_uniform_phase():
+    config = SolverConfig(1.0, 25.0, 1.0 / 120.0, 120, time_stepping="auto")
+    mode, plan = _build_phase_plan(config, 600000)
     assert mode == "uniform"
     assert len(plan) == 1
     assert plan[0][2] == 95
@@ -396,7 +396,7 @@ def test_large_auto_pardiso_plan_uses_single_uniform_phase():
 
 
 def test_small_auto_plan_keeps_legacy_phases():
-    config = SolverConfig(1.0, 25.0, 1.0 / 120.0, 120, use_pardiso=True, time_stepping="auto")
-    mode, plan = _build_phase_plan(config, 10000, True)
+    config = SolverConfig(1.0, 25.0, 1.0 / 120.0, 120, time_stepping="auto")
+    mode, plan = _build_phase_plan(config, 10000)
     assert mode == "multi_phase"
     assert [item[0]["name"] for item in plan] == ["A", "B", "C"]

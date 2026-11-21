@@ -16,18 +16,16 @@ HAS_WX : bool
     True if wxPython is available.
 HAS_LIBS : bool
     True if all core dependencies (numpy, scipy, matplotlib, wx) are available.
-HAS_PARDISO : bool
-    True if pypardiso (Intel MKL sparse solver) is available.
 HAS_NUMBA : bool
     True if numba (JIT compilation) is available.
 HAS_NATIVE_CORE : bool
-    True if the optional Windows x64 CPU DLL is available.
+    True if the optional native C++/OpenMP CPU core shared library is available.
+HAS_NATIVE_MG : bool
+    True if the native multigrid V-cycle kernels (v2 ABI) are available.
 """
 
 import importlib.util
 import os
-import platform
-import sys
 
 # Granular detection of each core dependency
 HAS_NUMPY = False
@@ -70,17 +68,6 @@ else:
 # Composite flag for backwards compatibility
 HAS_LIBS = HAS_NUMPY and HAS_SCIPY and HAS_MATPLOTLIB and HAS_WX
 
-# Optional: Intel MKL-based sparse solver (faster for large systems)
-_pardiso_spec = importlib.util.find_spec("pypardiso")
-if _pardiso_spec is not None:
-    try:
-        import pypardiso
-        HAS_PARDISO = True
-    except ImportError:
-        HAS_PARDISO = False
-else:
-    HAS_PARDISO = False
-
 # Optional: Numba JIT compilation (not currently used, reserved for future)
 try:
     import numba
@@ -89,63 +76,10 @@ except ImportError:
     HAS_NUMBA = False
 
 try:
-    from .native_core import HAS_NATIVE_CORE
+    from .native_core import HAS_NATIVE_CORE, HAS_NATIVE_MG
 except (ImportError, OSError):
     HAS_NATIVE_CORE = False
-
-
-def is_pypardiso_supported_platform(platform_name=None, machine=None):
-    """
-    Return whether PyPardiso is supported on the current platform.
-
-    Parameters
-    ----------
-    platform_name : str, optional
-        Platform identifier. Defaults to ``sys.platform``.
-    machine : str, optional
-        CPU architecture. Defaults to ``platform.machine()``.
-
-    Returns
-    -------
-    bool
-        True for Windows/Linux on x86_64/amd64 architectures.
-    """
-    platform_id = (platform_name or sys.platform).lower()
-    arch = (machine or platform.machine()).lower()
-    return (
-        (platform_id == "win32" or platform_id.startswith("linux"))
-        and arch in ("x86_64", "amd64")
-    )
-
-
-def get_pypardiso_optional_dependency():
-    """
-    Return installer metadata for the optional PyPardiso accelerator.
-
-    Returns
-    -------
-    dict
-        Metadata used by the dependency installer to render the optional
-        PyPardiso checkbox and decide whether it should be selected.
-    """
-    supported = is_pypardiso_supported_platform()
-    enabled = supported and not HAS_PARDISO
-    if HAS_PARDISO:
-        status = "Already installed."
-    elif supported:
-        status = "Recommended accelerator for large simulations."
-    else:
-        status = "Unavailable on this platform; using SciPy solver fallback."
-    return {
-        "import_name": "pypardiso",
-        "pip_name": "pypardiso",
-        "label": "Install PyPardiso accelerator",
-        "supported": supported,
-        "installed": HAS_PARDISO,
-        "enabled": enabled,
-        "default_selected": enabled,
-        "status": status,
-    }
+    HAS_NATIVE_MG = False
 
 
 def get_missing_packages():
@@ -192,8 +126,9 @@ def get_capabilities_summary():
       matplotlib: Available
       wx: Available
       Core libs (all): Available
-      PyPardiso (Intel MKL solver): Not available
       Numba (JIT compilation): Not available
+      Native matrix-free CPU core: Available
+      Native multigrid V-cycle: Available
     """
     _avail = lambda v: "Available" if v else "Not available"
     lines = ["ThermalSim Capabilities:"]
@@ -202,7 +137,7 @@ def get_capabilities_summary():
     lines.append(f"  matplotlib: {_avail(HAS_MATPLOTLIB)}")
     lines.append(f"  wx: {_avail(HAS_WX)}")
     lines.append(f"  Core libs (all): {_avail(HAS_LIBS)}")
-    lines.append(f"  PyPardiso (Intel MKL solver): {_avail(HAS_PARDISO)}")
     lines.append(f"  Numba (JIT compilation): {_avail(HAS_NUMBA)}")
     lines.append(f"  Native matrix-free CPU core: {_avail(HAS_NATIVE_CORE)}")
+    lines.append(f"  Native multigrid V-cycle: {_avail(HAS_NATIVE_MG)}")
     return "\n".join(lines)

@@ -5,6 +5,9 @@ This module implements the core numerical solver for transient thermal
 simulation, including sparse matrix assembly and time-stepping.
 """
 
+import contextlib
+import ctypes
+import sys
 import time
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Callable
@@ -13,11 +16,18 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
-from .capabilities import HAS_PARDISO
 from .native_core import HAS_NATIVE_CORE, apply_structured_native
 
-if HAS_PARDISO:
-    import pypardiso
+try:
+    from .native_core import (
+        damped_jacobi_native,
+        residual_restrict_2x2_native,
+        prolong_add_2x2_native,
+    )
+except ImportError:
+    damped_jacobi_native = None
+    residual_restrict_2x2_native = None
+    prolong_add_2x2_native = None
 
 
 @dataclass
@@ -35,24 +45,29 @@ class SolverConfig:
         Base time step in seconds.
     steps_target : int
         Target number of time steps.
-    use_pardiso : bool
-        Whether to use PyPardiso solver if available.
     use_multi_phase : bool
         Whether to use multi-phase time stepping.
     snapshots_enabled : bool
         Whether to capture time-series snapshots.
     snap_times : List[float]
         Times at which to capture snapshots.
+    steady_state : bool
+        When True (and heat source is constant), solve ``K * T = Q + b`` directly
+        in one linear solve instead of transient time stepping.
+    early_stop : bool
+        When True (and heat source is constant with no pending snapshots), stop
+        transient stepping early once steady-state equilibrium is reached.
     """
     sim_time: float
     amb: float
     dt_base: float
     steps_target: int
-    use_pardiso: bool = False
     use_multi_phase: bool = True
     snapshots_enabled: bool = False
     snap_times: List[float] = None
     time_stepping: str = "multi_phase"
+    steady_state: bool = False
+    early_stop: bool = True
 
     def __post_init__(self):
         if self.snap_times is None:
@@ -63,7 +78,7 @@ class SolverConfig:
         self.time_stepping = mode
 
 
-def _build_phase_plan(config: SolverConfig, node_count: int, use_pardiso: bool):
+def _build_phase_plan(config: SolverConfig, node_count: int):
     """Return the validated time-step phase plan for a simulation."""
     mode = config.time_stepping
     auto_large = False
@@ -72,12 +87,9 @@ def _build_phase_plan(config: SolverConfig, node_count: int, use_pardiso: bool):
     elif mode == "auto":
         # Large direct-solver systems pay a high price for every distinct
         # matrix factorization (6 factorizations for 3-phase BE+BDF2 vs 1 for
-        # derivative-start uniform BDF2). SciPy SuperLU hits this penalty
-        # earlier than PARDISO, so switch to single-factorization uniform BDF2
-        # at 100k nodes for SciPy and 250k nodes for PARDISO.
-        auto_large = (
-            node_count >= 250_000 if use_pardiso else node_count >= 100_000
-        )
+        # derivative-start uniform BDF2). Switch to single-factorization
+        # uniform BDF2 at 100k nodes.
+        auto_large = node_count >= 100_000
         mode = "uniform" if auto_large else "multi_phase"
 
     if mode == "multi_phase":
@@ -162,7 +174,6 @@ class CachedLinearSolver:
     solve: Callable[[np.ndarray], np.ndarray]
     owner: Any
     backend: str
-    spd_residual: Optional[float]
 
     def release(self):
         """Release the optional native factorization."""
@@ -390,39 +401,104 @@ class _StructuredGeometricMultigrid:
 
     def _cycle(self, level: int, rhs: np.ndarray) -> np.ndarray:
         if level == len(self.operators) - 1:
-            return np.asarray(self.coarse_solver(rhs), dtype=np.float64)
+            return np.ascontiguousarray(
+                self.coarse_solver(rhs), dtype=np.float64
+            ).reshape(-1)
 
         op = self.operators[level]
         diag_mass = self.diag_masses[level]
         omega_inv = self.omega_inv_diags[level]
 
         # Pre-smoothing starting from zero avoids an unnecessary matvec on step 1.
-        value = omega_inv * rhs
-        for _ in range(self.smooth_steps - 1):
-            residual = rhs - op._apply_with_diagonal(diag_mass, value)
-            residual *= omega_inv
-            value += residual
+        value = None
+        if damped_jacobi_native is not None:
+            value = damped_jacobi_native(
+                op.layer_count,
+                op.rows,
+                op.cols,
+                op.gx,
+                op.gy,
+                op.gz,
+                diag_mass,
+                omega_inv,
+                rhs,
+                None,
+                self.smooth_steps,
+                zero_init=True,
+            )
+        if value is None:
+            value = omega_inv * rhs
+            for _ in range(self.smooth_steps - 1):
+                residual = rhs - op._apply_with_diagonal(diag_mass, value)
+                residual *= omega_inv
+                value += residual
 
-        residual = rhs - op._apply_with_diagonal(diag_mass, value)
-        coarse_rhs = _restrict_2x2(
-            residual.reshape(op.layer_count, op.rows, op.cols)
-        ).reshape(-1)
+        coarse_rhs = None
+        if residual_restrict_2x2_native is not None:
+            coarse_rhs = residual_restrict_2x2_native(
+                op.layer_count,
+                op.rows,
+                op.cols,
+                op.gx,
+                op.gy,
+                op.gz,
+                diag_mass,
+                rhs,
+                value,
+            )
+        if coarse_rhs is None:
+            residual = rhs - op._apply_with_diagonal(diag_mass, value)
+            coarse_rhs = _restrict_2x2(
+                residual.reshape(op.layer_count, op.rows, op.cols)
+            ).reshape(-1)
+
         coarse_correction = self._cycle(level + 1, coarse_rhs)
 
-        coarse_op = self.operators[level + 1]
-        coarse_view = coarse_correction.reshape(
-            coarse_op.layer_count, coarse_op.rows, coarse_op.cols
-        )
-        value_view = value.reshape(op.layer_count, op.rows, op.cols)
-        value_view[:, 0::2, 0::2] += coarse_view
-        if op.cols > 1:
-            value_view[:, 0::2, 1::2] += coarse_view[:, :, : op.cols // 2]
-        if op.rows > 1:
-            value_view[:, 1::2, 0::2] += coarse_view[:, : op.rows // 2, :]
-        if op.rows > 1 and op.cols > 1:
-            value_view[:, 1::2, 1::2] += coarse_view[
-                :, : op.rows // 2, : op.cols // 2
-            ]
+        prolonged = False
+        if prolong_add_2x2_native is not None:
+            prolonged = bool(
+                prolong_add_2x2_native(
+                    op.layer_count,
+                    op.rows,
+                    op.cols,
+                    coarse_correction,
+                    value,
+                )
+            )
+        if not prolonged:
+            coarse_op = self.operators[level + 1]
+            coarse_view = coarse_correction.reshape(
+                coarse_op.layer_count, coarse_op.rows, coarse_op.cols
+            )
+            value_view = value.reshape(op.layer_count, op.rows, op.cols)
+            value_view[:, 0::2, 0::2] += coarse_view
+            if op.cols > 1:
+                value_view[:, 0::2, 1::2] += coarse_view[:, :, : op.cols // 2]
+            if op.rows > 1:
+                value_view[:, 1::2, 0::2] += coarse_view[:, : op.rows // 2, :]
+            if op.rows > 1 and op.cols > 1:
+                value_view[:, 1::2, 1::2] += coarse_view[
+                    :, : op.rows // 2, : op.cols // 2
+                ]
+
+        post_value = None
+        if damped_jacobi_native is not None:
+            post_value = damped_jacobi_native(
+                op.layer_count,
+                op.rows,
+                op.cols,
+                op.gx,
+                op.gy,
+                op.gz,
+                diag_mass,
+                omega_inv,
+                rhs,
+                value,
+                self.smooth_steps,
+                zero_init=False,
+            )
+        if post_value is not None:
+            return post_value
 
         for _ in range(self.smooth_steps):
             residual = rhs - op._apply_with_diagonal(diag_mass, value)
@@ -432,7 +508,9 @@ class _StructuredGeometricMultigrid:
 
     def solve(self, rhs: np.ndarray) -> np.ndarray:
         """Apply one symmetric V-cycle."""
-        return self._cycle(0, np.asarray(rhs, dtype=np.float64).reshape(-1))
+        return self._cycle(
+            0, np.ascontiguousarray(rhs, dtype=np.float64).reshape(-1)
+        )
 
 
 @dataclass
@@ -921,55 +999,103 @@ def _release_linear_solver(owner):
             pass
 
 
-def _factor_linear_system(A: sp.csr_matrix, use_pardiso: bool):
-    """Factor a thermal system, preferring PARDISO's SPD representation.
-
-    The transient system is symmetric positive definite: the conduction
-    operator is symmetric and the positive heat-capacity diagonal makes every
-    implicit time-step matrix strictly positive definite.  Supplying only its
-    upper triangle lets PARDISO use the appropriate faster, lower-memory
-    factorization.  A small residual probe protects the existing generic
-    PARDISO path as a fallback for unexpected backend behaviour.
-    """
-    if not use_pardiso:
-        owner = spla.splu(A.tocsc())
-        return owner.solve, owner, "SciPy", None
-
-    spd_owner = None
-    try:
-        spd_matrix = sp.triu(A, format="csr")
-        spd_owner = pypardiso.PyPardisoSolver(mtype=2)
-        spd_owner.factorize(spd_matrix)
-
-        # Verify the backend mode once per factorization before accepting it.
-        # This is negligible compared with factorization and prevents a bad
-        # optional PARDISO installation from silently changing results.
-        probe = np.ones(A.shape[0], dtype=np.float64)
-        probe_solution = spd_owner.solve(spd_matrix, probe)
-        residual = float(np.max(np.abs(A.dot(probe_solution) - probe)))
-        if not np.all(np.isfinite(probe_solution)) or residual > 1e-10:
-            raise RuntimeError(f"SPD residual probe failed ({residual:.3e})")
-
-        solver = lambda rhs, _owner=spd_owner, _matrix=spd_matrix: _owner.solve(_matrix, rhs)
-        return solver, spd_owner, "PARDISO-SPD", residual
-    except Exception as exc:
-        _release_linear_solver(spd_owner)
-        print(f"[ThermalSim][WARN] PARDISO SPD fallback: {exc}")
-
-    try:
-        owner = pypardiso.PyPardisoSolver()
-        owner.factorize(A)
-        solver = lambda rhs, _owner=owner, _matrix=A: _owner.solve(_matrix, rhs)
-        return solver, owner, "PARDISO", None
-    except Exception as exc:
-        _release_linear_solver(locals().get("owner"))
-        print(f"[ThermalSim][WARN] PARDISO fallback to SciPy: {exc}")
-        owner = spla.splu(A.tocsc())
-        return owner.solve, owner, "SciPy fallback", None
+def _factor_linear_system(A: sp.csr_matrix):
+    """Factor a thermal linear system using SciPy SuperLU."""
+    owner = spla.splu(A.tocsc())
+    return owner.solve, owner, "SciPy", None
 
 
 class _CancelledIterativeSolve(RuntimeError):
     """Internal signal used to stop SciPy CG from its callback."""
+
+
+_OPENBLAS_THREAD_SYMBOLS = (
+    ("scipy_openblas_get_num_threads64_", "scipy_openblas_set_num_threads64_"),
+    ("scipy_openblas_get_num_threads", "scipy_openblas_set_num_threads"),
+    ("openblas_get_num_threads64_", "openblas_set_num_threads64_"),
+    ("openblas_get_num_threads", "openblas_set_num_threads"),
+)
+
+
+@contextlib.contextmanager
+def _limit_blas_threads(max_threads: int = 1):
+    """Temporarily cap BLAS worker threads to avoid OpenMP spin-barrier contention.
+
+    Uses ``threadpoolctl`` when available, otherwise scans ``/proc/self/maps``
+    on Linux for already-loaded OpenBLAS shared libraries and restores their
+    original thread counts on exit. Silently no-ops on unsupported platforms.
+    """
+    limit = max(1, int(max_threads))
+    tpc_ctx = None
+    try:
+        import threadpoolctl
+
+        tpc_ctx = threadpoolctl.threadpool_limits(limits=limit, user_api="blas")
+        tpc_ctx.__enter__()
+    except Exception:
+        tpc_ctx = None
+
+    if tpc_ctx is not None:
+        try:
+            yield
+        finally:
+            try:
+                tpc_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+        return
+
+    restorers = []
+    if sys.platform.startswith("linux"):
+        try:
+            seen_paths = set()
+            with open("/proc/self/maps", "r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    if "openblas" not in line.lower() or ".so" not in line:
+                        continue
+                    parts = line.strip().split()
+                    if not parts:
+                        continue
+                    lib_path = parts[-1]
+                    if (
+                        not lib_path.startswith("/")
+                        or "openblas" not in lib_path.lower()
+                        or lib_path in seen_paths
+                    ):
+                        continue
+                    seen_paths.add(lib_path)
+                    try:
+                        lib = ctypes.CDLL(lib_path)
+                    except OSError:
+                        continue
+                    for get_name, set_name in _OPENBLAS_THREAD_SYMBOLS:
+                        get_fn = getattr(lib, get_name, None)
+                        set_fn = getattr(lib, set_name, None)
+                        if get_fn is None or set_fn is None:
+                            continue
+                        try:
+                            get_fn.argtypes = []
+                            get_fn.restype = ctypes.c_int
+                            set_fn.argtypes = [ctypes.c_int]
+                            set_fn.restype = None
+                            previous = int(get_fn())
+                            if previous > limit:
+                                set_fn(limit)
+                                restorers.append((set_fn, previous))
+                        except Exception:
+                            pass
+                        break
+        except Exception:
+            pass
+
+    try:
+        yield
+    finally:
+        for set_fn, previous in restorers:
+            try:
+                set_fn(previous)
+            except Exception:
+                pass
 
 
 def _solve_pcg(
@@ -979,6 +1105,8 @@ def _solve_pcg(
     initial,
     cancel_check=None,
     relative_tolerance=1e-6,
+    maxiter=100,
+    retry_maxiter=200,
 ):
     """Solve one implicit step with preconditioned conjugate gradients."""
     iterations = 0
@@ -996,7 +1124,7 @@ def _solve_pcg(
         M=preconditioner,
         rtol=relative_tolerance,
         atol=0.0,
-        maxiter=100,
+        maxiter=maxiter,
         callback=callback,
     )
     retried = False
@@ -1009,7 +1137,7 @@ def _solve_pcg(
             M=preconditioner,
             rtol=relative_tolerance,
             atol=0.0,
-            maxiter=200,
+            maxiter=retry_maxiter,
             callback=callback,
         )
         info = retry_info
@@ -1027,6 +1155,288 @@ def _solve_pcg(
     return solution, iterations, retried, relative_residual
 
 
+def run_steady_state(
+    config: SolverConfig,
+    K: sp.csr_matrix,
+    Q: np.ndarray,
+    b: np.ndarray,
+    hA: np.ndarray,
+    layer_count: int,
+    rows: int,
+    cols: int,
+    progress_callback: Optional[Callable[[int, int], bool]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> SolverResult:
+    """Solve the steady-state thermal system ``K * T = Q + b`` directly."""
+    N = K.shape[0]
+    amb = config.amb
+    pin = float(np.sum(Q))
+
+    if cancel_check and cancel_check():
+        T_abort = np.full((layer_count, rows, cols), amb, dtype=np.float64)
+        return SolverResult(
+            T=T_abort,
+            aborted=True,
+            step_counter=0,
+            total_solve_time=0.0,
+            total_factor_time=0.0,
+            factor_count=0,
+            snapshot_stats=[],
+            snapshot_files=[],
+            phase_metrics=[],
+            balance_history=[],
+            k_norm_info={
+                "strategy": "direct_steady_state",
+                "backend": "SciPy",
+                "multi_phase": False,
+                "time_stepping": "steady_state",
+                "N": N,
+                "nnz_K": int(K.nnz),
+                "dt_base": config.dt_base,
+                "steps_target": 1,
+                "steps_total": 0,
+                "factorization_s": 0.0,
+                "factorizations": 0,
+                "factorization_cache_hit": False,
+                "avg_solve_s": 0.0,
+                "pin_w": pin,
+                "pout_final_w": 0.0,
+                "steady_rel_diff": None,
+                "steady_state": True,
+                "early_steady_state_stop": False,
+            },
+        )
+
+    rhs = np.asarray(Q, dtype=np.float64) + np.asarray(b, dtype=np.float64)
+    factor_start = time.perf_counter()
+    solve_fn, owner, backend, _ = _factor_linear_system(K)
+    factor_time = time.perf_counter() - factor_start
+    try:
+        solve_start = time.perf_counter()
+        Tn = np.asarray(solve_fn(rhs), dtype=np.float64).reshape(-1)
+        solve_time = time.perf_counter() - solve_start
+    finally:
+        _release_linear_solver(owner)
+
+    aborted = False
+    if progress_callback and not progress_callback(1, 1):
+        aborted = True
+
+    T = Tn.reshape((layer_count, rows, cols))
+    pout_final = float(np.sum(hA * (Tn - amb)))
+    steady_rel_diff = abs(pin - pout_final) / max(abs(pin), 1e-9)
+
+    phase_metrics = [{
+        "phase": "steady_state",
+        "dt": 0.0,
+        "steps": 1,
+        "assembly_s": 0.0,
+        "factorization_s": factor_time,
+        "avg_solve_s": solve_time,
+        "backend": backend,
+    }]
+    k_norm_info = {
+        "strategy": "direct_steady_state",
+        "backend": backend,
+        "multi_phase": False,
+        "time_stepping": "steady_state",
+        "N": N,
+        "nnz_K": int(K.nnz),
+        "dt_base": config.dt_base,
+        "steps_target": 1,
+        "steps_total": 1,
+        "factorization_s": factor_time,
+        "factorizations": 1,
+        "factorization_cache_hit": False,
+        "avg_solve_s": solve_time,
+        "pin_w": pin,
+        "pout_final_w": pout_final,
+        "steady_rel_diff": steady_rel_diff,
+        "steady_state": True,
+        "early_steady_state_stop": False,
+    }
+    return SolverResult(
+        T=T,
+        aborted=aborted,
+        step_counter=1,
+        total_solve_time=solve_time,
+        total_factor_time=factor_time,
+        factor_count=1,
+        snapshot_stats=[],
+        snapshot_files=[],
+        phase_metrics=phase_metrics,
+        balance_history=[],
+        k_norm_info=k_norm_info,
+    )
+
+
+def run_steady_state_matrix_free(
+    config: SolverConfig,
+    operator: StructuredThermalOperator,
+    C: np.ndarray,
+    Q: np.ndarray,
+    b: np.ndarray,
+    hA: np.ndarray,
+    progress_callback: Optional[Callable[[int, int], bool]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> SolverResult:
+    """Solve ``K * T = Q + b`` directly using a matrix-free or adaptive operator."""
+    layer_count = operator.layer_count
+    rows = operator.rows
+    cols = operator.cols
+    node_count = operator.shape[0]
+    amb = config.amb
+    pin = float(np.sum(Q))
+    if bool(getattr(operator, "prefer_derivative_start", False)):
+        backend_name = "Adaptive-Multigrid-PCG"
+    elif HAS_NATIVE_CORE:
+        backend_name = "Native-MatrixFree-PCG"
+    else:
+        backend_name = "MatrixFree-PCG"
+
+    if cancel_check and cancel_check():
+        T_abort = np.full((layer_count, rows, cols), amb, dtype=np.float64)
+        return SolverResult(
+            T=T_abort,
+            aborted=True,
+            step_counter=0,
+            total_solve_time=0.0,
+            total_factor_time=0.0,
+            factor_count=0,
+            snapshot_stats=[],
+            snapshot_files=[],
+            phase_metrics=[],
+            balance_history=[],
+            k_norm_info={
+                "strategy": "direct_steady_state",
+                "backend": backend_name,
+                "multi_phase": False,
+                "time_stepping": "steady_state",
+                "N": node_count,
+                "nnz_K": operator.nnz_estimate,
+                "dt_base": config.dt_base,
+                "steps_target": 1,
+                "steps_total": 0,
+                "factorization_s": 0.0,
+                "factorizations": 0,
+                "factorization_cache_hit": False,
+                "avg_solve_s": 0.0,
+                "avg_pcg_iterations": 0.0,
+                "pcg_retry_count": 0,
+                "pcg_relative_residual_max": 0.0,
+                "pin_w": pin,
+                "pout_final_w": 0.0,
+                "steady_rel_diff": None,
+                "steady_state": True,
+                "early_steady_state_stop": False,
+            },
+        )
+
+    capacity = (
+        np.zeros(node_count, dtype=np.float64)
+        if C is None
+        else np.asarray(C, dtype=np.float64)
+    )
+    rhs = np.asarray(Q, dtype=np.float64) + np.asarray(b, dtype=np.float64)
+    initial = np.full(node_count, amb, dtype=np.float64)
+
+    setup_start = time.perf_counter()
+    aborted = False
+    step_counter = 0
+    iterations = 0
+    retried = False
+    relative_residual = 0.0
+    solve_time = 0.0
+    temperature = initial
+    use_blas_limit = (
+        HAS_NATIVE_CORE
+        and not bool(getattr(operator, "prefer_derivative_start", False))
+    )
+    blas_guard = (
+        _limit_blas_threads(1) if use_blas_limit else contextlib.nullcontext()
+    )
+
+    with blas_guard:
+        steady_operator, steady_preconditioner = operator.implicit_linear_operator(
+            capacity, 0.0
+        )
+        setup_time = time.perf_counter() - setup_start
+
+        solve_start = time.perf_counter()
+        try:
+            temperature, iterations, retried, relative_residual = _solve_pcg(
+                steady_operator,
+                steady_preconditioner,
+                rhs,
+                initial,
+                cancel_check=cancel_check,
+                relative_tolerance=1e-7,
+                maxiter=250,
+                retry_maxiter=500,
+            )
+            solve_time = time.perf_counter() - solve_start
+            step_counter = 1
+        except _CancelledIterativeSolve:
+            solve_time = time.perf_counter() - solve_start
+            aborted = True
+
+    if not aborted and progress_callback and not progress_callback(1, 1):
+        aborted = True
+
+    final_view = temperature.reshape(layer_count, rows, cols)
+    pout_final = float(np.sum(hA * (temperature - amb)))
+    steady_rel_diff = (
+        abs(pin - pout_final) / max(abs(pin), 1e-9) if step_counter > 0 else None
+    )
+
+    phase_metrics = [{
+        "phase": "steady_state",
+        "dt": 0.0,
+        "steps": step_counter,
+        "assembly_s": setup_time,
+        "factorization_s": 0.0,
+        "avg_solve_s": solve_time,
+        "avg_pcg_iterations": float(iterations),
+        "backend": backend_name,
+    }]
+    k_norm_info = {
+        "strategy": "direct_steady_state",
+        "backend": backend_name,
+        "multi_phase": False,
+        "time_stepping": "steady_state",
+        "N": node_count,
+        "nnz_K": operator.nnz_estimate,
+        "dt_base": config.dt_base,
+        "steps_target": 1,
+        "steps_total": step_counter,
+        "factorization_s": 0.0,
+        "factorizations": 0,
+        "factorization_cache_hit": False,
+        "avg_solve_s": solve_time,
+        "avg_pcg_iterations": float(iterations),
+        "pcg_retry_count": int(retried),
+        "pcg_relative_residual_max": relative_residual,
+        "pin_w": pin,
+        "pout_final_w": pout_final,
+        "steady_rel_diff": steady_rel_diff,
+        "steady_state": True,
+        "early_steady_state_stop": False,
+    }
+    return SolverResult(
+        T=final_view,
+        aborted=aborted,
+        step_counter=step_counter,
+        total_solve_time=solve_time,
+        total_factor_time=0.0,
+        factor_count=0,
+        snapshot_stats=[],
+        snapshot_files=[],
+        phase_metrics=phase_metrics,
+        balance_history=[],
+        k_norm_info=k_norm_info,
+    )
+
+
 def run_simulation_matrix_free(
     config: SolverConfig,
     operator: StructuredThermalOperator,
@@ -1040,6 +1450,18 @@ def run_simulation_matrix_free(
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> SolverResult:
     """Run BDF2 using a matrix-free structured operator and iterative solves."""
+    if config.steady_state and Q_func is None:
+        return run_steady_state_matrix_free(
+            config=config,
+            operator=operator,
+            C=C,
+            Q=Q,
+            b=b,
+            hA=hA,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+
     layer_count = operator.layer_count
     rows = operator.rows
     cols = operator.cols
@@ -1047,10 +1469,12 @@ def run_simulation_matrix_free(
     ambient = config.amb
     temperature = np.full(node_count, ambient, dtype=np.float64)
     previous_temperature = temperature.copy()
+    guess_workspace = np.empty(node_count, dtype=np.float64)
     initial_energy = float(np.sum(C * (temperature - ambient)))
     current_time = 0.0
     step_counter = 0
     aborted = False
+    early_stopped = False
     total_solve_time = 0.0
     total_iterations = 0
     retry_count = 0
@@ -1074,9 +1498,23 @@ def run_simulation_matrix_free(
     else:
         backend_name = "MatrixFree-PCG"
 
-    time_stepping_used, phase_plan = _build_phase_plan(config, node_count, False)
+    time_stepping_used, phase_plan = _build_phase_plan(config, node_count)
     total_steps = sum(item[2] for item in phase_plan)
     update_interval = max(1, total_steps // 100)
+
+    def should_early_stop():
+        if (
+            not config.early_stop
+            or Q_func is not None
+            or step_counter < 5
+            or pin <= 1e-12
+        ):
+            return False
+        if config.snapshots_enabled and next_snapshot_idx < len(config.snap_times):
+            return False
+        if abs(pin - pout_step) / pin >= 1e-4:
+            return False
+        return float(np.max(np.abs(temperature - previous_temperature))) < 1e-4
 
     def record_snapshot(t_elapsed):
         nonlocal previous_snapshot_time, previous_snapshot_energy, snapshot_number
@@ -1110,16 +1548,22 @@ def run_simulation_matrix_free(
                 snapshot_files.append((t_elapsed, path))
         snapshot_number += 1
 
-    def advance(rhs, implicit_operator, preconditioner, dt_value):
+    def advance(rhs, implicit_operator, preconditioner, dt_value, extrapolate=False):
         nonlocal temperature, previous_temperature, current_time, step_counter
         nonlocal total_solve_time, total_iterations, retry_count
         nonlocal max_relative_residual, pout_step, balance_integral
+        if extrapolate:
+            np.multiply(2.0, temperature, out=guess_workspace)
+            np.subtract(guess_workspace, previous_temperature, out=guess_workspace)
+            initial_guess = guess_workspace
+        else:
+            initial_guess = temperature
         solve_started = time.perf_counter()
         solution, iterations, retried, relative_residual = _solve_pcg(
             implicit_operator,
             preconditioner,
             rhs,
-            temperature,
+            initial_guess,
             cancel_check=cancel_check,
         )
         elapsed = time.perf_counter() - solve_started
@@ -1134,38 +1578,131 @@ def run_simulation_matrix_free(
         balance_integral += dt_value * (pin - pout_step)
         return elapsed, iterations
 
-    for phase_definition, _, phase_steps, phase_dt in phase_plan:
-        if phase_steps <= 0 or aborted:
-            continue
-        phase_started = time.perf_counter()
-        derivative = C / phase_dt
-        phase_solve_time = 0.0
-        phase_iterations = 0
-        phase_steps_done = 0
-        derivative_start = (
-            bool(phase_definition.get("derivative_start"))
-            or (
-                time_stepping_used == "uniform"
-                and (
-                    node_count >= 250_000
-                    or bool(getattr(operator, "prefer_derivative_start", False))
+    use_blas_limit = (
+        HAS_NATIVE_CORE
+        and not bool(getattr(operator, "prefer_derivative_start", False))
+    )
+    blas_guard = (
+        _limit_blas_threads(1) if use_blas_limit else contextlib.nullcontext()
+    )
+
+    with blas_guard:
+        for phase_definition, _, phase_steps, phase_dt in phase_plan:
+            if phase_steps <= 0 or aborted or early_stopped:
+                continue
+            phase_started = time.perf_counter()
+            derivative = C / phase_dt
+            phase_solve_time = 0.0
+            phase_iterations = 0
+            phase_steps_done = 0
+            derivative_start = (
+                bool(phase_definition.get("derivative_start"))
+                or (
+                    time_stepping_used == "uniform"
+                    and (
+                        node_count >= 250_000
+                        or bool(getattr(operator, "prefer_derivative_start", False))
+                    )
                 )
             )
-        )
 
-        try:
-            if derivative_start:
+            try:
+                if derivative_start:
+                    bdf_operator, bdf_preconditioner = operator.implicit_linear_operator(
+                        C, 1.5 / phase_dt
+                    )
+                    if Q_func is not None:
+                        source = Q_func(current_time)
+                        pin = float(np.sum(source))
+                    initial_derivative = (
+                        source + b - operator.dot(temperature)
+                    ) / C
+                    previous_temperature = temperature - phase_dt * initial_derivative
+                    while phase_steps_done < phase_steps and not aborted and not early_stopped:
+                        if cancel_check and cancel_check():
+                            aborted = True
+                            break
+                        if Q_func is not None:
+                            source = Q_func(current_time + phase_dt)
+                            pin = float(np.sum(source))
+                        rhs = (
+                            2.0 * derivative * temperature
+                            - 0.5 * derivative * previous_temperature
+                            + source
+                            + b
+                        )
+                        elapsed, iterations = advance(
+                            rhs,
+                            bdf_operator,
+                            bdf_preconditioner,
+                            phase_dt,
+                            extrapolate=(phase_steps_done >= 1),
+                        )
+                        phase_solve_time += elapsed
+                        phase_iterations += iterations
+                        phase_steps_done += 1
+                        if (
+                            step_counter % update_interval == 0
+                            or step_counter == total_steps
+                        ):
+                            if progress_callback and not progress_callback(
+                                step_counter, total_steps
+                            ):
+                                aborted = True
+                                break
+                        if config.snapshots_enabled:
+                            while (
+                                next_snapshot_idx < len(config.snap_times)
+                                and current_time >= config.snap_times[next_snapshot_idx]
+                            ):
+                                record_snapshot(config.snap_times[next_snapshot_idx])
+                                next_snapshot_idx += 1
+                        if should_early_stop():
+                            early_stopped = True
+                            break
+                    phase_metrics.append({
+                        "phase": phase_definition["name"],
+                        "dt": phase_dt,
+                        "steps": phase_steps_done,
+                        "assembly_s": time.perf_counter() - phase_started - phase_solve_time,
+                        "factorization_s": 0.0,
+                        "avg_solve_s": phase_solve_time / max(phase_steps_done, 1),
+                        "avg_pcg_iterations": phase_iterations / max(phase_steps_done, 1),
+                        "startup": "derivative_bdf2",
+                        "backend": backend_name,
+                    })
+                    continue
+
+                be_operator, be_preconditioner = operator.implicit_linear_operator(
+                    C, 1.0 / phase_dt
+                )
                 bdf_operator, bdf_preconditioner = operator.implicit_linear_operator(
                     C, 1.5 / phase_dt
                 )
                 if Q_func is not None:
-                    source = Q_func(current_time)
+                    source = Q_func(current_time + phase_dt)
                     pin = float(np.sum(source))
-                initial_derivative = (
-                    source + b - operator.dot(temperature)
-                ) / C
-                previous_temperature = temperature - phase_dt * initial_derivative
-                while phase_steps_done < phase_steps and not aborted:
+                rhs = derivative * temperature + source + b
+                elapsed, iterations = advance(
+                    rhs, be_operator, be_preconditioner, phase_dt, extrapolate=False
+                )
+                phase_solve_time += elapsed
+                phase_iterations += iterations
+                phase_steps_done += 1
+                if step_counter % update_interval == 0 or step_counter == total_steps:
+                    if progress_callback and not progress_callback(step_counter, total_steps):
+                        aborted = True
+                if config.snapshots_enabled:
+                    while (
+                        next_snapshot_idx < len(config.snap_times)
+                        and current_time >= config.snap_times[next_snapshot_idx]
+                    ):
+                        record_snapshot(config.snap_times[next_snapshot_idx])
+                        next_snapshot_idx += 1
+                if not aborted and should_early_stop():
+                    early_stopped = True
+
+                while phase_steps_done < phase_steps and not aborted and not early_stopped:
                     if cancel_check and cancel_check():
                         aborted = True
                         break
@@ -1179,18 +1716,18 @@ def run_simulation_matrix_free(
                         + b
                     )
                     elapsed, iterations = advance(
-                        rhs, bdf_operator, bdf_preconditioner, phase_dt
+                        rhs,
+                        bdf_operator,
+                        bdf_preconditioner,
+                        phase_dt,
+                        extrapolate=(phase_steps_done >= 1),
                     )
                     phase_solve_time += elapsed
                     phase_iterations += iterations
                     phase_steps_done += 1
-                    if (
-                        step_counter % update_interval == 0
-                        or step_counter == total_steps
-                    ):
-                        if progress_callback and not progress_callback(
-                            step_counter, total_steps
-                        ):
+
+                    if step_counter % update_interval == 0 or step_counter == total_steps:
+                        if progress_callback and not progress_callback(step_counter, total_steps):
                             aborted = True
                             break
                     if config.snapshots_enabled:
@@ -1200,94 +1737,29 @@ def run_simulation_matrix_free(
                         ):
                             record_snapshot(config.snap_times[next_snapshot_idx])
                             next_snapshot_idx += 1
-                phase_metrics.append({
-                    "phase": phase_definition["name"],
-                    "dt": phase_dt,
-                    "steps": phase_steps_done,
-                    "assembly_s": time.perf_counter() - phase_started - phase_solve_time,
-                    "factorization_s": 0.0,
-                    "avg_solve_s": phase_solve_time / max(phase_steps_done, 1),
-                    "avg_pcg_iterations": phase_iterations / max(phase_steps_done, 1),
-                    "startup": "derivative_bdf2",
-                    "backend": backend_name,
-                })
-                continue
-
-            be_operator, be_preconditioner = operator.implicit_linear_operator(
-                C, 1.0 / phase_dt
-            )
-            bdf_operator, bdf_preconditioner = operator.implicit_linear_operator(
-                C, 1.5 / phase_dt
-            )
-            if Q_func is not None:
-                source = Q_func(current_time + phase_dt)
-                pin = float(np.sum(source))
-            rhs = derivative * temperature + source + b
-            elapsed, iterations = advance(
-                rhs, be_operator, be_preconditioner, phase_dt
-            )
-            phase_solve_time += elapsed
-            phase_iterations += iterations
-            phase_steps_done += 1
-            if step_counter % update_interval == 0 or step_counter == total_steps:
-                if progress_callback and not progress_callback(step_counter, total_steps):
-                    aborted = True
-            if config.snapshots_enabled:
-                while (
-                    next_snapshot_idx < len(config.snap_times)
-                    and current_time >= config.snap_times[next_snapshot_idx]
-                ):
-                    record_snapshot(config.snap_times[next_snapshot_idx])
-                    next_snapshot_idx += 1
-
-            while phase_steps_done < phase_steps and not aborted:
-                if cancel_check and cancel_check():
-                    aborted = True
-                    break
-                if Q_func is not None:
-                    source = Q_func(current_time + phase_dt)
-                    pin = float(np.sum(source))
-                rhs = (
-                    2.0 * derivative * temperature
-                    - 0.5 * derivative * previous_temperature
-                    + source
-                    + b
-                )
-                elapsed, iterations = advance(
-                    rhs, bdf_operator, bdf_preconditioner, phase_dt
-                )
-                phase_solve_time += elapsed
-                phase_iterations += iterations
-                phase_steps_done += 1
-
-                if step_counter % update_interval == 0 or step_counter == total_steps:
-                    if progress_callback and not progress_callback(step_counter, total_steps):
-                        aborted = True
+                    if should_early_stop():
+                        early_stopped = True
                         break
-                if config.snapshots_enabled:
-                    while (
-                        next_snapshot_idx < len(config.snap_times)
-                        and current_time >= config.snap_times[next_snapshot_idx]
-                    ):
-                        record_snapshot(config.snap_times[next_snapshot_idx])
-                        next_snapshot_idx += 1
-        except _CancelledIterativeSolve:
-            aborted = True
+            except _CancelledIterativeSolve:
+                aborted = True
 
-        phase_metrics.append({
-            "phase": phase_definition["name"],
-            "dt": phase_dt,
-            "steps": phase_steps_done,
-            "assembly_s": time.perf_counter() - phase_started - phase_solve_time,
-            "factorization_s": 0.0,
-            "avg_solve_s": phase_solve_time / max(phase_steps_done, 1),
-            "avg_pcg_iterations": phase_iterations / max(phase_steps_done, 1),
-            "backend": backend_name,
-        })
+            phase_metrics.append({
+                "phase": phase_definition["name"],
+                "dt": phase_dt,
+                "steps": phase_steps_done,
+                "assembly_s": time.perf_counter() - phase_started - phase_solve_time,
+                "factorization_s": 0.0,
+                "avg_solve_s": phase_solve_time / max(phase_steps_done, 1),
+                "avg_pcg_iterations": phase_iterations / max(phase_steps_done, 1),
+                "backend": backend_name,
+            })
 
     final_view = temperature.reshape(layer_count, rows, cols)
     pout_final = float(np.sum(hA * (temperature - ambient)))
     average_solve = total_solve_time / max(step_counter, 1)
+    steady_rel_diff = (
+        abs(pin - pout_final) / max(abs(pin), 1e-9) if early_stopped else None
+    )
     k_norm_info = {
         "strategy": "matrix_free_implicit_fvm_bdf2",
         "backend": backend_name,
@@ -1307,7 +1779,8 @@ def run_simulation_matrix_free(
         "pcg_relative_residual_max": max_relative_residual,
         "pin_w": pin,
         "pout_final_w": pout_final,
-        "steady_rel_diff": None,
+        "steady_rel_diff": steady_rel_diff,
+        "early_steady_state_stop": early_stopped,
     }
     return SolverResult(
         T=final_view,
@@ -1385,15 +1858,27 @@ def run_simulation(
     SolverResult
         Simulation results including final temperature and diagnostics.
     """
+    if config.steady_state and Q_func is None:
+        return run_steady_state(
+            config=config,
+            K=K,
+            Q=Q,
+            b=b,
+            hA=hA,
+            layer_count=layer_count,
+            rows=rows,
+            cols=cols,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+
     N = K.shape[0]
     RC = rows * cols
     sim_time = config.sim_time
     amb = config.amb
 
-    use_pardiso = config.use_pardiso and HAS_PARDISO
-    backend = "PARDISO" if use_pardiso else "SciPy"
+    backend = "SciPy"
     backend_modes = []
-    spd_residuals = []
 
     # Initialize temperature
     Tn = np.ones(N, dtype=np.float64) * amb
@@ -1412,6 +1897,7 @@ def run_simulation(
     next_snap_idx = 0
     current_time = 0.0
     aborted = False
+    early_stopped = False
     total_solve_time = 0.0
     total_factor_time = 0.0
     factor_count = 0
@@ -1421,10 +1907,24 @@ def run_simulation(
     phase_metrics = []
     balance_history = []
 
-    time_stepping_used, phase_plan = _build_phase_plan(config, N, use_pardiso)
+    time_stepping_used, phase_plan = _build_phase_plan(config, N)
     total_steps = sum(item[2] for item in phase_plan)
 
     update_interval = max(1, total_steps // 100)
+
+    def should_early_stop():
+        if (
+            not config.early_stop
+            or Q_func is not None
+            or step_counter < 5
+            or pin <= 1e-12
+        ):
+            return False
+        if config.snapshots_enabled and next_snap_idx < len(config.snap_times):
+            return False
+        if abs(pin - pout_step) / pin >= 1e-4:
+            return False
+        return float(np.max(np.abs(Tn - Tnm1))) < 1e-4
 
     def record_snapshot(t_elapsed):
         nonlocal prev_snap_time, prev_snap_energy, snap_cnt
@@ -1492,7 +1992,7 @@ def run_simulation(
 
     # Main time-stepping loop
     for pdef, phase_time, phase_step_count, phase_dt in phase_plan:
-        if phase_step_count <= 0:
+        if phase_step_count <= 0 or aborted or early_stopped:
             continue
 
         # Build system matrices for this phase
@@ -1533,32 +2033,27 @@ def run_simulation(
                 solve_bdf2 = cached_factor.solve
                 bdf_owner = cached_factor.owner
                 phase_backend = cached_factor.backend
-                spd_residual = cached_factor.spd_residual
                 factor_time = 0.0
                 factor_cache_hit = True
                 factor_cached = True
                 factorization_cache_used = True
             else:
                 factor_start = time.perf_counter()
-                solve_bdf2, bdf_owner, phase_backend, spd_residual = _factor_linear_system(
-                    A_bdf2, use_pardiso
-                )
+                solve_bdf2, bdf_owner, phase_backend, _ = _factor_linear_system(A_bdf2)
                 factor_time = time.perf_counter() - factor_start
                 total_factor_time += factor_time
                 factor_count += 1
                 if factorization_cache is not None and factorization_cache_key:
                     factorization_cache.put(
                         factorization_cache_key,
-                        CachedLinearSolver(solve_bdf2, bdf_owner, phase_backend, spd_residual),
+                        CachedLinearSolver(solve_bdf2, bdf_owner, phase_backend),
                     )
                     factor_cached = True
             backend_modes.append(phase_backend)
-            if spd_residual is not None:
-                spd_residuals.append(spd_residual)
             phase_solve_time = 0.0
             phase_steps_done = 0
 
-            while not aborted and phase_steps_done < phase_step_count:
+            while not aborted and not early_stopped and phase_steps_done < phase_step_count:
                 if cancel_check and cancel_check():
                     aborted = True
                     break
@@ -1578,6 +2073,9 @@ def run_simulation(
                     while next_snap_idx < len(config.snap_times) and current_time >= config.snap_times[next_snap_idx]:
                         record_snapshot(config.snap_times[next_snap_idx])
                         next_snap_idx += 1
+                if should_early_stop():
+                    early_stopped = True
+                    break
 
             if not factor_cached:
                 _release_linear_solver(bdf_owner)
@@ -1591,10 +2089,9 @@ def run_simulation(
                 "avg_solve_s": phase_solve_time / max(phase_steps_done, 1),
                 "startup": "derivative_bdf2",
                 "backend": phase_backend,
-                "spd_probe_residual": spd_residual,
                 "factorization_cache_hit": factor_cache_hit,
             })
-            if aborted:
+            if aborted or early_stopped:
                 break
             continue
 
@@ -1602,21 +2099,17 @@ def run_simulation(
         phase_factor_time = 0.0
         phase_steps_done = 0
         phase_backend = None
-        phase_spd_residual = None
 
         # Backward Euler bootstraps BDF2. It is a one-shot matrix, so release
         # its factorization before preparing the reusable BDF2 system.
         factor_start = time.perf_counter()
-        solve_be, be_owner, be_backend, be_spd_residual = _factor_linear_system(A_be, use_pardiso)
+        solve_be, be_owner, be_backend, _ = _factor_linear_system(A_be)
         factor_elapsed = time.perf_counter() - factor_start
         phase_factor_time += factor_elapsed
         total_factor_time += factor_elapsed
         factor_count += 1
         backend_modes.append(be_backend)
-        if be_spd_residual is not None:
-            spd_residuals.append(be_spd_residual)
         phase_backend = be_backend
-        phase_spd_residual = be_spd_residual
 
         if Q_func is not None:
             Q_current = Q_func(current_time + phase_dt)
@@ -1646,25 +2139,23 @@ def run_simulation(
                 record_snapshot(config.snap_times[next_snap_idx])
                 next_snap_idx += 1
 
+        if not aborted and should_early_stop():
+            early_stopped = True
+
         # Explicitly factor the BDF2 system once and reuse that exact owner.
         solve_bdf2 = None
         bdf_owner = None
-        if not aborted and phase_step_count > 1:
+        if not aborted and not early_stopped and phase_step_count > 1:
             factor_start = time.perf_counter()
-            solve_bdf2, bdf_owner, bdf_backend, bdf_spd_residual = _factor_linear_system(
-                A_bdf2, use_pardiso
-            )
+            solve_bdf2, bdf_owner, bdf_backend, _ = _factor_linear_system(A_bdf2)
             factor_elapsed = time.perf_counter() - factor_start
             phase_factor_time += factor_elapsed
             total_factor_time += factor_elapsed
             factor_count += 1
             backend_modes.append(bdf_backend)
-            if bdf_spd_residual is not None:
-                spd_residuals.append(bdf_spd_residual)
             phase_backend = bdf_backend
-            phase_spd_residual = bdf_spd_residual
 
-        while not aborted and phase_steps_done < phase_step_count:
+        while not aborted and not early_stopped and phase_steps_done < phase_step_count:
             if cancel_check and cancel_check():
                 aborted = True
                 break
@@ -1687,6 +2178,10 @@ def run_simulation(
                     record_snapshot(config.snap_times[next_snap_idx])
                     next_snap_idx += 1
 
+            if should_early_stop():
+                early_stopped = True
+                break
+
             if aborted:
                 break
 
@@ -1706,10 +2201,9 @@ def run_simulation(
             "factorization_s": phase_factor_time,
             "avg_solve_s": phase_avg_solve,
             "backend": phase_backend,
-            "spd_probe_residual": phase_spd_residual,
         })
 
-        if aborted:
+        if aborted or early_stopped:
             break
 
     # Compute final statistics
@@ -1718,9 +2212,9 @@ def run_simulation(
     delta_t_final = Tn - amb
     pout_final = float(np.sum(hA * delta_t_final))
 
-    steady_ok = False
+    steady_ok = early_stopped
     rel_diff = None
-    if balance_history:
+    if not steady_ok and balance_history:
         recent = balance_history[-min(3, len(balance_history)):]
         steady_ok = all(
             abs(item["dE"]) / max(abs(item["delta_t"] * pin), 1e-9) < 0.01
@@ -1750,10 +2244,10 @@ def run_simulation(
         "factorizations": factor_count,
         "factorization_cache_hit": factorization_cache_used,
         "avg_solve_s": avg_solve_time,
-        "spd_probe_residual_max": max(spd_residuals) if spd_residuals else None,
         "pin_w": pin,
         "pout_final_w": pout_final,
-        "steady_rel_diff": rel_diff
+        "steady_rel_diff": rel_diff,
+        "early_steady_state_stop": early_stopped,
     }
 
     return SolverResult(

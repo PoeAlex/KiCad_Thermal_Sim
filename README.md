@@ -2,7 +2,7 @@
 
 ![Simulation results](docs/images/result.png "6-layer thermal simulation results")
 
-**KiCad Thermal Sim** is a lightweight KiCad PCB Editor plugin for fast, layout-oriented **heat spreading simulation across all copper layers** (`F.Cu` to `B.Cu`, including inner layers).
+**KiCad Thermal Sim** is a lightweight KiCad 9.0 & 10.0 PCB Editor plugin for fast, layout-oriented **heat spreading simulation across all copper layers** (`F.Cu` to `B.Cu`, including inner layers).
 
 This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineering tool to quickly answer:
 
@@ -19,21 +19,26 @@ This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineer
 
 - **2D in-plane conduction** on each copper layer.
 - **Vertical coupling** between adjacent copper layers through FR4 and via enhancement.
-- **Manual power injection** from explicitly configured **Heat Sources**.
-- Constant pad power and time-varying **PWL power profiles**.
+- **Direct Steady-State (final temperature)** mode solving $K \cdot T = Q + b$ directly in a single solve for constant heat sources (solves 160k+ node multilayer PCBs in well under a second).
+- **Transient BDF2 time integration** with linear PCG warm-start extrapolation and lossless early steady-state stop.
+- **Native C++/OpenMP v2 Multigrid CPU core** (`thermalsim_core.dll`, `libthermalsim_core.so`, `libthermalsim_core.dylib`) with automatic fallback to a pure NumPy/SciPy implementation.
+- **Manual power injection** from explicitly configured **Heat Sources** (constant power or time-varying **PWL power profiles**).
 - Optional **DC current-flow heating** from source/sink pads on KiCad nets.
 - **Convection** to ambient on top and bottom outer surfaces.
 - Optional **Thermal Pad** geometry on `User.Eco1` for stronger bottom-side heat removal.
 - Current-path diagnostics: copper loss, effective resistance, equivalent voltage drop, grid quality, and a Joule loss map.
+- Persistent compressed `.npz` disk geometry cache and hotspot-preserving downsampled HTML interactive heatmaps for million-node grids.
 
 ---
 
 ## Installation
 
+Compatible with **KiCad 9.0** and **KiCad 10.0** on Windows, Linux, and macOS.
+
 ### Option A: KiCad Plugin Manager
 
 1. Download the latest `ThermalSim-vX.Y.Z.zip` from the [Releases](https://github.com/PoeAlex/KiCad_Thermal_Sim/releases) page.
-2. In KiCad, open **Plugin and Content Manager**.
+2. In KiCad 9.0 or 10.0, open **Plugin and Content Manager**.
 3. Click **Install from File...** and select the downloaded ZIP.
 4. Restart KiCad.
 5. On first run, the plugin detects missing dependencies and offers to install them automatically.
@@ -41,25 +46,25 @@ This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineer
 ### Option B: Manual Copy
 
 1. Download or clone this repository.
-2. Copy the plugin folder, meaning the folder that contains `__init__.py`, `thermal_plugin.py`, and the other `.py` modules, into KiCad's plugin directory:
+2. Copy the plugin folder (containing `__init__.py`, `thermal_plugin.py`, and the other `.py` modules, plus the optional native shared library if built) into KiCad's plugin directory for your version (`9.0` or `10.0`):
 
-   - **Windows**: `%APPDATA%\kicad\9.0\scripting\plugins\`
-   - **Linux**: `~/.local/share/kicad/9.0/scripting/plugins/`
-   - **macOS**: `~/Library/Application Support/kicad/9.0/scripting/plugins/`
+   - **Windows**:
+     - KiCad 9.0: `%APPDATA%\kicad\9.0\scripting\plugins\`
+     - KiCad 10.0: `%APPDATA%\kicad\10.0\scripting\plugins\`
+   - **Linux**:
+     - KiCad 9.0: `~/.local/share/kicad/9.0/scripting/plugins/`
+     - KiCad 10.0: `~/.local/share/kicad/10.0/scripting/plugins/`
+   - **macOS**:
+     - KiCad 9.0: `~/Library/Application Support/kicad/9.0/scripting/plugins/`
+     - KiCad 10.0: `~/Library/Application Support/kicad/10.0/scripting/plugins/`
 
 3. Restart KiCad.
 4. On first run, the plugin offers to install missing packages (`numpy`, `scipy`, `matplotlib`) automatically.
 
-Alternatively, install packages manually in the **KiCad 9.0 Command Prompt**:
+Alternatively, install packages manually in the **KiCad 9.0 / 10.0 Command Prompt** (or your system Python on Linux):
 
 ```bash
 pip install numpy scipy matplotlib
-```
-
-Optional for faster large solves on supported Windows/Linux x86_64 systems:
-
-```bash
-pip install pypardiso
 ```
 
 Run the plugin in PCB Editor via **Tools -> External Plugins -> 2.5D Thermal Sim**.
@@ -72,7 +77,7 @@ Run the plugin in PCB Editor via **Tools -> External Plugins -> 2.5D Thermal Sim
 2. Select one or more pads if you want to pre-fill manual heat sources.
 3. Run **Tools -> External Plugins -> 2.5D Thermal Sim**.
 4. Use **Heat Sources** to add pads that dissipate manual power, then enter constant W values or PWL file paths.
-5. Set **Duration**, **Ambient**, and **Resolution** on the **Overview** tab.
+5. Choose **Steady-state (final temperature)** or set **Duration**, **Ambient**, and **Resolution** on the **Overview** tab.
 6. Optionally use **Current Heating** to add source/sink pads and per-pad currents for copper `I^2R` heating.
 7. Optionally use **Advanced** for the simulation area, thermal pad, convection, and solver settings.
 8. Click **Preview** to check the mapped geometry, then **Run**.
@@ -91,7 +96,7 @@ Run the plugin in PCB Editor via **Tools -> External Plugins -> 2.5D Thermal Sim
 
 The resizable dialog keeps board context and live preflight status visible above and below four compact tabs:
 
-- **Overview** - duration, ambient temperature, target cell size, compute budget, live cost estimate, output, and collapsible board details.
+- **Overview** - steady-state toggle, duration, ambient temperature, target cell size, compute budget, live cost estimate, output, and collapsible board details.
 - **Heat Sources** - manual heat sources selected independently from current terminals.
 - **Current Heating** - DC current source/sink terminals for Joule heating.
 - **Advanced** - collapsible simulation-area, thermal-pad, and solver settings.
@@ -106,22 +111,24 @@ Shows detected copper layers with thicknesses and dielectric gaps parsed from th
 
 #### Main Settings
 
-- **Duration (sec)** - total simulated time. Shorter durations emphasize transient peaks; longer durations approach quasi steady-state.
+- **Steady-state (final temperature)** - solves $K \cdot T = Q + b$ directly in a single solve for constant heat sources, skipping transient time stepping and solving 160k+ node multilayer PCBs in well under a second. Disable this option for transient analysis or time-varying PWL profiles.
+- **Duration (sec)** - total simulated time in transient mode. Transient BDF2 uses linear PCG warm-start extrapolation and lossless early steady-state stop when temperatures have converged.
 - **Ambient Temp (C)** - reference temperature. Results are relative to ambient.
 - **Target Cell Size (mm)** - desired spatial grid size. Smaller values improve hotspot and trace localization but increase runtime.
-- **Compute Budget** - choose **Fast**, **Balanced**, **Detailed**, **Very detailed**, or **Custom**. The budget is based on total solver nodes across all copper layers.
-- **Maximum Solver Nodes** - available in Custom mode for an explicit upper
-  limit of up to 100 million equivalent uniform nodes. Values above 10 million
-  are expert settings and may require tens of GB of RAM before adaptive
-  reduction.
+- **Compute Budget** - based on total solver nodes across all copper layers, with an **85% auto-coarsening target** when a requested resolution exceeds the budget:
+  - **Fast** - up to **500k** nodes
+  - **Balanced** (default) - up to **1.2M** nodes
+  - **Detailed** - up to **3M** nodes
+  - **Very detailed** - up to **6M** nodes
+  - **Custom** - explicit upper limit up to **100M** equivalent uniform nodes (values above 10M are expert settings and may require tens of GB of RAM before adaptive reduction)
 
-The live estimate shows requested versus actual cell size, grid dimensions, total nodes, approximate resolvable feature size, memory range, and a relative runtime class. For large boards, ThermalSim may automatically coarsen the requested cell size to remain within the selected budget. The report records the requested and actual resolution, compute budget, and simulated board fraction.
+The live estimate shows requested versus actual cell size, grid dimensions, total nodes, approximate resolvable feature size, memory range, and a relative runtime class. For large boards, ThermalSim automatically coarsens the requested cell size toward 85% of the selected budget so you keep most of your chosen detail while staying within limits. The report records the requested and actual resolution, compute budget, and simulated board fraction.
 
 #### Output
 
 - **Show All Layers** - display results for all copper layers.
-- **Save Snapshots** - store intermediate temperature images.
-- **Snapshot Count** - number of intermediate snapshots.
+- **Save Snapshots** - store intermediate temperature images (transient mode).
+- **Snapshot Count** - number of intermediate snapshots (transient mode).
 - **Output Folder** - where the timestamped result folder is created.
 
 #### Settings Files
@@ -219,18 +226,17 @@ The preflight status shows the effective dimensions and percentage of the board.
 
 - **Convection h (W/m2K)** - convection coefficient for top/bottom surfaces. Default is 10.
 - **PCB Thickness (mm)** - overall board thickness. Stackup thickness is used when available.
-- **Compute Engine** - `Auto` selects the matrix-free CPU engine for large jobs and keeps the legacy sparse solver for small jobs. Both engines remain manually selectable.
-- **Spatial Mesh** - `Adaptive` keeps the requested cell size at copper edges, pads, vias, sources, and thermal-pad boundaries while merging homogeneous interiors. `Uniform` keeps the full regular grid.
+- **Compute Engine** - `Auto` selects the matrix-free CPU engine (with geometric multigrid PCG) for larger jobs (starting at 50k nodes when the Native C++/OpenMP v2 multigrid core is active, or 250k nodes without it) and keeps the sparse SciPy direct solver for small jobs. Both engines remain manually selectable.
+- **Spatial Mesh** - `Auto`, `Uniform`, or `Adaptive`:
+  - **`Auto`** (default) uses `Uniform` with the Native C++/OpenMP v2 multigrid solver up to **5M nodes** for maximum speed and zero coarsening error, and switches to `Adaptive` above 5M nodes or when running without the native multigrid core.
+  - **`Uniform`** keeps the full regular grid.
+  - **`Adaptive`** keeps the requested cell size at copper edges, pads, vias, sources, and thermal-pad boundaries while merging homogeneous interiors.
 - **Adaptive Max Cell Ratio** - largest adaptive cell relative to the requested cell size. The default is 8.
-- **Capabilities** - detected solver backend, including the optional `thermalsim_core.dll`.
+- **Capabilities** - detected solver backend, including the Native C++/OpenMP v2 multigrid core (`thermalsim_core.dll`, `libthermalsim_core.so`, or `libthermalsim_core.dylib`).
 
-The **Balanced** compute budget is the default. Presets use total solver nodes, so a four-layer board automatically receives fewer 2D cells than a two-layer board at the same budget. **Custom** exposes one explicit maximum-node value; ThermalSim retains headroom when it must auto-coarsen.
+The **Balanced** compute budget (1.2M nodes) is the default. Presets use total solver nodes, so a four-layer board automatically receives fewer 2D cells than a two-layer board at the same budget. When auto-coarsening is needed, ThermalSim targets 85% of the budget so headroom is preserved without sacrificing unnecessary resolution.
 
-The fast engine applies the finite-volume operator without constructing the
-large global COO/CSR matrix used by the legacy direct solver. Adaptive runs use
-a conservative reduced graph and geometrically coarsened multigrid
-preconditioning. Reports show the equivalent uniform nodes, actual adaptive
-nodes, reduction factor, PCG iterations, and residual.
+The fast engine applies the finite-volume operator without constructing a large global COO/CSR matrix. Uniform native runs use C++/OpenMP v2 structured geometric multigrid V-cycles; adaptive runs use a conservative reduced graph with geometrically coarsened multigrid preconditioning. Reports show the equivalent uniform nodes, actual adaptive nodes, reduction factor, PCG iterations, and residual.
 
 ---
 
@@ -238,10 +244,9 @@ nodes, reduction factor, PCG iterations, and residual.
 
 The **Preview** button generates a geometry visualization showing copper distribution, power/current pad locations, via regions, and the effective simulation-area boundary on each layer. Its header reports the cropped dimensions and percentage of the board.
 
-ThermalSim uses the copper-zone fills already stored by KiCad. If zones are
-stale or unfilled, press **B** in PCB Editor before Preview or Run. The plugin
-does not refill zones automatically because this can block the interface for
-minutes on large boards and is unstable in some KiCad builds.
+ThermalSim uses the copper-zone fills already stored by KiCad. If zones are stale or unfilled, press **B** in PCB Editor before Preview or Run. The plugin does not refill zones automatically because this can block the interface for minutes on large boards and is unstable in some KiCad builds.
+
+Rasterized board geometry is cached on disk using safe compressed `.npz` archives (no pickle), so repeated previews and parameter sweeps on the same board skip redundant geometry rasterization.
 
 ![Preview](docs/images/preview.png "KiCad editor with geometry preview")
 
@@ -253,11 +258,11 @@ Each run creates a timestamped result folder, for example `Thermalsim_20260426_1
 
 Typical files:
 
-- `thermal_report.html` - main report with settings, stackup, diagnostics, images, and interactive heatmap.
+- `thermal_report.html` - main report with settings, stackup, diagnostics, images, and interactive heatmap. For million-node grids, the embedded interactive heatmap payload is automatically downsampled using hotspot-preserving pooling so peak temperatures stay accurate while the HTML stays fast and lightweight.
 - `thermal_preview.png` - mapped geometry preview.
 - `thermal_stackup.png` or `thermal_final.png` - final temperature heatmap.
 - `joule_loss_map.png` - current-induced copper loss map when current heating is active.
-- `snap_*.png` - optional time-series snapshots.
+- `snap_*.png` - optional time-series snapshots (transient mode).
 
 ### Current Path Diagnostics
 
@@ -296,17 +301,18 @@ The plugin is split into focused modules:
 
 | Module | Purpose |
 |--------|---------|
-| `capabilities.py` | Runtime detection of numpy, scipy, matplotlib, pypardiso, numba |
+| `capabilities.py` | Runtime detection of `numpy`, `scipy`, `matplotlib`, and the Native C++/OpenMP v2 core |
 | `dependency_installer.py` | Auto-install dialog for missing packages via pip |
 | `stackup_parser.py` | Parse copper/dielectric layers from `.kicad_pcb` S-expressions |
 | `gui_dialogs.py` | wxPython dialog for simulation parameters |
 | `geometry_mapper.py` | Accurately rasterize tracks, arcs, pads, vias, and filled zones |
 | `adaptive_mesh.py` | Build conservative adaptive meshes and multigrid operators |
 | `electrical_solver.py` | Solve DC current flow and convert copper losses to heat sources |
-| `thermal_solver.py` | Legacy sparse and matrix-free PCG/BDF2 thermal solvers |
-| `native_core.py` | Load the optional Windows x64 C++/OpenMP CPU core |
+| `thermal_solver.py` | Direct steady-state, transient BDF2, and matrix-free multigrid PCG thermal solvers |
+| `native_core.py` | Cross-platform loader for the optional C++/OpenMP v2 Multigrid CPU core |
+| `workflow.py` | Safe compressed `.npz` disk geometry caching, operator caching, and solver phase planning |
 | `pwl_parser.py` | Parse LTspice-style PWL power profiles |
-| `visualization.py` | Generate thermal plots, previews, heatmap payloads, and Joule loss maps |
+| `visualization.py` | Generate thermal plots, previews, hotspot-preserving interactive heatmaps, and Joule loss maps |
 | `thermal_report.py` | Generate the HTML report |
 | `thermal_plugin.py` | Orchestrate workflow and KiCad ActionPlugin integration |
 
@@ -331,13 +337,68 @@ The plugin is split into focused modules:
 1. Add manual dissipating components in **Heat Sources**.
 2. Add source/sink terminals in **Current Heating** only when copper `I^2R` heating matters.
 3. Press **B** in PCB Editor so every copper zone has a current fill.
-4. Enable **Limit to Active Sources and Current Paths** and start with a moderate thermal margin, for example 20 mm.
-5. Check the effective board percentage; active current nets are always included completely.
-6. Tune **Target Cell Size** until hotspots and current-path metrics are stable. Try 0.5 mm, then 0.3 mm.
-7. Increase the **Compute Budget** only after checking the live node, memory, and runtime estimate.
-8. Save JSON settings for repeatable project comparisons.
-9. Compare layout variants using the same settings.
-10. Validate important designs with measurement or a full 3D thermal workflow.
+4. Enable **Steady-state (final temperature)** for fast constant-power design iterations, or set **Duration** for transient/PWL studies.
+5. Enable **Limit to Active Sources and Current Paths** and start with a moderate thermal margin, for example 20 mm.
+6. Check the effective board percentage; active current nets are always included completely.
+7. Tune **Target Cell Size** until hotspots and current-path metrics are stable. Try 0.5 mm, then 0.3 mm.
+8. Increase the **Compute Budget** only after checking the live node, memory, and runtime estimate.
+9. Save JSON settings for repeatable project comparisons.
+10. Compare layout variants using the same settings and validate important designs with measurement or a full 3D thermal workflow.
+
+---
+
+## Building the Native C++/OpenMP v2 Multigrid Core
+
+The optional native C++/OpenMP v2 core accelerates matrix-free stencil evaluation and geometric multigrid V-cycles (damped Jacobi smoothing, 2x2 residual restriction, and prolongation) across all CPU cores. Without it, the same fast-engine interface runs seamlessly on NumPy/SciPy.
+
+### Windows (CMake / MSVC)
+
+Install Visual Studio Build Tools with the C++ workload, then run:
+
+```bash
+cmake -S native -B native/build
+cmake --build native/build --config Release
+```
+
+This produces `native/bin/thermalsim_core.dll`.
+
+### Linux (CMake or `g++`)
+
+Using CMake:
+
+```bash
+cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release
+cmake --build native/build
+```
+
+Or directly with `g++`:
+
+```bash
+mkdir -p native/bin
+g++ -O3 -fno-fast-math -fopenmp -shared -fPIC -std=c++17 native/thermalsim_core.cpp -o native/bin/libthermalsim_core.so
+```
+
+This produces `native/bin/libthermalsim_core.so`.
+
+### macOS (CMake or `clang++`)
+
+Using CMake (install `libomp` via Homebrew for OpenMP multithreading):
+
+```bash
+cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release
+cmake --build native/build
+```
+
+Or directly with `clang++`:
+
+```bash
+mkdir -p native/bin
+clang++ -O3 -fno-fast-math -shared -fPIC -std=c++17 native/thermalsim_core.cpp -o native/bin/libthermalsim_core.dylib
+```
+
+This produces `native/bin/libthermalsim_core.dylib`.
+
+Any built binaries in `native/bin/` (`thermalsim_core.dll`, `libthermalsim_core.so`, `libthermalsim_core.dylib`) are packaged automatically by `build_pcm_package.py`.
 
 ---
 
@@ -349,29 +410,21 @@ Run the test suite from the repository root:
 run_tests.bat
 ```
 
+Or on Linux/macOS:
+
+```bash
+python3 run_tests.py -v
+```
+
 Run the synthetic large-grid benchmark without a proprietary board file:
 
 ```bash
 python benchmark_fast_engine.py --nodes 10000000 --layers 4 --solve-steps 3
 ```
 
-Legacy matrix construction is automatically skipped above the configured
-safety limit. The benchmark reports equivalent/adaptive node counts, operator
-build times, solve time, iteration counts, and process memory.
+Legacy matrix construction is automatically skipped above the configured safety limit. The benchmark reports equivalent/adaptive node counts, operator build times, solve time, iteration counts, and process memory.
 
-To build the optional native Windows CPU core, install Visual Studio Build
-Tools with the C++ workload, then run:
-
-```bash
-cmake -S native -B native/build
-cmake --build native/build --config Release
-```
-
-The generated `native/bin/thermalsim_core.dll` is included automatically by
-`build_pcm_package.py`. Without the DLL, the same fast-engine interface uses
-the NumPy/SciPy CPU implementation.
-
-Useful variants:
+Useful test variants:
 
 ```bat
 run_tests.bat -k "test_thermal_solver"
@@ -381,11 +434,18 @@ run_tests.bat --cov=ThermalSim
 
 ### Real KiCad Benchmark
 
-Use KiCad's bundled Python to benchmark a real board without saving or modifying it:
+Use KiCad's bundled Python (KiCad 9.0 or 10.0) to benchmark a real board without saving or modifying it:
 
 ```powershell
-& "C:\Program Files\KiCad\9.0\bin\python.exe" benchmark_real_board.py `
+& "C:\Program Files\KiCad\10.0\bin\python.exe" benchmark_real_board.py `
   "C:\path\to\board.kicad_pcb" --scenario thermal --time-stepping auto
+```
+
+On Linux (using system Python with KiCad 9.0/10.0 `pcbnew`):
+
+```bash
+THERMALSIM_HEADLESS=1 python3 benchmark_real_board.py \
+  /path/to/board.kicad_pcb --scenario thermal --time-stepping auto
 ```
 
 Set `THERMALSIM_HEADLESS=1` when importing ThermalSim as a library outside PCB Editor. This prevents ActionPlugin registration while keeping the solver and board readers available.

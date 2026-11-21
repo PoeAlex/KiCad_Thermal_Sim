@@ -17,10 +17,15 @@ class TestCapabilityFlags:
         from ThermalSim.capabilities import HAS_LIBS
         assert isinstance(HAS_LIBS, bool)
 
-    def test_has_pardiso_is_boolean(self):
-        """Test that HAS_PARDISO is a boolean value."""
-        from ThermalSim.capabilities import HAS_PARDISO
-        assert isinstance(HAS_PARDISO, bool)
+    def test_has_native_core_is_boolean(self):
+        """Test that HAS_NATIVE_CORE is a boolean value."""
+        from ThermalSim.capabilities import HAS_NATIVE_CORE
+        assert isinstance(HAS_NATIVE_CORE, bool)
+
+    def test_has_native_mg_is_boolean(self):
+        """Test that HAS_NATIVE_MG is a boolean value."""
+        from ThermalSim.capabilities import HAS_NATIVE_MG
+        assert isinstance(HAS_NATIVE_MG, bool)
 
     def test_has_numba_is_boolean(self):
         """Test that HAS_NUMBA is a boolean value."""
@@ -73,47 +78,6 @@ class TestCapabilityFlags:
             # Note: wx might not be available in test environment
             # so we just verify the flag is set
             assert isinstance(HAS_LIBS, bool)
-
-
-class TestPyPardisoPlatformSupport:
-    """Tests for PyPardiso platform compatibility detection."""
-
-    def test_windows_amd64_supported(self):
-        """Test that Windows x86_64/amd64 supports PyPardiso."""
-        from ThermalSim.capabilities import is_pypardiso_supported_platform
-        assert is_pypardiso_supported_platform("win32", "AMD64") is True
-
-    def test_linux_x86_64_supported(self):
-        """Test that Linux x86_64 supports PyPardiso."""
-        from ThermalSim.capabilities import is_pypardiso_supported_platform
-        assert is_pypardiso_supported_platform("linux", "x86_64") is True
-
-    def test_macos_unsupported(self):
-        """Test that macOS is not offered PyPardiso automatically."""
-        from ThermalSim.capabilities import is_pypardiso_supported_platform
-        assert is_pypardiso_supported_platform("darwin", "x86_64") is False
-        assert is_pypardiso_supported_platform("darwin", "arm64") is False
-
-    def test_linux_arm_unsupported(self):
-        """Test that Linux ARM/aarch64 is not offered PyPardiso automatically."""
-        from ThermalSim.capabilities import is_pypardiso_supported_platform
-        assert is_pypardiso_supported_platform("linux", "aarch64") is False
-
-    def test_optional_dependency_descriptor_defaults_when_supported(self):
-        """Test that supported missing PyPardiso is selected by default."""
-        from ThermalSim import capabilities
-        original = capabilities.HAS_PARDISO
-        original_func = capabilities.is_pypardiso_supported_platform
-        try:
-            capabilities.HAS_PARDISO = False
-            capabilities.is_pypardiso_supported_platform = lambda: True
-            result = capabilities.get_pypardiso_optional_dependency()
-            assert result["pip_name"] == "pypardiso"
-            assert result["enabled"] is True
-            assert result["default_selected"] is True
-        finally:
-            capabilities.HAS_PARDISO = original
-            capabilities.is_pypardiso_supported_platform = original_func
 
 
 class TestGranularFlags:
@@ -263,11 +227,17 @@ class TestGetCapabilitiesSummary:
         result = get_capabilities_summary()
         assert "Core libs (all)" in result
 
-    def test_contains_pardiso_status(self):
-        """Test that summary mentions PyPardiso."""
+    def test_contains_native_core_status(self):
+        """Test that summary mentions the native matrix-free CPU core."""
         from ThermalSim.capabilities import get_capabilities_summary
         result = get_capabilities_summary()
-        assert "PyPardiso" in result or "pardiso" in result.lower()
+        assert "Native matrix-free CPU core" in result
+
+    def test_contains_native_mg_status(self):
+        """Test that summary mentions the native multigrid V-cycle."""
+        from ThermalSim.capabilities import get_capabilities_summary
+        result = get_capabilities_summary()
+        assert "Native multigrid V-cycle" in result
 
     def test_contains_numba_status(self):
         """Test that summary mentions Numba."""
@@ -306,14 +276,27 @@ class TestCapabilityFlagsConsistency:
                     assert 'Not available' in line
                 break
 
-    def test_pardiso_flag_matches_summary(self):
-        """Test that HAS_PARDISO flag matches summary text."""
-        from ThermalSim.capabilities import HAS_PARDISO, get_capabilities_summary
+    def test_native_core_flag_matches_summary(self):
+        """Test that HAS_NATIVE_CORE flag matches summary text."""
+        from ThermalSim.capabilities import HAS_NATIVE_CORE, get_capabilities_summary
         summary = get_capabilities_summary()
 
         for line in summary.split('\n'):
-            if 'PyPardiso' in line or 'pardiso' in line.lower():
-                if HAS_PARDISO:
+            if 'Native matrix-free CPU core' in line:
+                if HAS_NATIVE_CORE:
+                    assert 'Available' in line
+                else:
+                    assert 'Not available' in line
+                break
+
+    def test_native_mg_flag_matches_summary(self):
+        """Test that HAS_NATIVE_MG flag matches summary text."""
+        from ThermalSim.capabilities import HAS_NATIVE_MG, get_capabilities_summary
+        summary = get_capabilities_summary()
+
+        for line in summary.split('\n'):
+            if 'Native multigrid V-cycle' in line:
+                if HAS_NATIVE_MG:
                     assert 'Available' in line
                 else:
                     assert 'Not available' in line
@@ -343,16 +326,20 @@ class TestModuleImportBehavior:
 
     def test_reimport_stable(self):
         """Test that reimporting gives same flags."""
-        from ThermalSim.capabilities import HAS_LIBS, HAS_PARDISO, HAS_NUMBA
+        from ThermalSim.capabilities import (
+            HAS_LIBS, HAS_NATIVE_CORE, HAS_NATIVE_MG, HAS_NUMBA
+        )
 
         # Reimport
         import ThermalSim.capabilities as capabilities
         importlib.reload(capabilities)
 
-        from ThermalSim.capabilities import HAS_PARDISO as HAS_PARDISO2
+        from ThermalSim.capabilities import HAS_NATIVE_CORE as HAS_NATIVE_CORE2
+        from ThermalSim.capabilities import HAS_NATIVE_MG as HAS_NATIVE_MG2
         from ThermalSim.capabilities import HAS_NUMBA as HAS_NUMBA2
 
-        assert HAS_PARDISO == HAS_PARDISO2
+        assert HAS_NATIVE_CORE == HAS_NATIVE_CORE2
+        assert HAS_NATIVE_MG == HAS_NATIVE_MG2
         assert HAS_NUMBA == HAS_NUMBA2
 
     def test_attributes_exist(self):
@@ -364,8 +351,9 @@ class TestModuleImportBehavior:
         assert hasattr(capabilities, 'HAS_SCIPY')
         assert hasattr(capabilities, 'HAS_MATPLOTLIB')
         assert hasattr(capabilities, 'HAS_WX')
-        assert hasattr(capabilities, 'HAS_PARDISO')
         assert hasattr(capabilities, 'HAS_NUMBA')
+        assert hasattr(capabilities, 'HAS_NATIVE_CORE')
+        assert hasattr(capabilities, 'HAS_NATIVE_MG')
         assert hasattr(capabilities, 'get_capabilities_summary')
         assert hasattr(capabilities, 'get_missing_packages')
 
@@ -406,5 +394,6 @@ class TestEdgeCases:
         assert capabilities.HAS_SCIPY in [True, False]
         assert capabilities.HAS_MATPLOTLIB in [True, False]
         assert capabilities.HAS_WX in [True, False]
-        assert capabilities.HAS_PARDISO in [True, False]
         assert capabilities.HAS_NUMBA in [True, False]
+        assert capabilities.HAS_NATIVE_CORE in [True, False]
+        assert capabilities.HAS_NATIVE_MG in [True, False]

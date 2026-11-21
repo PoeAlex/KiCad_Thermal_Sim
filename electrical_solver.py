@@ -16,18 +16,11 @@ from scipy.sparse.csgraph import connected_components
 
 import pcbnew
 
-from .capabilities import HAS_PARDISO
 from .geometry_mapper import _fill_zone_mask_polygons
-
-if HAS_PARDISO:
-    import pypardiso
-else:
-    pypardiso = None
 
 _ELECTRICAL_ITERATIVE_NODE_THRESHOLD = 150_000
 _ELECTRICAL_ITERATIVE_RTOL = 1e-8
 _ELECTRICAL_ITERATIVE_MAXITER = 4000
-_ELECTRICAL_PARDISO_RESIDUAL_TOL = 1e-8
 
 
 @dataclass
@@ -556,15 +549,6 @@ def _solve_one_net(
     return ElectricalResult(q_full, [summary], warnings, errors)
 
 
-def _release_pardiso_solver(owner: Any) -> None:
-    """Release native memory associated with a temporary PyPardiso solver."""
-    if owner is not None and hasattr(owner, "free_memory"):
-        try:
-            owner.free_memory(everything=True)
-        except Exception:
-            pass
-
-
 def _relative_residual(
     matrix: sp.csr_matrix,
     solution: np.ndarray,
@@ -589,12 +573,10 @@ def _solve_electrical_system(
 
     The grounded copper-network Laplacian is symmetric positive definite.
     Solver selection order:
-    1. PyPardiso SPD (``mtype=2`` on upper-triangular CSR) with residual check,
-       falling back to generic ``pypardiso.spsolve`` if available.
-    2. For large systems (``N >= iterative_threshold``) without PyPardiso,
-       Jacobi-preconditioned Conjugate Gradients (``spla.cg``) verified against
-       a tight relative residual (``<= 1e-8``).
-    3. Direct SciPy SuperLU (``spla.spsolve``) on a CSC matrix as default for
+    1. For large systems (``N >= iterative_threshold``), Jacobi-preconditioned
+       Conjugate Gradients (``spla.cg``) verified against a tight relative
+       residual (``<= 1e-8``).
+    2. Direct SciPy SuperLU (``spla.spsolve``) on a CSC matrix as default for
        smaller systems and safe fallback.
     """
     rhs = np.asarray(sub_rhs, dtype=np.float64).reshape(-1)
@@ -609,42 +591,6 @@ def _solve_electrical_system(
     sub_lap_csr = (
         sub_lap if getattr(sub_lap, "format", None) == "csr" else sub_lap.tocsr()
     )
-
-    if HAS_PARDISO and pypardiso is not None:
-        if hasattr(pypardiso, "PyPardisoSolver"):
-            spd_owner = None
-            try:
-                spd_matrix = sp.triu(sub_lap_csr, format="csr")
-                spd_owner = pypardiso.PyPardisoSolver(mtype=2)
-                solution = np.asarray(
-                    spd_owner.solve(spd_matrix, rhs), dtype=np.float64
-                ).reshape(-1)
-                if (
-                    solution.shape == (n_nodes,)
-                    and np.all(np.isfinite(solution))
-                    and _relative_residual(sub_lap_csr, solution, rhs, rhs_norm)
-                    <= _ELECTRICAL_PARDISO_RESIDUAL_TOL
-                ):
-                    return solution
-            except Exception:
-                pass
-            finally:
-                _release_pardiso_solver(spd_owner)
-
-        if hasattr(pypardiso, "spsolve"):
-            try:
-                solution = np.asarray(
-                    pypardiso.spsolve(sub_lap_csr, rhs), dtype=np.float64
-                ).reshape(-1)
-                if (
-                    solution.shape == (n_nodes,)
-                    and np.all(np.isfinite(solution))
-                    and _relative_residual(sub_lap_csr, solution, rhs, rhs_norm)
-                    <= _ELECTRICAL_PARDISO_RESIDUAL_TOL
-                ):
-                    return solution
-            except Exception:
-                pass
 
     threshold = (
         _ELECTRICAL_ITERATIVE_NODE_THRESHOLD

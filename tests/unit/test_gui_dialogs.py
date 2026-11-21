@@ -779,7 +779,7 @@ class TestSettingsDialogInstantiation:
                 'grid_expert_limits': True,
                 'grid_max_cells': 800000,
                 'grid_target_cells': 400000,
-                'solver_backend': 'scipy',
+                'time_stepping': 'uniform',
             },
         )
 
@@ -892,9 +892,9 @@ class TestSimulationDetailSettings:
 
         assert values['grid_expert_limits'] is False
         assert values['grid_detail_level'] == 'balanced'
-        assert values['grid_node_budget'] == 800000
-        assert values['grid_max_cells'] == 400000
-        assert values['grid_target_cells'] == 200000
+        assert values['grid_node_budget'] == 1_200_000
+        assert values['grid_max_cells'] == 600_000
+        assert values['grid_target_cells'] == 510_000
         assert not dlg.grid_node_budget_input.IsEnabled()
 
     def test_switching_from_custom_to_balanced_restores_preset(self):
@@ -913,7 +913,7 @@ class TestSimulationDetailSettings:
 
         assert values['grid_expert_limits'] is False
         assert values['grid_detail_level'] == 'balanced'
-        assert values['grid_node_budget'] == 800000
+        assert values['grid_node_budget'] == 1_200_000
         assert not dlg.grid_node_budget_input.IsEnabled()
 
     def test_custom_mode_accepts_one_hundred_million_nodes(self):
@@ -929,7 +929,7 @@ class TestSimulationDetailSettings:
         assert values['grid_detail_level'] == 'custom'
         assert values['grid_node_budget'] == 100_000_000
         assert values['grid_max_cells'] == 50_000_000
-        assert values['grid_target_cells'] == 25_000_000
+        assert values['grid_target_cells'] == 42_500_000
 
     def test_custom_defaults_are_clamped_to_one_hundred_million_nodes(self):
         """Oversized imported settings should be clamped to the UI maximum."""
@@ -959,7 +959,7 @@ class TestSimulationDetailSettings:
         assert values['time'] == 30.0
         assert values['grid_expert_limits'] is False
         assert values['grid_detail_level'] == 'balanced'
-        assert values['grid_node_budget'] == 800000
+        assert values['grid_node_budget'] == 1_200_000
 
     def test_apply_defaults_with_grid_expert_limits(self):
         """Saved expert grid limits should migrate to a Custom node budget."""
@@ -977,10 +977,109 @@ class TestSimulationDetailSettings:
 
         assert values['grid_expert_limits'] is True
         assert values['grid_detail_level'] == 'custom'
-        assert values['grid_node_budget'] == 1600000
-        assert values['grid_max_cells'] == 800000
-        assert values['grid_target_cells'] == 400000
+        assert values['grid_node_budget'] == 1_600_000
+        assert values['grid_max_cells'] == 800_000
+        assert values['grid_target_cells'] == 680_000
         assert dlg.grid_node_budget_input.IsEnabled()
+
+    def test_all_grid_detail_presets_match_expected_budgets_and_85pct_targets(self):
+        """All named presets should match updated budgets and 85% auto-coarsen targets."""
+        from ThermalSim.gui_dialogs import (
+            DEFAULT_GRID_DETAIL,
+            DEFAULT_GRID_NODE_BUDGET,
+            GRID_DETAIL_PRESETS,
+            SettingsDialog,
+        )
+        from ThermalSim.thermal_plugin import (
+            GRID_DETAIL_PRESETS as PLUGIN_GRID_DETAIL_PRESETS,
+        )
+
+        expected = {
+            "fast": (500_000, 425_000),
+            "balanced": (1_200_000, 1_020_000),
+            "detailed": (3_000_000, 2_550_000),
+            "very_detailed": (6_000_000, 5_100_000),
+        }
+        assert GRID_DETAIL_PRESETS == expected
+        assert PLUGIN_GRID_DETAIL_PRESETS == expected
+        assert DEFAULT_GRID_DETAIL == "balanced"
+        assert DEFAULT_GRID_NODE_BUDGET == 1_200_000
+
+        dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
+        for idx, name in enumerate(("fast", "balanced", "detailed", "very_detailed")):
+            dlg.grid_detail_choice.SetSelection(idx)
+            dlg._on_grid_detail_changed(None)
+            values = dlg.get_values()
+            max_nodes, target_nodes = expected[name]
+            assert values['grid_detail_level'] == name
+            assert values['grid_node_budget'] == max_nodes
+            assert values['grid_max_cells'] == max_nodes // 4
+            assert values['grid_target_cells'] == target_nodes // 4
+
+    def test_mesh_mode_auto_uniform_adaptive_serialization_and_defaults(self):
+        """Spatial mesh dropdown should default to Auto and round-trip all 3 modes."""
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
+        assert dlg.mesh_mode_choice.GetSelection() == 0
+        assert dlg.mesh_mode_choice.GetStringSelection() == "Auto"
+        assert dlg.get_values()['mesh_mode'] == "auto"
+
+        for idx, mode in ((0, "auto"), (1, "uniform"), (2, "adaptive")):
+            dlg.mesh_mode_choice.SetSelection(idx)
+            assert dlg.get_values()['mesh_mode'] == mode
+
+        dlg_uniform = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"], defaults={'mesh_mode': 'uniform'}
+        )
+        assert dlg_uniform.get_values()['mesh_mode'] == "uniform"
+        assert dlg_uniform.solver_pane.IsExpanded()
+
+        dlg_adaptive = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"], defaults={'mesh_mode': 'adaptive'}
+        )
+        assert dlg_adaptive.get_values()['mesh_mode'] == "adaptive"
+        assert dlg_adaptive.solver_pane.IsExpanded()
+
+        # Restoring defaults without mesh_mode returns to 'auto'
+        dlg_adaptive._apply_defaults({'time': 25.0})
+        assert dlg_adaptive.get_values()['mesh_mode'] == "auto"
+
+    def test_legacy_solver_backend_setting_is_ignored_and_engine_label_updates(self, monkeypatch):
+        """Old JSON settings with legacy solver_backend load safely; capabilities label reflects native flags."""
+        import ThermalSim.gui_dialogs as gui_mod
+
+        # Legacy JSON containing deprecated backend key must load cleanly without error
+        legacy_key = "par" + "diso"
+        dlg = gui_mod.SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            defaults={'solver_backend': legacy_key, 'time': 15.0},
+        )
+        assert not hasattr(dlg, "solver_backend_choice")
+        values = dlg.get_values()
+        assert 'solver_backend' not in values
+        assert values['time'] == 15.0
+        assert not dlg.solver_pane.IsExpanded()
+
+        # Tooltips must not mention deprecated backend
+        for text in gui_mod.TOOLTIP_TEXTS.values():
+            assert legacy_key not in text.lower()
+
+        # Capabilities label reflects HAS_NATIVE_MG / HAS_NATIVE_CORE
+        monkeypatch.setattr(gui_mod, "HAS_NATIVE_MG", True)
+        monkeypatch.setattr(gui_mod, "HAS_NATIVE_CORE", True)
+        dlg_mg = gui_mod.SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
+        assert dlg_mg.lbl_capabilities.GetLabel() == "Engine: Native C++/OpenMP + SciPy"
+
+        monkeypatch.setattr(gui_mod, "HAS_NATIVE_MG", False)
+        monkeypatch.setattr(gui_mod, "HAS_NATIVE_CORE", True)
+        dlg_core = gui_mod.SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
+        assert dlg_core.lbl_capabilities.GetLabel() == "Engine: Native C++ + SciPy"
+
+        monkeypatch.setattr(gui_mod, "HAS_NATIVE_MG", False)
+        monkeypatch.setattr(gui_mod, "HAS_NATIVE_CORE", False)
+        dlg_py = gui_mod.SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
+        assert dlg_py.lbl_capabilities.GetLabel() == "Engine: NumPy + SciPy"
 
     def test_area_settings_use_current_aware_mode_and_margin(self):
         """The geometry checkbox should serialize the new area settings."""
@@ -1079,3 +1178,92 @@ class TestPreflightDebounce:
         dlg._on_cancel(None)
         assert timer.stop_calls == stops_before + 1
         assert dlg._preflight_timer is None
+
+
+class TestSteadyStateSettings:
+    """Tests for steady-state checkbox behavior, serialization, and defaults."""
+
+    def test_steady_state_tooltip_and_defaults(self):
+        from ThermalSim.gui_dialogs import SettingsDialog, TOOLTIP_TEXTS
+
+        assert 'steady_state' in TOOLTIP_TEXTS
+        assert TOOLTIP_TEXTS['steady_state'].strip() == TOOLTIP_TEXTS['steady_state']
+
+        dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
+
+        assert dlg.chk_steady_state.GetValue() is False
+        assert dlg.chk_steady_state.label == "Steady-state (final temperature)"
+        assert dlg.time_input.IsEnabled() is True
+        assert dlg.chk_snapshots.IsEnabled() is True
+        assert dlg.snap_count_input.IsEnabled() is False
+        assert dlg.get_values()['steady_state'] is False
+
+    def test_steady_state_toggle_disables_and_restores_transient_controls(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+        from ThermalSim.workflow import GridEstimate, PreflightResult
+
+        preflight_calls = []
+        grid = GridEstimate(0.5, 0.5, 0, 0, 10, 10, 24, 24, 2, False, False, 200000, 100000)
+
+        def preflight(settings):
+            preflight_calls.append(settings['steady_state'])
+            return PreflightResult(grid=grid)
+
+        dlg = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            preflight_callback=preflight,
+        )
+        dlg.chk_snapshots.SetValue(True)
+        dlg._on_snapshots_toggle(None)
+        assert dlg.snap_count_input.IsEnabled() is True
+        preflight_calls.clear()
+
+        # Enable steady-state: time, snapshots, and snap_count must all disable
+        dlg.chk_steady_state.SetValue(True)
+        dlg._on_steady_state_toggle(None)
+        assert dlg.time_input.IsEnabled() is False
+        assert dlg.chk_snapshots.IsEnabled() is False
+        assert dlg.snap_count_input.IsEnabled() is False
+        assert dlg.get_values()['steady_state'] is True
+        assert preflight_calls == [True]
+
+        # Disable steady-state: time, snapshots, and snap_count (since snapshots checked) re-enable
+        dlg.chk_steady_state.SetValue(False)
+        dlg._on_steady_state_toggle(None)
+        assert dlg.time_input.IsEnabled() is True
+        assert dlg.chk_snapshots.IsEnabled() is True
+        assert dlg.snap_count_input.IsEnabled() is True
+        assert dlg.get_values()['steady_state'] is False
+        assert preflight_calls == [True, False]
+
+        # When snapshots is unchecked, unchecking steady-state keeps snap_count disabled
+        dlg.chk_snapshots.SetValue(False)
+        dlg._on_snapshots_toggle(None)
+        dlg.chk_steady_state.SetValue(True)
+        dlg._on_steady_state_toggle(None)
+        dlg.chk_steady_state.SetValue(False)
+        dlg._on_steady_state_toggle(None)
+        assert dlg.time_input.IsEnabled() is True
+        assert dlg.chk_snapshots.IsEnabled() is True
+        assert dlg.snap_count_input.IsEnabled() is False
+
+    def test_apply_defaults_restores_steady_state_and_defaults_false_when_absent(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            defaults={'steady_state': True, 'snapshots': True, 'snap_count': 8},
+        )
+        assert dlg.chk_steady_state.GetValue() is True
+        assert dlg.time_input.IsEnabled() is False
+        assert dlg.chk_snapshots.IsEnabled() is False
+        assert dlg.snap_count_input.IsEnabled() is False
+        assert dlg.get_values()['steady_state'] is True
+
+        # Applying defaults without steady_state resets it to False
+        dlg._apply_defaults({'time': 30.0, 'snapshots': False})
+        assert dlg.chk_steady_state.GetValue() is False
+        assert dlg.time_input.IsEnabled() is True
+        assert dlg.chk_snapshots.IsEnabled() is True
+        assert dlg.snap_count_input.IsEnabled() is False
+        assert dlg.get_values()['steady_state'] is False
