@@ -14,7 +14,6 @@ sys.path.insert(0, str(PLUGIN_DIR.parent))
 import numpy as np
 import pcbnew
 
-from KiCad_Thermal_Sim.capabilities import HAS_PARDISO
 from KiCad_Thermal_Sim.geometry_mapper import build_geometry_state
 from KiCad_Thermal_Sim.stackup_parser import parse_stackup_from_board_file
 from KiCad_Thermal_Sim.thermal_solver import SolverConfig, build_stiffness_matrix, run_simulation
@@ -193,7 +192,6 @@ def benchmark(args):
             amb=25.0,
             dt_base=args.time / steps,
             steps_target=steps,
-            use_pardiso=HAS_PARDISO and args.backend != "scipy",
             use_multi_phase=True,
             time_stepping=args.time_stepping,
         )
@@ -222,7 +220,6 @@ def benchmark(args):
                 amb=25.0,
                 dt_base=args.time / steps,
                 steps_target=steps,
-                use_pardiso=HAS_PARDISO and args.backend != "scipy",
                 use_multi_phase=True,
                 time_stepping="multi_phase",
             )
@@ -247,7 +244,6 @@ def main():
     parser.add_argument("--scenario", choices=("preview", "thermal", "all"), default="all")
     parser.add_argument("--resolution", type=float, default=0.1)
     parser.add_argument("--time", type=float, default=1.0)
-    parser.add_argument("--backend", choices=("auto", "scipy", "pardiso"), default="auto")
     parser.add_argument(
         "--time-stepping", choices=("auto", "multi_phase", "two_phase", "uniform"), default="auto"
     )

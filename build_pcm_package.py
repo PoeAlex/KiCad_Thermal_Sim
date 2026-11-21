@@ -17,7 +17,7 @@ import os
 import sys
 import zipfile
 
-VERSION = "0.3.5"
+VERSION = "0.4.0"
 
 IDENTIFIER = "com.github.poealex.kicad-thermal-sim"
 
@@ -60,24 +60,29 @@ def build_metadata(version):
         "$schema": "https://go.kicad.org/pcm/schemas/v1",
         "name": "ThermalSim - 2.5D Thermal Simulation",
         "description": (
-            "2.5D transient thermal simulation for multilayer PCBs. "
-            "Simulates heat spreading using finite volume methods with "
-            "BDF2 time integration, directly within KiCad."
+            "Fast 2.5D steady-state and transient thermal simulation for "
+            "multilayer PCBs in KiCad 9 & 10, powered by a Native C++/OpenMP "
+            "multigrid CPU solver."
         ),
         "description_full": (
-            "ThermalSim performs 2.5D transient thermal simulation of "
-            "multilayer PCBs. Select heat-source pads, configure simulation "
-            "parameters, and visualize temperature distribution across all "
-            "copper layers.\n\n"
+            "ThermalSim performs fast 2.5D steady-state and transient thermal "
+            "simulation of multilayer PCBs in KiCad 9 & 10. Select heat-source "
+            "pads, configure simulation parameters, and visualize temperature "
+            "distribution across all copper layers.\n\n"
             "Features:\n"
+            "- KiCad 9.0 & 10.0 compatibility\n"
+            "- Direct Steady-State mode (single-solve final temperature) and "
+            "BDF2 transient time integration with early steady-state stop\n"
+            "- Native C++/OpenMP v2 Multigrid CPU core (Windows, Linux, macOS) "
+            "with automatic NumPy/SciPy fallback\n"
             "- Automatic stackup detection from board file\n"
             "- Multi-layer heat spreading with via coupling\n"
             "- DC current-flow Joule heating in traces, vias, and zones\n"
-            "- BDF2 implicit time integration\n"
-            "- Matrix-free CPU solver with adaptive multilevel meshes\n"
+            "- Auto, Uniform, and Adaptive spatial meshing up to 100M nodes\n"
             "- Piecewise-linear (PWL) time-varying power profiles\n"
             "- Heatsink/thermal-pad support (User.Eco1 layer)\n"
-            "- HTML report with embedded thermal images\n\n"
+            "- Compressed .npz geometry caching and HTML report with "
+            "hotspot-preserving interactive heatmaps\n\n"
             "Requires: numpy, scipy, matplotlib (auto-install dialog included)"
         ),
         "identifier": IDENTIFIER,
@@ -140,11 +145,16 @@ def build_zip(version, output_dir):
             arc_name = f"plugins/{filename}"
             zf.write(src_path, arc_name)
 
-        native_dll = os.path.join(
-            script_dir, "native", "bin", "thermalsim_core.dll"
-        )
-        if os.path.isfile(native_dll):
-            zf.write(native_dll, "plugins/thermalsim_core.dll")
+        for binary_name in (
+            "thermalsim_core.dll",
+            "libthermalsim_core.so",
+            "libthermalsim_core.dylib",
+        ):
+            native_bin = os.path.join(
+                script_dir, "native", "bin", binary_name
+            )
+            if os.path.isfile(native_bin):
+                zf.write(native_bin, f"plugins/{binary_name}")
 
     return zip_path
 

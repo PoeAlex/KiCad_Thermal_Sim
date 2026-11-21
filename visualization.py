@@ -20,6 +20,52 @@ from matplotlib.patches import Rectangle
 import pcbnew
 
 
+def _downsample_layer_block_max(layer, stride):
+    """Downsample a 2D temperature array via hotspot-preserving block-max pooling."""
+    arr = np.asarray(layer, dtype=np.float64)
+    rows, cols = arr.shape
+    if stride <= 1 or rows == 0 or cols == 0:
+        return arr
+
+    out_rows = (rows + stride - 1) // stride
+    out_cols = (cols + stride - 1) // stride
+    pad_rows = out_rows * stride - rows
+    pad_cols = out_cols * stride - cols
+
+    finite = np.isfinite(arr)
+    all_finite = bool(np.all(finite))
+    if all_finite and pad_rows == 0 and pad_cols == 0:
+        return arr.reshape(out_rows, stride, out_cols, stride).max(axis=(1, 3))
+
+    padded = np.full((out_rows * stride, out_cols * stride), -np.inf, dtype=np.float64)
+    if all_finite:
+        padded[:rows, :cols] = arr
+    else:
+        padded[:rows, :cols] = np.where(finite, arr, -np.inf)
+
+    pooled = padded.reshape(out_rows, stride, out_cols, stride).max(axis=(1, 3))
+    if not all_finite:
+        pooled = np.where(np.isfinite(pooled), pooled, np.nan)
+    return pooled
+
+
+def _layer_to_json_list(layer):
+    """Convert a 2D layer array into a row-major JSON-safe list rounded to 3 decimals."""
+    arr = np.asarray(layer, dtype=np.float64)
+    if arr.size == 0:
+        return []
+    finite = np.isfinite(arr)
+    if np.all(finite):
+        return np.round(arr, 3).ravel(order="C").tolist()
+
+    safe = np.where(finite, arr, 0.0)
+    result = np.round(safe, 3).ravel(order="C").tolist()
+    non_finite_indices = np.flatnonzero(~finite.ravel(order="C")).tolist()
+    for idx in non_finite_indices:
+        result[idx] = None
+    return result
+
+
 def build_interactive_heatmap_payload(
     T,
     amb,
@@ -28,7 +74,8 @@ def build_interactive_heatmap_payload(
     x_min_mm=0.0,
     y_min_mm=0.0,
     show_all=True,
-    max_delta_c=250.0
+    max_delta_c=250.0,
+    max_dim=320,
 ):
     """
     Build a JSON-safe payload for the interactive HTML heatmap viewer.
@@ -51,6 +98,10 @@ def build_interactive_heatmap_payload(
         Whether all layers are visible in the interactive viewer.
     max_delta_c : float, optional
         Maximum color scale range above ambient.
+    max_dim : int or None, optional
+        Maximum grid dimension along the longer axis before hotspot-preserving
+        block-max downsampling is applied. Defaults to 320. Set to None or <= 0
+        to disable downsampling.
 
     Returns
     -------
@@ -75,6 +126,16 @@ def build_interactive_heatmap_payload(
     vmax = min(vmax, float(amb) + float(max_delta_c))
     vmax = max(vmax, float(amb))
 
+    max_axis = max(rows, cols)
+    if max_dim is not None and int(max_dim) > 0 and max_axis > int(max_dim):
+        stride = int(math.ceil(max_axis / int(max_dim)))
+    else:
+        stride = 1
+    downsampled = stride > 1
+
+    orig_res_mm = float(res_mm)
+    display_res_mm = orig_res_mm * stride
+
     def _layer_name(index):
         if index < len(layer_names):
             return str(layer_names[index])
@@ -84,14 +145,9 @@ def build_interactive_heatmap_payload(
             return "Bottom (B.Cu)"
         return f"Inner {index}"
 
-    def _json_value(value):
-        if value is None or not np.isfinite(value):
-            return None
-        return round(float(value), 3)
-
     layers = []
     for index in visible_indices:
-        layer = np.asarray(T[index])
+        layer = np.asarray(T[index], dtype=np.float64)
         finite_layer = np.isfinite(layer)
         if np.any(finite_layer):
             layer_min = float(np.min(layer[finite_layer]))
@@ -99,12 +155,14 @@ def build_interactive_heatmap_payload(
         else:
             layer_min = float(amb)
             layer_max = float(amb)
-        flat_data = [_json_value(val) for val in layer.ravel(order='C')]
+        display_layer = _downsample_layer_block_max(layer, stride) if downsampled else layer
+        disp_rows, disp_cols = display_layer.shape
+        flat_data = _layer_to_json_list(display_layer)
         layers.append({
             "index": int(index),
             "name": _layer_name(index),
-            "rows": int(rows),
-            "cols": int(cols),
+            "rows": int(disp_rows),
+            "cols": int(disp_cols),
             "min_c": round(layer_min, 3),
             "max_c": round(layer_max, 3),
             "data": flat_data,
@@ -114,9 +172,14 @@ def build_interactive_heatmap_payload(
         "ambient_c": round(float(amb), 3),
         "vmin_c": round(float(amb), 3),
         "vmax_c": round(vmax, 3),
-        "res_mm": round(float(res_mm), 6),
+        "res_mm": round(display_res_mm, 6),
+        "original_res_mm": round(orig_res_mm, 6),
         "x_min_mm": round(float(x_min_mm), 6),
         "y_min_mm": round(float(y_min_mm), 6),
+        "original_rows": int(rows),
+        "original_cols": int(cols),
+        "downsample_stride": int(stride),
+        "downsampled": bool(downsampled),
         "visible_layer_indices": visible_indices,
         "layers": layers,
     }

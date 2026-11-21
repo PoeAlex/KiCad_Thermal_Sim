@@ -26,29 +26,42 @@ def _find_python():
     """Find the Python interpreter for pip commands.
 
     In embedded environments (e.g. KiCad), sys.executable points to the
-    host application (kicad.exe / pcbnew.exe) rather than python.exe.
-    This function locates the actual Python interpreter.
+    host application (kicad.exe / pcbnew.exe / kicad) rather than python.
+    This function locates the actual Python interpreter across Windows,
+    Linux, and macOS.
     """
+    import ntpath
     import os
 
-    exe = sys.executable
+    exe = sys.executable or ""
+    use_nt = os.name == "nt" or ("\\" in exe and "/" not in exe)
+    path_mod = ntpath if use_nt else os.path
+
     # If sys.executable is already Python, use it directly
-    if "python" in os.path.basename(exe).lower():
+    if "python" in path_mod.basename(exe).lower():
         return exe
 
-    # Look for python.exe in the same directory as the host application
-    # (KiCad ships python.exe alongside kicad.exe in the bin/ folder)
-    exe_dir = os.path.dirname(exe)
-    for name in ("python.exe", "python3.exe", "python"):
-        candidate = os.path.join(exe_dir, name)
-        if os.path.isfile(candidate):
-            return candidate
+    names = ("python.exe", "python3.exe", "python3", "python")
 
-    # Try sys.prefix (Python installation root)
-    for name in ("python.exe", "python3.exe", "python"):
-        candidate = os.path.join(sys.prefix, name)
-        if os.path.isfile(candidate):
-            return candidate
+    # Look for python in the same directory as the host application
+    # (KiCad ships python alongside kicad in the bin/ folder)
+    exe_dir = path_mod.dirname(exe)
+    if exe_dir:
+        for name in names:
+            candidate = path_mod.join(exe_dir, name)
+            if os.path.isfile(candidate):
+                return candidate
+
+    # Try sys.prefix (Python installation root and bin/ subdirectory)
+    prefix = sys.prefix or ""
+    if prefix:
+        prefix_use_nt = os.name == "nt" or ("\\" in prefix and "/" not in prefix)
+        prefix_mod = ntpath if prefix_use_nt else os.path
+        for search_dir in (prefix, prefix_mod.join(prefix, "bin")):
+            for name in names:
+                candidate = prefix_mod.join(search_dir, name)
+                if os.path.isfile(candidate):
+                    return candidate
 
     # Last resort: fall back to sys.executable
     return exe

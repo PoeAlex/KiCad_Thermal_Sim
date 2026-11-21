@@ -6,6 +6,8 @@ target_compile_features(thermalsim_core PRIVATE cxx_std_17)
 
 if(MSVC)
     target_compile_options(thermalsim_core PRIVATE /O2 /arch:AVX2 /fp:precise)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(thermalsim_core PRIVATE -O3 -fno-fast-math -Wall -Wextra)
 endif()
 
 find_package(OpenMP)
@@ -18,4 +20,7 @@ set_target_properties(thermalsim_core PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )

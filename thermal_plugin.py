@@ -19,7 +19,11 @@ import pcbnew
 import numpy as np
 import wx
 
-from .capabilities import HAS_LIBS, HAS_PARDISO, get_pypardiso_optional_dependency
+from .capabilities import HAS_LIBS
+try:
+    from .capabilities import HAS_NATIVE_MG
+except ImportError:
+    HAS_NATIVE_MG = False
 from .stackup_parser import parse_stackup_from_board_file, format_stackup_report_um
 from .gui_dialogs import (
     DEFAULT_GRID_MAX_CELLS,
@@ -68,13 +72,30 @@ from .workflow import (
 
 
 GRID_DETAIL_PRESETS = {
-    "fast": (300_000, 150_000),
-    "balanced": (800_000, 400_000),
-    "detailed": (1_600_000, 800_000),
-    "very_detailed": (3_000_000, 1_500_000),
+    "fast": (500_000, 425_000),
+    "balanced": (1_200_000, 1_020_000),
+    "detailed": (3_000_000, 2_550_000),
+    "very_detailed": (6_000_000, 5_100_000),
 }
 DEFAULT_GRID_DETAIL = "balanced"
 DEFAULT_GRID_NODE_BUDGET = GRID_DETAIL_PRESETS[DEFAULT_GRID_DETAIL][0]
+
+
+def _auto_fast_engine_threshold():
+    """Return the node threshold for switching Auto compute_engine to matrix-free."""
+    return 50_000 if HAS_NATIVE_MG else 250_000
+
+
+def _resolve_mesh_mode(settings, use_fast_engine, node_count):
+    """Resolve user mesh_mode ('auto', 'uniform', 'adaptive') to 'uniform' or 'adaptive'."""
+    if not use_fast_engine:
+        return "uniform"
+    mesh_mode = str(settings.get("mesh_mode", "auto") or "auto").strip().lower()
+    if mesh_mode not in {"auto", "uniform", "adaptive"}:
+        mesh_mode = "auto"
+    if mesh_mode == "auto":
+        return "uniform" if (HAS_NATIVE_MG and int(node_count) <= 5_000_000) else "adaptive"
+    return mesh_mode
 
 
 @dataclass
@@ -348,7 +369,7 @@ def _resolve_grid_policy(settings, layer_count):
         except Exception:
             max_nodes = DEFAULT_GRID_NODE_BUDGET
         max_nodes = min(MAX_CUSTOM_GRID_NODES, max(50_000, max_nodes))
-        target_nodes = max(25_000, max_nodes // 2)
+        target_nodes = max(25_000, int(max_nodes * 0.85))
         expert = True
     else:
         max_nodes, target_nodes = GRID_DETAIL_PRESETS[detail]
@@ -676,24 +697,24 @@ def _estimate_solver_cost(nodes, settings):
     nodes = max(0, int(nodes))
     compute_engine = str(
         settings.get("compute_engine", "auto") or "auto"
-    ).lower()
+    ).strip().lower()
     fast_engine = (
         compute_engine == "fast_native"
-        or (compute_engine == "auto" and nodes >= 250_000)
+        or (compute_engine == "auto" and nodes >= _auto_fast_engine_threshold())
     )
     if fast_engine:
-        memory_low = int(math.ceil(nodes * 0.00012))
-        memory_high = int(math.ceil(nodes * 0.00045))
-        thresholds = (500_000, 2_000_000, 7_000_000)
+        if HAS_NATIVE_MG:
+            memory_low = int(math.ceil(nodes * 0.00025))
+            memory_high = int(math.ceil(nodes * 0.00050))
+            thresholds = (800_000, 3_000_000, 8_000_000)
+        else:
+            memory_low = int(math.ceil(nodes * 0.00012))
+            memory_high = int(math.ceil(nodes * 0.00045))
+            thresholds = (500_000, 2_000_000, 7_000_000)
     else:
         memory_low = int(math.ceil(nodes * 0.00035))
         memory_high = int(math.ceil(nodes * 0.00120))
         thresholds = (150_000, 500_000, 1_000_000)
-    backend = str(settings.get("solver_backend", "auto") or "auto").lower()
-    if not fast_engine and (
-        backend == "pardiso" or (backend == "auto" and HAS_PARDISO)
-    ):
-        thresholds = (250_000, 800_000, 1_600_000)
     if nodes < thresholds[0]:
         runtime = "Fast"
     elif nodes < thresholds[1]:
@@ -885,13 +906,58 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         row.extend((getter, int(point.x), int(point.y)))
                     except Exception:
                         continue
+                is_via = "VIA" in type(item).__name__.upper()
                 try:
-                    row.extend(("width", int(item.GetWidth())))
+                    if is_via:
+                        if copper_ids:
+                            try:
+                                width_val = int(item.GetWidth(int(copper_ids[0])))
+                            except TypeError:
+                                width_val = int(item.GetWidth())
+                        else:
+                            width_val = int(rect.GetWidth())
+                    else:
+                        width_val = int(item.GetWidth())
+                    row.extend(("width", width_val))
                 except Exception:
                     pass
                 primitive_rows.append(tuple(row))
             except Exception:
                 continue
+        try:
+            drawings = list(board.GetDrawings() if hasattr(board, "GetDrawings") else [])
+        except Exception:
+            drawings = []
+        eco1_layer = getattr(pcbnew, "Eco1_User", None)
+        if eco1_layer is not None:
+            eco1_layer_id = int(eco1_layer)
+            for drawing in drawings:
+                try:
+                    layer = int(drawing.GetLayer())
+                    if layer != eco1_layer_id:
+                        continue
+                    rect = drawing.GetBoundingBox()
+                    drawing_row = [
+                        "drawing",
+                        type(drawing).__name__,
+                        layer,
+                        rect.GetX(),
+                        rect.GetY(),
+                        rect.GetWidth(),
+                        rect.GetHeight(),
+                    ]
+                    for getter in ("GetShape", "GetStart", "GetEnd", "GetCenter", "GetPosition"):
+                        try:
+                            value = getattr(drawing, getter)()
+                            if hasattr(value, "x") and hasattr(value, "y"):
+                                drawing_row.extend((getter, int(value.x), int(value.y)))
+                            else:
+                                drawing_row.extend((getter, str(value)))
+                        except Exception:
+                            continue
+                    primitive_rows.append(tuple(drawing_row))
+                except Exception:
+                    continue
         for zone in zones:
             try:
                 rect = zone.GetBoundingBox()
@@ -1046,9 +1112,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             from .dependency_installer import DependencyInstallDialog
             missing = get_missing_packages()
             if missing:
-                dlg = DependencyInstallDialog(
-                    self.host_window, missing, [get_pypardiso_optional_dependency()]
-                )
+                dlg = DependencyInstallDialog(self.host_window, missing)
                 dlg.ShowModal()
                 dlg.Destroy()
             else:
@@ -1136,8 +1200,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         def run_callback(settings):
             self._save_settings(settings)
-            power_pads = self._resolve_power_pad_objects(board, settings, legacy_pads=pads_list)
-            current_pads = self._resolve_current_pad_objects(board, settings)
+            pad_lookup = self._maybe_build_pad_lookup(board, settings)
+            power_pads = self._resolve_power_pad_objects(
+                board, settings, legacy_pads=pads_list, pad_lookup=pad_lookup
+            )
+            current_pads = self._resolve_current_pad_objects(
+                board, settings, pad_lookup=pad_lookup
+            )
             focus_pads = self._unique_pads(power_pads + current_pads)
             try:
                 self._run_simulation(
@@ -1192,8 +1261,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     settings = dlg.get_values()
                     if settings:
                         self._save_settings(settings)
-                        power_pads = self._resolve_power_pad_objects(board, settings, legacy_pads=pads_list)
-                        current_pads = self._resolve_current_pad_objects(board, settings)
+                        pad_lookup = self._maybe_build_pad_lookup(board, settings)
+                        power_pads = self._resolve_power_pad_objects(
+                            board, settings, legacy_pads=pads_list, pad_lookup=pad_lookup
+                        )
+                        current_pads = self._resolve_current_pad_objects(
+                            board, settings, pad_lookup=pad_lookup
+                        )
                         focus_pads = self._unique_pads(power_pads + current_pads)
                         self._run_simulation(
                             board, copper_ids, layer_names, bbox, pads_list,
@@ -1372,7 +1446,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 by_name[descriptor["name"]] = (descriptor, pad)
         return by_key, by_name
 
-    def _resolve_power_pad_entries(self, board, settings):
+    def _maybe_build_pad_lookup(self, board, settings):
+        """Build a shared pad lookup once when settings require pad resolution."""
+        cfg = settings or {}
+        needs_power = bool(cfg.get("power_pads"))
+        needs_current = bool(cfg.get("current_enabled"))
+        if not needs_power and not needs_current:
+            return None
+        return self._build_pad_lookup(board)
+
+    def _resolve_power_pad_entries(self, board, settings, pad_lookup=None):
         """Resolve manual power-pad settings to live pad objects and power strings."""
         raw_power_pads = prepare_power_pads(
             settings.get("power_pads", []),
@@ -1380,7 +1463,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         )
         if not raw_power_pads:
             return [], []
-        by_key, by_name = self._build_pad_lookup(board)
+        by_key, by_name = (
+            pad_lookup if pad_lookup is not None else self._build_pad_lookup(board)
+        )
         entries = []
         missing = []
         for pad_info in raw_power_pads:
@@ -1394,18 +1479,20 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             entries.append((merged, pad, merged["power"]))
         return entries, missing
 
-    def _resolve_power_pad_objects(self, board, settings, legacy_pads=None):
+    def _resolve_power_pad_objects(self, board, settings, legacy_pads=None, pad_lookup=None):
         """Resolve manual power pads to live pad objects for preview/focus area."""
         if "power_pads" not in (settings or {}):
             return list(legacy_pads or [])
-        entries, _ = self._resolve_power_pad_entries(board, settings)
+        entries, _ = self._resolve_power_pad_entries(board, settings, pad_lookup=pad_lookup)
         return self._unique_pads([pad for _, pad, _ in entries])
 
-    def _resolve_current_pad_objects(self, board, settings):
+    def _resolve_current_pad_objects(self, board, settings, pad_lookup=None):
         """Resolve current-group pad descriptors to live pad objects."""
         if not settings.get("current_enabled"):
             return []
-        by_key, by_name = self._build_pad_lookup(board)
+        by_key, by_name = (
+            pad_lookup if pad_lookup is not None else self._build_pad_lookup(board)
+        )
         pads = []
         seen = set()
         for group in prepare_current_groups(settings.get("current_groups", [])):
@@ -1419,13 +1506,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     seen.add(id(pad))
         return pads
 
-    def _resolve_current_terminals(self, board, settings):
+    def _resolve_current_terminals(self, board, settings, pad_lookup=None):
         """Resolve current-group settings into CurrentTerminal objects."""
         terminals = []
         missing = []
         if not settings.get("current_enabled"):
             return terminals, missing
-        by_key, by_name = self._build_pad_lookup(board)
+        by_key, by_name = (
+            pad_lookup if pad_lookup is not None else self._build_pad_lookup(board)
+        )
         for group in prepare_current_groups(settings.get("current_groups", [])):
             for pad_info in group.get("pads", []):
                 current = float(pad_info.get("current_a", 0.0) or 0.0)
@@ -1475,12 +1564,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
     def _preflight(self, board, copper_ids, bbox, settings):
         """Validate settings and estimate the exact grid before execution."""
         result = PreflightResult()
-        power_entries, missing_power = self._resolve_power_pad_entries(board, settings)
+        pad_lookup = self._maybe_build_pad_lookup(board, settings)
+        power_entries, missing_power = self._resolve_power_pad_entries(
+            board, settings, pad_lookup=pad_lookup
+        )
         power_pads = [pad for _, pad, _ in power_entries]
         terminals = []
         missing_current = []
         if settings.get("current_enabled"):
-            terminals, missing_current = self._resolve_current_terminals(board, settings)
+            terminals, missing_current = self._resolve_current_terminals(
+                board, settings, pad_lookup=pad_lookup
+            )
         current_pads = [item.pad for item in terminals]
         focus_pads = self._unique_pads(power_pads + current_pads)
         result.area = _estimate_simulation_area(
@@ -1495,6 +1589,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         if missing_power:
             result.errors.append(f"{len(missing_power)} heat-source pad(s) are missing from the board.")
         has_power = False
+        has_pwl = False
         for _, _, entry in power_entries:
             value = str(entry or "").strip()
             if not value:
@@ -1502,11 +1597,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             try:
                 has_power = has_power or abs(float(value)) > 0.0
             except ValueError:
+                has_pwl = True
                 try:
                     _, pwl_values = parse_pwl_file(value)
                     has_power = has_power or bool(np.any(np.asarray(pwl_values) != 0.0))
                 except Exception as exc:
                     result.errors.append(f"Invalid PWL source '{value}': {exc}")
+
+        if settings.get("steady_state") and has_pwl:
+            result.warnings.append(
+                "Steady-state mode ignores PWL time variation; "
+                "disable Steady-state for time-varying PWL profiles."
+            )
 
         has_current = False
         if settings.get("current_enabled"):
@@ -1545,8 +1647,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 "uniform nodes. Adaptive reduction depends on the actual PCB "
                 "geometry; verify the displayed RAM estimate before running."
             )
-        if settings.get("solver_backend") == "pardiso" and not HAS_PARDISO:
-            result.errors.append("PyPardiso was selected but is not available.")
         return result
 
     def _derive_stackup_thicknesses(self, board, copper_ids, stack_info, settings):
@@ -1621,8 +1721,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         if not self._require_filled_zones(self.board):
             return None
         preview_status("Resolving heat sources and simulation area...")
-        power_pads = self._resolve_power_pad_objects(self.board, settings, legacy_pads=self.pads_list)
-        terminals, _ = self._resolve_current_terminals(self.board, settings)
+        pad_lookup = self._maybe_build_pad_lookup(self.board, settings)
+        power_pads = self._resolve_power_pad_objects(
+            self.board, settings, legacy_pads=self.pads_list, pad_lookup=pad_lookup
+        )
+        terminals, _ = self._resolve_current_terminals(
+            self.board, settings, pad_lookup=pad_lookup
+        )
         current_pads = [item.pad for item in terminals]
         preview_pads = self._unique_pads(power_pads + current_pads)
         effective_settings = dict(settings)
@@ -1661,14 +1766,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         preview_adaptive_mesh = None
         preview_engine = str(
             effective_settings.get("compute_engine", "auto") or "auto"
-        ).lower()
-        preview_mesh_mode = str(
-            effective_settings.get("mesh_mode", "adaptive") or "adaptive"
-        ).lower()
-        if (
-            preview_mesh_mode == "adaptive"
-            and preview_engine != "legacy"
-        ):
+        ).strip().lower()
+        if preview_engine not in {"auto", "fast_native", "legacy"}:
+            preview_engine = "auto"
+        preview_use_fast_engine = (
+            preview_engine == "fast_native"
+            or (preview_engine == "auto" and grid.nodes >= _auto_fast_engine_threshold())
+        )
+        preview_mesh_mode = _resolve_mesh_mode(
+            effective_settings, preview_use_fast_engine, grid.nodes
+        )
+        if preview_mesh_mode == "adaptive":
             preview_status("Building adaptive refinement levels...")
             source_mask = np.zeros(
                 (len(self.copper_ids), grid.rows, grid.cols), dtype=bool
@@ -1739,12 +1847,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             return
 
         focus_pads = focus_pads if focus_pads is not None else pads_list
+        pad_lookup = self._maybe_build_pad_lookup(board, settings)
         area_power_pads = self._resolve_power_pad_objects(
-            board, settings, legacy_pads=pads_list
+            board, settings, legacy_pads=pads_list, pad_lookup=pad_lookup
         )
         area_terminals = []
         if settings.get("current_enabled"):
-            area_terminals, _ = self._resolve_current_terminals(board, settings)
+            area_terminals, _ = self._resolve_current_terminals(
+                board, settings, pad_lookup=pad_lookup
+            )
         area = _estimate_simulation_area(
             board, bbox, settings,
             power_pads=area_power_pads,
@@ -1875,14 +1986,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             engine_setting = "auto"
         use_fast_engine = (
             engine_setting == "fast_native"
-            or (engine_setting == "auto" and grid.nodes >= 250_000)
+            or (engine_setting == "auto" and grid.nodes >= _auto_fast_engine_threshold())
         )
         resolved_engine = "fast_native" if use_fast_engine else "legacy"
-        mesh_mode = str(settings.get("mesh_mode", "adaptive") or "adaptive").lower()
-        if mesh_mode not in {"adaptive", "uniform"}:
-            mesh_mode = "adaptive"
-        if not use_fast_engine:
-            mesh_mode = "uniform"
+        mesh_mode = _resolve_mesh_mode(settings, use_fast_engine, grid.nodes)
 
         operator_key = stable_fingerprint({
             "geometry": cache_key,
@@ -1930,7 +2037,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         has_power_pad_settings = "power_pads" in settings
         missing_power_pads = []
         if has_power_pad_settings:
-            power_pad_entries, missing_power_pads = self._resolve_power_pad_entries(board, settings)
+            power_pad_entries, missing_power_pads = self._resolve_power_pad_entries(
+                board, settings, pad_lookup=pad_lookup
+            )
             power_pads = [pad for _, pad, _ in power_pad_entries]
             power_pad_names = [descriptor.get("name", "") for descriptor, _, _ in power_pad_entries]
             entries = [power for _, _, power in power_pad_entries if str(power).strip()]
@@ -1997,7 +2106,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             set_dialog_state("running", "Solving active electrical paths...")
             electrical_start = time.perf_counter()
             electrical_cache_hit = False
-            terminals, missing_pads = self._resolve_current_terminals(board, settings)
+            terminals, missing_pads = self._resolve_current_terminals(
+                board, settings, pad_lookup=pad_lookup
+            )
             if missing_pads:
                 wx.MessageBox(
                     "Current simulation references pads that were not found on the board:\n"
@@ -2131,19 +2242,29 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 "mesh_reduction_ratio": 1.0,
                 "adaptive_max_cell_ratio": 1,
             })
+        steady_state = bool(settings.get("steady_state", False)) and Q_func is None
         print(f"[ThermalSim] init timings: {_format_timing_summary(init_timings)}")
-        set_dialog_state("running", "Starting transient solver...")
+        set_dialog_state(
+            "running",
+            "Solving steady-state thermal model..."
+            if steady_state
+            else "Starting transient solver...",
+        )
 
         # Snapshot configuration
         snap_times = []
-        if settings.get('snapshots'):
+        if settings.get('snapshots') and not steady_state:
             snap_count = max(1, min(50, int(settings.get('snap_count', 5))))
             snap_times = [sim_time * (k / (snap_count + 1)) for k in range(1, snap_count + 1)]
         snap_times = sorted({t for t in snap_times if 0.0 < t < sim_time})
 
         # Progress dialog
         pd = wx.ProgressDialog(
-            "ThermalSim", "Preparing thermal model...", 100,
+            "ThermalSim",
+            "Solving steady-state thermal model..."
+            if steady_state
+            else "Preparing thermal model...",
+            100,
             style=wx.PD_CAN_ABORT | wx.PD_APP_MODAL | wx.PD_REMAINING_TIME | wx.PD_AUTO_HIDE
         )
 
@@ -2172,29 +2293,31 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         configured_time_stepping = settings.get("time_stepping", "auto")
         if use_fast_engine and configured_time_stepping == "auto":
             configured_time_stepping = "uniform"
+        solver_config_fields = getattr(SolverConfig, "__dataclass_fields__", None)
+        steady_state_kwargs = (
+            {"steady_state": steady_state}
+            if (solver_config_fields is None or "steady_state" in solver_config_fields)
+            else {}
+        )
         config = SolverConfig(
             sim_time=sim_time,
             amb=amb,
             dt_base=dt,
             steps_target=steps_target,
-            use_pardiso=(
-                not use_fast_engine
-                and HAS_PARDISO
-                and settings.get("solver_backend", "auto") != "scipy"
-            ),
             use_multi_phase=True,
             time_stepping=configured_time_stepping,
-            snapshots_enabled=settings.get('snapshots', False),
-            snap_times=snap_times
+            snapshots_enabled=bool(settings.get('snapshots', False)) and not steady_state,
+            snap_times=snap_times,
+            **steady_state_kwargs,
         )
         factorization_cache_key = stable_fingerprint({
             "operator": operator_key,
-            "backend": "pardiso" if config.use_pardiso else "scipy",
             "time_stepping": config.time_stepping,
             "sim_time": float(config.sim_time),
             "dt_base": float(config.dt_base),
             "steps_target": int(config.steps_target),
             "use_multi_phase": bool(config.use_multi_phase),
+            "steady_state": bool(steady_state),
         })
 
         worker_result = {}
@@ -2273,14 +2396,14 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             amb=amb,
                             dt_base=dt,
                             steps_target=steps_target,
-                            use_pardiso=(
-                                HAS_PARDISO
-                                and settings.get("solver_backend", "auto") != "scipy"
-                            ),
                             use_multi_phase=True,
                             time_stepping=settings.get("time_stepping", "auto"),
-                            snapshots_enabled=settings.get("snapshots", False),
+                            snapshots_enabled=(
+                                bool(settings.get("snapshots", False))
+                                and not steady_state
+                            ),
                             snap_times=snap_times,
+                            **steady_state_kwargs,
                         )
                         worker_result["result"] = run_simulation(
                             fallback_config,
@@ -2323,7 +2446,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             total = progress_state["total"]
             percent = int((current / total) * 100) if total else 0
             try:
-                update_result = pd.Update(percent, f"Solving thermal model - step {current}/{total}")
+                progress_message = (
+                    "Solving steady-state thermal model..."
+                    if steady_state
+                    else f"Solving thermal model - step {current}/{total}"
+                )
+                update_result = pd.Update(percent, progress_message)
                 keep_going = update_result[0] if isinstance(update_result, tuple) else update_result
                 if not keep_going or (hasattr(pd, "WasCancelled") and pd.WasCancelled()):
                     cancel_token.cancel()

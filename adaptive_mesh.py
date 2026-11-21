@@ -376,11 +376,14 @@ def build_adaptive_mesh(
         feature[1:, :] |= boundary
     feature |= np.asarray(via_map) > 1.0
     heatsink = np.asarray(heatsink_mask, dtype=bool)
-    feature |= heatsink
     if cols > 1:
-        feature[:, 1:] |= heatsink[:, 1:] != heatsink[:, :-1]
+        hs_boundary = heatsink[:, :-1] != heatsink[:, 1:]
+        feature[:, :-1] |= hs_boundary
+        feature[:, 1:] |= hs_boundary
     if rows > 1:
-        feature[1:, :] |= heatsink[1:, :] != heatsink[:-1, :]
+        hs_boundary = heatsink[:-1, :] != heatsink[1:, :]
+        feature[:-1, :] |= hs_boundary
+        feature[1:, :] |= hs_boundary
     if source_mask is not None:
         source = np.asarray(source_mask, dtype=bool)
         if source.ndim == 3:
@@ -451,6 +454,8 @@ def build_adaptive_system(
     cols = fine_operator.cols
     leaf_count = mesh.leaf_count
     leaf_map = mesh.leaf_map
+    leaf_heights = (mesh.leaves[:, 1] - mesh.leaves[:, 0]).astype(np.float64)
+    leaf_widths = (mesh.leaves[:, 3] - mesh.leaves[:, 2]).astype(np.float64)
     global_first = []
     global_second = []
     global_conductance = []
@@ -463,16 +468,26 @@ def build_adaptive_system(
             left = leaf_map[:, :-1]
             right = leaf_map[:, 1:]
             boundary = left != right
-            first_parts.append(left[boundary])
-            second_parts.append(right[boundary])
-            conductance_parts.append(fine_operator.gx[layer_idx][boundary])
+            left_ids = left[boundary]
+            right_ids = right[boundary]
+            x_dist = 0.5 * (leaf_widths[left_ids] + leaf_widths[right_ids])
+            first_parts.append(left_ids)
+            second_parts.append(right_ids)
+            conductance_parts.append(
+                fine_operator.gx[layer_idx][boundary] / x_dist
+            )
         if rows > 1:
             upper = leaf_map[:-1, :]
             lower = leaf_map[1:, :]
             boundary = upper != lower
-            first_parts.append(upper[boundary])
-            second_parts.append(lower[boundary])
-            conductance_parts.append(fine_operator.gy[layer_idx][boundary])
+            upper_ids = upper[boundary]
+            lower_ids = lower[boundary]
+            y_dist = 0.5 * (leaf_heights[upper_ids] + leaf_heights[lower_ids])
+            first_parts.append(upper_ids)
+            second_parts.append(lower_ids)
+            conductance_parts.append(
+                fine_operator.gy[layer_idx][boundary] / y_dist
+            )
         if first_parts:
             first, second, conductance = _aggregate_edges(
                 np.concatenate(first_parts),
