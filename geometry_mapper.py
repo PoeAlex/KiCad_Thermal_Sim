@@ -913,8 +913,21 @@ def build_geometry_state(
                     pass
                 if not via_layers:
                     via_layers = list(range(num_layers))
+                via_layer_id = (
+                    copper_ids[via_layers[0]]
+                    if via_layers and copper_ids
+                    else None
+                )
                 try:
-                    diameter_mm = float(track.GetWidth()) * 1e-6
+                    width_iu = None
+                    if via_layer_id is not None:
+                        try:
+                            width_iu = track.GetWidth(int(via_layer_id))
+                        except TypeError:
+                            width_iu = track.GetWidth()
+                    else:
+                        width_iu = track.GetWidth()
+                    diameter_mm = float(width_iu) * 1e-6
                     center = track.GetPosition()
                 except Exception:
                     diameter_mm = max(

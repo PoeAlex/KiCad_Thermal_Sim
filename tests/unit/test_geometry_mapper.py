@@ -664,3 +664,48 @@ class TestCreateMultilayerMaps:
         assert mask[2, 2]
         assert not mask[4, 4]
         assert not mask[0, 0]
+
+    def test_via_get_width_passes_layer_argument_for_kicad10(self):
+        """KiCad 10 PCB_VIA.GetWidth expects a layer ID argument."""
+        calls = []
+
+        class KiCad10Via(MockVia):
+            def GetPosition(self):
+                return VECTOR2I(5500000, 5500000)
+
+            def GetWidth(self, layer=None):
+                calls.append(layer)
+                if layer is None:
+                    raise AssertionError("PCB_VIA::GetWidth called without a layer argument")
+                return 800000
+
+        via = KiCad10Via(
+            bbox=EDA_RECT(5100000, 5100000, 800000, 800000),
+            layers=[F_Cu, B_Cu],
+        )
+        board = MockBoard(
+            tracks=[via],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+        )
+
+        state = build_geometry_state(
+            board=board,
+            copper_ids=[F_Cu, B_Cu],
+            rows=10,
+            cols=10,
+            x_min=0.0,
+            y_min=0.0,
+            res=1.0,
+            settings={
+                "ignore_traces": False,
+                "ignore_polygons": False,
+                "use_heatsink": False,
+            },
+            via_factor=1300.0,
+            pads_list=[],
+        )
+
+        assert calls == [F_Cu]
+        assert state.via_map[5, 5] == 1300.0
+        assert state.copper_mask[0, 5, 5]
+        assert state.copper_mask[1, 5, 5]
