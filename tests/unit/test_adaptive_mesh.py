@@ -2,11 +2,19 @@
 
 import numpy as np
 
-from ThermalSim.adaptive_mesh import build_adaptive_mesh, build_adaptive_system
+from ThermalSim.adaptive_mesh import (
+    build_adaptive_mesh,
+    build_adaptive_system,
+    restrict_heatsink_model,
+)
 from ThermalSim.thermal_solver import (
     SolverConfig,
+    build_heatsink_model,
+    build_stiffness_matrix,
     build_structured_operator,
     run_simulation_matrix_free,
+    run_steady_state,
+    run_steady_state_matrix_free,
 )
 
 
@@ -309,3 +317,106 @@ def test_partial_heatsink_boundary_remains_fine_while_interior_coarsens():
     assert np.max(interior_leaves[:, 1] - interior_leaves[:, 0]) >= 4
     assert np.max(interior_leaves[:, 3] - interior_leaves[:, 2]) >= 4
     assert mesh.reduction_ratio > 2.0
+
+
+def test_restrict_heatsink_model_preserves_conductance_and_matches_steady_state():
+    """restrict_heatsink_model preserves sum(g) and matches exact augmented adaptive solve."""
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
+
+    assert restrict_heatsink_model(None, None, 2) is None
+
+    layers, rows, cols = 2, 32, 32
+    copper = np.ones((layers, rows, cols), dtype=bool)
+    via_map = np.ones((rows, cols), dtype=np.float64)
+    via_map[14:18, 14:18] = 20.0
+    heatsink = np.zeros((rows, cols), dtype=bool)
+    heatsink[8:24, 8:24] = True
+    dx = dy = 0.5e-3
+    t_cu = np.full(layers, 35e-6)
+    t_fr4_eff = np.full(layers, 0.8e-3)
+    settings = {
+        "h_conv": 10.0,
+        "pad_th": 1.0,
+        "pad_k": 3.0,
+        "pad_contact_factor": 0.3,
+        "use_heatsink": True,
+        "pad_sink_mode": "heatsink",
+        "heatsink_rth_kw": 3.5,
+        "heatsink_material": "aluminium",
+        "heatsink_mass_g": 40.0,
+    }
+    amb = 25.0
+
+    operator, b_op, hA_op, _ = build_structured_operator(
+        layers, rows, cols, copper, t_cu, t_fr4_eff,
+        390.0, 0.3, dx, dy, via_map, [1.0e-3], heatsink.astype(float), settings, amb,
+    )
+    K_fine, b_fine, hA_fine, _ = build_stiffness_matrix(
+        layers, rows, cols, copper, t_cu, t_fr4_eff,
+        390.0, 0.3, dx, dy, via_map, [1.0e-3], heatsink.astype(float), settings, amb,
+    )
+    capacity = np.full(copper.size, 0.002, dtype=np.float64)
+    source_mask = np.zeros_like(copper)
+    source_mask[0, 15:17, 15:17] = True
+    power = np.zeros(copper.size, dtype=np.float64)
+    power[np.flatnonzero(source_mask.reshape(-1))] = 0.5
+
+    mesh = build_adaptive_mesh(
+        copper, via_map, heatsink, source_mask=source_mask, max_cell_ratio=8
+    )
+    adaptive = build_adaptive_system(
+        operator, capacity, power, b_op, hA_op, mesh
+    )
+
+    hs_fine = build_heatsink_model(
+        layers, rows, cols, dx, dy, heatsink.astype(float), settings, amb
+    )
+    hs_adaptive = restrict_heatsink_model(hs_fine, mesh, layers)
+    assert hs_adaptive is not None
+    np.testing.assert_allclose(
+        np.sum(hs_adaptive.pad_conductance),
+        np.sum(hs_fine.pad_conductance),
+        rtol=1e-12,
+    )
+    assert hs_adaptive.rth_kw == hs_fine.rth_kw
+    assert hs_adaptive.capacity_j_k == hs_fine.capacity_j_k
+    assert hs_adaptive.initial_temp_c == hs_fine.initial_temp_c
+    assert hs_adaptive.mode == hs_fine.mode
+
+    # Compare adaptive MG-PCG steady-state against augmented direct solve on adaptive matrix
+    g_a = hs_adaptive.pad_conductance
+    g_hs_a = hs_adaptive.g_hs_amb
+    A_aug = sp.bmat(
+        [
+            [adaptive.operator.matrix, sp.csc_matrix(-g_a.reshape(-1, 1))],
+            [sp.csc_matrix(-g_a.reshape(1, -1)), sp.csc_matrix([[g_hs_a + np.sum(g_a)]])],
+        ],
+        format="csc",
+    )
+    rhs_aug = np.concatenate((adaptive.power + adaptive.boundary_rhs, [g_hs_a * amb]))
+    sol_aug = spla.spsolve(A_aug, rhs_aug)
+    T_adapt_truth = sol_aug[:-1]
+    T_hs_truth = float(sol_aug[-1])
+
+    ss_cfg = SolverConfig(
+        sim_time=10.0, amb=amb, dt_base=1.0, steps_target=10, steady_state=True
+    )
+    res_adapt = run_steady_state_matrix_free(
+        ss_cfg,
+        adaptive.operator,
+        adaptive.capacity,
+        adaptive.power,
+        adaptive.boundary_rhs,
+        adaptive.h_area,
+        heatsink_model=hs_adaptive,
+    )
+    res_fine = run_steady_state(
+        ss_cfg, K_fine, power, b_fine, hA_fine, layers, rows, cols, heatsink_model=hs_fine
+    )
+
+    assert float(np.max(np.abs(res_adapt.T.reshape(-1) - T_adapt_truth))) < 1e-5
+    assert abs(res_adapt.k_norm_info["heatsink_temp_c"] - T_hs_truth) < 1e-5
+    assert abs(
+        res_adapt.k_norm_info["heatsink_temp_c"] - res_fine.k_norm_info["heatsink_temp_c"]
+    ) < 0.2

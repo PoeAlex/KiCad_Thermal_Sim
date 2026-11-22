@@ -32,6 +32,7 @@ from .gui_dialogs import (
     SettingsDialog,
     prepare_current_groups,
     prepare_power_pads,
+    resolve_heatsink_cp,
 )
 from .electrical_solver import (
     CurrentTerminal,
@@ -40,10 +41,15 @@ from .electrical_solver import (
     net_key_from_values,
     solve_electrical_heating,
 )
-from .adaptive_mesh import build_adaptive_mesh, build_adaptive_system
+from .adaptive_mesh import (
+    build_adaptive_mesh,
+    build_adaptive_system,
+    restrict_heatsink_model,
+)
 from .geometry_mapper import build_geometry_state, create_multilayer_maps, get_pad_pixels
 from .thermal_solver import (
     SolverConfig,
+    build_heatsink_model,
     build_stiffness_matrix,
     build_structured_operator,
     run_simulation,
@@ -96,6 +102,67 @@ def _resolve_mesh_mode(settings, use_fast_engine, node_count):
     if mesh_mode == "auto":
         return "uniform" if (HAS_NATIVE_MG and int(node_count) <= 5_000_000) else "adaptive"
     return mesh_mode
+
+
+def _build_operator_cache_key(
+    cache_key,
+    resolved_engine,
+    t_cu,
+    gap_m,
+    t_fr4_eff,
+    dx,
+    amb,
+    settings,
+):
+    """Return stable operator cache key including thermal-pad mode and contact settings."""
+    pad_sink_mode = str(settings.get("pad_sink_mode", "fixed") or "fixed").strip().lower()
+    pad_contact_factor = settings.get("pad_contact_factor", 0.2)
+    pad_sink_temp_c = settings.get("pad_sink_temp_c", 25.0)
+    return stable_fingerprint({
+        "geometry": cache_key,
+        "compute_engine": resolved_engine,
+        "copper_thickness_m": [float(value) for value in t_cu],
+        "dielectric_gap_m": [float(value) for value in gap_m],
+        "fr4_effective_m": [float(value) for value in t_fr4_eff],
+        "cell_size_m": float(dx),
+        "ambient_c": float(amb),
+        "h_conv": float(settings.get("h_conv", 10.0)),
+        "pad_th": float(settings.get("pad_th", 1.0)),
+        "pad_k": float(settings.get("pad_k", 3.0)),
+        "pad_cap_areal": float(settings.get("pad_cap_areal", 0.0) or 0.0),
+        "pad_sink_mode": pad_sink_mode,
+        "pad_contact_factor": float(
+            0.2 if pad_contact_factor is None else pad_contact_factor
+        ),
+        "pad_sink_temp_use_ambient": bool(
+            settings.get("pad_sink_temp_use_ambient", True)
+        ),
+        "pad_sink_temp_c": float(
+            25.0 if pad_sink_temp_c is None else pad_sink_temp_c
+        ),
+    })
+
+
+def _build_factorization_cache_key(operator_key, config, steady_state, settings):
+    """Return stable factorization cache key including 0D heatsink parameters."""
+    rth_kw = settings.get("heatsink_rth_kw", 5.0)
+    mass_g = settings.get("heatsink_mass_g", 50.0)
+    cp_j_kgk = resolve_heatsink_cp(
+        settings.get("heatsink_material", "aluminium"),
+        settings.get("heatsink_cp_j_kgk", 897.0),
+    )
+    return stable_fingerprint({
+        "operator": operator_key,
+        "time_stepping": config.time_stepping,
+        "sim_time": float(config.sim_time),
+        "dt_base": float(config.dt_base),
+        "steps_target": int(config.steps_target),
+        "use_multi_phase": bool(config.use_multi_phase),
+        "steady_state": bool(steady_state),
+        "heatsink_rth_kw": float(5.0 if rth_kw is None else rth_kw),
+        "heatsink_mass_g": float(50.0 if mass_g is None else mass_g),
+        "heatsink_cp_j_kgk": float(cp_j_kgk),
+    })
 
 
 @dataclass
@@ -1991,19 +2058,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         resolved_engine = "fast_native" if use_fast_engine else "legacy"
         mesh_mode = _resolve_mesh_mode(settings, use_fast_engine, grid.nodes)
 
-        operator_key = stable_fingerprint({
-            "geometry": cache_key,
-            "compute_engine": resolved_engine,
-            "copper_thickness_m": [float(value) for value in t_cu],
-            "dielectric_gap_m": [float(value) for value in gap_m],
-            "fr4_effective_m": [float(value) for value in t_fr4_eff],
-            "cell_size_m": float(dx),
-            "ambient_c": float(amb),
-            "h_conv": float(settings.get("h_conv", 10.0)),
-            "pad_th": float(settings.get("pad_th", 1.0)),
-            "pad_k": float(settings.get("pad_k", 3.0)),
-            "pad_cap_areal": float(settings.get("pad_cap_areal", 0.0) or 0.0),
-        })
+        operator_key = _build_operator_cache_key(
+            cache_key,
+            resolved_engine,
+            t_cu,
+            gap_m,
+            t_fr4_eff,
+            dx,
+            amb,
+            settings,
+        )
         cached_operator = self.operator_cache.get(operator_key)
         operator_cache_hit = cached_operator is not None
 
@@ -2242,6 +2306,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 "mesh_reduction_ratio": 1.0,
                 "adaptive_max_cell_ratio": 1,
             })
+        heatsink_model = build_heatsink_model(
+            layer_count, rows, cols, dx, dy, H_map, settings, amb
+        )
+        if adaptive_system is not None and heatsink_model is not None:
+            solver_heatsink_model = restrict_heatsink_model(
+                heatsink_model, adaptive_system.mesh, layer_count
+            )
+        else:
+            solver_heatsink_model = heatsink_model
         steady_state = bool(settings.get("steady_state", False)) and Q_func is None
         print(f"[ThermalSim] init timings: {_format_timing_summary(init_timings)}")
         set_dialog_state(
@@ -2310,15 +2383,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             snap_times=snap_times,
             **steady_state_kwargs,
         )
-        factorization_cache_key = stable_fingerprint({
-            "operator": operator_key,
-            "time_stepping": config.time_stepping,
-            "sim_time": float(config.sim_time),
-            "dt_base": float(config.dt_base),
-            "steps_target": int(config.steps_target),
-            "use_multi_phase": bool(config.use_multi_phase),
-            "steady_state": bool(steady_state),
-        })
+        factorization_cache_key = _build_factorization_cache_key(
+            operator_key, config, steady_state, settings
+        )
 
         worker_result = {}
 
@@ -2355,18 +2422,25 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         if adaptive_system is not None
                         else Q_func
                     )
+                    mf_kwargs = {}
+                    if solver_heatsink_model is not None:
+                        mf_kwargs["heatsink_model"] = solver_heatsink_model
                     worker_result["result"] = run_simulation_matrix_free(
                         config, solver_operator, solver_capacity, solver_power,
                         solver_boundary, solver_h_area,
                         progress_callback, solver_snapshot_callback,
                         Q_func=solver_power_func,
                         cancel_check=lambda: cancel_token.cancelled,
+                        **mf_kwargs,
                     )
                     if adaptive_system is not None:
                         worker_result["result"].T = adaptive_system.mesh.prolong(
                             worker_result["result"].T.reshape(-1), layer_count
                         )
                 else:
+                    legacy_kwargs = {}
+                    if heatsink_model is not None:
+                        legacy_kwargs["heatsink_model"] = heatsink_model
                     worker_result["result"] = run_simulation(
                         config, K_matrix, C, Q, b, hA,
                         layer_count, rows, cols,
@@ -2375,6 +2449,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         cancel_check=lambda: cancel_token.cancelled,
                         factorization_cache=self.factorization_cache,
                         factorization_cache_key=factorization_cache_key,
+                        **legacy_kwargs,
                     )
             except Exception:
                 fast_traceback = traceback.format_exc()
@@ -2405,6 +2480,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             snap_times=snap_times,
                             **steady_state_kwargs,
                         )
+                        fallback_kwargs = {}
+                        if heatsink_model is not None:
+                            fallback_kwargs["heatsink_model"] = heatsink_model
                         worker_result["result"] = run_simulation(
                             fallback_config,
                             fallback_matrix,
@@ -2419,6 +2497,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             snapshot_callback,
                             Q_func=Q_func,
                             cancel_check=lambda: cancel_token.cancelled,
+                            **fallback_kwargs,
                         )
                         worker_result["result"].k_norm_info.update({
                             "compute_engine": "legacy_fallback",
@@ -2517,6 +2596,24 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             "factorization_cache_hit": result.k_norm_info.get("factorization_cache_hit"),
             "electrical_summary": electrical_summary,
         })
+        if settings.get("use_heatsink"):
+            pad_sink_mode = str(
+                settings.get("pad_sink_mode", "fixed") or "fixed"
+            ).strip().lower()
+            if pad_sink_mode == "fixed":
+                pad_contact = settings.get("pad_contact_factor", 0.2)
+                result.k_norm_info.update({
+                    "heatsink_mode": "fixed",
+                    "pad_contact_factor": float(
+                        0.2 if pad_contact is None else pad_contact
+                    ),
+                })
+            elif pad_sink_mode == "heatsink" and not np.any(H_map):
+                result.k_norm_info.update({
+                    "heatsink_enabled": False,
+                    "heatsink_mode": "heatsink",
+                    "heatsink_inactive_reason": "No User.Eco1 thermal pad shapes found on board",
+                })
 
         # Save results
         if settings['show_all']:

@@ -1267,3 +1267,151 @@ class TestSteadyStateSettings:
         assert dlg.chk_snapshots.IsEnabled() is True
         assert dlg.snap_count_input.IsEnabled() is False
         assert dlg.get_values()['steady_state'] is False
+
+
+class TestDynamicHeatsinkSettings:
+    """Tests for Dynamic 0D Heatsink controls, presets, live summary, and round-trip."""
+
+    def test_heatsink_defaults_and_options(self):
+        from ThermalSim.gui_dialogs import (
+            HEATSINK_MATERIAL_OPTIONS,
+            TOOLTIP_TEXTS,
+            SettingsDialog,
+        )
+
+        assert [key for _, key, _ in HEATSINK_MATERIAL_OPTIONS] == [
+            "aluminium", "copper", "steel", "magnesium", "custom"
+        ]
+        for tooltip_key in (
+            "pad_contact_factor",
+            "pad_sink_mode",
+            "pad_sink_temp_use_ambient",
+            "pad_sink_temp_c",
+            "heatsink_rth_kw",
+            "heatsink_material",
+            "heatsink_mass_g",
+            "heatsink_cp_j_kgk",
+        ):
+            assert tooltip_key in TOOLTIP_TEXTS
+            assert TOOLTIP_TEXTS[tooltip_key].strip() == TOOLTIP_TEXTS[tooltip_key]
+
+        dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
+        values = dlg.get_values()
+
+        assert values["use_heatsink"] is False
+        assert values["pad_sink_mode"] == "fixed"
+        assert values["pad_contact_factor"] == 0.2
+        assert values["pad_sink_temp_use_ambient"] is True
+        assert values["pad_sink_temp_c"] == 25.0
+        assert values["heatsink_rth_kw"] == 5.0
+        assert values["heatsink_material"] == "aluminium"
+        assert values["heatsink_mass_g"] == 50.0
+        assert values["heatsink_cp_j_kgk"] == 897.0
+
+        assert dlg.pad_contact_factor.IsEnabled() is False
+        assert dlg.chk_pad_sink_ambient.IsEnabled() is False
+        assert dlg.pad_sink_temp_input.IsEnabled() is False
+        assert dlg.heatsink_rth_input.IsEnabled() is False
+        assert dlg.heatsink_mass_input.IsEnabled() is False
+        assert dlg.heatsink_cp_input.IsEnabled() is False
+        assert dlg.lbl_heatsink_summary.GetLabel() == "Fixed sink temperature (infinite thermal mass)"
+
+    def test_fixed_vs_heatsink_mode_and_material_presets_live_summary(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
+
+        # Enable thermal pad in fixed mode
+        dlg.chk_heatsink.SetValue(True)
+        dlg._on_heatsink_toggle(None)
+        assert dlg.thermal_pad_pane.IsExpanded()
+        assert dlg.pad_contact_factor.IsEnabled() is True
+        assert dlg.chk_pad_sink_ambient.IsEnabled() is True
+        assert dlg.pad_sink_temp_input.IsEnabled() is False
+        assert dlg.heatsink_rth_input.IsEnabled() is False
+        assert dlg.heatsink_mass_input.IsEnabled() is False
+        assert dlg.heatsink_cp_input.IsEnabled() is False
+
+        # Uncheck ambient temp -> fixed sink temp input becomes editable
+        dlg.chk_pad_sink_ambient.SetValue(False)
+        dlg._on_pad_sink_ambient_toggle(None)
+        assert dlg.pad_sink_temp_input.IsEnabled() is True
+
+        # Switch to Dynamic heatsink (0D) mode
+        dlg.pad_sink_mode_choice.SetSelection(1)
+        dlg._on_pad_sink_mode_changed(None)
+        assert dlg.chk_pad_sink_ambient.IsEnabled() is False
+        assert dlg.pad_sink_temp_input.IsEnabled() is False
+        assert dlg.heatsink_rth_input.IsEnabled() is True
+        assert dlg.heatsink_mass_input.IsEnabled() is True
+        assert dlg.heatsink_cp_input.IsEnabled() is False
+        assert dlg.lbl_heatsink_summary.GetLabel() == (
+            "C_hs = 44.9 J/K  \u00b7  Time constant tau = 224.2 s"
+        )
+
+        # Copper preset auto-fills c_p and updates summary
+        dlg.heatsink_material_choice.SetSelection(1)
+        dlg._on_heatsink_material_changed(None)
+        assert dlg.heatsink_cp_input.GetValue() == 385.0
+        assert dlg.heatsink_cp_input.IsEnabled() is False
+        assert dlg.get_values()["heatsink_material"] == "copper"
+        assert dlg.get_values()["heatsink_cp_j_kgk"] == 385.0
+        assert dlg.lbl_heatsink_summary.GetLabel() == (
+            "C_hs = 19.2 J/K  \u00b7  Time constant tau = 96.2 s"
+        )
+
+        # Custom material enables c_p input and updates summary live
+        dlg.heatsink_material_choice.SetSelection(4)
+        dlg._on_heatsink_material_changed(None)
+        assert dlg.heatsink_cp_input.IsEnabled() is True
+        dlg.heatsink_cp_input.SetValue(1000.0)
+        dlg.heatsink_mass_input.SetValue(100.0)
+        dlg.heatsink_rth_input.SetValue(3.0)
+        dlg._on_heatsink_param_changed(None)
+        assert dlg.lbl_heatsink_summary.GetLabel() == (
+            "C_hs = 100.0 J/K  \u00b7  Time constant tau = 300.0 s"
+        )
+
+        # Zero mass shows instantaneous heatsink summary
+        dlg.heatsink_mass_input.SetValue(0.0)
+        dlg._on_heatsink_param_changed(None)
+        assert dlg.lbl_heatsink_summary.GetLabel() == (
+            "C_hs = 0.0 J/K (instantaneous heatsink, tau = 0 s)"
+        )
+
+    def test_apply_defaults_round_trip_and_backward_compat(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        saved = {
+            "use_heatsink": True,
+            "pad_th": 0.5,
+            "pad_k": 5.0,
+            "pad_cap_areal": 250.0,
+            "pad_sink_mode": "heatsink",
+            "pad_contact_factor": 0.75,
+            "pad_sink_temp_use_ambient": False,
+            "pad_sink_temp_c": 40.0,
+            "heatsink_rth_kw": 3.0,
+            "heatsink_material": "custom",
+            "heatsink_mass_g": 120.0,
+            "heatsink_cp_j_kgk": 950.0,
+        }
+        dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"], defaults=saved)
+        assert dlg.thermal_pad_pane.IsExpanded()
+        assert dlg.heatsink_cp_input.IsEnabled() is True
+        values = dlg.get_values()
+        for key, expected in saved.items():
+            assert values[key] == expected
+
+        # Applying legacy defaults without new heatsink keys resets them safely
+        dlg._apply_defaults({"use_heatsink": True, "pad_th": 1.0, "pad_k": 3.0})
+        restored = dlg.get_values()
+        assert restored["pad_sink_mode"] == "fixed"
+        assert restored["pad_contact_factor"] == 0.2
+        assert restored["pad_sink_temp_use_ambient"] is True
+        assert restored["pad_sink_temp_c"] == 25.0
+        assert restored["heatsink_rth_kw"] == 5.0
+        assert restored["heatsink_material"] == "aluminium"
+        assert restored["heatsink_mass_g"] == 50.0
+        assert restored["heatsink_cp_j_kgk"] == 897.0
+        assert dlg.lbl_heatsink_summary.GetLabel() == "Fixed sink temperature (infinite thermal mass)"

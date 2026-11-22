@@ -221,6 +221,10 @@ The preflight status shows the effective dimensions and percentage of the board.
 - **Pad Thickness (mm)** - thermal interface thickness.
 - **Pad Cond. (W/mK)** - thermal interface conductivity.
 - **Pad Heat Cap. (J/m2K)** - additional areal heat capacity.
+- **Contact factor** - effective interface contact factor (`0.05`–`1.0`, default `0.2`).
+- **Sink model** - choose between two thermal boundary models:
+  - **Fixed temperature** - couples the thermal pad to ambient or a custom fixed sink temperature (infinite thermal mass).
+  - **Dynamic heatsink (0D)** - couples the thermal pad to a lumped 0D heatsink node with heatsink-to-ambient thermal resistance ($R_{\text{th}}$ in K/W) and optional thermal mass from weight (g) and material preset (**Aluminium**, **Copper**, **Steel**, **Magnesium**, or **Custom** $c_p$). The GUI shows live thermal capacity ($C_{\text{hs}}$) and time constant ($\tau = R_{\text{th}} \cdot C_{\text{hs}}$); setting mass to `0 g` models an instantaneous heatsink. Reports include the heatsink temperature and heatsink-vs-PCB-air heat removal split.
 
 #### Solver
 

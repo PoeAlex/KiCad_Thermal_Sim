@@ -30,6 +30,120 @@ except ImportError:
     prolong_add_2x2_native = None
 
 
+HEATSINK_MATERIAL_CP = {
+    "aluminium": 897.0,
+    "copper": 385.0,
+    "steel": 490.0,
+    "magnesium": 1020.0,
+}
+
+
+def resolve_heatsink_cp(settings: Dict) -> float:
+    """Resolve specific heat capacity (J/(kg*K)) for the heatsink material."""
+    mat = str(settings.get("heatsink_material", "aluminium") or "aluminium").strip().lower()
+    if mat == "custom":
+        val = settings.get("heatsink_cp_j_kgk", 897.0)
+        return max(0.0, float(897.0 if val is None else val))
+    return float(HEATSINK_MATERIAL_CP.get(mat, HEATSINK_MATERIAL_CP["aluminium"]))
+
+
+def compute_heatsink_capacity_j_k(settings: Dict) -> float:
+    """Compute lumped 0D heatsink thermal capacity (J/K) from mass and material."""
+    mass_val = settings.get("heatsink_mass_g", 50.0)
+    mass_g = max(0.0, float(50.0 if mass_val is None else mass_val))
+    return mass_g * 1e-3 * resolve_heatsink_cp(settings)
+
+
+@dataclass
+class HeatsinkModel:
+    """Lumped 0D dynamic heatsink coupled to bottom-layer thermal pad nodes."""
+
+    pad_conductance: np.ndarray
+    rth_kw: float
+    capacity_j_k: float = 0.0
+    initial_temp_c: Optional[float] = None
+    mode: str = "heatsink"
+
+    def __post_init__(self):
+        if self.pad_conductance is not None:
+            self.pad_conductance = np.ascontiguousarray(
+                self.pad_conductance, dtype=np.float64
+            ).reshape(-1)
+
+    @property
+    def g_hs_amb(self) -> float:
+        """Heatsink-to-ambient thermal conductance (W/K)."""
+        return 1.0 / max(float(self.rth_kw), 1e-9)
+
+    @property
+    def tau_s(self) -> float:
+        """Lumped heatsink thermal time constant R_th * C_hs (seconds)."""
+        return max(0.0, float(self.capacity_j_k)) * max(float(self.rth_kw), 0.0)
+
+    @property
+    def is_active(self) -> bool:
+        """Return True when at least one PCB node couples to the heatsink."""
+        return (
+            self.pad_conductance is not None
+            and self.pad_conductance.size > 0
+            and float(np.sum(self.pad_conductance)) > 0.0
+        )
+
+
+def build_heatsink_coupling_vector(
+    layer_count: int,
+    rows: int,
+    cols: int,
+    dx: float,
+    dy: float,
+    H_map: np.ndarray,
+    settings: Dict,
+) -> np.ndarray:
+    """Build the 1D pad conductance vector g (W/K) on bottom-layer heatsink nodes."""
+    pad_thick_m = max(0.0001, float(settings.get("pad_th", 1.0)) * 1e-3)
+    pad_k = float(settings.get("pad_k", 3.0))
+    contact_factor = max(1e-6, float(settings.get("pad_contact_factor", 0.2)))
+    h_sink = (pad_k / pad_thick_m) * contact_factor
+    plane_cells = rows * cols
+    g = np.zeros(layer_count * plane_cells, dtype=np.float64)
+    g[(layer_count - 1) * plane_cells :] = (
+        np.asarray(H_map, dtype=np.float64) * h_sink * (dx * dy)
+    ).ravel()
+    return g
+
+
+def build_heatsink_model(
+    layer_count: int,
+    rows: int,
+    cols: int,
+    dx: float,
+    dy: float,
+    H_map: np.ndarray,
+    settings: Dict,
+    amb: float,
+) -> Optional[HeatsinkModel]:
+    """Construct a HeatsinkModel when dynamic heatsink mode is active on H_map."""
+    if not bool(settings.get("use_heatsink", True)):
+        return None
+    sink_mode = str(settings.get("pad_sink_mode", "fixed") or "fixed").strip().lower()
+    if sink_mode != "heatsink":
+        return None
+    h_map_arr = np.asarray(H_map, dtype=np.float64)
+    if not np.any(h_map_arr):
+        return None
+    pad_conductance = build_heatsink_coupling_vector(
+        layer_count, rows, cols, dx, dy, h_map_arr, settings
+    )
+    rth_val = settings.get("heatsink_rth_kw", 5.0)
+    rth_kw = max(1e-6, float(5.0 if rth_val is None else rth_val))
+    return HeatsinkModel(
+        pad_conductance=pad_conductance,
+        rth_kw=rth_kw,
+        capacity_j_k=compute_heatsink_capacity_j_k(settings),
+        initial_temp_c=float(amb),
+    )
+
+
 @dataclass
 class SolverConfig:
     """
@@ -661,6 +775,43 @@ class StructuredThermalOperator:
         return operator, preconditioner
 
 
+def _compute_bottom_boundary_terms(
+    H_map: np.ndarray,
+    pixel_area: float,
+    settings: Dict,
+    amb: float,
+):
+    """Compute bottom-surface diagonal conductance, RHS contribution, and hA."""
+    h_air_bot = float(settings.get("h_conv", 10.0))
+    pad_thick_m = max(0.0001, float(settings.get("pad_th", 1.0)) * 1e-3)
+    pad_k = float(settings.get("pad_k", 3.0))
+    contact_factor = max(1e-6, float(settings.get("pad_contact_factor", 0.2)))
+    h_sink = (pad_k / pad_thick_m) * contact_factor
+
+    h_map_arr = np.asarray(H_map, dtype=np.float64)
+    g_air_bot = ((1.0 - h_map_arr) * h_air_bot * pixel_area).ravel()
+    g_pad_bot = (h_map_arr * h_sink * pixel_area).ravel()
+    diag_add_bot = g_air_bot + g_pad_bot
+
+    sink_mode = str(settings.get("pad_sink_mode", "fixed") or "fixed").strip().lower()
+    use_heatsink = bool(settings.get("use_heatsink", True))
+    if use_heatsink and sink_mode == "heatsink" and np.any(h_map_arr):
+        b_add_bot = g_air_bot * float(amb)
+        hA_add_bot = g_air_bot
+    else:
+        use_amb = bool(settings.get("pad_sink_temp_use_ambient", True))
+        sink_temp_raw = settings.get("pad_sink_temp_c")
+        sink_temp = (
+            float(amb)
+            if (use_amb or sink_temp_raw is None)
+            else float(sink_temp_raw)
+        )
+        b_add_bot = g_air_bot * float(amb) + g_pad_bot * sink_temp
+        hA_add_bot = diag_add_bot
+
+    return diag_add_bot, b_add_bot, hA_add_bot
+
+
 def build_structured_operator(
     layer_count: int,
     rows: int,
@@ -731,17 +882,13 @@ def build_structured_operator(
     boundary_rhs[plane_indices] += top_addition * amb
     h_area[plane_indices] += top_addition
 
-    h_air_bottom = float(settings.get("h_conv", 10.0))
-    pad_thickness = max(0.0001, settings["pad_th"] * 1e-3)
-    h_sink = (settings["pad_k"] / pad_thickness) * 0.2
-    bottom_effective = (
-        (1.0 - H_map) * h_air_bottom + H_map * h_sink
+    diag_add_bot, b_add_bot, hA_add_bot = _compute_bottom_boundary_terms(
+        H_map, pixel_area, settings, amb
     )
-    bottom_addition = (bottom_effective * pixel_area).reshape(-1)
     bottom_indices = (layer_count - 1) * plane_cells + plane_indices
-    boundary_diag[bottom_indices] += bottom_addition
-    boundary_rhs[bottom_indices] += bottom_addition * amb
-    h_area[bottom_indices] += bottom_addition
+    boundary_diag[bottom_indices] += diag_add_bot
+    boundary_rhs[bottom_indices] += b_add_bot
+    h_area[bottom_indices] += hA_add_bot
 
     diagonal_view = boundary_diag.reshape(layer_count, rows, cols).copy()
     if cols > 1:
@@ -969,21 +1116,17 @@ def build_stiffness_matrix(
     b[top_idx] += diag_add_top * amb
 
     # Bottom surface: air convection + heatsink
-    h_air_bot = float(settings.get('h_conv', 10.0))
-    pad_thick_m = max(0.0001, settings['pad_th'] * 1e-3)
-    pad_k = settings['pad_k']
-    contact_factor = 0.2
-    h_sink = (pad_k / pad_thick_m) * contact_factor
-    h_bot_eff = (1.0 - H_map) * h_air_bot + H_map * h_sink
-    diag_add_bot = (h_bot_eff * pixel_area).ravel()
+    diag_add_bot, b_add_bot, hA_add_bot = _compute_bottom_boundary_terms(
+        H_map, pixel_area, settings, amb
+    )
     bot_base = (layer_count - 1) * RC
     bot_idx = bot_base + top_idx
     diag_extra[bot_idx] += diag_add_bot
-    b[bot_idx] += diag_add_bot * amb
+    b[bot_idx] += b_add_bot
 
     hA = np.zeros(N, dtype=np.float64)
     hA[top_idx] += diag_add_top
-    hA[bot_idx] += diag_add_bot
+    hA[bot_idx] += hA_add_bot
 
     K = K_base + sp.diags(diag_extra, format="csr")
 
@@ -1155,6 +1298,158 @@ def _solve_pcg(
     return solution, iterations, retried, relative_residual
 
 
+@dataclass
+class _HeatsinkPhaseState:
+    """Cached Sherman-Morrison rank-1 coupling state for one linear operator."""
+
+    g: np.ndarray
+    g_sum: float
+    g_hs_amb: float
+    c_hs: float
+    alpha_hs: float
+    u: np.ndarray
+    delta: float
+
+    @classmethod
+    def from_u(
+        cls,
+        heatsink_model: HeatsinkModel,
+        gamma: float,
+        u: np.ndarray,
+    ) -> "_HeatsinkPhaseState":
+        g = heatsink_model.pad_conductance
+        g_sum = float(np.sum(g))
+        g_hs_amb = heatsink_model.g_hs_amb
+        c_hs = max(0.0, float(heatsink_model.capacity_j_k))
+        alpha_hs = (gamma * c_hs if c_hs > 0.0 else 0.0) + g_hs_amb + g_sum
+        u_vec = np.asarray(u, dtype=np.float64).reshape(-1)
+        delta = alpha_hs - float(np.dot(g, u_vec))
+        if delta <= 1e-18:
+            raise RuntimeError(
+                f"Sherman-Morrison heatsink denominator is non-positive ({delta:.3e})."
+            )
+        return cls(
+            g=g,
+            g_sum=g_sum,
+            g_hs_amb=g_hs_amb,
+            c_hs=c_hs,
+            alpha_hs=alpha_hs,
+            u=u_vec,
+            delta=delta,
+        )
+
+    @classmethod
+    def prepare_direct(
+        cls,
+        heatsink_model: HeatsinkModel,
+        gamma: float,
+        solve_fn: Callable[[np.ndarray], np.ndarray],
+    ) -> "_HeatsinkPhaseState":
+        return cls.from_u(heatsink_model, gamma, solve_fn(heatsink_model.pad_conductance))
+
+    @classmethod
+    def prepare_pcg(
+        cls,
+        heatsink_model: HeatsinkModel,
+        gamma: float,
+        operator,
+        preconditioner,
+        cancel_check=None,
+        rtol: float = 1e-8,
+    ):
+        g = heatsink_model.pad_conductance
+        u, _, _, rel_res = _solve_pcg(
+            operator,
+            preconditioner,
+            g,
+            np.zeros_like(g),
+            cancel_check=cancel_check,
+            relative_tolerance=rtol,
+            maxiter=300,
+            retry_maxiter=600,
+        )
+        return cls.from_u(heatsink_model, gamma, u), rel_res
+
+    def scalar_rhs(
+        self,
+        amb: float,
+        t_hs_n: float = 0.0,
+        t_hs_nm1: float = 0.0,
+        dt: float = 0.0,
+        bdf2: bool = False,
+    ) -> float:
+        r_hs = self.g_hs_amb * float(amb)
+        if self.c_hs > 0.0 and dt > 0.0:
+            d_hs = self.c_hs / dt
+            if bdf2:
+                r_hs += 2.0 * d_hs * t_hs_n - 0.5 * d_hs * t_hs_nm1
+            else:
+                r_hs += d_hs * t_hs_n
+        return float(r_hs)
+
+    def modified_rhs(self, pcb_rhs: np.ndarray, r_hs: float) -> np.ndarray:
+        return pcb_rhs + (r_hs / self.alpha_hs) * self.g
+
+    def warm_start_x1(self, t_guess: np.ndarray) -> np.ndarray:
+        coeff = float(np.dot(self.g, t_guess)) / self.alpha_hs
+        return t_guess - coeff * self.u
+
+    def recover(self, x1: np.ndarray, r_hs: float):
+        x1_vec = np.asarray(x1, dtype=np.float64).reshape(-1)
+        g_dot_x1 = float(np.dot(self.g, x1_vec))
+        t_new = x1_vec + (g_dot_x1 / self.delta) * self.u
+        t_hs_new = (r_hs + float(np.dot(self.g, t_new))) / self.alpha_hs
+        return t_new, float(t_hs_new)
+
+
+def _validate_heatsink_model(
+    heatsink_model: Optional[HeatsinkModel],
+    node_count: int,
+) -> bool:
+    """Return True if heatsink_model is active, validating vector shape."""
+    if heatsink_model is None or not heatsink_model.is_active:
+        return False
+    if heatsink_model.pad_conductance.shape != (node_count,):
+        raise ValueError(
+            f"heatsink_model.pad_conductance shape {heatsink_model.pad_conductance.shape} "
+            f"does not match node count ({node_count},)."
+        )
+    return True
+
+
+def _heatsink_diagnostics(
+    heatsink_model: Optional[HeatsinkModel],
+    T_flat: np.ndarray,
+    t_hs: float,
+    hA: np.ndarray,
+    amb: float,
+):
+    """Compute total heat output (W) and heatsink metadata for k_norm_info."""
+    p_pcb_air = float(np.dot(hA, T_flat - amb))
+    if heatsink_model is None or not heatsink_model.is_active:
+        return p_pcb_air, {}
+    g = heatsink_model.pad_conductance
+    g_hs_amb = heatsink_model.g_hs_amb
+    c_hs = max(0.0, float(heatsink_model.capacity_j_k))
+    p_hs_amb = float(g_hs_amb * (t_hs - amb))
+    p_pcb_to_hs = float(np.dot(g, T_flat - t_hs))
+    p_total = p_pcb_air + p_hs_amb
+    hs_frac = float(p_hs_amb / p_total) if p_total > 1e-12 else 0.0
+    return p_total, {
+        "heatsink_enabled": True,
+        "heatsink_mode": str(heatsink_model.mode or "heatsink"),
+        "heatsink_temp_c": float(t_hs),
+        "heatsink_temp_rise_c": float(t_hs - amb),
+        "heatsink_rth_kw": float(heatsink_model.rth_kw),
+        "heatsink_capacity_j_k": float(c_hs),
+        "heatsink_tau_s": float(heatsink_model.tau_s),
+        "heatsink_power_w": p_hs_amb,
+        "heatsink_pad_flux_w": p_pcb_to_hs,
+        "pcb_convection_power_w": p_pcb_air,
+        "heatsink_power_fraction": hs_frac,
+    }
+
+
 def run_steady_state(
     config: SolverConfig,
     K: sp.csr_matrix,
@@ -1166,14 +1461,49 @@ def run_steady_state(
     cols: int,
     progress_callback: Optional[Callable[[int, int], bool]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    heatsink_model: Optional[HeatsinkModel] = None,
 ) -> SolverResult:
     """Solve the steady-state thermal system ``K * T = Q + b`` directly."""
     N = K.shape[0]
     amb = config.amb
     pin = float(np.sum(Q))
+    hs_active = _validate_heatsink_model(heatsink_model, N)
+    t_hs = (
+        float(amb if heatsink_model.initial_temp_c is None else heatsink_model.initial_temp_c)
+        if hs_active
+        else float(amb)
+    )
 
     if cancel_check and cancel_check():
         T_abort = np.full((layer_count, rows, cols), amb, dtype=np.float64)
+        _, hs_info = _heatsink_diagnostics(
+            heatsink_model if hs_active else None,
+            T_abort.reshape(-1),
+            t_hs,
+            hA,
+            amb,
+        )
+        k_norm_info = {
+            "strategy": "direct_steady_state",
+            "backend": "SciPy",
+            "multi_phase": False,
+            "time_stepping": "steady_state",
+            "N": N,
+            "nnz_K": int(K.nnz),
+            "dt_base": config.dt_base,
+            "steps_target": 1,
+            "steps_total": 0,
+            "factorization_s": 0.0,
+            "factorizations": 0,
+            "factorization_cache_hit": False,
+            "avg_solve_s": 0.0,
+            "pin_w": pin,
+            "pout_final_w": 0.0,
+            "steady_rel_diff": None,
+            "steady_state": True,
+            "early_steady_state_stop": False,
+        }
+        k_norm_info.update(hs_info)
         return SolverResult(
             T=T_abort,
             aborted=True,
@@ -1185,26 +1515,7 @@ def run_steady_state(
             snapshot_files=[],
             phase_metrics=[],
             balance_history=[],
-            k_norm_info={
-                "strategy": "direct_steady_state",
-                "backend": "SciPy",
-                "multi_phase": False,
-                "time_stepping": "steady_state",
-                "N": N,
-                "nnz_K": int(K.nnz),
-                "dt_base": config.dt_base,
-                "steps_target": 1,
-                "steps_total": 0,
-                "factorization_s": 0.0,
-                "factorizations": 0,
-                "factorization_cache_hit": False,
-                "avg_solve_s": 0.0,
-                "pin_w": pin,
-                "pout_final_w": 0.0,
-                "steady_rel_diff": None,
-                "steady_state": True,
-                "early_steady_state_stop": False,
-            },
+            k_norm_info=k_norm_info,
         )
 
     rhs = np.asarray(Q, dtype=np.float64) + np.asarray(b, dtype=np.float64)
@@ -1213,7 +1524,13 @@ def run_steady_state(
     factor_time = time.perf_counter() - factor_start
     try:
         solve_start = time.perf_counter()
-        Tn = np.asarray(solve_fn(rhs), dtype=np.float64).reshape(-1)
+        if hs_active:
+            phase_hs = _HeatsinkPhaseState.prepare_direct(heatsink_model, 0.0, solve_fn)
+            r_hs = phase_hs.scalar_rhs(amb)
+            x1 = solve_fn(phase_hs.modified_rhs(rhs, r_hs))
+            Tn, t_hs = phase_hs.recover(x1, r_hs)
+        else:
+            Tn = np.asarray(solve_fn(rhs), dtype=np.float64).reshape(-1)
         solve_time = time.perf_counter() - solve_start
     finally:
         _release_linear_solver(owner)
@@ -1223,7 +1540,9 @@ def run_steady_state(
         aborted = True
 
     T = Tn.reshape((layer_count, rows, cols))
-    pout_final = float(np.sum(hA * (Tn - amb)))
+    pout_final, hs_info = _heatsink_diagnostics(
+        heatsink_model if hs_active else None, Tn, t_hs, hA, amb
+    )
     steady_rel_diff = abs(pin - pout_final) / max(abs(pin), 1e-9)
 
     phase_metrics = [{
@@ -1255,6 +1574,7 @@ def run_steady_state(
         "steady_state": True,
         "early_steady_state_stop": False,
     }
+    k_norm_info.update(hs_info)
     return SolverResult(
         T=T,
         aborted=aborted,
@@ -1279,6 +1599,7 @@ def run_steady_state_matrix_free(
     hA: np.ndarray,
     progress_callback: Optional[Callable[[int, int], bool]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    heatsink_model: Optional[HeatsinkModel] = None,
 ) -> SolverResult:
     """Solve ``K * T = Q + b`` directly using a matrix-free or adaptive operator."""
     layer_count = operator.layer_count
@@ -1287,6 +1608,12 @@ def run_steady_state_matrix_free(
     node_count = operator.shape[0]
     amb = config.amb
     pin = float(np.sum(Q))
+    hs_active = _validate_heatsink_model(heatsink_model, node_count)
+    t_hs = (
+        float(amb if heatsink_model.initial_temp_c is None else heatsink_model.initial_temp_c)
+        if hs_active
+        else float(amb)
+    )
     if bool(getattr(operator, "prefer_derivative_start", False)):
         backend_name = "Adaptive-Multigrid-PCG"
     elif HAS_NATIVE_CORE:
@@ -1296,6 +1623,37 @@ def run_steady_state_matrix_free(
 
     if cancel_check and cancel_check():
         T_abort = np.full((layer_count, rows, cols), amb, dtype=np.float64)
+        _, hs_info = _heatsink_diagnostics(
+            heatsink_model if hs_active else None,
+            T_abort.reshape(-1),
+            t_hs,
+            hA,
+            amb,
+        )
+        k_norm_info = {
+            "strategy": "direct_steady_state",
+            "backend": backend_name,
+            "multi_phase": False,
+            "time_stepping": "steady_state",
+            "N": node_count,
+            "nnz_K": operator.nnz_estimate,
+            "dt_base": config.dt_base,
+            "steps_target": 1,
+            "steps_total": 0,
+            "factorization_s": 0.0,
+            "factorizations": 0,
+            "factorization_cache_hit": False,
+            "avg_solve_s": 0.0,
+            "avg_pcg_iterations": 0.0,
+            "pcg_retry_count": 0,
+            "pcg_relative_residual_max": 0.0,
+            "pin_w": pin,
+            "pout_final_w": 0.0,
+            "steady_rel_diff": None,
+            "steady_state": True,
+            "early_steady_state_stop": False,
+        }
+        k_norm_info.update(hs_info)
         return SolverResult(
             T=T_abort,
             aborted=True,
@@ -1307,29 +1665,7 @@ def run_steady_state_matrix_free(
             snapshot_files=[],
             phase_metrics=[],
             balance_history=[],
-            k_norm_info={
-                "strategy": "direct_steady_state",
-                "backend": backend_name,
-                "multi_phase": False,
-                "time_stepping": "steady_state",
-                "N": node_count,
-                "nnz_K": operator.nnz_estimate,
-                "dt_base": config.dt_base,
-                "steps_target": 1,
-                "steps_total": 0,
-                "factorization_s": 0.0,
-                "factorizations": 0,
-                "factorization_cache_hit": False,
-                "avg_solve_s": 0.0,
-                "avg_pcg_iterations": 0.0,
-                "pcg_retry_count": 0,
-                "pcg_relative_residual_max": 0.0,
-                "pin_w": pin,
-                "pout_final_w": 0.0,
-                "steady_rel_diff": None,
-                "steady_state": True,
-                "early_steady_state_stop": False,
-            },
+            k_norm_info=k_norm_info,
         )
 
     capacity = (
@@ -1347,6 +1683,7 @@ def run_steady_state_matrix_free(
     retried = False
     relative_residual = 0.0
     solve_time = 0.0
+    setup_time = 0.0
     temperature = initial
     use_blas_limit = (
         HAS_NATIVE_CORE
@@ -1360,31 +1697,57 @@ def run_steady_state_matrix_free(
         steady_operator, steady_preconditioner = operator.implicit_linear_operator(
             capacity, 0.0
         )
-        setup_time = time.perf_counter() - setup_start
-
-        solve_start = time.perf_counter()
+        phase_hs = None
+        u_rel_res = 0.0
         try:
-            temperature, iterations, retried, relative_residual = _solve_pcg(
+            if hs_active:
+                phase_hs, u_rel_res = _HeatsinkPhaseState.prepare_pcg(
+                    heatsink_model,
+                    0.0,
+                    steady_operator,
+                    steady_preconditioner,
+                    cancel_check=cancel_check,
+                    rtol=1e-8,
+                )
+            setup_time = time.perf_counter() - setup_start
+
+            solve_start = time.perf_counter()
+            if phase_hs is not None:
+                r_hs = phase_hs.scalar_rhs(amb)
+                solve_rhs = phase_hs.modified_rhs(rhs, r_hs)
+                solve_init = phase_hs.warm_start_x1(initial)
+            else:
+                r_hs = 0.0
+                solve_rhs = rhs
+                solve_init = initial
+            solution, iterations, retried, relative_residual = _solve_pcg(
                 steady_operator,
                 steady_preconditioner,
-                rhs,
-                initial,
+                solve_rhs,
+                solve_init,
                 cancel_check=cancel_check,
                 relative_tolerance=1e-7,
                 maxiter=250,
                 retry_maxiter=500,
             )
+            if phase_hs is not None:
+                temperature, t_hs = phase_hs.recover(solution, r_hs)
+                relative_residual = max(relative_residual, u_rel_res)
+            else:
+                temperature = solution
             solve_time = time.perf_counter() - solve_start
             step_counter = 1
         except _CancelledIterativeSolve:
-            solve_time = time.perf_counter() - solve_start
+            solve_time = time.perf_counter() - setup_start
             aborted = True
 
     if not aborted and progress_callback and not progress_callback(1, 1):
         aborted = True
 
     final_view = temperature.reshape(layer_count, rows, cols)
-    pout_final = float(np.sum(hA * (temperature - amb)))
+    pout_final, hs_info = _heatsink_diagnostics(
+        heatsink_model if hs_active else None, temperature, t_hs, hA, amb
+    )
     steady_rel_diff = (
         abs(pin - pout_final) / max(abs(pin), 1e-9) if step_counter > 0 else None
     )
@@ -1422,6 +1785,7 @@ def run_steady_state_matrix_free(
         "steady_state": True,
         "early_steady_state_stop": False,
     }
+    k_norm_info.update(hs_info)
     return SolverResult(
         T=final_view,
         aborted=aborted,
@@ -1448,6 +1812,7 @@ def run_simulation_matrix_free(
     snapshot_callback: Optional[Callable[[np.ndarray, float, int], str]] = None,
     Q_func: Optional[Callable[[float], np.ndarray]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    heatsink_model: Optional[HeatsinkModel] = None,
 ) -> SolverResult:
     """Run BDF2 using a matrix-free structured operator and iterative solves."""
     if config.steady_state and Q_func is None:
@@ -1460,6 +1825,7 @@ def run_simulation_matrix_free(
             hA=hA,
             progress_callback=progress_callback,
             cancel_check=cancel_check,
+            heatsink_model=heatsink_model,
         )
 
     layer_count = operator.layer_count
@@ -1467,10 +1833,20 @@ def run_simulation_matrix_free(
     cols = operator.cols
     node_count = operator.shape[0]
     ambient = config.amb
+    hs_active = _validate_heatsink_model(heatsink_model, node_count)
+    c_hs = max(0.0, float(heatsink_model.capacity_j_k)) if hs_active else 0.0
+    t_hs = (
+        float(ambient if heatsink_model.initial_temp_c is None else heatsink_model.initial_temp_c)
+        if hs_active
+        else float(ambient)
+    )
+    t_hs_prev = t_hs
     temperature = np.full(node_count, ambient, dtype=np.float64)
     previous_temperature = temperature.copy()
     guess_workspace = np.empty(node_count, dtype=np.float64)
-    initial_energy = float(np.sum(C * (temperature - ambient)))
+    initial_energy = float(np.sum(C * (temperature - ambient))) + (
+        c_hs * (t_hs - ambient) if hs_active else 0.0
+    )
     current_time = 0.0
     step_counter = 0
     aborted = False
@@ -1486,7 +1862,9 @@ def run_simulation_matrix_free(
     previous_snapshot_time = 0.0
     previous_snapshot_energy = initial_energy
     balance_integral = 0.0
-    pout_step = 0.0
+    pout_step = float(np.sum(hA * (temperature - ambient))) + (
+        heatsink_model.g_hs_amb * (t_hs - ambient) if hs_active else 0.0
+    )
     source = Q_func(0.0) if Q_func is not None else Q
     pin = float(np.sum(source))
     next_snapshot_idx = 0
@@ -1514,12 +1892,17 @@ def run_simulation_matrix_free(
             return False
         if abs(pin - pout_step) / pin >= 1e-4:
             return False
-        return float(np.max(np.abs(temperature - previous_temperature))) < 1e-4
+        max_delta = float(np.max(np.abs(temperature - previous_temperature)))
+        if hs_active:
+            max_delta = max(max_delta, abs(t_hs - t_hs_prev))
+        return max_delta < 1e-4
 
     def record_snapshot(t_elapsed):
         nonlocal previous_snapshot_time, previous_snapshot_energy, snapshot_number
         view = temperature.reshape(layer_count, rows, cols)
-        energy = float(np.sum(C * (temperature - ambient)))
+        energy = float(np.sum(C * (temperature - ambient))) + (
+            c_hs * (t_hs - ambient) if hs_active else 0.0
+        )
         energy_delta = energy - initial_energy
         absolute_error = abs(energy_delta - balance_integral)
         relative_error = absolute_error / max(abs(t_elapsed * pin), 1e-9)
@@ -1531,7 +1914,7 @@ def run_simulation_matrix_free(
             })
         previous_snapshot_time = t_elapsed
         previous_snapshot_energy = energy
-        snapshot_stats.append({
+        snap_entry = {
             "t": t_elapsed,
             "max_top": float(np.max(view[0])),
             "max_bottom": float(np.max(view[-1])),
@@ -1541,32 +1924,57 @@ def run_simulation_matrix_free(
             "eps_abs": absolute_error,
             "eps_rel": relative_error,
             "energy_warn": relative_error > 0.01 or absolute_error > 0.01,
-        })
+        }
+        if hs_active:
+            snap_entry["heatsink_temp_c"] = float(t_hs)
+        snapshot_stats.append(snap_entry)
         if snapshot_callback:
             path = snapshot_callback(view, t_elapsed, snapshot_number)
             if path:
                 snapshot_files.append((t_elapsed, path))
         snapshot_number += 1
 
-    def advance(rhs, implicit_operator, preconditioner, dt_value, extrapolate=False):
-        nonlocal temperature, previous_temperature, current_time, step_counter
+    def advance(
+        rhs,
+        implicit_operator,
+        preconditioner,
+        dt_value,
+        extrapolate=False,
+        phase_hs: Optional[_HeatsinkPhaseState] = None,
+        bdf2_hs: bool = False,
+    ):
+        nonlocal temperature, previous_temperature, t_hs, t_hs_prev
+        nonlocal current_time, step_counter
         nonlocal total_solve_time, total_iterations, retry_count
         nonlocal max_relative_residual, pout_step, balance_integral
         if extrapolate:
             np.multiply(2.0, temperature, out=guess_workspace)
             np.subtract(guess_workspace, previous_temperature, out=guess_workspace)
-            initial_guess = guess_workspace
+            t_guess = guess_workspace
         else:
-            initial_guess = temperature
+            t_guess = temperature
+        if phase_hs is not None:
+            r_hs = phase_hs.scalar_rhs(
+                ambient, t_hs, t_hs_prev, dt_value, bdf2=bdf2_hs
+            )
+            solve_rhs = phase_hs.modified_rhs(rhs, r_hs)
+            initial_guess = phase_hs.warm_start_x1(t_guess)
+        else:
+            r_hs = 0.0
+            solve_rhs = rhs
+            initial_guess = t_guess
         solve_started = time.perf_counter()
         solution, iterations, retried, relative_residual = _solve_pcg(
             implicit_operator,
             preconditioner,
-            rhs,
+            solve_rhs,
             initial_guess,
             cancel_check=cancel_check,
         )
         elapsed = time.perf_counter() - solve_started
+        if phase_hs is not None:
+            solution, t_hs_new = phase_hs.recover(solution, r_hs)
+            t_hs_prev, t_hs = t_hs, t_hs_new
         previous_temperature, temperature = temperature, solution
         current_time += dt_value
         step_counter += 1
@@ -1574,7 +1982,9 @@ def run_simulation_matrix_free(
         total_iterations += iterations
         retry_count += int(retried)
         max_relative_residual = max(max_relative_residual, relative_residual)
-        pout_step = float(np.sum(hA * (temperature - ambient)))
+        pout_step = float(np.sum(hA * (temperature - ambient))) + (
+            heatsink_model.g_hs_amb * (t_hs - ambient) if hs_active else 0.0
+        )
         balance_integral += dt_value * (pin - pout_step)
         return elapsed, iterations
 
@@ -1611,13 +2021,50 @@ def run_simulation_matrix_free(
                     bdf_operator, bdf_preconditioner = operator.implicit_linear_operator(
                         C, 1.5 / phase_dt
                     )
+                    phase_hs_bdf = None
+                    if hs_active:
+                        phase_hs_bdf, u_rel = _HeatsinkPhaseState.prepare_pcg(
+                            heatsink_model,
+                            1.5 / phase_dt,
+                            bdf_operator,
+                            bdf_preconditioner,
+                            cancel_check=cancel_check,
+                            rtol=1e-8,
+                        )
+                        max_relative_residual = max(max_relative_residual, u_rel)
                     if Q_func is not None:
                         source = Q_func(current_time)
                         pin = float(np.sum(source))
-                    initial_derivative = (
-                        source + b - operator.dot(temperature)
-                    ) / C
-                    previous_temperature = temperature - phase_dt * initial_derivative
+                    if hs_active:
+                        g = heatsink_model.pad_conductance
+                        t_hs_0 = (
+                            t_hs
+                            if c_hs > 0.0
+                            else (
+                                heatsink_model.g_hs_amb * ambient
+                                + float(np.dot(g, temperature))
+                            )
+                            / (heatsink_model.g_hs_amb + float(np.sum(g)))
+                        )
+                        initial_derivative = (
+                            source + b + g * t_hs_0 - operator.dot(temperature)
+                        ) / C
+                        previous_temperature = (
+                            temperature - phase_dt * initial_derivative
+                        )
+                        if c_hs > 0.0:
+                            d_t_hs = (
+                                heatsink_model.g_hs_amb * (ambient - t_hs)
+                                + float(np.dot(g, temperature - t_hs))
+                            ) / c_hs
+                            t_hs_prev = t_hs - phase_dt * d_t_hs
+                    else:
+                        initial_derivative = (
+                            source + b - operator.dot(temperature)
+                        ) / C
+                        previous_temperature = (
+                            temperature - phase_dt * initial_derivative
+                        )
                     while phase_steps_done < phase_steps and not aborted and not early_stopped:
                         if cancel_check and cancel_check():
                             aborted = True
@@ -1637,6 +2084,8 @@ def run_simulation_matrix_free(
                             bdf_preconditioner,
                             phase_dt,
                             extrapolate=(phase_steps_done >= 1),
+                            phase_hs=phase_hs_bdf,
+                            bdf2_hs=True,
                         )
                         phase_solve_time += elapsed
                         phase_iterations += iterations
@@ -1676,15 +2125,46 @@ def run_simulation_matrix_free(
                 be_operator, be_preconditioner = operator.implicit_linear_operator(
                     C, 1.0 / phase_dt
                 )
-                bdf_operator, bdf_preconditioner = operator.implicit_linear_operator(
-                    C, 1.5 / phase_dt
-                )
+                phase_hs_be = None
+                if hs_active:
+                    phase_hs_be, u_rel = _HeatsinkPhaseState.prepare_pcg(
+                        heatsink_model,
+                        1.0 / phase_dt,
+                        be_operator,
+                        be_preconditioner,
+                        cancel_check=cancel_check,
+                        rtol=1e-8,
+                    )
+                    max_relative_residual = max(max_relative_residual, u_rel)
+                bdf_operator = None
+                bdf_preconditioner = None
+                phase_hs_bdf = None
+                if phase_steps > 1:
+                    bdf_operator, bdf_preconditioner = operator.implicit_linear_operator(
+                        C, 1.5 / phase_dt
+                    )
+                    if hs_active:
+                        phase_hs_bdf, u_rel = _HeatsinkPhaseState.prepare_pcg(
+                            heatsink_model,
+                            1.5 / phase_dt,
+                            bdf_operator,
+                            bdf_preconditioner,
+                            cancel_check=cancel_check,
+                            rtol=1e-8,
+                        )
+                        max_relative_residual = max(max_relative_residual, u_rel)
                 if Q_func is not None:
                     source = Q_func(current_time + phase_dt)
                     pin = float(np.sum(source))
                 rhs = derivative * temperature + source + b
                 elapsed, iterations = advance(
-                    rhs, be_operator, be_preconditioner, phase_dt, extrapolate=False
+                    rhs,
+                    be_operator,
+                    be_preconditioner,
+                    phase_dt,
+                    extrapolate=False,
+                    phase_hs=phase_hs_be,
+                    bdf2_hs=False,
                 )
                 phase_solve_time += elapsed
                 phase_iterations += iterations
@@ -1721,6 +2201,8 @@ def run_simulation_matrix_free(
                         bdf_preconditioner,
                         phase_dt,
                         extrapolate=(phase_steps_done >= 1),
+                        phase_hs=phase_hs_bdf,
+                        bdf2_hs=True,
                     )
                     phase_solve_time += elapsed
                     phase_iterations += iterations
@@ -1755,7 +2237,9 @@ def run_simulation_matrix_free(
             })
 
     final_view = temperature.reshape(layer_count, rows, cols)
-    pout_final = float(np.sum(hA * (temperature - ambient)))
+    pout_final, hs_info = _heatsink_diagnostics(
+        heatsink_model if hs_active else None, temperature, t_hs, hA, ambient
+    )
     average_solve = total_solve_time / max(step_counter, 1)
     steady_rel_diff = (
         abs(pin - pout_final) / max(abs(pin), 1e-9) if early_stopped else None
@@ -1782,6 +2266,7 @@ def run_simulation_matrix_free(
         "steady_rel_diff": steady_rel_diff,
         "early_steady_state_stop": early_stopped,
     }
+    k_norm_info.update(hs_info)
     return SolverResult(
         T=final_view,
         aborted=aborted,
@@ -1813,6 +2298,7 @@ def run_simulation(
     cancel_check: Optional[Callable[[], bool]] = None,
     factorization_cache: Optional[Any] = None,
     factorization_cache_key: Optional[str] = None,
+    heatsink_model: Optional[HeatsinkModel] = None,
 ) -> SolverResult:
     """
     Run the transient thermal simulation using BDF2 time integration.
@@ -1852,6 +2338,8 @@ def run_simulation(
         Used only by the source-independent uniform BDF2 operator.
     factorization_cache_key : str, optional
         Complete identity for the cached operator and time-step configuration.
+    heatsink_model : HeatsinkModel, optional
+        Lumped 0D dynamic heatsink model coupled via exact Sherman-Morrison.
 
     Returns
     -------
@@ -1870,12 +2358,21 @@ def run_simulation(
             cols=cols,
             progress_callback=progress_callback,
             cancel_check=cancel_check,
+            heatsink_model=heatsink_model,
         )
 
     N = K.shape[0]
     RC = rows * cols
     sim_time = config.sim_time
     amb = config.amb
+    hs_active = _validate_heatsink_model(heatsink_model, N)
+    c_hs = max(0.0, float(heatsink_model.capacity_j_k)) if hs_active else 0.0
+    t_hs = (
+        float(amb if heatsink_model.initial_temp_c is None else heatsink_model.initial_temp_c)
+        if hs_active
+        else float(amb)
+    )
+    t_hs_prev = t_hs
 
     backend = "SciPy"
     backend_modes = []
@@ -1883,9 +2380,11 @@ def run_simulation(
     # Initialize temperature
     Tn = np.ones(N, dtype=np.float64) * amb
     Tnm1 = Tn.copy()
-    e0 = float(np.sum(C * (Tn - amb)))
+    e0 = float(np.sum(C * (Tn - amb))) + (c_hs * (t_hs - amb) if hs_active else 0.0)
     balance_integral = 0.0
-    pout_step = float(np.sum(hA * (Tn - amb)))
+    pout_step = float(np.sum(hA * (Tn - amb))) + (
+        heatsink_model.g_hs_amb * (t_hs - amb) if hs_active else 0.0
+    )
     prev_snap_time = 0.0
     prev_snap_energy = e0
     Q_current = Q_func(0.0) if Q_func is not None else Q
@@ -1924,7 +2423,10 @@ def run_simulation(
             return False
         if abs(pin - pout_step) / pin >= 1e-4:
             return False
-        return float(np.max(np.abs(Tn - Tnm1))) < 1e-4
+        max_delta = float(np.max(np.abs(Tn - Tnm1)))
+        if hs_active:
+            max_delta = max(max_delta, abs(t_hs - t_hs_prev))
+        return max_delta < 1e-4
 
     def record_snapshot(t_elapsed):
         nonlocal prev_snap_time, prev_snap_energy, snap_cnt
@@ -1932,7 +2434,9 @@ def run_simulation(
         max_top = float(np.max(T_view[0]))
         max_bot = float(np.max(T_view[-1]))
         delta_t = Tn - amb
-        energy = float(np.sum(C * delta_t))
+        energy = float(np.sum(C * delta_t)) + (
+            c_hs * (t_hs - amb) if hs_active else 0.0
+        )
         dE = energy - e0
         eps_abs = abs(dE - balance_integral)
         eps_rel = eps_abs / max(abs(t_elapsed * pin), 1e-9)
@@ -1958,7 +2462,7 @@ def run_simulation(
         prev_snap_time = t_elapsed
         prev_snap_energy = energy
 
-        snapshot_stats.append({
+        snap_entry = {
             "t": t_elapsed,
             "max_top": max_top,
             "max_bottom": max_bot,
@@ -1968,7 +2472,10 @@ def run_simulation(
             "eps_abs": eps_abs,
             "eps_rel": eps_rel,
             "energy_warn": balance_warn
-        })
+        }
+        if hs_active:
+            snap_entry["heatsink_temp_c"] = float(t_hs)
+        snapshot_stats.append(snap_entry)
 
         if snapshot_callback:
             snap_path = snapshot_callback(T_view, t_elapsed, snap_cnt)
@@ -1976,17 +2483,35 @@ def run_simulation(
                 snapshot_files.append((t_elapsed, snap_path))
         snap_cnt += 1
 
-    def advance_step(rhs, solver, dt_k):
-        nonlocal Tnm1, Tn, current_time, step_counter, pout_step, balance_integral, total_solve_time
+    def advance_step(
+        rhs,
+        solver,
+        dt_k,
+        phase_hs: Optional[_HeatsinkPhaseState] = None,
+        bdf2_hs: bool = False,
+    ):
+        nonlocal Tnm1, Tn, t_hs, t_hs_prev, current_time, step_counter
+        nonlocal pout_step, balance_integral, total_solve_time
+        if phase_hs is not None:
+            r_hs = phase_hs.scalar_rhs(amb, t_hs, t_hs_prev, dt_k, bdf2=bdf2_hs)
+            solve_rhs = phase_hs.modified_rhs(rhs, r_hs)
+        else:
+            r_hs = 0.0
+            solve_rhs = rhs
         solve_start = time.perf_counter()
-        Tnp1 = solver(rhs)
+        Tnp1 = solver(solve_rhs)
         solve_elapsed = time.perf_counter() - solve_start
         total_solve_time += solve_elapsed
+        if phase_hs is not None:
+            Tnp1, t_hs_new = phase_hs.recover(Tnp1, r_hs)
+            t_hs_prev, t_hs = t_hs, t_hs_new
         Tnm1, Tn = Tn, Tnp1
         current_time += dt_k
         step_counter += 1
         delta_t = Tn - amb
-        pout_step = float(np.sum(hA * delta_t))
+        pout_step = float(np.sum(hA * delta_t)) + (
+            heatsink_model.g_hs_amb * (t_hs - amb) if hs_active else 0.0
+        )
         balance_integral += dt_k * (pin - pout_step)
         return solve_elapsed
 
@@ -2019,8 +2544,25 @@ def run_simulation(
             # This is used by Auto on large uniform direct-solver systems.
             Q_current = Q_func(current_time) if Q_func is not None else Q
             pin = float(np.sum(Q_current))
-            derivative0 = (Q_current + b - K.dot(Tn)) / C
-            Tnm1 = Tn - phase_dt * derivative0
+            if hs_active:
+                g = heatsink_model.pad_conductance
+                t_hs_0 = (
+                    t_hs
+                    if c_hs > 0.0
+                    else (heatsink_model.g_hs_amb * amb + float(np.dot(g, Tn)))
+                    / (heatsink_model.g_hs_amb + float(np.sum(g)))
+                )
+                derivative0 = (Q_current + b + g * t_hs_0 - K.dot(Tn)) / C
+                Tnm1 = Tn - phase_dt * derivative0
+                if c_hs > 0.0:
+                    d_t_hs = (
+                        heatsink_model.g_hs_amb * (amb - t_hs)
+                        + float(np.dot(g, Tn - t_hs))
+                    ) / c_hs
+                    t_hs_prev = t_hs - phase_dt * d_t_hs
+            else:
+                derivative0 = (Q_current + b - K.dot(Tn)) / C
+                Tnm1 = Tn - phase_dt * derivative0
 
             factor_cache_hit = False
             factor_cached = False
@@ -2049,6 +2591,13 @@ def run_simulation(
                         CachedLinearSolver(solve_bdf2, bdf_owner, phase_backend),
                     )
                     factor_cached = True
+            phase_hs_bdf = (
+                _HeatsinkPhaseState.prepare_direct(
+                    heatsink_model, 1.5 / phase_dt, solve_bdf2
+                )
+                if hs_active
+                else None
+            )
             backend_modes.append(phase_backend)
             phase_solve_time = 0.0
             phase_steps_done = 0
@@ -2061,7 +2610,13 @@ def run_simulation(
                     Q_current = Q_func(current_time + phase_dt)
                     pin = float(np.sum(Q_current))
                 rhs = build_bdf2_rhs(Q_current)
-                phase_solve_time += advance_step(rhs, solve_bdf2, phase_dt)
+                phase_solve_time += advance_step(
+                    rhs,
+                    solve_bdf2,
+                    phase_dt,
+                    phase_hs=phase_hs_bdf,
+                    bdf2_hs=True,
+                )
                 phase_steps_done += 1
 
                 if step_counter % update_interval == 0 or step_counter == total_steps:
@@ -2110,6 +2665,11 @@ def run_simulation(
         factor_count += 1
         backend_modes.append(be_backend)
         phase_backend = be_backend
+        phase_hs_be = (
+            _HeatsinkPhaseState.prepare_direct(heatsink_model, 1.0 / phase_dt, solve_be)
+            if hs_active
+            else None
+        )
 
         if Q_func is not None:
             Q_current = Q_func(current_time + phase_dt)
@@ -2118,7 +2678,13 @@ def run_simulation(
         rhs_workspace += Q_current
         rhs_workspace += b
         rhs1 = rhs_workspace
-        solve_elapsed = advance_step(rhs1, solve_be, phase_dt)
+        solve_elapsed = advance_step(
+            rhs1,
+            solve_be,
+            phase_dt,
+            phase_hs=phase_hs_be,
+            bdf2_hs=False,
+        )
         phase_solve_time += solve_elapsed
         phase_steps_done += 1
 
@@ -2145,6 +2711,7 @@ def run_simulation(
         # Explicitly factor the BDF2 system once and reuse that exact owner.
         solve_bdf2 = None
         bdf_owner = None
+        phase_hs_bdf = None
         if not aborted and not early_stopped and phase_step_count > 1:
             factor_start = time.perf_counter()
             solve_bdf2, bdf_owner, bdf_backend, _ = _factor_linear_system(A_bdf2)
@@ -2154,6 +2721,10 @@ def run_simulation(
             factor_count += 1
             backend_modes.append(bdf_backend)
             phase_backend = bdf_backend
+            if hs_active:
+                phase_hs_bdf = _HeatsinkPhaseState.prepare_direct(
+                    heatsink_model, 1.5 / phase_dt, solve_bdf2
+                )
 
         while not aborted and not early_stopped and phase_steps_done < phase_step_count:
             if cancel_check and cancel_check():
@@ -2163,7 +2734,13 @@ def run_simulation(
                 Q_current = Q_func(current_time + phase_dt)
                 pin = float(np.sum(Q_current))
             rhs = build_bdf2_rhs(Q_current)
-            solve_elapsed = advance_step(rhs, solve_bdf2, phase_dt)
+            solve_elapsed = advance_step(
+                rhs,
+                solve_bdf2,
+                phase_dt,
+                phase_hs=phase_hs_bdf,
+                bdf2_hs=True,
+            )
             phase_solve_time += solve_elapsed
             phase_steps_done += 1
 
@@ -2209,8 +2786,9 @@ def run_simulation(
     # Compute final statistics
     avg_solve_time = total_solve_time / max(step_counter, 1)
     T = Tn.reshape((layer_count, rows, cols))
-    delta_t_final = Tn - amb
-    pout_final = float(np.sum(hA * delta_t_final))
+    pout_final, hs_info = _heatsink_diagnostics(
+        heatsink_model if hs_active else None, Tn, t_hs, hA, amb
+    )
 
     steady_ok = early_stopped
     rel_diff = None
@@ -2249,6 +2827,7 @@ def run_simulation(
         "steady_rel_diff": rel_diff,
         "early_steady_state_stop": early_stopped,
     }
+    k_norm_info.update(hs_info)
 
     return SolverResult(
         T=T,

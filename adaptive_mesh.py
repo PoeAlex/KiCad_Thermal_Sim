@@ -14,6 +14,8 @@ import scipy.ndimage as ndi
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
+from .thermal_solver import HeatsinkModel
+
 
 @dataclass
 class AdaptiveMesh:
@@ -546,4 +548,23 @@ def build_adaptive_system(
         power=mesh.restrict_sum(power, layer_count),
         boundary_rhs=mesh.restrict_sum(boundary_rhs, layer_count),
         h_area=mesh.restrict_sum(h_area, layer_count),
+    )
+
+
+def restrict_heatsink_model(
+    heatsink_model: Optional[HeatsinkModel],
+    mesh: AdaptiveMesh,
+    layer_count: int,
+) -> Optional[HeatsinkModel]:
+    """Restrict a fine-grid HeatsinkModel conservatively onto an adaptive mesh."""
+    if heatsink_model is None:
+        return None
+    return HeatsinkModel(
+        pad_conductance=mesh.restrict_sum(
+            heatsink_model.pad_conductance, layer_count
+        ),
+        rth_kw=heatsink_model.rth_kw,
+        capacity_j_k=heatsink_model.capacity_j_k,
+        initial_temp_c=heatsink_model.initial_temp_c,
+        mode=heatsink_model.mode,
     )

@@ -938,6 +938,11 @@ class TestSteadyStatePluginWiring:
             plugin_mod, "save_preview_image", lambda *a, **k: str(tmp_path / "prev.png")
         )
         monkeypatch.setattr(
+            plugin_mod, "build_interactive_heatmap_payload", lambda *a, **k: {}
+        )
+        import webbrowser
+        monkeypatch.setattr(webbrowser, "open", lambda *a, **k: True)
+        monkeypatch.setattr(
             plugin_mod, "write_html_report", lambda *a, **k: str(tmp_path / "rep.html")
         )
 
@@ -1073,6 +1078,11 @@ class TestSteadyStatePluginWiring:
             plugin_mod, "save_preview_image", lambda *a, **k: str(tmp_path / "prev.png")
         )
         monkeypatch.setattr(
+            plugin_mod, "build_interactive_heatmap_payload", lambda *a, **k: {}
+        )
+        import webbrowser
+        monkeypatch.setattr(webbrowser, "open", lambda *a, **k: True)
+        monkeypatch.setattr(
             plugin_mod, "write_html_report", lambda *a, **k: str(tmp_path / "rep.html")
         )
 
@@ -1105,3 +1115,265 @@ class TestSteadyStatePluginWiring:
         assert len(captured_configs) == 2
         assert captured_configs[0]["steady_state"] is True
         assert captured_configs[1]["steady_state"] is True
+
+
+class TestDynamicHeatsinkPluginWiring:
+    """Tests for dynamic 0D heatsink cache keys, model restriction, and metadata."""
+
+    def test_operator_and_factorization_keys_invalidate_on_heatsink_settings(self):
+        from ThermalSim.thermal_plugin import (
+            _build_factorization_cache_key,
+            _build_operator_cache_key,
+        )
+        from ThermalSim.thermal_solver import SolverConfig
+
+        cfg = SolverConfig(sim_time=20.0, amb=25.0, dt_base=0.25, steps_target=80)
+        base_settings = {
+            "h_conv": 10.0,
+            "pad_th": 1.0,
+            "pad_k": 3.0,
+            "pad_cap_areal": 0.0,
+            "pad_sink_mode": "fixed",
+            "pad_contact_factor": 0.2,
+            "pad_sink_temp_use_ambient": True,
+            "pad_sink_temp_c": 25.0,
+            "heatsink_rth_kw": 5.0,
+            "heatsink_material": "aluminium",
+            "heatsink_mass_g": 50.0,
+            "heatsink_cp_j_kgk": 897.0,
+        }
+
+        op_base = _build_operator_cache_key(
+            "geom", "legacy", [3.5e-5, 3.5e-5], [1.5e-3], [7.5e-4, 7.5e-4], 5e-4, 25.0, base_settings
+        )
+        fac_base = _build_factorization_cache_key(op_base, cfg, False, base_settings)
+
+        for key, new_val in (
+            ("pad_sink_mode", "heatsink"),
+            ("pad_contact_factor", 0.5),
+            ("pad_sink_temp_use_ambient", False),
+            ("pad_sink_temp_c", 40.0),
+        ):
+            mod = {**base_settings, key: new_val}
+            op_mod = _build_operator_cache_key(
+                "geom", "legacy", [3.5e-5, 3.5e-5], [1.5e-3], [7.5e-4, 7.5e-4], 5e-4, 25.0, mod
+            )
+            assert op_mod != op_base, f"operator_key did not change for {key}"
+            assert _build_factorization_cache_key(op_mod, cfg, False, mod) != fac_base
+
+        # Changing 0D heatsink parameters keeps PCB operator_key unchanged but invalidates factorization_cache_key
+        for key, new_val in (
+            ("heatsink_rth_kw", 2.5),
+            ("heatsink_mass_g", 100.0),
+            ("heatsink_material", "copper"),
+        ):
+            mod = {**base_settings, key: new_val}
+            op_mod = _build_operator_cache_key(
+                "geom", "legacy", [3.5e-5, 3.5e-5], [1.5e-3], [7.5e-4, 7.5e-4], 5e-4, 25.0, mod
+            )
+            assert op_mod == op_base
+            assert _build_factorization_cache_key(op_mod, cfg, False, mod) != fac_base
+
+    def _run_plugin_with_heatsink(
+        self, tmp_path, monkeypatch, settings_overrides, with_eco1=True
+    ):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_plugin import ThermalPlugin
+        from ThermalSim.thermal_solver import SolverResult
+
+        pad = MockPad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(4_500_000, 4_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        drawings = (
+            [MockDrawing(layer=Eco1_User, bbox=EDA_RECT(2_000_000, 2_000_000, 6_000_000, 6_000_000))]
+            if with_eco1
+            else []
+        )
+        board = MockBoard(
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+            footprints=[MockFootprint("U1", [pad])],
+            drawings=drawings,
+        )
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        desc = plugin._pad_descriptor(board, "U1", pad)
+
+        recorded = {
+            "build_calls": [],
+            "restrict_calls": [],
+            "mf_kwargs": [],
+            "legacy_kwargs": [],
+            "report_k_norm": [],
+        }
+
+        def fake_build_heatsink_model(layer_count, rows, cols, dx, dy, H_map, settings, amb):
+            recorded["build_calls"].append((layer_count, rows, cols, bool(np.any(H_map))))
+            if settings.get("use_heatsink") and settings.get("pad_sink_mode") == "heatsink" and np.any(H_map):
+                return {"kind": "full_heatsink_model", "nodes": layer_count * rows * cols}
+            return None
+
+        def fake_restrict_heatsink_model(model, mesh, layer_count):
+            recorded["restrict_calls"].append(layer_count)
+            return {"kind": "restricted_heatsink_model", "parent": model}
+
+        def fake_mf_solver(
+            config, solver_op, solver_cap, solver_q, solver_b, solver_hA,
+            progress_cb, snap_cb, **kwargs
+        ):
+            recorded["mf_kwargs"].append(kwargs)
+            n_nodes = solver_cap.shape[0]
+            if hasattr(solver_op, "layer_count"):
+                T_out = np.full((solver_op.layer_count, solver_op.rows, solver_op.cols), 45.0)
+            else:
+                T_out = np.full(n_nodes, 45.0)
+            return SolverResult(
+                T=T_out,
+                aborted=False,
+                step_counter=1,
+                total_solve_time=0.01,
+                total_factor_time=0.01,
+                factor_count=1,
+                snapshot_stats=[],
+                snapshot_files=[],
+                phase_metrics=[],
+                balance_history=[],
+                k_norm_info={},
+            )
+
+        def fake_legacy_solver(
+            config, K, C, Q, b, hA, layer_count, rows, cols, *args, **kwargs
+        ):
+            recorded["legacy_kwargs"].append(kwargs)
+            return SolverResult(
+                T=np.full((layer_count, rows, cols), 45.0),
+                aborted=False,
+                step_counter=1,
+                total_solve_time=0.01,
+                total_factor_time=0.01,
+                factor_count=1,
+                snapshot_stats=[],
+                snapshot_files=[],
+                phase_metrics=[],
+                balance_history=[],
+                k_norm_info={},
+            )
+
+        class DummyProgressDialog:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def Update(self, value, newmsg=""):
+                return (True, False)
+
+            def WasCancelled(self):
+                return False
+
+            def Hide(self):
+                pass
+
+            def Destroy(self):
+                pass
+
+        monkeypatch.setattr(plugin_mod, "build_heatsink_model", fake_build_heatsink_model)
+        monkeypatch.setattr(plugin_mod, "restrict_heatsink_model", fake_restrict_heatsink_model)
+        monkeypatch.setattr(plugin_mod, "run_simulation_matrix_free", fake_mf_solver)
+        monkeypatch.setattr(plugin_mod, "run_simulation", fake_legacy_solver)
+        monkeypatch.setattr(plugin_mod.wx, "ProgressDialog", DummyProgressDialog, raising=False)
+        monkeypatch.setattr(plugin_mod.wx, "GetApp", lambda: None, raising=False)
+        monkeypatch.setattr(
+            plugin_mod, "show_results_all_layers", lambda *a, **k: str(tmp_path / "hm.png")
+        )
+        monkeypatch.setattr(
+            plugin_mod, "save_preview_image", lambda *a, **k: str(tmp_path / "prev.png")
+        )
+        monkeypatch.setattr(
+            plugin_mod, "build_interactive_heatmap_payload", lambda *a, **k: {}
+        )
+        import webbrowser
+        monkeypatch.setattr(webbrowser, "open", lambda *a, **k: True)
+
+        def fake_write_report(*args, **kwargs):
+            recorded["report_k_norm"].append(dict(kwargs.get("k_norm_info", {})))
+            return str(tmp_path / "rep.html")
+
+        monkeypatch.setattr(plugin_mod, "write_html_report", fake_write_report)
+
+        settings = {
+            "res": 2.0,
+            "time": 20.0,
+            "amb": 25.0,
+            "thick": 1.6,
+            "h_conv": 10.0,
+            "use_heatsink": True,
+            "pad_th": 1.0,
+            "pad_k": 3.0,
+            "pad_contact_factor": 0.6,
+            "pad_sink_mode": "heatsink",
+            "heatsink_rth_kw": 3.0,
+            "heatsink_material": "aluminium",
+            "heatsink_mass_g": 100.0,
+            "heatsink_cp_j_kgk": 897.0,
+            "show_all": True,
+            "snapshots": False,
+            "steady_state": True,
+            "output_dir": str(tmp_path),
+            "power_pads": [{**desc, "power": "2.0"}],
+            **settings_overrides,
+        }
+        plugin._run_simulation(
+            board,
+            [F_Cu, B_Cu],
+            ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad],
+            settings,
+            {},
+            ["U1-1"],
+        )
+        return recorded
+
+    def test_heatsink_model_wiring_uniform_adaptive_legacy_and_metadata(self, tmp_path, monkeypatch):
+        # Uniform matrix-free passes full heatsink_model without restricting
+        rec_uniform = self._run_plugin_with_heatsink(
+            tmp_path, monkeypatch, {"compute_engine": "fast_native", "mesh_mode": "uniform"}
+        )
+        assert len(rec_uniform["build_calls"]) == 1
+        assert rec_uniform["restrict_calls"] == []
+        assert rec_uniform["mf_kwargs"][0]["heatsink_model"]["kind"] == "full_heatsink_model"
+
+        # Adaptive matrix-free restricts heatsink_model
+        rec_adaptive = self._run_plugin_with_heatsink(
+            tmp_path, monkeypatch, {"compute_engine": "fast_native", "mesh_mode": "adaptive"}
+        )
+        assert len(rec_adaptive["build_calls"]) == 1
+        assert len(rec_adaptive["restrict_calls"]) == 1
+        assert rec_adaptive["mf_kwargs"][0]["heatsink_model"]["kind"] == "restricted_heatsink_model"
+
+        # Legacy sparse path passes full heatsink_model
+        rec_legacy = self._run_plugin_with_heatsink(
+            tmp_path, monkeypatch, {"compute_engine": "legacy"}
+        )
+        assert rec_legacy["legacy_kwargs"][0]["heatsink_model"]["kind"] == "full_heatsink_model"
+
+        # Fixed mode records heatsink_mode='fixed' and pad_contact_factor, omits heatsink_model kwarg
+        rec_fixed = self._run_plugin_with_heatsink(
+            tmp_path, monkeypatch, {"compute_engine": "legacy", "pad_sink_mode": "fixed", "pad_contact_factor": 0.4}
+        )
+        assert "heatsink_model" not in rec_fixed["legacy_kwargs"][0]
+        assert rec_fixed["report_k_norm"][0]["heatsink_mode"] == "fixed"
+        assert rec_fixed["report_k_norm"][0]["pad_contact_factor"] == 0.4
+
+        # Dynamic heatsink mode without User.Eco1 shapes records inactive reason
+        rec_no_eco = self._run_plugin_with_heatsink(
+            tmp_path, monkeypatch, {"compute_engine": "legacy", "pad_sink_mode": "heatsink"}, with_eco1=False
+        )
+        assert "heatsink_model" not in rec_no_eco["legacy_kwargs"][0]
+        info = rec_no_eco["report_k_norm"][0]
+        assert info["heatsink_enabled"] is False
+        assert info["heatsink_mode"] == "heatsink"
+        assert info["heatsink_inactive_reason"] == "No User.Eco1 thermal pad shapes found on board"
