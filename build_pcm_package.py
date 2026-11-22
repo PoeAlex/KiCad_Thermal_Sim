@@ -17,7 +17,7 @@ import os
 import sys
 import zipfile
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 IDENTIFIER = "com.github.poealex.kicad-thermal-sim"
 
@@ -80,7 +80,8 @@ def build_metadata(version):
             "- DC current-flow Joule heating in traces, vias, and zones\n"
             "- Auto, Uniform, and Adaptive spatial meshing up to 100M nodes\n"
             "- Piecewise-linear (PWL) time-varying power profiles\n"
-            "- Heatsink/thermal-pad support (User.Eco1 layer)\n"
+            "- Heatsink/thermal-pad support (User.Eco1 layer) with fixed sink "
+            "or dynamic 0D heatsink (R_th + thermal mass)\n"
             "- Compressed .npz geometry caching and HTML report with "
             "hotspot-preserving interactive heatmaps\n\n"
             "Requires: numpy, scipy, matplotlib (auto-install dialog included)"
