@@ -619,10 +619,19 @@ class TestGridCoarsening:
         assert plugin_mod._resolve_mesh_mode({"mesh_mode": "uniform"}, True, 1_000_000) == "uniform"
 
     def test_estimate_solver_cost_reflects_native_mg_and_ignores_legacy_backend(self, monkeypatch):
-        """Native MG cost model uses calibrated RAM/runtime thresholds and ignores legacy backend."""
+        """Native compact/MG cost models use calibrated RAM/runtime thresholds and ignore legacy backend."""
         import ThermalSim.thermal_plugin as plugin_mod
 
         monkeypatch.setattr(plugin_mod, "HAS_NATIVE_MG", True)
+        monkeypatch.setattr(plugin_mod, "HAS_NATIVE_COMPACT", True)
+        c_low, c_high, c_rt = plugin_mod._estimate_solver_cost(
+            3_000_000, {"compute_engine": "auto"}
+        )
+        assert c_low == 150
+        assert c_high == 300
+        assert c_rt == "Slow"
+
+        monkeypatch.setattr(plugin_mod, "HAS_NATIVE_COMPACT", False)
         low, high, runtime = plugin_mod._estimate_solver_cost(
             3_000_000, {"compute_engine": "auto"}
         )
@@ -1226,7 +1235,7 @@ class TestDynamicHeatsinkPluginWiring:
             progress_cb, snap_cb, **kwargs
         ):
             recorded["mf_kwargs"].append(kwargs)
-            n_nodes = solver_cap.shape[0]
+            n_nodes = solver_op.shape[0] if solver_cap is None else solver_cap.shape[0]
             if hasattr(solver_op, "layer_count"):
                 T_out = np.full((solver_op.layer_count, solver_op.rows, solver_op.cols), 45.0)
             else:
@@ -1377,3 +1386,364 @@ class TestDynamicHeatsinkPluginWiring:
         assert info["heatsink_enabled"] is False
         assert info["heatsink_mode"] == "heatsink"
         assert info["heatsink_inactive_reason"] == "No User.Eco1 thermal pad shapes found on board"
+
+
+class TestCompactLowRamPluginWiring:
+    """Tests for zero-peak compact operator, direct adaptive, cleanup, and fallback wiring."""
+
+    def _setup_plugin_env(self, tmp_path, monkeypatch, with_eco1=True):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        pad = MockPad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(4_500_000, 4_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        drawings = (
+            [MockDrawing(layer=Eco1_User, bbox=EDA_RECT(2_000_000, 2_000_000, 6_000_000, 6_000_000))]
+            if with_eco1
+            else []
+        )
+        board = MockBoard(
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+            footprints=[MockFootprint("U1", [pad])],
+            drawings=drawings,
+        )
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        desc = plugin._pad_descriptor(board, "U1", pad)
+
+        class DummyProgressDialog:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def Update(self, value, newmsg=""):
+                return (True, False)
+
+            def WasCancelled(self):
+                return False
+
+            def Hide(self):
+                pass
+
+            def Destroy(self):
+                pass
+
+        monkeypatch.setattr(plugin_mod.wx, "ProgressDialog", DummyProgressDialog, raising=False)
+        monkeypatch.setattr(plugin_mod.wx, "GetApp", lambda: None, raising=False)
+        monkeypatch.setattr(
+            plugin_mod, "show_results_all_layers", lambda *a, **k: str(tmp_path / "hm.png")
+        )
+        monkeypatch.setattr(
+            plugin_mod, "save_preview_image", lambda *a, **k: str(tmp_path / "prev.png")
+        )
+        monkeypatch.setattr(
+            plugin_mod, "build_interactive_heatmap_payload", lambda *a, **k: {}
+        )
+        import webbrowser
+        monkeypatch.setattr(webbrowser, "open", lambda *a, **k: True)
+        monkeypatch.setattr(
+            plugin_mod, "write_html_report", lambda *a, **k: str(tmp_path / "rep.html")
+        )
+
+        base_settings = {
+            "res": 2.0,
+            "time": 20.0,
+            "amb": 25.0,
+            "thick": 1.6,
+            "h_conv": 10.0,
+            "use_heatsink": with_eco1,
+            "pad_th": 1.0,
+            "pad_k": 3.0,
+            "pad_contact_factor": 0.6,
+            "pad_sink_mode": "heatsink" if with_eco1 else "fixed",
+            "heatsink_rth_kw": 3.0,
+            "heatsink_mass_g": 100.0,
+            "heatsink_cp_j_kgk": 897.0,
+            "show_all": True,
+            "snapshots": False,
+            "steady_state": True,
+            "output_dir": str(tmp_path),
+            "power_pads": [{**desc, "power": "2.0"}],
+        }
+        return plugin, board, pad, base_settings
+
+    def test_uniform_fast_native_uses_compact_operator_sparse_power_and_cleans_up(
+        self, tmp_path, monkeypatch
+    ):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_solver import (
+            CompactStructuredThermalOperator,
+            SolverResult,
+            SparsePowerVector,
+        )
+
+        plugin, board, pad, settings = self._setup_plugin_env(tmp_path, monkeypatch, with_eco1=True)
+        settings["compute_engine"] = "fast_native"
+        settings["mesh_mode"] = "uniform"
+
+        recorded = {"mf_args": [], "scratch_clears": 0, "op_cache_clears": 0}
+        orig_clear_caches = CompactStructuredThermalOperator.clear_caches
+
+        def spy_clear_caches(self_op):
+            recorded["op_cache_clears"] += 1
+            return orig_clear_caches(self_op)
+
+        def spy_clear_scratch():
+            recorded["scratch_clears"] += 1
+
+        def forbid_structured(*args, **kwargs):
+            raise AssertionError("build_structured_operator must not be called on compact path")
+
+        def spy_mf_solver(config, op, C, Q, b, hA, *args, **kwargs):
+            recorded["mf_args"].append((op, C, Q, b, hA, kwargs.get("heatsink_model")))
+            return SolverResult(
+                T=np.full((op.layer_count, op.rows, op.cols), 40.0),
+                k_norm_info={},
+                step_counter=1,
+                total_solve_time=0.01,
+                total_factor_time=0.0,
+                factor_count=0,
+            )
+
+        monkeypatch.setattr(CompactStructuredThermalOperator, "clear_caches", spy_clear_caches)
+        monkeypatch.setattr(plugin_mod, "clear_native_scratch", spy_clear_scratch)
+        monkeypatch.setattr(plugin_mod, "run_simulation_matrix_free", spy_mf_solver)
+        # Keep _ORIG_BUILD_STRUCTURED_OPERATOR check satisfied while verifying build_structured_operator isn't called
+        monkeypatch.setattr(plugin_mod, "build_structured_operator", forbid_structured)
+        monkeypatch.setattr(plugin_mod, "_ORIG_BUILD_STRUCTURED_OPERATOR", forbid_structured)
+
+        plugin._run_simulation(
+            board,
+            [F_Cu, B_Cu],
+            ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad],
+            settings,
+            {},
+            ["U1-1"],
+        )
+
+        assert len(recorded["mf_args"]) == 1
+        op, C, Q, b, hA, hs_model = recorded["mf_args"][0]
+        assert isinstance(op, CompactStructuredThermalOperator)
+        assert C is None
+        assert b is None
+        assert hA is None
+        assert isinstance(Q, SparsePowerVector)
+        assert np.isclose(Q.total_power(), 2.0)
+        assert hs_model is not None
+        assert hs_model.bottom_layer_only is True
+        assert recorded["op_cache_clears"] == 1
+        assert recorded["scratch_clears"] == 1
+
+    def test_adaptive_fast_native_uses_direct_compact_assembly_and_never_builds_fine_operator(
+        self, tmp_path, monkeypatch
+    ):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.adaptive_mesh import AdaptiveSparseOperator
+        from ThermalSim.thermal_solver import SolverResult, SparsePowerVector
+
+        plugin, board, pad, settings = self._setup_plugin_env(tmp_path, monkeypatch, with_eco1=True)
+        settings["compute_engine"] = "fast_native"
+        settings["mesh_mode"] = "adaptive"
+
+        recorded = {
+            "compact_adaptive_power": [],
+            "mf_hs": [],
+            "op_cache_clears": 0,
+            "scratch_clears": 0,
+        }
+        orig_compact_adaptive = plugin_mod.build_adaptive_system_compact
+        orig_ad_clear = AdaptiveSparseOperator.clear_caches
+
+        def spy_build_adaptive_compact(*args, **kwargs):
+            recorded["compact_adaptive_power"].append(args[16])
+            return orig_compact_adaptive(*args, **kwargs)
+
+        def spy_ad_clear(self_op):
+            recorded["op_cache_clears"] += 1
+            return orig_ad_clear(self_op)
+
+        def forbid_structured(*args, **kwargs):
+            raise AssertionError("build_structured_operator must not be called in compact adaptive mode")
+
+        def spy_mf_solver(config, op, C, Q, b, hA, *args, **kwargs):
+            recorded["mf_hs"].append(kwargs.get("heatsink_model"))
+            return SolverResult(
+                T=np.full(op.shape[0], 40.0),
+                k_norm_info={},
+                step_counter=1,
+                total_solve_time=0.01,
+                total_factor_time=0.0,
+                factor_count=0,
+            )
+
+        monkeypatch.setattr(plugin_mod, "build_adaptive_system_compact", spy_build_adaptive_compact)
+        monkeypatch.setattr(AdaptiveSparseOperator, "clear_caches", spy_ad_clear)
+        monkeypatch.setattr(plugin_mod, "clear_native_scratch", lambda: recorded.__setitem__("scratch_clears", recorded["scratch_clears"] + 1))
+        monkeypatch.setattr(plugin_mod, "run_simulation_matrix_free", spy_mf_solver)
+        monkeypatch.setattr(plugin_mod, "build_structured_operator", forbid_structured)
+        monkeypatch.setattr(plugin_mod, "_ORIG_BUILD_STRUCTURED_OPERATOR", forbid_structured)
+
+        plugin._run_simulation(
+            board,
+            [F_Cu, B_Cu],
+            ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad],
+            settings,
+            {},
+            ["U1-1"],
+        )
+
+        assert len(recorded["compact_adaptive_power"]) == 1
+        assert isinstance(recorded["compact_adaptive_power"][0], SparsePowerVector)
+        assert recorded["mf_hs"][0] is not None
+        assert recorded["mf_hs"][0].bottom_layer_only is True
+        assert recorded["op_cache_clears"] == 1
+        assert recorded["scratch_clears"] == 1
+
+    def test_compact_uniform_falls_back_lazily_to_legacy_when_fast_solver_raises(
+        self, tmp_path, monkeypatch
+    ):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_solver import SolverResult
+
+        plugin, board, pad, settings = self._setup_plugin_env(tmp_path, monkeypatch, with_eco1=True)
+        settings["compute_engine"] = "fast_native"
+        settings["mesh_mode"] = "uniform"
+
+        recorded = {"legacy_calls": [], "scratch_clears": 0}
+
+        def failing_mf(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        def spy_legacy(config, K, C, Q, b, hA, layer_count, rows, cols, *args, **kwargs):
+            recorded["legacy_calls"].append((C, Q, kwargs.get("heatsink_model")))
+            return SolverResult(
+                T=np.full((layer_count, rows, cols), 42.0),
+                k_norm_info={},
+                step_counter=1,
+                total_solve_time=0.01,
+                total_factor_time=0.01,
+                factor_count=1,
+            )
+
+        monkeypatch.setattr(plugin_mod, "run_simulation_matrix_free", failing_mf)
+        monkeypatch.setattr(plugin_mod, "run_simulation", spy_legacy)
+        monkeypatch.setattr(
+            plugin_mod,
+            "clear_native_scratch",
+            lambda: recorded.__setitem__("scratch_clears", recorded["scratch_clears"] + 1),
+        )
+
+        plugin._run_simulation(
+            board,
+            [F_Cu, B_Cu],
+            ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad],
+            settings,
+            {},
+            ["U1-1"],
+        )
+
+        assert len(recorded["legacy_calls"]) == 1
+        C_fb, Q_fb, hs_fb = recorded["legacy_calls"][0]
+        assert isinstance(C_fb, np.ndarray)
+        assert isinstance(Q_fb, np.ndarray)
+        assert np.isclose(np.sum(Q_fb), 2.0)
+        assert hs_fb is not None
+        assert hs_fb.bottom_layer_only is False
+        assert recorded["scratch_clears"] == 1
+
+    def test_dialog_close_callback_clears_in_memory_caches_only(self, tmp_path, monkeypatch):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_plugin import ThermalPlugin
+        from ThermalSim.workflow import GeometryCache
+
+        disk_dir = tmp_path / "geom_cache"
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        plugin.geometry_cache = GeometryCache(persistent=True, cache_dir=str(disk_dir))
+
+        pad = MockPad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(4_500_000, 4_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        board = MockBoard(
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+            footprints=[MockFootprint("U1", [pad])],
+        )
+        # Seed in-memory + disk geometry cache and in-memory operator/factorization/electrical caches
+        from ThermalSim.geometry_mapper import build_geometry_state
+        state = build_geometry_state(
+            board=board,
+            copper_ids=[F_Cu, B_Cu],
+            rows=4,
+            cols=4,
+            x_min=0.0,
+            y_min=0.0,
+            res=1.0,
+            settings={"ignore_traces": False, "ignore_polygons": False, "use_heatsink": False},
+            via_factor=1300.0,
+            pads_list=[pad],
+        )
+        plugin.geometry_cache.put("geom-key", state)
+        npz_files_before = list(disk_dir.glob("*.npz"))
+        assert len(npz_files_before) == 1
+
+        plugin.operator_cache.put("op-key", ("op",))
+        plugin.electrical_cache.put("el-key", ("el",))
+        released = []
+
+        class DummyFac:
+            def release(self):
+                released.append(True)
+
+        plugin.factorization_cache.put("fac-key", DummyFac())
+
+        captured = {}
+
+        class DummyDialog:
+            def __init__(self, *args, **kwargs):
+                captured["close_callback"] = kwargs["close_callback"]
+
+            def Show(self):
+                pass
+
+        monkeypatch.setattr(plugin_mod.pcbnew, "GetBoard", lambda: board, raising=False)
+        monkeypatch.setattr(plugin_mod, "_find_pcb_editor_parent", lambda _b=None: None)
+        monkeypatch.setattr(plugin_mod, "SettingsDialog", DummyDialog)
+        monkeypatch.setattr(plugin_mod, "parse_stackup_from_board_file", lambda *a, **k: {})
+        monkeypatch.setattr(plugin, "_show_startup_progress", lambda *a, **k: None)
+        monkeypatch.setattr(plugin, "_close_startup_progress", lambda *a, **k: None)
+        monkeypatch.setattr(plugin, "_load_settings", lambda *a, **k: {})
+        monkeypatch.setattr(plugin, "_detect_copper_layers", lambda _b: ([F_Cu, B_Cu], ["F.Cu", "B.Cu"]))
+        monkeypatch.setattr(board, "GetBoundingBox", lambda: EDA_RECT(0, 0, 10_000_000, 10_000_000), raising=False)
+
+        plugin.Run()
+        assert plugin.settings_dialog is not None
+
+        captured["close_callback"]()
+        assert plugin.settings_dialog is None
+        assert plugin.operator_cache.key is None
+        assert plugin.operator_cache.value is None
+        assert plugin.electrical_cache.key is None
+        assert plugin.electrical_cache.value is None
+        assert plugin.factorization_cache.key is None
+        assert plugin.factorization_cache.value is None
+        assert released == [True]
+        assert plugin.geometry_cache.key is None
+        assert plugin.geometry_cache.value is None
+        # Disk .npz cache file must remain intact
+        assert list(disk_dir.glob("*.npz")) == npz_files_before

@@ -294,9 +294,13 @@ _MG_SHAPES = [
 
 
 @pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
-def test_compiled_core_reports_v2_and_mg_support(compiled_native_core):
-    assert compiled_native_core.version == 2
+def test_compiled_core_reports_v3_and_compact_support(compiled_native_core):
+    assert compiled_native_core.version == 3
     assert compiled_native_core.has_mg is True
+    assert compiled_native_core.has_compact is True
+    assert native_core.HAS_NATIVE_CORE is True
+    assert native_core.HAS_NATIVE_MG is True
+    assert native_core.HAS_NATIVE_COMPACT is True
 
 
 @pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
@@ -514,6 +518,7 @@ def test_v1_library_loads_cleanly_with_mg_fallback(tmp_path, monkeypatch):
     v1_core = native_core.NativeCore(v1_so)
     assert v1_core.version == 1
     assert v1_core.has_mg is False
+    assert v1_core.has_compact is False
 
     empty = np.empty(0, dtype=np.float64)
     out = v1_core.apply_structured(
@@ -537,3 +542,521 @@ def test_v1_library_loads_cleanly_with_mg_fallback(tmp_path, monkeypatch):
     fine = np.zeros(1, dtype=np.float64)
     assert native_core.prolong_add_2x2_native(1, 1, 1, np.ones(1), fine) is False
     np.testing.assert_array_equal(fine, np.zeros(1))
+
+    # v3 compact/f32 helpers also cleanly fall back on v1 libraries.
+    u8_one = np.ones(1, dtype=np.uint8)
+    f32_one = np.ones(1, dtype=np.float32)
+    lut3 = np.ones(3, dtype=np.float64)
+    lut2 = np.ones(2, dtype=np.float64)
+    assert (
+        native_core.apply_compact_native(
+            1, 1, 1, u8_one, None, u8_one, lut3, lut3, None, lut2, 0.1, 0.2, 0.3, 0.4, 1.0, np.ones(1)
+        )
+        is None
+    )
+    assert (
+        native_core.damped_jacobi_compact_f32_native(
+            1, 1, 1, u8_one, None, u8_one, lut3, lut3, None, lut2, 0.1, 0.2, 0.3, 0.4, 1.0, 0.7, f32_one, None, 2, zero_init=True
+        )
+        is None
+    )
+    assert (
+        native_core.residual_restrict_2x2_compact_f32_native(
+            1, 1, 1, u8_one, None, u8_one, lut3, lut3, None, lut2, 0.1, 0.2, 0.3, 0.4, 1.0, f32_one, f32_one
+        )
+        is None
+    )
+    assert (
+        native_core.coarsen_compact_to_f32_native(
+            1, 1, 1, u8_one, None, u8_one, lut3, lut3, None, lut2, 0.1, 0.2, 0.3, 0.4
+        )
+        is None
+    )
+    empty_f32 = np.empty(0, dtype=np.float32)
+    assert (
+        native_core.damped_jacobi_f32_native(
+            1, 1, 1, empty_f32, empty_f32, empty_f32, f32_one, f32_one, f32_one, None, 2, zero_init=True
+        )
+        is None
+    )
+    assert (
+        native_core.residual_restrict_2x2_f32_native(
+            1, 1, 1, empty_f32, empty_f32, empty_f32, f32_one, f32_one, f32_one
+        )
+        is None
+    )
+    fine_f32 = np.zeros(1, dtype=np.float32)
+    assert native_core.prolong_add_2x2_f32_native(1, 1, 1, f32_one, fine_f32) is False
+    np.testing.assert_array_equal(fine_f32, np.zeros(1, dtype=np.float32))
+
+
+def _make_compact_problem(layer_count, rows, cols, seed, with_hs=True, with_vias=True):
+    rng = np.random.default_rng(seed)
+    copper_mask = (rng.random((layer_count, rows, cols)) > 0.45).astype(np.uint8)
+    if with_hs:
+        hs_mask = (rng.random((rows, cols)) > 0.6).astype(np.uint8)
+    else:
+        hs_mask = np.zeros((rows, cols), dtype=np.uint8)
+
+    if layer_count > 1:
+        if with_vias:
+            via_enh = rng.uniform(1.0, 50.0, size=(rows, cols)).astype(np.float32)
+        else:
+            via_enh = np.ones((rows, cols), dtype=np.float32)
+        gz_scale = rng.uniform(0.02, 0.5, size=layer_count - 1).astype(np.float64)
+    else:
+        via_enh = None
+        gz_scale = None
+
+    gx_lut = np.empty(layer_count * 3, dtype=np.float64)
+    gy_lut = np.empty(layer_count * 3, dtype=np.float64)
+    cap_lut = np.empty(layer_count * 2, dtype=np.float64)
+    for layer in range(layer_count):
+        base_x = rng.uniform(0.05, 0.4)
+        base_y = rng.uniform(0.05, 0.4)
+        gx_lut[layer * 3 : layer * 3 + 3] = [base_x, base_x * 2.5, base_x * 12.0]
+        gy_lut[layer * 3 : layer * 3 + 3] = [base_y, base_y * 2.5, base_y * 12.0]
+        cap_fr4 = rng.uniform(0.01, 0.05)
+        cap_lut[layer * 2 : layer * 2 + 2] = [cap_fr4, cap_fr4 + rng.uniform(0.02, 0.08)]
+
+    pad_cap_cell = float(rng.uniform(0.01, 0.2))
+    top_diag = float(rng.uniform(0.005, 0.05))
+    bot_air_diag = float(rng.uniform(0.005, 0.05))
+    bot_pad_diag = float(rng.uniform(0.05, 0.5))
+    return (
+        copper_mask,
+        via_enh,
+        hs_mask,
+        gx_lut,
+        gy_lut,
+        gz_scale,
+        cap_lut,
+        pad_cap_cell,
+        top_diag,
+        bot_air_diag,
+        bot_pad_diag,
+    )
+
+
+def _expand_compact_to_reference(
+    layer_count,
+    rows,
+    cols,
+    copper_mask,
+    via_enh,
+    hs_mask,
+    gx_lut,
+    gy_lut,
+    gz_scale,
+    cap_lut,
+    pad_cap_cell,
+    top_diag,
+    bot_air_diag,
+    bot_pad_diag,
+):
+    cm = copper_mask.astype(np.int64)
+    hs = hs_mask.astype(bool)
+
+    gx = np.empty((layer_count, rows, max(cols - 1, 0)), dtype=np.float64)
+    gy = np.empty((layer_count, max(rows - 1, 0), cols), dtype=np.float64)
+    for layer in range(layer_count):
+        if cols > 1:
+            gx[layer] = gx_lut[layer * 3 + cm[layer, :, :-1] + cm[layer, :, 1:]]
+        if rows > 1:
+            gy[layer] = gy_lut[layer * 3 + cm[layer, :-1, :] + cm[layer, 1:, :]]
+
+    if layer_count > 1:
+        gz = gz_scale[:, None, None] * via_enh.astype(np.float64)[None, :, :]
+    else:
+        gz = np.empty((0, rows, cols), dtype=np.float64)
+
+    boundary_3d = np.zeros((layer_count, rows, cols), dtype=np.float64)
+    boundary_3d[0, :, :] += top_diag
+    boundary_3d[layer_count - 1, :, :] += np.where(hs, bot_pad_diag, bot_air_diag)
+
+    cap_3d = np.empty((layer_count, rows, cols), dtype=np.float64)
+    for layer in range(layer_count):
+        cap_3d[layer] = cap_lut[layer * 2 + cm[layer]]
+    cap_3d[layer_count - 1, hs] += pad_cap_cell
+
+    return gx, gy, gz, boundary_3d.reshape(-1), cap_3d.reshape(-1)
+
+
+_COMPACT_SHAPES = [
+    (1, 1, 1),
+    (1, 1, 5),
+    (1, 5, 1),
+    (1, 7, 9),
+    (1, 8, 10),
+    (4, 1, 1),
+    (4, 7, 9),
+    (4, 16, 18),
+    (4, 33, 35),
+]
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+@pytest.mark.parametrize("layer_count,rows,cols", _COMPACT_SHAPES)
+@pytest.mark.parametrize("scale", [0.0, 2.5])
+@pytest.mark.parametrize("with_hs,with_vias", [(True, True), (False, False)])
+def test_compiled_apply_compact_matches_reference(
+    compiled_native_core, monkeypatch, layer_count, rows, cols, scale, with_hs, with_vias
+):
+    params = _make_compact_problem(
+        layer_count,
+        rows,
+        cols,
+        seed=500 + layer_count * 100 + rows * 7 + cols,
+        with_hs=with_hs,
+        with_vias=with_vias,
+    )
+    gx, gy, gz, boundary, cap = _expand_compact_to_reference(
+        layer_count, rows, cols, *params
+    )
+    diag_mass = boundary + scale * cap
+    rng = np.random.default_rng(77 + layer_count * 31 + rows * 3 + cols)
+    vec = rng.normal(25.0, 8.0, size=layer_count * rows * cols)
+    expected = _numpy_reference_dot(layer_count, rows, cols, gx, gy, gz, diag_mass, vec)
+
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+    actual = native_core.apply_compact_native(
+        layer_count, rows, cols, *params, scale, vec
+    )
+    assert actual is not None
+    assert actual.dtype == np.float64
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+    out_buf = np.empty_like(vec)
+    actual_out = native_core.apply_compact_native(
+        layer_count, rows, cols, *params, scale, vec, out=out_buf
+    )
+    assert actual_out is out_buf
+    np.testing.assert_allclose(out_buf, expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+@pytest.mark.parametrize("layer_count,rows,cols", _COMPACT_SHAPES + [(1, 3, 1050)])
+@pytest.mark.parametrize("scale", [0.0, 1.75])
+@pytest.mark.parametrize("zero_init,iterations", [(True, 1), (True, 2), (False, 2), (False, 0), (True, 0)])
+def test_compiled_damped_jacobi_compact_f32_matches_reference(
+    compiled_native_core,
+    monkeypatch,
+    layer_count,
+    rows,
+    cols,
+    scale,
+    zero_init,
+    iterations,
+):
+    params = _make_compact_problem(
+        layer_count, rows, cols, seed=600 + layer_count * 100 + rows * 7 + cols
+    )
+    gx, gy, gz, boundary, cap = _expand_compact_to_reference(
+        layer_count, rows, cols, *params
+    )
+    diag_mass = boundary + scale * cap
+    diag_3d = diag_mass.reshape(layer_count, rows, cols).copy()
+    if cols > 1:
+        diag_3d[:, :, :-1] += gx
+        diag_3d[:, :, 1:] += gx
+    if rows > 1:
+        diag_3d[:, :-1, :] += gy
+        diag_3d[:, 1:, :] += gy
+    if layer_count > 1:
+        diag_3d[:-1, :, :] += gz
+        diag_3d[1:, :, :] += gz
+
+    omega = 0.72
+    omega_inv_diag = omega / diag_3d.reshape(-1)
+
+    rng = np.random.default_rng(88 + layer_count * 31 + rows * 3 + cols)
+    rhs_f32 = rng.normal(5.0, 2.0, size=layer_count * rows * cols).astype(np.float32)
+    x0_f32 = rng.normal(15.0, 4.0, size=layer_count * rows * cols).astype(np.float32)
+
+    expected = _numpy_reference_damped_jacobi(
+        layer_count,
+        rows,
+        cols,
+        gx,
+        gy,
+        gz,
+        diag_mass,
+        omega_inv_diag,
+        rhs_f32.astype(np.float64),
+        x0_f32.astype(np.float64),
+        iterations,
+        zero_init,
+    )
+
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+    scratch = np.empty(layer_count * rows * cols, dtype=np.float32)
+    if zero_init:
+        actual = native_core.damped_jacobi_compact_f32_native(
+            layer_count,
+            rows,
+            cols,
+            *params,
+            scale,
+            omega,
+            rhs_f32,
+            None,
+            iterations,
+            zero_init=True,
+            scratch=scratch,
+        )
+    else:
+        buf = x0_f32.copy()
+        actual = native_core.damped_jacobi_compact_f32_native(
+            layer_count,
+            rows,
+            cols,
+            *params,
+            scale,
+            omega,
+            rhs_f32,
+            buf,
+            iterations,
+            zero_init=False,
+            scratch=scratch,
+        )
+        assert actual is buf
+
+    assert actual is not None
+    assert actual.dtype == np.float32
+    np.testing.assert_allclose(actual.astype(np.float64), expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+@pytest.mark.parametrize("layer_count,rows,cols", _COMPACT_SHAPES + [(1, 3, 1050)])
+@pytest.mark.parametrize("scale", [0.0, 2.0])
+def test_compiled_residual_restrict_2x2_compact_f32_matches_reference(
+    compiled_native_core, monkeypatch, layer_count, rows, cols, scale
+):
+    params = _make_compact_problem(
+        layer_count, rows, cols, seed=700 + layer_count * 100 + rows * 7 + cols
+    )
+    gx, gy, gz, boundary, cap = _expand_compact_to_reference(
+        layer_count, rows, cols, *params
+    )
+    diag_mass = boundary + scale * cap
+    rng = np.random.default_rng(99 + layer_count * 31 + rows * 3 + cols)
+    rhs_f32 = rng.normal(5.0, 2.0, size=layer_count * rows * cols).astype(np.float32)
+    x_f32 = rng.normal(15.0, 4.0, size=layer_count * rows * cols).astype(np.float32)
+
+    ax = _numpy_reference_dot(
+        layer_count, rows, cols, gx, gy, gz, diag_mass, x_f32.astype(np.float64)
+    )
+    expected = thermal_solver._restrict_2x2(
+        (rhs_f32.astype(np.float64) - ax).reshape(layer_count, rows, cols)
+    ).reshape(-1)
+
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+    actual = native_core.residual_restrict_2x2_compact_f32_native(
+        layer_count, rows, cols, *params, scale, rhs_f32, x_f32
+    )
+    assert actual is not None
+    assert actual.dtype == np.float32
+    np.testing.assert_allclose(actual.astype(np.float64), expected, rtol=1e-5, atol=1e-5)
+
+    out_buf = np.empty_like(actual)
+    actual_out = native_core.residual_restrict_2x2_compact_f32_native(
+        layer_count, rows, cols, *params, scale, rhs_f32, x_f32, out=out_buf
+    )
+    assert actual_out is out_buf
+    np.testing.assert_allclose(out_buf.astype(np.float64), expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+@pytest.mark.parametrize("layer_count,rows,cols", _COMPACT_SHAPES)
+@pytest.mark.parametrize("with_hs,with_vias", [(True, True), (False, False)])
+def test_compiled_coarsen_compact_to_f32_matches_reference(
+    compiled_native_core, monkeypatch, layer_count, rows, cols, with_hs, with_vias
+):
+    params = _make_compact_problem(
+        layer_count,
+        rows,
+        cols,
+        seed=800 + layer_count * 100 + rows * 7 + cols,
+        with_hs=with_hs,
+        with_vias=with_vias,
+    )
+    gx, gy, gz, boundary, cap = _expand_compact_to_reference(
+        layer_count, rows, cols, *params
+    )
+    fine_op = thermal_solver.StructuredThermalOperator(
+        layer_count=layer_count,
+        rows=rows,
+        cols=cols,
+        gx=gx,
+        gy=gy,
+        gz=gz,
+        boundary_diag=boundary,
+        stiffness_diag=np.zeros_like(boundary),
+    )
+    ref_coarse = thermal_solver._coarsen_structured_operator(fine_op)
+    ref_cap_c = thermal_solver._restrict_2x2(
+        cap.reshape(layer_count, rows, cols)
+    ).reshape(-1)
+
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+    res = native_core.coarsen_compact_to_f32_native(layer_count, rows, cols, *params)
+    assert res is not None
+    gx_c, gy_c, gz_c, boundary_c, stiffness_diag_c, cap_c = res
+
+    for arr in (gx_c, gy_c, gz_c, boundary_c, stiffness_diag_c, cap_c):
+        assert arr.dtype == np.float32
+        assert arr.flags.c_contiguous
+
+    assert gx_c.shape == ref_coarse.gx.shape
+    assert gy_c.shape == ref_coarse.gy.shape
+    assert gz_c.shape == ref_coarse.gz.shape
+    assert boundary_c.shape == ref_coarse.boundary_diag.shape
+    assert stiffness_diag_c.shape == ref_coarse.stiffness_diag.shape
+    assert cap_c.shape == ref_cap_c.shape
+
+    np.testing.assert_allclose(gx_c.astype(np.float64), ref_coarse.gx, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(gy_c.astype(np.float64), ref_coarse.gy, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(gz_c.astype(np.float64), ref_coarse.gz, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(boundary_c.astype(np.float64), ref_coarse.boundary_diag, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(stiffness_diag_c.astype(np.float64), ref_coarse.stiffness_diag, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(cap_c.astype(np.float64), ref_cap_c, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+@pytest.mark.parametrize("layer_count,rows,cols", _MG_SHAPES + [(1, 3, 1050)])
+@pytest.mark.parametrize("zero_init,iterations", [(True, 1), (True, 2), (False, 2), (False, 0), (True, 0)])
+def test_compiled_damped_jacobi_f32_matches_reference(
+    compiled_native_core, monkeypatch, layer_count, rows, cols, zero_init, iterations
+):
+    gx, gy, gz, diag_mass, omega_inv_diag, rhs, x0 = _make_random_problem(
+        layer_count, rows, cols, seed=900 + layer_count * 100 + rows * 7 + cols
+    )
+    gx_f = gx.astype(np.float32)
+    gy_f = gy.astype(np.float32)
+    gz_f = gz.astype(np.float32)
+    dm_f = diag_mass.astype(np.float32)
+    wi_f = omega_inv_diag.astype(np.float32)
+    rhs_f = rhs.astype(np.float32)
+    x0_f = x0.astype(np.float32)
+
+    expected = _numpy_reference_damped_jacobi(
+        layer_count,
+        rows,
+        cols,
+        gx_f.astype(np.float64),
+        gy_f.astype(np.float64),
+        gz_f.astype(np.float64),
+        dm_f.astype(np.float64),
+        wi_f.astype(np.float64),
+        rhs_f.astype(np.float64),
+        x0_f.astype(np.float64),
+        iterations,
+        zero_init,
+    )
+
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+    if zero_init:
+        actual = native_core.damped_jacobi_f32_native(
+            layer_count, rows, cols, gx_f, gy_f, gz_f, dm_f, wi_f, rhs_f, None, iterations, zero_init=True
+        )
+    else:
+        buf = x0_f.copy()
+        actual = native_core.damped_jacobi_f32_native(
+            layer_count, rows, cols, gx_f, gy_f, gz_f, dm_f, wi_f, rhs_f, buf, iterations, zero_init=False
+        )
+        assert actual is buf
+
+    assert actual is not None
+    assert actual.dtype == np.float32
+    np.testing.assert_allclose(actual.astype(np.float64), expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+@pytest.mark.parametrize("layer_count,rows,cols", _MG_SHAPES + [(1, 3, 1050)])
+def test_compiled_residual_restrict_2x2_f32_matches_reference(
+    compiled_native_core, monkeypatch, layer_count, rows, cols
+):
+    gx, gy, gz, diag_mass, _, rhs, x0 = _make_random_problem(
+        layer_count, rows, cols, seed=1000 + layer_count * 100 + rows * 7 + cols
+    )
+    gx_f = gx.astype(np.float32)
+    gy_f = gy.astype(np.float32)
+    gz_f = gz.astype(np.float32)
+    dm_f = diag_mass.astype(np.float32)
+    rhs_f = rhs.astype(np.float32)
+    x0_f = x0.astype(np.float32)
+
+    ax = _numpy_reference_dot(
+        layer_count,
+        rows,
+        cols,
+        gx_f.astype(np.float64),
+        gy_f.astype(np.float64),
+        gz_f.astype(np.float64),
+        dm_f.astype(np.float64),
+        x0_f.astype(np.float64),
+    )
+    expected = thermal_solver._restrict_2x2(
+        (rhs_f.astype(np.float64) - ax).reshape(layer_count, rows, cols)
+    ).reshape(-1)
+
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+    actual = native_core.residual_restrict_2x2_f32_native(
+        layer_count, rows, cols, gx_f, gy_f, gz_f, dm_f, rhs_f, x0_f
+    )
+    assert actual is not None
+    assert actual.dtype == np.float32
+    np.testing.assert_allclose(actual.astype(np.float64), expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+@pytest.mark.parametrize("layer_count,rows,cols", _MG_SHAPES)
+def test_compiled_prolong_add_2x2_f32_matches_reference(
+    compiled_native_core, monkeypatch, layer_count, rows, cols
+):
+    rng = np.random.default_rng(1100 + layer_count * 100 + rows * 7 + cols)
+    coarse_rows = (rows + 1) // 2
+    coarse_cols = (cols + 1) // 2
+    coarse_f = rng.normal(1.5, 4.0, size=layer_count * coarse_rows * coarse_cols).astype(np.float32)
+    fine_f = rng.normal(25.0, 5.0, size=layer_count * rows * cols).astype(np.float32)
+
+    expected = _numpy_reference_prolong_add(
+        layer_count, rows, cols, coarse_f.astype(np.float64), fine_f.astype(np.float64)
+    )
+    actual = fine_f.copy()
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+    ok = native_core.prolong_add_2x2_f32_native(
+        layer_count, rows, cols, coarse_f, actual
+    )
+    assert ok is True
+    assert actual.dtype == np.float32
+    np.testing.assert_allclose(actual.astype(np.float64), expected, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+def test_clear_native_scratch_releases_tls_buffers(compiled_native_core, monkeypatch):
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+    gx, gy, gz, diag_mass, omega_inv_diag, rhs, _ = _make_random_problem(2, 6, 8, seed=1200)
+    native_core.damped_jacobi_native(
+        2, 6, 8, gx, gy, gz, diag_mass, omega_inv_diag, rhs, None, 1, zero_init=True
+    )
+    native_core.damped_jacobi_f32_native(
+        2,
+        6,
+        8,
+        gx.astype(np.float32),
+        gy.astype(np.float32),
+        gz.astype(np.float32),
+        diag_mass.astype(np.float32),
+        omega_inv_diag.astype(np.float32),
+        rhs.astype(np.float32),
+        None,
+        1,
+        zero_init=True,
+    )
+    assert hasattr(compiled_native_core._tls, "jacobi_scratch")
+    assert hasattr(compiled_native_core._tls, "jacobi_scratch_f32")
+
+    native_core.clear_native_scratch()
+    assert not hasattr(compiled_native_core._tls, "jacobi_scratch")
+    assert not hasattr(compiled_native_core._tls, "jacobi_scratch_f32")

@@ -24,6 +24,13 @@ try:
     from .capabilities import HAS_NATIVE_MG
 except ImportError:
     HAS_NATIVE_MG = False
+try:
+    from .native_core import HAS_NATIVE_COMPACT, clear_native_scratch
+except ImportError:
+    HAS_NATIVE_COMPACT = False
+
+    def clear_native_scratch():
+        return None
 from .stackup_parser import parse_stackup_from_board_file, format_stackup_report_um
 from .gui_dialogs import (
     DEFAULT_GRID_MAX_CELLS,
@@ -46,15 +53,34 @@ from .adaptive_mesh import (
     build_adaptive_system,
     restrict_heatsink_model,
 )
+try:
+    from .adaptive_mesh import build_adaptive_system_compact
+except ImportError:
+    build_adaptive_system_compact = None
 from .geometry_mapper import build_geometry_state, create_multilayer_maps, get_pad_pixels
 from .thermal_solver import (
+    HeatsinkModel,
     SolverConfig,
     build_heatsink_model,
     build_stiffness_matrix,
     build_structured_operator,
+    compute_heatsink_capacity_j_k,
     run_simulation,
     run_simulation_matrix_free,
 )
+try:
+    from .thermal_solver import (
+        CompactStructuredThermalOperator,
+        SparsePowerVector,
+        build_compact_structured_operator,
+    )
+except ImportError:
+    CompactStructuredThermalOperator = None
+    SparsePowerVector = None
+    build_compact_structured_operator = None
+
+_ORIG_BUILD_STRUCTURED_OPERATOR = build_structured_operator
+_ORIG_BUILD_HEATSINK_MODEL = build_heatsink_model
 from .pwl_parser import parse_pwl_file
 from .visualization import (
     save_snapshot, show_results_top_bot, show_results_all_layers, save_preview_image,
@@ -364,6 +390,86 @@ def _build_power_vector(pad_sources, pad_contributions, total_nodes):
         return _workspace
 
     return q_initial, q_func
+
+
+def _build_sparse_power_vector(pad_sources, pad_contributions, total_nodes):
+    """Build a SparsePowerVector for constant pad sources without dense N-float allocation."""
+    idx_parts = []
+    val_parts = []
+    for idx, (source_type, source_value) in enumerate(pad_sources):
+        if idx >= len(pad_contributions):
+            break
+        contribution = pad_contributions[idx]
+        if contribution.indices.size == 0 or source_type != "const":
+            continue
+        val = float(source_value)
+        if val == 0.0:
+            continue
+        idx_parts.append(contribution.indices)
+        val_parts.append(val * contribution.weights)
+    if idx_parts:
+        indices = np.concatenate(idx_parts)
+        values = np.concatenate(val_parts)
+    else:
+        indices = np.empty(0, dtype=np.int64)
+        values = np.empty(0, dtype=np.float64)
+    return SparsePowerVector(indices=indices, values=values, size=total_nodes)
+
+
+def _build_dense_capacity(
+    layer_count,
+    rows,
+    cols,
+    copper_mask,
+    t_cu,
+    t_fr4_eff,
+    pixel_area,
+    rho_cu,
+    cp_cu,
+    rho_fr4,
+    cp_fr4,
+    pad_cap_areal,
+    heatsink_mask,
+):
+    """Materialize the 1D float64 heat-capacity vector for legacy/dense paths."""
+    C_layers = np.empty((layer_count, rows, cols), dtype=np.float64)
+    for layer_idx in range(layer_count):
+        V_cu = pixel_area * t_cu[layer_idx]
+        V_fr4 = pixel_area * t_fr4_eff[layer_idx]
+        mask = copper_mask[layer_idx]
+        C_layer = np.where(mask, rho_cu * cp_cu * V_cu, rho_fr4 * cp_fr4 * V_fr4)
+        C_layer += mask * (rho_fr4 * cp_fr4 * V_fr4)
+        C_layers[layer_idx] = C_layer
+    if pad_cap_areal > 0.0 and np.any(heatsink_mask):
+        pad_cap_per_cell = pad_cap_areal * pixel_area
+        C_layers[-1] += pad_cap_per_cell * np.asarray(heatsink_mask, dtype=np.float64)
+    return C_layers.reshape(-1)
+
+
+def _build_compact_heatsink_model(dx, dy, heatsink_mask, settings, amb):
+    """Build a 2D bottom-layer HeatsinkModel without allocating a full 3D vector."""
+    if not bool(settings.get("use_heatsink", True)):
+        return None
+    sink_mode = str(settings.get("pad_sink_mode", "fixed") or "fixed").strip().lower()
+    if sink_mode != "heatsink":
+        return None
+    hs_bool = np.asarray(heatsink_mask, dtype=bool)
+    if not np.any(hs_bool):
+        return None
+    pad_thick_m = max(0.0001, float(settings.get("pad_th", 1.0)) * 1e-3)
+    pad_k = float(settings.get("pad_k", 3.0))
+    contact_factor = max(1e-6, float(settings.get("pad_contact_factor", 0.2)))
+    h_sink = (pad_k / pad_thick_m) * contact_factor
+    pad_conductance = hs_bool.astype(np.float64).reshape(-1) * (h_sink * float(dx) * float(dy))
+    rth_val = settings.get("heatsink_rth_kw", 5.0)
+    rth_kw = max(1e-6, float(5.0 if rth_val is None else rth_val))
+    return HeatsinkModel(
+        pad_conductance=pad_conductance,
+        rth_kw=rth_kw,
+        capacity_j_k=compute_heatsink_capacity_j_k(settings),
+        initial_temp_c=float(amb),
+        bottom_layer_only=True,
+    )
 
 
 def _format_timing_summary(timings):
@@ -770,7 +876,11 @@ def _estimate_solver_cost(nodes, settings):
         or (compute_engine == "auto" and nodes >= _auto_fast_engine_threshold())
     )
     if fast_engine:
-        if HAS_NATIVE_MG:
+        if HAS_NATIVE_COMPACT and HAS_NATIVE_MG:
+            memory_low = int(math.ceil(nodes * 0.00005))
+            memory_high = int(math.ceil(nodes * 0.00010))
+            thresholds = (800_000, 3_000_000, 8_000_000)
+        elif HAS_NATIVE_MG:
             memory_low = int(math.ceil(nodes * 0.00025))
             memory_high = int(math.ceil(nodes * 0.00050))
             thresholds = (800_000, 3_000_000, 8_000_000)
@@ -1295,6 +1405,11 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         def close_callback():
             self.settings_dialog = None
+            self.operator_cache.clear()
+            self.factorization_cache.clear()
+            self.electrical_cache.clear()
+            self.geometry_cache.key = None
+            self.geometry_cache.value = None
 
         def preflight_callback(settings):
             return self._preflight(board, copper_ids, bbox, settings)
@@ -2024,7 +2139,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         init_timings["geometry_cache_hit"] = geometry_cache_hit
         copper_mask = geometry_state.copper_mask
         V_map = geometry_state.via_map
-        H_map = geometry_state.heatsink_mask.astype(np.float64, copy=False)
+        H_map = geometry_state.heatsink_mask
 
         # Time step calculation
         dx = res * 1e-3
@@ -2058,6 +2173,20 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         resolved_engine = "fast_native" if use_fast_engine else "legacy"
         mesh_mode = _resolve_mesh_mode(settings, use_fast_engine, grid.nodes)
 
+        use_compact_uniform = (
+            use_fast_engine
+            and mesh_mode != "adaptive"
+            and build_compact_structured_operator is not None
+            and build_structured_operator is _ORIG_BUILD_STRUCTURED_OPERATOR
+        )
+        use_compact_adaptive = (
+            use_fast_engine
+            and mesh_mode == "adaptive"
+            and build_adaptive_system_compact is not None
+            and build_structured_operator is _ORIG_BUILD_STRUCTURED_OPERATOR
+        )
+        use_compact_path = use_compact_uniform or use_compact_adaptive
+
         operator_key = _build_operator_cache_key(
             cache_key,
             resolved_engine,
@@ -2068,28 +2197,40 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             amb,
             settings,
         )
-        cached_operator = self.operator_cache.get(operator_key)
+        operator_cache_lookup_key = (
+            f"{operator_key}:compact_uniform" if use_compact_uniform else operator_key
+        )
+        cached_operator = (
+            None if use_compact_adaptive else self.operator_cache.get(operator_cache_lookup_key)
+        )
         operator_cache_hit = cached_operator is not None
 
-        # Heat capacity
+        # Heat capacity (deferred/omitted on zero-peak compact paths)
         set_dialog_state("running", "Preparing material capacities...")
         capacity_start = time.perf_counter()
         pad_cap_areal = float(settings.get('pad_cap_areal', 0.0) or 0.0)
+        C = None
+        K_matrix = None
+        b = None
+        hA = None
         if operator_cache_hit:
             C, K_matrix, b, hA = cached_operator
-        else:
-            C_layers = np.empty((layer_count, rows, cols), dtype=np.float64)
-            for l in range(layer_count):
-                V_cu = pixel_area * t_cu[l]
-                V_fr4 = pixel_area * t_fr4_eff[l]
-                mask = copper_mask[l]
-                C_layer = np.where(mask, rho_cu * cp_cu * V_cu, rho_fr4 * cp_fr4 * V_fr4)
-                C_layer += mask * (rho_fr4 * cp_fr4 * V_fr4)
-                C_layers[l] = C_layer
-            if pad_cap_areal > 0.0 and np.any(H_map):
-                pad_cap_per_cell = pad_cap_areal * pixel_area
-                C_layers[-1] += pad_cap_per_cell * H_map
-            C = C_layers.reshape(-1)
+        elif not use_compact_path:
+            C = _build_dense_capacity(
+                layer_count,
+                rows,
+                cols,
+                copper_mask,
+                t_cu,
+                t_fr4_eff,
+                pixel_area,
+                rho_cu,
+                cp_cu,
+                rho_fr4,
+                cp_fr4,
+                pad_cap_areal,
+                H_map,
+            )
         init_timings["capacity_build_s"] = time.perf_counter() - capacity_start
         init_timings["operator_cache_hit"] = operator_cache_hit
 
@@ -2161,7 +2302,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             y_min=y_min,
             res=res,
         )
-        Q, Q_func = _build_power_vector(pad_sources, pad_contributions, N)
+        has_pwl_sources = any(source_type == 'pwl' for source_type, _ in pad_sources)
+        Q = None
+        Q_func = None
+        Q_sparse = None
+        if not use_compact_path or has_pwl_sources or SparsePowerVector is None:
+            Q, Q_func = _build_power_vector(pad_sources, pad_contributions, N)
         init_timings["power_vector_build_s"] = time.perf_counter() - power_start
 
         electrical_summary = None
@@ -2216,6 +2362,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     return
                 q_joule = electrical_result.q_joule
                 if np.any(q_joule):
+                    if Q is None:
+                        Q, Q_func = _build_power_vector(pad_sources, pad_contributions, N)
                     Q = Q + q_joule
                     if Q_func is not None:
                         base_q_func = Q_func
@@ -2238,6 +2386,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             init_timings["electrical_solve_s"] = time.perf_counter() - electrical_start
             init_timings["electrical_cache_hit"] = electrical_cache_hit
 
+        if Q is None and Q_func is None:
+            if use_compact_path and SparsePowerVector is not None:
+                Q_sparse = _build_sparse_power_vector(pad_sources, pad_contributions, N)
+            else:
+                Q, Q_func = _build_power_vector(pad_sources, pad_contributions, N)
+
         # Build pad_power for reporting
         pad_power = []
         for i, name in enumerate(power_pad_names):
@@ -2251,19 +2405,32 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             else:
                 pad_power.append((name, None))
 
-        # Build the thermal operator. Large jobs use the matrix-free regular
-        # grid representation, avoiding COO/CSR construction and direct
-        # factorization startup.
+        # Build the thermal operator. Large jobs use the compact matrix-free
+        # representation or direct adaptive assembly, avoiding dense 3D arrays.
         set_dialog_state("running", "Building the thermal operator...")
         stiffness_start = time.perf_counter()
-        if not operator_cache_hit:
-            builder = build_structured_operator if use_fast_engine else build_stiffness_matrix
-            K_matrix, b, hA, _ = builder(
-                layer_count, rows, cols, copper_mask, t_cu, t_fr4_eff,
-                k_cu, k_fr4, dx, dy, V_map, gap_m, H_map, settings, amb
-            )
-            self.operator_cache.put(operator_key, (C, K_matrix, b, hA))
-        init_timings["stiffness_matrix_s"] = time.perf_counter() - stiffness_start
+        if use_compact_uniform:
+            if not operator_cache_hit:
+                K_matrix = build_compact_structured_operator(
+                    layer_count, rows, cols, copper_mask, t_cu, t_fr4_eff,
+                    k_cu, k_fr4, dx, dy, V_map, gap_m, H_map, settings, amb,
+                    rho_cu=rho_cu, cp_cu=cp_cu, rho_fr4=rho_fr4, cp_fr4=cp_fr4,
+                    pad_cap_areal=pad_cap_areal,
+                )
+                self.operator_cache.put(operator_cache_lookup_key, (None, K_matrix, None, None))
+            init_timings["stiffness_matrix_s"] = time.perf_counter() - stiffness_start
+        elif use_compact_adaptive:
+            init_timings["stiffness_matrix_s"] = 0.0
+        else:
+            if not operator_cache_hit:
+                H_map_float = H_map.astype(np.float64, copy=False)
+                builder = build_structured_operator if use_fast_engine else build_stiffness_matrix
+                K_matrix, b, hA, _ = builder(
+                    layer_count, rows, cols, copper_mask, t_cu, t_fr4_eff,
+                    k_cu, k_fr4, dx, dy, V_map, gap_m, H_map_float, settings, amb
+                )
+                self.operator_cache.put(operator_cache_lookup_key, (C, K_matrix, b, hA))
+            init_timings["stiffness_matrix_s"] = time.perf_counter() - stiffness_start
         init_timings["compute_engine"] = resolved_engine
 
         adaptive_system = None
@@ -2285,9 +2452,19 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 source_mask=source_mask.reshape(layer_count, rows, cols),
                 max_cell_ratio=max_cell_ratio,
             )
-            adaptive_system = build_adaptive_system(
-                K_matrix, C, Q, b, hA, adaptive_grid
-            )
+            if use_compact_adaptive:
+                adaptive_power_input = Q_sparse if Q_sparse is not None else Q
+                adaptive_system = build_adaptive_system_compact(
+                    layer_count, rows, cols, copper_mask, t_cu, t_fr4_eff,
+                    k_cu, k_fr4, dx, dy, V_map, gap_m, H_map, settings, amb,
+                    adaptive_grid, adaptive_power_input,
+                    rho_cu=rho_cu, cp_cu=cp_cu, rho_fr4=rho_fr4, cp_fr4=cp_fr4,
+                    pad_cap_areal=pad_cap_areal,
+                )
+            else:
+                adaptive_system = build_adaptive_system(
+                    K_matrix, C, Q, b, hA, adaptive_grid
+                )
             init_timings["adaptive_mesh_s"] = time.perf_counter() - adaptive_started
             grid_info.update({
                 "mesh_mode": "adaptive",
@@ -2306,9 +2483,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 "mesh_reduction_ratio": 1.0,
                 "adaptive_max_cell_ratio": 1,
             })
-        heatsink_model = build_heatsink_model(
-            layer_count, rows, cols, dx, dy, H_map, settings, amb
-        )
+        if build_heatsink_model is not _ORIG_BUILD_HEATSINK_MODEL or not use_compact_path:
+            H_map_float = H_map.astype(np.float64, copy=False)
+            heatsink_model = build_heatsink_model(
+                layer_count, rows, cols, dx, dy, H_map_float, settings, amb
+            )
+        elif use_compact_uniform:
+            heatsink_model = K_matrix.build_heatsink_model(settings, amb)
+        else:
+            heatsink_model = _build_compact_heatsink_model(
+                dx, dy, H_map, settings, amb
+            )
         if adaptive_system is not None and heatsink_model is not None:
             solver_heatsink_model = restrict_heatsink_model(
                 heatsink_model, adaptive_system.mesh, layer_count
@@ -2405,7 +2590,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     solver_power = (
                         adaptive_system.power
                         if adaptive_system is not None
-                        else Q
+                        else (Q_sparse if Q_sparse is not None else Q)
                     )
                     solver_boundary = (
                         adaptive_system.boundary_rhs
@@ -2459,11 +2644,41 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             "[ThermalSim][WARN] Fast CPU solver failed; "
                             "retrying the safe legacy backend."
                         )
+                        H_map_float = H_map.astype(np.float64, copy=False)
+                        fallback_C = (
+                            C
+                            if C is not None
+                            else _build_dense_capacity(
+                                layer_count,
+                                rows,
+                                cols,
+                                copper_mask,
+                                t_cu,
+                                t_fr4_eff,
+                                pixel_area,
+                                rho_cu,
+                                cp_cu,
+                                rho_fr4,
+                                cp_fr4,
+                                pad_cap_areal,
+                                H_map,
+                            )
+                        )
+                        if Q is not None:
+                            fallback_Q = Q
+                            fallback_Q_func = Q_func
+                        elif Q_sparse is not None:
+                            fallback_Q = Q_sparse.to_dense()
+                            fallback_Q_func = None
+                        else:
+                            fallback_Q, fallback_Q_func = _build_power_vector(
+                                pad_sources, pad_contributions, N
+                            )
                         fallback_matrix, fallback_b, fallback_h_area, _ = (
                             build_stiffness_matrix(
                                 layer_count, rows, cols, copper_mask,
                                 t_cu, t_fr4_eff, k_cu, k_fr4,
-                                dx, dy, V_map, gap_m, H_map, settings, amb,
+                                dx, dy, V_map, gap_m, H_map_float, settings, amb,
                             )
                         )
                         fallback_config = SolverConfig(
@@ -2480,14 +2695,24 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             snap_times=snap_times,
                             **steady_state_kwargs,
                         )
+                        fallback_heatsink = (
+                            heatsink_model
+                            if (
+                                heatsink_model is not None
+                                and not getattr(heatsink_model, "bottom_layer_only", False)
+                            )
+                            else build_heatsink_model(
+                                layer_count, rows, cols, dx, dy, H_map_float, settings, amb
+                            )
+                        )
                         fallback_kwargs = {}
-                        if heatsink_model is not None:
-                            fallback_kwargs["heatsink_model"] = heatsink_model
+                        if fallback_heatsink is not None:
+                            fallback_kwargs["heatsink_model"] = fallback_heatsink
                         worker_result["result"] = run_simulation(
                             fallback_config,
                             fallback_matrix,
-                            C,
-                            Q,
+                            fallback_C,
+                            fallback_Q,
                             fallback_b,
                             fallback_h_area,
                             layer_count,
@@ -2495,7 +2720,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             cols,
                             progress_callback,
                             snapshot_callback,
-                            Q_func=Q_func,
+                            Q_func=fallback_Q_func,
                             cancel_check=lambda: cancel_token.cancelled,
                             **fallback_kwargs,
                         )
@@ -2519,29 +2744,36 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     worker_result["traceback"] = fast_traceback
 
         worker = threading.Thread(target=solver_worker, name="ThermalSimSolver", daemon=True)
-        worker.start()
-        while worker.is_alive():
-            current = progress_state["current"]
-            total = progress_state["total"]
-            percent = int((current / total) * 100) if total else 0
-            try:
-                progress_message = (
-                    "Solving steady-state thermal model..."
-                    if steady_state
-                    else f"Solving thermal model - step {current}/{total}"
-                )
-                update_result = pd.Update(percent, progress_message)
-                keep_going = update_result[0] if isinstance(update_result, tuple) else update_result
-                if not keep_going or (hasattr(pd, "WasCancelled") and pd.WasCancelled()):
+        try:
+            worker.start()
+            while worker.is_alive():
+                current = progress_state["current"]
+                total = progress_state["total"]
+                percent = int((current / total) * 100) if total else 0
+                try:
+                    progress_message = (
+                        "Solving steady-state thermal model..."
+                        if steady_state
+                        else f"Solving thermal model - step {current}/{total}"
+                    )
+                    update_result = pd.Update(percent, progress_message)
+                    keep_going = update_result[0] if isinstance(update_result, tuple) else update_result
+                    if not keep_going or (hasattr(pd, "WasCancelled") and pd.WasCancelled()):
+                        cancel_token.cancel()
+                    app = wx.GetApp()
+                    if app is not None:
+                        app.Yield(True)
+                except Exception:
                     cancel_token.cancel()
-                app = wx.GetApp()
-                if app is not None:
-                    app.Yield(True)
-            except Exception:
-                cancel_token.cancel()
-            worker.join(0.05)
-        worker.join()
-        self.cancel_token = None
+                worker.join(0.05)
+            worker.join()
+        finally:
+            self.cancel_token = None
+            if K_matrix is not None and hasattr(K_matrix, "clear_caches"):
+                K_matrix.clear_caches()
+            if adaptive_system is not None and hasattr(adaptive_system.operator, "clear_caches"):
+                adaptive_system.operator.clear_caches()
+            clear_native_scratch()
 
         try:
             pd.Update(100, "Done")

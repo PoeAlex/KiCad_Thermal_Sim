@@ -5,10 +5,13 @@ import numpy as np
 from ThermalSim.adaptive_mesh import (
     build_adaptive_mesh,
     build_adaptive_system,
+    build_adaptive_system_compact,
     restrict_heatsink_model,
 )
 from ThermalSim.thermal_solver import (
     SolverConfig,
+    SparsePowerVector,
+    build_compact_structured_operator,
     build_heatsink_model,
     build_stiffness_matrix,
     build_structured_operator,
@@ -420,3 +423,149 @@ def test_restrict_heatsink_model_preserves_conductance_and_matches_steady_state(
     assert abs(
         res_adapt.k_norm_info["heatsink_temp_c"] - res_fine.k_norm_info["heatsink_temp_c"]
     ) < 0.2
+
+
+def test_build_adaptive_system_compact_matches_reference_exactly():
+    """build_adaptive_system_compact matches build_adaptive_system(build_structured_operator(...)) to <1e-11."""
+    import pytest
+
+    for layers, rows, cols, hs_mode in (
+        (1, 24, 24, False),
+        (4, 25, 29, True),
+    ):
+        dx = dy = 0.4e-3
+        yy, xx = np.ogrid[:rows, :cols]
+        copper = np.zeros((layers, rows, cols), dtype=bool)
+        for l in range(layers):
+            copper[l] = (
+                ((yy + 3 * l) % 9 < 2)
+                | (
+                    (xx >= cols // 4) & (xx < (3 * cols) // 4)
+                    & (yy >= rows // 4) & (yy < (3 * rows) // 4)
+                )
+            )
+        t_cu = np.full(layers, 35e-6, dtype=np.float64)
+        t_fr4_eff = np.full(layers, 1.6e-3 / layers, dtype=np.float64)
+        gap_m = [1.6e-3 / max(layers - 1, 1)] * max(0, layers - 1)
+        via_map = np.ones((rows, cols), dtype=np.float64)
+        via_map[(yy % 10 == 4) & (xx % 10 == 4)] = 18.0
+        heatsink = np.zeros((rows, cols), dtype=bool)
+        heatsink[rows // 3 : (2 * rows) // 3, cols // 3 : (2 * cols) // 3] = True
+        settings = {
+            "h_conv": 10.0,
+            "pad_th": 1.0,
+            "pad_k": 3.0,
+            "pad_contact_factor": 0.25,
+            "use_heatsink": True,
+            "pad_sink_mode": "heatsink" if hs_mode else "fixed",
+            "pad_sink_temp_use_ambient": False,
+            "pad_sink_temp_c": 35.0,
+            "heatsink_rth_kw": 3.5,
+            "heatsink_material": "aluminium",
+            "heatsink_mass_g": 40.0,
+        }
+        amb = 25.0
+        pad_cap_areal = 200.0
+        pixel_area = dx * dy
+        rho_cu, cp_cu = 8960.0, 385.0
+        rho_fr4, cp_fr4 = 1850.0, 1100.0
+
+        C_layers = np.empty((layers, rows, cols), dtype=np.float64)
+        for l in range(layers):
+            v_cu = pixel_area * t_cu[l]
+            v_fr4 = pixel_area * t_fr4_eff[l]
+            mask = copper[l]
+            c_l = np.where(mask, rho_cu * cp_cu * v_cu, rho_fr4 * cp_fr4 * v_fr4)
+            c_l += mask * (rho_fr4 * cp_fr4 * v_fr4)
+            C_layers[l] = c_l
+        if pad_cap_areal > 0.0 and np.any(heatsink):
+            C_layers[-1] += pad_cap_areal * pixel_area * heatsink.astype(np.float64)
+        capacity = C_layers.reshape(-1)
+
+        src_indices = np.array(
+            [(rows // 2) * cols + (cols // 2), (rows // 2) * cols + (cols // 2) + 1],
+            dtype=np.int64,
+        )
+        src_values = np.array([1.1, 0.7], dtype=np.float64)
+        power_sparse = SparsePowerVector(src_indices, src_values, copper.size)
+        power_dense = power_sparse.to_dense()
+        source_mask = np.zeros(copper.size, dtype=bool)
+        source_mask[src_indices] = True
+        source_mask = source_mask.reshape(copper.shape)
+
+        mesh = build_adaptive_mesh(
+            copper, via_map, heatsink, source_mask=source_mask, max_cell_ratio=8
+        )
+        fine_op, fine_b, fine_hA, _ = build_structured_operator(
+            layers, rows, cols, copper, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, via_map, gap_m, heatsink.astype(np.float64), settings, amb,
+        )
+        ref = build_adaptive_system(
+            fine_op, capacity, power_dense, fine_b, fine_hA, mesh
+        )
+        compact_sparse = build_adaptive_system_compact(
+            layers, rows, cols, copper, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, via_map, gap_m, heatsink, settings, amb,
+            mesh, power_sparse,
+            rho_cu=rho_cu, cp_cu=cp_cu, rho_fr4=rho_fr4, cp_fr4=cp_fr4,
+            pad_cap_areal=pad_cap_areal,
+        )
+        compact_dense = build_adaptive_system_compact(
+            layers, rows, cols, copper, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, via_map, gap_m, heatsink, settings, amb,
+            mesh, power_dense,
+            rho_cu=rho_cu, cp_cu=cp_cu, rho_fr4=rho_fr4, cp_fr4=cp_fr4,
+            pad_cap_areal=pad_cap_areal,
+        )
+
+        for sys_cmp in (compact_sparse, compact_dense):
+            np.testing.assert_allclose(
+                (sys_cmp.operator.matrix - ref.operator.matrix).toarray(),
+                0.0,
+                atol=1e-11,
+            )
+            np.testing.assert_allclose(sys_cmp.capacity, ref.capacity, rtol=1e-11, atol=1e-11)
+            np.testing.assert_allclose(sys_cmp.power, ref.power, rtol=1e-11, atol=1e-11)
+            np.testing.assert_allclose(sys_cmp.boundary_rhs, ref.boundary_rhs, rtol=1e-11, atol=1e-11)
+            np.testing.assert_allclose(sys_cmp.h_area, ref.h_area, rtol=1e-11, atol=1e-11)
+
+        # Verify AdaptiveSparseOperator.clear_caches()
+        compact_sparse.operator.implicit_linear_operator(compact_sparse.capacity, 1.0)
+        assert len(compact_sparse.operator._preconditioner_cache) == 1
+        compact_sparse.operator.clear_caches()
+        assert compact_sparse.operator._preconditioner_cache == {}
+
+        # Verify restrict_heatsink_model works for 2D bottom_layer_only HeatsinkModel
+        if hs_mode:
+            compact_fine_op = build_compact_structured_operator(
+                layers, rows, cols, copper, t_cu, t_fr4_eff,
+                390.0, 0.3, dx, dy, via_map, gap_m, heatsink, settings, amb,
+            )
+            hs_2d = compact_fine_op.build_heatsink_model(settings, amb)
+            hs_3d = build_heatsink_model(
+                layers, rows, cols, dx, dy, heatsink.astype(np.float64), settings, amb
+            )
+            hs_ad_2d = restrict_heatsink_model(hs_2d, mesh, layers)
+            hs_ad_3d = restrict_heatsink_model(hs_3d, mesh, layers)
+            assert hs_ad_2d.bottom_layer_only is True
+            assert hs_ad_3d.bottom_layer_only is False
+            np.testing.assert_allclose(
+                hs_ad_2d.pad_conductance,
+                hs_ad_3d.pad_conductance[-mesh.leaf_count :],
+                atol=1e-12,
+            )
+            ss_cfg = SolverConfig(sim_time=10.0, amb=amb, dt_base=1.0, steps_target=10, steady_state=True)
+            res_2d = run_steady_state_matrix_free(
+                ss_cfg, compact_sparse.operator, compact_sparse.capacity,
+                compact_sparse.power, compact_sparse.boundary_rhs, compact_sparse.h_area,
+                heatsink_model=hs_ad_2d,
+            )
+            res_3d = run_steady_state_matrix_free(
+                ss_cfg, ref.operator, ref.capacity,
+                ref.power, ref.boundary_rhs, ref.h_area,
+                heatsink_model=hs_ad_3d,
+            )
+            np.testing.assert_allclose(res_2d.T, res_3d.T, rtol=1e-10, atol=1e-10)
+            assert res_2d.k_norm_info["heatsink_temp_c"] == pytest.approx(
+                res_3d.k_norm_info["heatsink_temp_c"], abs=1e-10
+            )

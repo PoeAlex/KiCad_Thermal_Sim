@@ -20,14 +20,41 @@ from .native_core import HAS_NATIVE_CORE, apply_structured_native
 
 try:
     from .native_core import (
+        HAS_NATIVE_MG,
         damped_jacobi_native,
         residual_restrict_2x2_native,
         prolong_add_2x2_native,
     )
 except ImportError:
+    HAS_NATIVE_MG = False
     damped_jacobi_native = None
     residual_restrict_2x2_native = None
     prolong_add_2x2_native = None
+
+try:
+    from .native_core import (
+        HAS_NATIVE_COMPACT,
+        apply_compact_native,
+        damped_jacobi_compact_f32_native,
+        residual_restrict_2x2_compact_f32_native,
+        coarsen_compact_to_f32_native,
+        damped_jacobi_f32_native,
+        residual_restrict_2x2_f32_native,
+        prolong_add_2x2_f32_native,
+        clear_native_scratch,
+    )
+except ImportError:
+    HAS_NATIVE_COMPACT = False
+    apply_compact_native = None
+    damped_jacobi_compact_f32_native = None
+    residual_restrict_2x2_compact_f32_native = None
+    coarsen_compact_to_f32_native = None
+    damped_jacobi_f32_native = None
+    residual_restrict_2x2_f32_native = None
+    prolong_add_2x2_f32_native = None
+
+    def clear_native_scratch():
+        pass
 
 
 HEATSINK_MATERIAL_CP = {
@@ -55,6 +82,41 @@ def compute_heatsink_capacity_j_k(settings: Dict) -> float:
 
 
 @dataclass
+class SparsePowerVector:
+    """Sparse nodal heat source vector storing only active node indices and values."""
+
+    indices: np.ndarray
+    values: np.ndarray
+    size: int
+
+    def __post_init__(self):
+        self.indices = np.ascontiguousarray(self.indices, dtype=np.int64).reshape(-1)
+        self.values = np.ascontiguousarray(self.values, dtype=np.float64).reshape(-1)
+        self.size = int(self.size)
+        if self.indices.size != self.values.size:
+            raise ValueError(
+                f"SparsePowerVector indices ({self.indices.size}) and "
+                f"values ({self.values.size}) lengths must match."
+            )
+
+    def total_power(self) -> float:
+        """Return total injected heat power (W)."""
+        return float(np.sum(self.values))
+
+    def add_to(self, out: np.ndarray) -> np.ndarray:
+        """Accumulate sparse heat sources in-place into ``out``."""
+        if self.indices.size:
+            np.add.at(out, self.indices, self.values)
+        return out
+
+    def to_dense(self) -> np.ndarray:
+        """Materialize a dense 1D float64 power vector."""
+        dense = np.zeros(self.size, dtype=np.float64)
+        self.add_to(dense)
+        return dense
+
+
+@dataclass
 class HeatsinkModel:
     """Lumped 0D dynamic heatsink coupled to bottom-layer thermal pad nodes."""
 
@@ -63,6 +125,7 @@ class HeatsinkModel:
     capacity_j_k: float = 0.0
     initial_temp_c: Optional[float] = None
     mode: str = "heatsink"
+    bottom_layer_only: bool = False
 
     def __post_init__(self):
         if self.pad_conductance is not None:
@@ -295,36 +358,51 @@ class CachedLinearSolver:
         self.owner = None
 
 
-def _restrict_2x2(array: np.ndarray) -> np.ndarray:
-    """Conservatively sum 2x2 spatial blocks on a ``(layers, rows, cols)`` array."""
+def _restrict_2x2_into(array: np.ndarray, out: np.ndarray) -> np.ndarray:
+    """Conservatively sum 2x2 spatial blocks of ``(layers, rows, cols)`` into ``out``."""
     layers, rows, cols = array.shape
     coarse_rows = (rows + 1) // 2
     coarse_cols = (cols + 1) // 2
     even_rows = (rows // 2) * 2
+    even_cols = (cols // 2) * 2
+
     if rows == even_rows:
         row_sum = array[:, 0::2, :] + array[:, 1::2, :]
     else:
-        row_sum = np.empty((layers, coarse_rows, cols), dtype=np.float64)
+        row_sum = np.empty((layers, coarse_rows, cols), dtype=array.dtype)
         if even_rows > 0:
             row_sum[:, :-1, :] = (
                 array[:, 0:even_rows:2, :] + array[:, 1:even_rows:2, :]
             )
         row_sum[:, -1, :] = array[:, -1, :]
 
-    even_cols = (cols // 2) * 2
     if cols == even_cols:
-        return row_sum[:, :, 0::2] + row_sum[:, :, 1::2]
-    out = np.empty((layers, coarse_rows, coarse_cols), dtype=np.float64)
+        np.add(row_sum[:, :, 0::2], row_sum[:, :, 1::2], out=out)
+        return out
     if even_cols > 0:
-        out[:, :, :-1] = (
-            row_sum[:, :, 0:even_cols:2] + row_sum[:, :, 1:even_cols:2]
+        np.add(
+            row_sum[:, :, 0:even_cols:2],
+            row_sum[:, :, 1:even_cols:2],
+            out=out[:, :, :-1],
         )
     out[:, :, -1] = row_sum[:, :, -1]
     return out
 
 
+def _restrict_2x2(array: np.ndarray, dtype=None) -> np.ndarray:
+    """Conservatively sum 2x2 spatial blocks on a ``(layers, rows, cols)`` array."""
+    layers, rows, cols = array.shape
+    out_dtype = array.dtype if dtype is None else dtype
+    out = np.empty(
+        (layers, (rows + 1) // 2, (cols + 1) // 2),
+        dtype=out_dtype,
+    )
+    return _restrict_2x2_into(array, out)
+
+
 def _coarsen_structured_operator(
     operator: "StructuredThermalOperator",
+    dtype=np.float64,
 ) -> "StructuredThermalOperator":
     """Return the exact Galerkin 2x2 spatial coarsening ``P^T K P``."""
     layers = operator.layer_count
@@ -340,38 +418,43 @@ def _coarsen_structured_operator(
         if rows == even_rows:
             gx_c = gx_odd[:, 0::2, :] + gx_odd[:, 1::2, :]
         else:
-            gx_c = np.empty((layers, coarse_rows, coarse_cols - 1), dtype=np.float64)
+            gx_c = np.empty((layers, coarse_rows, coarse_cols - 1), dtype=dtype)
             if even_rows > 0:
                 gx_c[:, :-1, :] = (
                     gx_odd[:, 0:even_rows:2, :] + gx_odd[:, 1:even_rows:2, :]
                 )
             gx_c[:, -1, :] = gx_odd[:, -1, :]
     else:
-        gx_c = np.empty((layers, coarse_rows, 0), dtype=np.float64)
+        gx_c = np.empty((layers, coarse_rows, 0), dtype=dtype)
 
     if coarse_rows > 1:
         gy_odd = operator.gy[:, 1::2, :]
         if cols == even_cols:
             gy_c = gy_odd[:, :, 0::2] + gy_odd[:, :, 1::2]
         else:
-            gy_c = np.empty((layers, coarse_rows - 1, coarse_cols), dtype=np.float64)
+            gy_c = np.empty((layers, coarse_rows - 1, coarse_cols), dtype=dtype)
             if even_cols > 0:
                 gy_c[:, :, :-1] = (
                     gy_odd[:, :, 0:even_cols:2] + gy_odd[:, :, 1:even_cols:2]
                 )
             gy_c[:, :, -1] = gy_odd[:, :, -1]
     else:
-        gy_c = np.empty((layers, 0, coarse_cols), dtype=np.float64)
+        gy_c = np.empty((layers, 0, coarse_cols), dtype=dtype)
 
     if layers > 1 and operator.gz.size:
-        gz_c = _restrict_2x2(operator.gz)
+        gz_c = _restrict_2x2(operator.gz, dtype=dtype)
     else:
-        gz_c = np.empty((0, coarse_rows, coarse_cols), dtype=np.float64)
+        gz_c = np.empty((0, coarse_rows, coarse_cols), dtype=dtype)
 
     boundary_c = _restrict_2x2(
-        operator.boundary_diag.reshape(layers, rows, cols)
+        operator.boundary_diag.reshape(layers, rows, cols),
+        dtype=dtype,
     ).reshape(-1)
-    diagonal_view = boundary_c.reshape(layers, coarse_rows, coarse_cols).copy()
+    diagonal_view = np.array(
+        boundary_c.reshape(layers, coarse_rows, coarse_cols),
+        dtype=dtype,
+        copy=True,
+    )
     if coarse_cols > 1:
         diagonal_view[:, :, :-1] += gx_c
         diagonal_view[:, :, 1:] += gx_c
@@ -386,11 +469,11 @@ def _coarsen_structured_operator(
         layer_count=layers,
         rows=coarse_rows,
         cols=coarse_cols,
-        gx=np.ascontiguousarray(gx_c, dtype=np.float64),
-        gy=np.ascontiguousarray(gy_c, dtype=np.float64),
-        gz=np.ascontiguousarray(gz_c, dtype=np.float64),
-        boundary_diag=np.ascontiguousarray(boundary_c, dtype=np.float64),
-        stiffness_diag=np.ascontiguousarray(diagonal_view.reshape(-1), dtype=np.float64),
+        gx=np.ascontiguousarray(gx_c, dtype=dtype),
+        gy=np.ascontiguousarray(gy_c, dtype=dtype),
+        gz=np.ascontiguousarray(gz_c, dtype=dtype),
+        boundary_diag=np.ascontiguousarray(boundary_c, dtype=dtype),
+        stiffness_diag=np.ascontiguousarray(diagonal_view.reshape(-1), dtype=dtype),
     )
 
 
@@ -404,7 +487,9 @@ def _assemble_structured_csc(
     cols = operator.cols
     plane_cells = rows * cols
     node_count = layers * plane_cells
-    diagonal = operator.stiffness_diag + scaled_capacity
+    diagonal = operator.stiffness_diag.astype(np.float64, copy=False) + np.asarray(
+        scaled_capacity, dtype=np.float64
+    )
 
     row_parts = [np.arange(node_count, dtype=np.int64)]
     col_parts = [np.arange(node_count, dtype=np.int64)]
@@ -416,7 +501,7 @@ def _assemble_structured_csc(
         col_base = np.arange(cols - 1, dtype=np.int64)[None, None, :]
         left = (layer_base + row_base + col_base).reshape(-1)
         right = left + 1
-        conductance = -operator.gx.reshape(-1)
+        conductance = -operator.gx.astype(np.float64, copy=False).reshape(-1)
         row_parts.extend((left, right))
         col_parts.extend((right, left))
         data_parts.extend((conductance, conductance))
@@ -427,7 +512,7 @@ def _assemble_structured_csc(
         col_base = np.arange(cols, dtype=np.int64)[None, None, :]
         upper = (layer_base + row_base + col_base).reshape(-1)
         lower = upper + cols
-        conductance = -operator.gy.reshape(-1)
+        conductance = -operator.gy.astype(np.float64, copy=False).reshape(-1)
         row_parts.extend((upper, lower))
         col_parts.extend((lower, upper))
         data_parts.extend((conductance, conductance))
@@ -438,7 +523,7 @@ def _assemble_structured_csc(
             np.arange(layers - 1, dtype=np.int64)[:, None] * plane_cells + plane_idx
         ).reshape(-1)
         bottom = top + plane_cells
-        conductance = -operator.gz.reshape(-1)
+        conductance = -operator.gz.astype(np.float64, copy=False).reshape(-1)
         row_parts.extend((top, bottom))
         col_parts.extend((bottom, top))
         data_parts.extend((conductance, conductance))
@@ -453,8 +538,183 @@ def _assemble_structured_csc(
     ).tocsc()
 
 
+def _apply_with_diagonal_f32_into(
+    layer_count: int,
+    rows: int,
+    cols: int,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    gz: np.ndarray,
+    diag_mass: np.ndarray,
+    vec: np.ndarray,
+    out: np.ndarray,
+) -> np.ndarray:
+    """In-place float32 structured matvec into ``out``."""
+    values = vec.reshape(layer_count, rows, cols)
+    res = out.reshape(layer_count, rows, cols)
+    np.multiply(diag_mass.reshape(values.shape), values, out=res)
+    if cols > 1:
+        diff = values[:, :, :-1] - values[:, :, 1:]
+        diff *= gx
+        res[:, :, :-1] += diff
+        res[:, :, 1:] -= diff
+    if rows > 1:
+        diff = values[:, :-1, :] - values[:, 1:, :]
+        diff *= gy
+        res[:, :-1, :] += diff
+        res[:, 1:, :] -= diff
+    if layer_count > 1 and gz.size:
+        diff = values[:-1, :, :] - values[1:, :, :]
+        diff *= gz
+        res[:-1, :, :] += diff
+        res[1:, :, :] -= diff
+    return out
+
+
+def _smooth_f32(
+    layer_count: int,
+    rows: int,
+    cols: int,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    gz: np.ndarray,
+    diag_mass: np.ndarray,
+    omega_inv: np.ndarray,
+    rhs: np.ndarray,
+    x: np.ndarray,
+    scratch: np.ndarray,
+    iterations: int,
+    zero_init: bool,
+) -> np.ndarray:
+    """Run float32 damped Jacobi smoothing in-place on ``x``."""
+    if damped_jacobi_f32_native is not None:
+        native_out = damped_jacobi_f32_native(
+            layer_count,
+            rows,
+            cols,
+            gx,
+            gy,
+            gz,
+            diag_mass,
+            omega_inv,
+            rhs,
+            x,
+            iterations,
+            zero_init=zero_init,
+            scratch=scratch,
+        )
+        if native_out is not None:
+            if native_out is not x:
+                np.copyto(x, native_out)
+            return x
+
+    if zero_init:
+        np.multiply(omega_inv, rhs, out=x)
+        remaining = max(0, iterations - 1)
+    else:
+        remaining = iterations
+    for _ in range(remaining):
+        _apply_with_diagonal_f32_into(
+            layer_count, rows, cols, gx, gy, gz, diag_mass, x, scratch
+        )
+        np.subtract(rhs, scratch, out=scratch)
+        scratch *= omega_inv
+        x += scratch
+    return x
+
+
+def _residual_restrict_2x2_f32(
+    layer_count: int,
+    rows: int,
+    cols: int,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    gz: np.ndarray,
+    diag_mass: np.ndarray,
+    rhs: np.ndarray,
+    x: np.ndarray,
+    scratch: np.ndarray,
+    coarse_rhs: np.ndarray,
+) -> np.ndarray:
+    """Compute float32 residual ``rhs - A*x`` and 2x2-restrict into ``coarse_rhs``."""
+    if residual_restrict_2x2_f32_native is not None:
+        native_out = residual_restrict_2x2_f32_native(
+            layer_count,
+            rows,
+            cols,
+            gx,
+            gy,
+            gz,
+            diag_mass,
+            rhs,
+            x,
+            out=coarse_rhs,
+        )
+        if native_out is not None:
+            if native_out is not coarse_rhs:
+                np.copyto(coarse_rhs, native_out)
+            return coarse_rhs
+
+    _apply_with_diagonal_f32_into(
+        layer_count, rows, cols, gx, gy, gz, diag_mass, x, scratch
+    )
+    np.subtract(rhs, scratch, out=scratch)
+    _restrict_2x2_into(
+        scratch.reshape(layer_count, rows, cols),
+        coarse_rhs.reshape(layer_count, (rows + 1) // 2, (cols + 1) // 2),
+    )
+    return coarse_rhs
+
+
+def _prolong_add_2x2_f32(
+    layer_count: int,
+    rows: int,
+    cols: int,
+    coarse_x: np.ndarray,
+    fine_x: np.ndarray,
+) -> None:
+    """In-place add float32 piecewise-constant 2x2 prolongation into ``fine_x``."""
+    if prolong_add_2x2_f32_native is not None and prolong_add_2x2_f32_native(
+        layer_count, rows, cols, coarse_x, fine_x
+    ):
+        return
+    coarse_rows = (rows + 1) // 2
+    coarse_cols = (cols + 1) // 2
+    coarse_view = coarse_x.reshape(layer_count, coarse_rows, coarse_cols)
+    fine_view = fine_x.reshape(layer_count, rows, cols)
+    fine_view[:, 0::2, 0::2] += coarse_view
+    if cols > 1:
+        fine_view[:, 0::2, 1::2] += coarse_view[:, :, : cols // 2]
+    if rows > 1:
+        fine_view[:, 1::2, 0::2] += coarse_view[:, : rows // 2, :]
+    if rows > 1 and cols > 1:
+        fine_view[:, 1::2, 1::2] += coarse_view[:, : rows // 2, : cols // 2]
+
+
+def _build_coarse_solver(
+    coarsest_op: "StructuredThermalOperator",
+    scaled_capacity: np.ndarray,
+):
+    """Assemble and factorize the coarsest float64 CSC system."""
+    scaled_cap_f64 = np.asarray(scaled_capacity, dtype=np.float64)
+    coarse_matrix = _assemble_structured_csc(coarsest_op, scaled_cap_f64)
+    try:
+        return spla.factorized(coarse_matrix)
+    except Exception:
+        coarse_diag = (
+            coarsest_op.stiffness_diag.astype(np.float64, copy=False) + scaled_cap_f64
+        )
+        coarse_inv = np.divide(
+            1.0,
+            coarse_diag,
+            out=np.zeros_like(coarse_diag),
+            where=np.abs(coarse_diag) > 1e-30,
+        )
+        return lambda rhs, _inv=coarse_inv: _inv * rhs
+
+
 class _StructuredGeometricMultigrid:
-    """Symmetric V-cycle geometric multigrid preconditioner for regular 3D grids."""
+    """Mixed-precision float32 V-cycle geometric multigrid preconditioner."""
 
     def __init__(
         self,
@@ -467,164 +727,175 @@ class _StructuredGeometricMultigrid:
         self.operators = operators
         self.omega = float(omega)
         self.smooth_steps = int(smooth_steps)
+        self.gxs: List[np.ndarray] = []
+        self.gys: List[np.ndarray] = []
+        self.gzs: List[np.ndarray] = []
         self.diag_masses: List[np.ndarray] = []
         self.omega_inv_diags: List[np.ndarray] = []
 
-        scaled_capacity = np.ascontiguousarray(
+        scaled_cap_f64 = np.ascontiguousarray(
             float(derivative_scale) * capacity, dtype=np.float64
         ).reshape(-1)
+        scaled_cap_f32: Optional[np.ndarray] = None
 
         for level_idx, level_op in enumerate(self.operators):
-            if level_idx > 0:
-                prev_op = self.operators[level_idx - 1]
-                scaled_capacity = np.ascontiguousarray(
-                    _restrict_2x2(
-                        scaled_capacity.reshape(
-                            prev_op.layer_count, prev_op.rows, prev_op.cols
-                        )
-                    ).reshape(-1),
-                    dtype=np.float64,
+            if level_idx == 0:
+                diag_mass_f64 = level_op.boundary_diag + scaled_cap_f64
+                diagonal_f64 = level_op.stiffness_diag + scaled_cap_f64
+                inv_diag = np.divide(
+                    1.0,
+                    diagonal_f64,
+                    out=np.zeros_like(diagonal_f64),
+                    where=np.abs(diagonal_f64) > 1e-30,
                 )
-            diag_mass = np.ascontiguousarray(
-                level_op.boundary_diag + scaled_capacity, dtype=np.float64
-            )
-            diagonal = level_op.stiffness_diag + scaled_capacity
-            inv_diag = np.divide(
-                1.0,
-                diagonal,
-                out=np.zeros_like(diagonal),
-                where=np.abs(diagonal) > 1e-30,
-            )
+                diag_mass = np.ascontiguousarray(diag_mass_f64, dtype=np.float32)
+                omega_inv = np.ascontiguousarray(
+                    self.omega * inv_diag, dtype=np.float32
+                )
+                scaled_cap_f32 = scaled_cap_f64.astype(np.float32)
+            else:
+                prev_op = self.operators[level_idx - 1]
+                scaled_cap_f32 = np.ascontiguousarray(
+                    _restrict_2x2(
+                        scaled_cap_f32.reshape(
+                            prev_op.layer_count, prev_op.rows, prev_op.cols
+                        ),
+                        dtype=np.float32,
+                    ).reshape(-1),
+                    dtype=np.float32,
+                )
+                diag_mass = np.ascontiguousarray(
+                    level_op.boundary_diag.astype(np.float32, copy=False)
+                    + scaled_cap_f32,
+                    dtype=np.float32,
+                )
+                diagonal = (
+                    level_op.stiffness_diag.astype(np.float32, copy=False)
+                    + scaled_cap_f32
+                )
+                inv_diag = np.divide(
+                    np.float32(1.0),
+                    diagonal,
+                    out=np.zeros_like(diagonal),
+                    where=np.abs(diagonal) > np.float32(1e-30),
+                )
+                omega_inv = np.ascontiguousarray(
+                    np.float32(self.omega) * inv_diag, dtype=np.float32
+                )
+
+            self.gxs.append(np.ascontiguousarray(level_op.gx, dtype=np.float32))
+            self.gys.append(np.ascontiguousarray(level_op.gy, dtype=np.float32))
+            self.gzs.append(np.ascontiguousarray(level_op.gz, dtype=np.float32))
             self.diag_masses.append(diag_mass)
-            self.omega_inv_diags.append(
-                np.ascontiguousarray(self.omega * inv_diag, dtype=np.float64)
-            )
+            self.omega_inv_diags.append(omega_inv)
 
-        coarse_matrix = _assemble_structured_csc(self.operators[-1], scaled_capacity)
-        try:
-            self.coarse_solver = spla.factorized(coarse_matrix)
-        except Exception:
-            coarse_diag = self.operators[-1].stiffness_diag + scaled_capacity
-            coarse_inv = np.divide(
-                1.0,
-                coarse_diag,
-                out=np.zeros_like(coarse_diag),
-                where=np.abs(coarse_diag) > 1e-30,
-            )
-            self.coarse_solver = lambda rhs, _inv=coarse_inv: _inv * rhs
+        coarsest_cap = scaled_cap_f64 if len(self.operators) == 1 else scaled_cap_f32
+        self.coarse_solver = _build_coarse_solver(self.operators[-1], coarsest_cap)
 
-    def _cycle(self, level: int, rhs: np.ndarray) -> np.ndarray:
+        self._rhs_bufs = [
+            np.empty(op.shape[0], dtype=np.float32) for op in self.operators
+        ]
+        self._x_bufs = [
+            np.empty(op.shape[0], dtype=np.float32) for op in self.operators
+        ]
+        self._scratch_bufs = [
+            np.empty(op.shape[0], dtype=np.float32) for op in self.operators[:-1]
+        ]
+
+    def _cycle(self, level: int) -> None:
         if level == len(self.operators) - 1:
-            return np.ascontiguousarray(
-                self.coarse_solver(rhs), dtype=np.float64
-            ).reshape(-1)
+            sol = self.coarse_solver(
+                self._rhs_bufs[level].astype(np.float64, copy=False)
+            )
+            np.copyto(self._x_bufs[level], np.asarray(sol, dtype=np.float64).reshape(-1), casting="unsafe")
+            return
 
         op = self.operators[level]
+        gx = self.gxs[level]
+        gy = self.gys[level]
+        gz = self.gzs[level]
         diag_mass = self.diag_masses[level]
         omega_inv = self.omega_inv_diags[level]
+        rhs = self._rhs_bufs[level]
+        x = self._x_bufs[level]
+        scratch = self._scratch_bufs[level]
 
-        # Pre-smoothing starting from zero avoids an unnecessary matvec on step 1.
-        value = None
-        if damped_jacobi_native is not None:
-            value = damped_jacobi_native(
-                op.layer_count,
-                op.rows,
-                op.cols,
-                op.gx,
-                op.gy,
-                op.gz,
-                diag_mass,
-                omega_inv,
-                rhs,
-                None,
-                self.smooth_steps,
-                zero_init=True,
-            )
-        if value is None:
-            value = omega_inv * rhs
-            for _ in range(self.smooth_steps - 1):
-                residual = rhs - op._apply_with_diagonal(diag_mass, value)
-                residual *= omega_inv
-                value += residual
+        _smooth_f32(
+            op.layer_count,
+            op.rows,
+            op.cols,
+            gx,
+            gy,
+            gz,
+            diag_mass,
+            omega_inv,
+            rhs,
+            x,
+            scratch,
+            self.smooth_steps,
+            zero_init=True,
+        )
+        _residual_restrict_2x2_f32(
+            op.layer_count,
+            op.rows,
+            op.cols,
+            gx,
+            gy,
+            gz,
+            diag_mass,
+            rhs,
+            x,
+            scratch,
+            self._rhs_bufs[level + 1],
+        )
+        self._cycle(level + 1)
+        _prolong_add_2x2_f32(
+            op.layer_count,
+            op.rows,
+            op.cols,
+            self._x_bufs[level + 1],
+            x,
+        )
+        _smooth_f32(
+            op.layer_count,
+            op.rows,
+            op.cols,
+            gx,
+            gy,
+            gz,
+            diag_mass,
+            omega_inv,
+            rhs,
+            x,
+            scratch,
+            self.smooth_steps,
+            zero_init=False,
+        )
 
-        coarse_rhs = None
-        if residual_restrict_2x2_native is not None:
-            coarse_rhs = residual_restrict_2x2_native(
-                op.layer_count,
-                op.rows,
-                op.cols,
-                op.gx,
-                op.gy,
-                op.gz,
-                diag_mass,
-                rhs,
-                value,
-            )
-        if coarse_rhs is None:
-            residual = rhs - op._apply_with_diagonal(diag_mass, value)
-            coarse_rhs = _restrict_2x2(
-                residual.reshape(op.layer_count, op.rows, op.cols)
-            ).reshape(-1)
-
-        coarse_correction = self._cycle(level + 1, coarse_rhs)
-
-        prolonged = False
-        if prolong_add_2x2_native is not None:
-            prolonged = bool(
-                prolong_add_2x2_native(
-                    op.layer_count,
-                    op.rows,
-                    op.cols,
-                    coarse_correction,
-                    value,
-                )
-            )
-        if not prolonged:
-            coarse_op = self.operators[level + 1]
-            coarse_view = coarse_correction.reshape(
-                coarse_op.layer_count, coarse_op.rows, coarse_op.cols
-            )
-            value_view = value.reshape(op.layer_count, op.rows, op.cols)
-            value_view[:, 0::2, 0::2] += coarse_view
-            if op.cols > 1:
-                value_view[:, 0::2, 1::2] += coarse_view[:, :, : op.cols // 2]
-            if op.rows > 1:
-                value_view[:, 1::2, 0::2] += coarse_view[:, : op.rows // 2, :]
-            if op.rows > 1 and op.cols > 1:
-                value_view[:, 1::2, 1::2] += coarse_view[
-                    :, : op.rows // 2, : op.cols // 2
-                ]
-
-        post_value = None
-        if damped_jacobi_native is not None:
-            post_value = damped_jacobi_native(
-                op.layer_count,
-                op.rows,
-                op.cols,
-                op.gx,
-                op.gy,
-                op.gz,
-                diag_mass,
-                omega_inv,
-                rhs,
-                value,
-                self.smooth_steps,
-                zero_init=False,
-            )
-        if post_value is not None:
-            return post_value
-
-        for _ in range(self.smooth_steps):
-            residual = rhs - op._apply_with_diagonal(diag_mass, value)
-            residual *= omega_inv
-            value += residual
-        return value
+    def solve_into(self, rhs: np.ndarray, out: np.ndarray) -> np.ndarray:
+        """Apply one symmetric V-cycle into preallocated float64 buffer ``out``."""
+        rhs_arr = np.asarray(rhs, dtype=np.float64).reshape(-1)
+        np.copyto(self._rhs_bufs[0], rhs_arr, casting="unsafe")
+        self._cycle(0)
+        np.copyto(out, self._x_bufs[0])
+        return out
 
     def solve(self, rhs: np.ndarray) -> np.ndarray:
-        """Apply one symmetric V-cycle."""
-        return self._cycle(
-            0, np.ascontiguousarray(rhs, dtype=np.float64).reshape(-1)
-        )
+        """Apply one symmetric V-cycle and return a fresh float64 array."""
+        out = np.empty(self._rhs_bufs[0].size, dtype=np.float64)
+        return self.solve_into(rhs, out)
+
+
+def _capacity_cache_key(capacity: Optional[np.ndarray]):
+    """Build a lightweight identity+shape+endpoint key without copying capacity."""
+    if capacity is None:
+        return None
+    return (
+        id(capacity),
+        capacity.size,
+        float(capacity[0]) if capacity.size else 0.0,
+        float(capacity[-1]) if capacity.size else 0.0,
+    )
 
 
 @dataclass
@@ -655,6 +926,11 @@ class StructuredThermalOperator:
         """Return the non-zero count of the equivalent assembled matrix."""
         edge_count = self.gx.size + self.gy.size + self.gz.size
         return int(self.shape[0] + 2 * edge_count)
+
+    def clear_caches(self):
+        """Release cached coarse operator hierarchies and preconditioners."""
+        self._preconditioner_cache.clear()
+        self._coarse_operators = None
 
     def _apply_with_diagonal(self, diag_mass: np.ndarray, vector) -> np.ndarray:
         """Apply conduction fluxes plus an arbitrary diagonal mass term."""
@@ -709,7 +985,7 @@ class StructuredThermalOperator:
     def _get_multigrid_operators(
         self, coarse_max_nodes: int = 1024, max_levels: int = 10
     ) -> List["StructuredThermalOperator"]:
-        """Build and cache the coarsened stiffness operator hierarchy."""
+        """Build and cache the float32 coarsened stiffness operator hierarchy."""
         if self._coarse_operators is not None:
             return self._coarse_operators
         levels = [self]
@@ -719,16 +995,24 @@ class StructuredThermalOperator:
                 break
             if current.rows <= 2 and current.cols <= 2:
                 break
-            current = _coarsen_structured_operator(current)
+            current = _coarsen_structured_operator(current, dtype=np.float32)
             levels.append(current)
         self._coarse_operators = levels
         return levels
 
     def implicit_linear_operator(self, capacity, derivative_scale):
         """Return ``K + derivative_scale * C`` as a SciPy LinearOperator."""
-        capacity = np.ascontiguousarray(capacity, dtype=np.float64).reshape(-1)
+        if (
+            isinstance(capacity, np.ndarray)
+            and capacity.dtype == np.float64
+            and capacity.ndim == 1
+            and capacity.flags.c_contiguous
+        ):
+            cap_arr = capacity
+        else:
+            cap_arr = np.ascontiguousarray(capacity, dtype=np.float64).reshape(-1)
         scale = float(derivative_scale)
-        scaled_capacity = scale * capacity
+        scaled_capacity = scale * cap_arr
         diag_mass = np.ascontiguousarray(
             self.boundary_diag + scaled_capacity, dtype=np.float64
         )
@@ -752,27 +1036,1038 @@ class StructuredThermalOperator:
                 matvec=lambda vector: inverse_diagonal * vector,
                 dtype=np.float64,
             )
+            preconditioner._solve_into = lambda v, out: np.multiply(
+                inverse_diagonal, v, out=out
+            )
             return operator, preconditioner
 
+        cap_key = _capacity_cache_key(cap_arr)
         cached = self._preconditioner_cache.get(scale)
-        if cached is not None and np.array_equal(cached[0], capacity):
+        if cached is not None and cached[0] == cap_key:
             multigrid = cached[1]
         else:
             multigrid = _StructuredGeometricMultigrid(
                 self._get_multigrid_operators(),
-                capacity,
+                cap_arr,
                 scale,
             )
-            if len(self._preconditioner_cache) >= 4:
-                self._preconditioner_cache.clear()
-            self._preconditioner_cache[scale] = (capacity.copy(), multigrid)
+            self._preconditioner_cache.clear()
+            self._preconditioner_cache[scale] = (cap_key, multigrid)
 
         preconditioner = spla.LinearOperator(
             shape,
             matvec=multigrid.solve,
             dtype=np.float64,
         )
+        preconditioner._solve_into = multigrid.solve_into
         return operator, preconditioner
+
+
+def _compute_layer_luts(
+    layer_count: int,
+    t_cu: np.ndarray,
+    t_fr4_eff: np.ndarray,
+    k_cu: float,
+    k_fr4: float,
+    dx: float,
+    dy: float,
+    gap_m: List[float],
+    rho_cu: float = 8960.0,
+    cp_cu: float = 385.0,
+    rho_fr4: float = 1850.0,
+    cp_fr4: float = 1100.0,
+    pad_cap_areal: float = 0.0,
+):
+    """Precompute compact 3-value edge conductance and 2-value capacity LUTs."""
+    eps = 1e-12
+    pixel_area = float(dx) * float(dy)
+    k0 = float(k_fr4)
+    k1 = float(k_cu)
+    gx_lut = np.empty((layer_count, 3), dtype=np.float64)
+    gy_lut = np.empty((layer_count, 3), dtype=np.float64)
+    cap_lut = np.empty((layer_count, 2), dtype=np.float64)
+
+    k_pair = (
+        2.0 * k0 * k0 / (k0 + k0 + eps),
+        2.0 * k0 * k1 / (k0 + k1 + eps),
+        2.0 * k1 * k1 / (k1 + k1 + eps),
+    )
+
+    for layer_idx in range(layer_count):
+        t0 = float(t_fr4_eff[layer_idx])
+        t1 = float(t_cu[layer_idx])
+        t_pair = (t0, 0.5 * (t0 + t1), t1)
+        for m in range(3):
+            gx_lut[layer_idx, m] = k_pair[m] * (t_pair[m] * dy) / dx
+            gy_lut[layer_idx, m] = k_pair[m] * (t_pair[m] * dx) / dy
+        cap_fr4 = float(rho_fr4) * float(cp_fr4) * pixel_area * t0
+        cap_cu = float(rho_cu) * float(cp_cu) * pixel_area * t1
+        cap_lut[layer_idx, 0] = cap_fr4
+        cap_lut[layer_idx, 1] = cap_cu + cap_fr4
+
+    if layer_count > 1 and gap_m:
+        gz_scale = np.empty(layer_count - 1, dtype=np.float64)
+        for layer_idx in range(layer_count - 1):
+            gap_value = max(float(gap_m[layer_idx]), 1e-6)
+            gz_scale[layer_idx] = k0 * pixel_area / gap_value
+    else:
+        gz_scale = np.empty(0, dtype=np.float64)
+
+    pad_cap_cell = float(pad_cap_areal) * pixel_area
+    return gx_lut, gy_lut, gz_scale, cap_lut, pad_cap_cell
+
+
+def _coarsen_compact_to_f32_numpy(op: "CompactStructuredThermalOperator"):
+    """Pure-NumPy layer-by-layer Level-0 -> Level-1 Galerkin coarsening in float32."""
+    layers = op.layer_count
+    rows = op.rows
+    cols = op.cols
+    c_rows = (rows + 1) // 2
+    c_cols = (cols + 1) // 2
+    even_rows = (rows // 2) * 2
+    even_cols = (cols // 2) * 2
+    hs_bool = op.heatsink_mask.astype(bool, copy=False)
+
+    gx_c = np.empty((layers, c_rows, max(c_cols - 1, 0)), dtype=np.float32)
+    gy_c = np.empty((layers, max(c_rows - 1, 0), c_cols), dtype=np.float32)
+    gz_c = np.empty((max(layers - 1, 0), c_rows, c_cols), dtype=np.float32)
+    boundary_c = np.empty((layers, c_rows, c_cols), dtype=np.float32)
+    cap_c = np.empty((layers, c_rows, c_cols), dtype=np.float32)
+
+    for layer_idx in range(layers):
+        mask_l = op.copper_mask[layer_idx]
+        if c_cols > 1:
+            idx_x = (mask_l[:, :-1] + mask_l[:, 1:])[:, 1::2]
+            gx_odd = op.gx_lut[layer_idx][idx_x]
+            if rows == even_rows:
+                gx_c[layer_idx] = (gx_odd[0::2, :] + gx_odd[1::2, :]).astype(np.float32)
+            else:
+                if even_rows > 0:
+                    gx_c[layer_idx, :-1, :] = (
+                        gx_odd[0:even_rows:2, :] + gx_odd[1:even_rows:2, :]
+                    ).astype(np.float32)
+                gx_c[layer_idx, -1, :] = gx_odd[-1, :].astype(np.float32)
+
+        if c_rows > 1:
+            idx_y = (mask_l[:-1, :] + mask_l[1:, :])[1::2, :]
+            gy_odd = op.gy_lut[layer_idx][idx_y]
+            if cols == even_cols:
+                gy_c[layer_idx] = (gy_odd[:, 0::2] + gy_odd[:, 1::2]).astype(np.float32)
+            else:
+                if even_cols > 0:
+                    gy_c[layer_idx, :, :-1] = (
+                        gy_odd[:, 0:even_cols:2] + gy_odd[:, 1:even_cols:2]
+                    ).astype(np.float32)
+                gy_c[layer_idx, :, -1] = gy_odd[:, -1].astype(np.float32)
+
+        cap_l = np.where(mask_l, op.cap_lut[layer_idx, 1], op.cap_lut[layer_idx, 0])
+        if layer_idx == layers - 1 and op.pad_cap_cell != 0.0:
+            cap_l[hs_bool] += op.pad_cap_cell
+        _restrict_2x2_into(cap_l[None, :, :], cap_c[layer_idx : layer_idx + 1])
+
+        b_l = np.zeros((rows, cols), dtype=np.float64)
+        if layer_idx == 0:
+            b_l += op.top_diag
+        if layer_idx == layers - 1:
+            b_l += np.where(hs_bool, op.bot_pad_diag, op.bot_air_diag)
+        _restrict_2x2_into(b_l[None, :, :], boundary_c[layer_idx : layer_idx + 1])
+
+    if layers > 1 and op.gz_scale.size:
+        via_f64 = op.via_enh.astype(np.float64)
+        for layer_idx in range(layers - 1):
+            gz_l = op.gz_scale[layer_idx] * via_f64
+            _restrict_2x2_into(gz_l[None, :, :], gz_c[layer_idx : layer_idx + 1])
+
+    stiffness_view = np.array(boundary_c, dtype=np.float64, copy=True)
+    if c_cols > 1:
+        stiffness_view[:, :, :-1] += gx_c
+        stiffness_view[:, :, 1:] += gx_c
+    if c_rows > 1:
+        stiffness_view[:, :-1, :] += gy_c
+        stiffness_view[:, 1:, :] += gy_c
+    if layers > 1 and gz_c.size:
+        stiffness_view[:-1, :, :] += gz_c
+        stiffness_view[1:, :, :] += gz_c
+
+    return (
+        np.ascontiguousarray(gx_c, dtype=np.float32),
+        np.ascontiguousarray(gy_c, dtype=np.float32),
+        np.ascontiguousarray(gz_c, dtype=np.float32),
+        np.ascontiguousarray(boundary_c.reshape(-1), dtype=np.float32),
+        np.ascontiguousarray(stiffness_view.reshape(-1), dtype=np.float32),
+        np.ascontiguousarray(cap_c.reshape(-1), dtype=np.float32),
+    )
+
+
+def _compact_layer_full_diag(
+    op: "CompactStructuredThermalOperator",
+    layer_idx: int,
+    scale: float,
+    hs_bool: np.ndarray,
+) -> np.ndarray:
+    """Compute Level-0 ``K_ii + scale * C_i`` for a single 2D layer."""
+    mask_l = op.copper_mask[layer_idx]
+    diag = np.zeros((op.rows, op.cols), dtype=np.float64)
+    if scale != 0.0:
+        cap_l = np.where(mask_l, op.cap_lut[layer_idx, 1], op.cap_lut[layer_idx, 0])
+        if layer_idx == op.layer_count - 1 and op.pad_cap_cell != 0.0:
+            cap_l[hs_bool] += op.pad_cap_cell
+        diag += scale * cap_l
+    if layer_idx == 0:
+        diag += op.top_diag
+    if layer_idx == op.layer_count - 1:
+        diag += np.where(hs_bool, op.bot_pad_diag, op.bot_air_diag)
+    if op.cols > 1:
+        gx_l = op.gx_lut[layer_idx][mask_l[:, :-1] + mask_l[:, 1:]]
+        diag[:, :-1] += gx_l
+        diag[:, 1:] += gx_l
+    if op.rows > 1:
+        gy_l = op.gy_lut[layer_idx][mask_l[:-1, :] + mask_l[1:, :]]
+        diag[:-1, :] += gy_l
+        diag[1:, :] += gy_l
+    if op.layer_count > 1 and op.gz_scale.size:
+        via_f64 = op.via_enh.astype(np.float64)
+        if layer_idx > 0:
+            diag += op.gz_scale[layer_idx - 1] * via_f64
+        if layer_idx < op.layer_count - 1:
+            diag += op.gz_scale[layer_idx] * via_f64
+    return diag
+
+
+def _compact_apply_f32_into(
+    op: "CompactStructuredThermalOperator",
+    scale: float,
+    x_f32: np.ndarray,
+    out_f32: np.ndarray,
+) -> np.ndarray:
+    """Layer-by-layer pure-NumPy Level-0 ``(K + scale*C) * x`` in float32."""
+    layers, rows, cols = op.layer_count, op.rows, op.cols
+    x_view = x_f32.reshape(layers, rows, cols)
+    out_view = out_f32.reshape(layers, rows, cols)
+    hs_bool = op.heatsink_mask.astype(bool, copy=False)
+    via_f32 = op.via_enh if (layers > 1 and op.gz_scale.size) else None
+
+    for l in range(layers):
+        mask_l = op.copper_mask[l]
+        x_l = x_view[l]
+        r_l = out_view[l]
+        diag_2d = np.zeros((rows, cols), dtype=np.float64)
+        if scale != 0.0:
+            c_l = np.where(mask_l, op.cap_lut[l, 1], op.cap_lut[l, 0])
+            if l == layers - 1 and op.pad_cap_cell != 0.0:
+                c_l[hs_bool] += op.pad_cap_cell
+            diag_2d += scale * c_l
+        if l == 0:
+            diag_2d += op.top_diag
+        if l == layers - 1:
+            diag_2d += np.where(hs_bool, op.bot_pad_diag, op.bot_air_diag)
+        np.multiply(diag_2d.astype(np.float32), x_l, out=r_l)
+
+        if cols > 1:
+            gx_l = op.gx_lut[l].astype(np.float32)[mask_l[:, :-1] + mask_l[:, 1:]]
+            flux_x = gx_l * (x_l[:, :-1] - x_l[:, 1:])
+            r_l[:, :-1] += flux_x
+            r_l[:, 1:] -= flux_x
+        if rows > 1:
+            gy_l = op.gy_lut[l].astype(np.float32)[mask_l[:-1, :] + mask_l[1:, :]]
+            flux_y = gy_l * (x_l[:-1, :] - x_l[1:, :])
+            r_l[:-1, :] += flux_y
+            r_l[1:, :] -= flux_y
+
+    if via_f32 is not None:
+        for l in range(layers - 1):
+            gz_l = np.float32(op.gz_scale[l]) * via_f32
+            flux_z = gz_l * (x_view[l] - x_view[l + 1])
+            out_view[l] += flux_z
+            out_view[l + 1] -= flux_z
+    return out_f32
+
+
+class _CompactGeometricMultigrid:
+    """Zero-Level-0-materialization mixed-precision V-cycle preconditioner."""
+
+    def __init__(
+        self,
+        compact_op: "CompactStructuredThermalOperator",
+        coarse_operators: List["StructuredThermalOperator"],
+        level1_cap_f32: np.ndarray,
+        derivative_scale: float,
+        omega: float = 0.72,
+        smooth_steps: int = 2,
+    ):
+        self.compact_op = compact_op
+        self.coarse_operators = coarse_operators
+        self.omega = float(omega)
+        self.smooth_steps = int(smooth_steps)
+        self.scale = float(derivative_scale)
+
+        self.gxs: List[np.ndarray] = []
+        self.gys: List[np.ndarray] = []
+        self.gzs: List[np.ndarray] = []
+        self.diag_masses: List[np.ndarray] = []
+        self.omega_inv_diags: List[np.ndarray] = []
+
+        scaled_cap_f32 = np.ascontiguousarray(
+            np.float32(self.scale) * level1_cap_f32, dtype=np.float32
+        ).reshape(-1)
+
+        for idx, level_op in enumerate(self.coarse_operators):
+            if idx > 0:
+                prev_op = self.coarse_operators[idx - 1]
+                scaled_cap_f32 = np.ascontiguousarray(
+                    _restrict_2x2(
+                        scaled_cap_f32.reshape(
+                            prev_op.layer_count, prev_op.rows, prev_op.cols
+                        ),
+                        dtype=np.float32,
+                    ).reshape(-1),
+                    dtype=np.float32,
+                )
+            diag_mass = np.ascontiguousarray(
+                level_op.boundary_diag.astype(np.float32, copy=False) + scaled_cap_f32,
+                dtype=np.float32,
+            )
+            diagonal = (
+                level_op.stiffness_diag.astype(np.float32, copy=False) + scaled_cap_f32
+            )
+            inv_diag = np.divide(
+                np.float32(1.0),
+                diagonal,
+                out=np.zeros_like(diagonal),
+                where=np.abs(diagonal) > np.float32(1e-30),
+            )
+            self.gxs.append(np.ascontiguousarray(level_op.gx, dtype=np.float32))
+            self.gys.append(np.ascontiguousarray(level_op.gy, dtype=np.float32))
+            self.gzs.append(np.ascontiguousarray(level_op.gz, dtype=np.float32))
+            self.diag_masses.append(diag_mass)
+            self.omega_inv_diags.append(
+                np.ascontiguousarray(np.float32(self.omega) * inv_diag, dtype=np.float32)
+            )
+
+        self.coarse_solver = _build_coarse_solver(
+            self.coarse_operators[-1], scaled_cap_f32
+        )
+
+        # Level 0 + coarse levels (1..num_coarse)
+        self._rhs_bufs = [
+            np.empty(compact_op.shape[0], dtype=np.float32)
+        ] + [np.empty(op.shape[0], dtype=np.float32) for op in self.coarse_operators]
+        self._x_bufs = [
+            np.empty(compact_op.shape[0], dtype=np.float32)
+        ] + [np.empty(op.shape[0], dtype=np.float32) for op in self.coarse_operators]
+        self._scratch_bufs = [
+            np.empty(compact_op.shape[0], dtype=np.float32)
+        ] + [np.empty(op.shape[0], dtype=np.float32) for op in self.coarse_operators[:-1]]
+
+    def _smooth_level0(self, zero_init: bool) -> None:
+        op = self.compact_op
+        rhs = self._rhs_bufs[0]
+        x = self._x_bufs[0]
+        scratch = self._scratch_bufs[0]
+        if damped_jacobi_compact_f32_native is not None:
+            native_out = damped_jacobi_compact_f32_native(
+                op.layer_count,
+                op.rows,
+                op.cols,
+                op.copper_mask,
+                op.via_enh,
+                op.heatsink_mask,
+                op.gx_lut,
+                op.gy_lut,
+                op.gz_scale,
+                op.cap_lut,
+                op.pad_cap_cell,
+                op.top_diag,
+                op.bot_air_diag,
+                op.bot_pad_diag,
+                self.scale,
+                self.omega,
+                rhs,
+                x,
+                self.smooth_steps,
+                zero_init=zero_init,
+                scratch=scratch,
+            )
+            if native_out is not None:
+                if native_out is not x:
+                    np.copyto(x, native_out)
+                return
+
+        hs_bool = op.heatsink_mask.astype(bool, copy=False)
+        x_view = x.reshape(op.layer_count, op.rows, op.cols)
+        rhs_view = rhs.reshape(op.layer_count, op.rows, op.cols)
+        scratch_view = scratch.reshape(op.layer_count, op.rows, op.cols)
+
+        def apply_omega_inv(src_view, dst_view, add_to_dst: bool):
+            for l in range(op.layer_count):
+                full_diag = _compact_layer_full_diag(op, l, self.scale, hs_bool)
+                inv_d = np.divide(
+                    self.omega,
+                    full_diag,
+                    out=np.zeros_like(full_diag),
+                    where=np.abs(full_diag) > 1e-30,
+                ).astype(np.float32)
+                if add_to_dst:
+                    dst_view[l] += inv_d * src_view[l]
+                else:
+                    np.multiply(inv_d, src_view[l], out=dst_view[l])
+
+        if zero_init:
+            apply_omega_inv(rhs_view, x_view, add_to_dst=False)
+            remaining = max(0, self.smooth_steps - 1)
+        else:
+            remaining = self.smooth_steps
+
+        for _ in range(remaining):
+            _compact_apply_f32_into(op, self.scale, x, scratch)
+            np.subtract(rhs, scratch, out=scratch)
+            apply_omega_inv(scratch_view, x_view, add_to_dst=True)
+
+    def _residual_restrict_level0(self) -> None:
+        op = self.compact_op
+        rhs = self._rhs_bufs[0]
+        x = self._x_bufs[0]
+        scratch = self._scratch_bufs[0]
+        coarse_rhs = self._rhs_bufs[1]
+        if residual_restrict_2x2_compact_f32_native is not None:
+            native_out = residual_restrict_2x2_compact_f32_native(
+                op.layer_count,
+                op.rows,
+                op.cols,
+                op.copper_mask,
+                op.via_enh,
+                op.heatsink_mask,
+                op.gx_lut,
+                op.gy_lut,
+                op.gz_scale,
+                op.cap_lut,
+                op.pad_cap_cell,
+                op.top_diag,
+                op.bot_air_diag,
+                op.bot_pad_diag,
+                self.scale,
+                rhs,
+                x,
+                out=coarse_rhs,
+            )
+            if native_out is not None:
+                if native_out is not coarse_rhs:
+                    np.copyto(coarse_rhs, native_out)
+                return
+
+        _compact_apply_f32_into(op, self.scale, x, scratch)
+        np.subtract(rhs, scratch, out=scratch)
+        _restrict_2x2_into(
+            scratch.reshape(op.layer_count, op.rows, op.cols),
+            coarse_rhs.reshape(
+                op.layer_count, (op.rows + 1) // 2, (op.cols + 1) // 2
+            ),
+        )
+
+    def _cycle(self, level: int) -> None:
+        num_total_levels = 1 + len(self.coarse_operators)
+        if level == num_total_levels - 1:
+            sol = self.coarse_solver(
+                self._rhs_bufs[level].astype(np.float64, copy=False)
+            )
+            np.copyto(
+                self._x_bufs[level],
+                np.asarray(sol, dtype=np.float64).reshape(-1),
+                casting="unsafe",
+            )
+            return
+
+        if level == 0:
+            op = self.compact_op
+            self._smooth_level0(zero_init=True)
+            self._residual_restrict_level0()
+            self._cycle(1)
+            _prolong_add_2x2_f32(
+                op.layer_count,
+                op.rows,
+                op.cols,
+                self._x_bufs[1],
+                self._x_bufs[0],
+            )
+            self._smooth_level0(zero_init=False)
+            return
+
+        c_idx = level - 1
+        op = self.coarse_operators[c_idx]
+        gx = self.gxs[c_idx]
+        gy = self.gys[c_idx]
+        gz = self.gzs[c_idx]
+        diag_mass = self.diag_masses[c_idx]
+        omega_inv = self.omega_inv_diags[c_idx]
+        rhs = self._rhs_bufs[level]
+        x = self._x_bufs[level]
+        scratch = self._scratch_bufs[level]
+
+        _smooth_f32(
+            op.layer_count,
+            op.rows,
+            op.cols,
+            gx,
+            gy,
+            gz,
+            diag_mass,
+            omega_inv,
+            rhs,
+            x,
+            scratch,
+            self.smooth_steps,
+            zero_init=True,
+        )
+        _residual_restrict_2x2_f32(
+            op.layer_count,
+            op.rows,
+            op.cols,
+            gx,
+            gy,
+            gz,
+            diag_mass,
+            rhs,
+            x,
+            scratch,
+            self._rhs_bufs[level + 1],
+        )
+        self._cycle(level + 1)
+        _prolong_add_2x2_f32(
+            op.layer_count,
+            op.rows,
+            op.cols,
+            self._x_bufs[level + 1],
+            x,
+        )
+        _smooth_f32(
+            op.layer_count,
+            op.rows,
+            op.cols,
+            gx,
+            gy,
+            gz,
+            diag_mass,
+            omega_inv,
+            rhs,
+            x,
+            scratch,
+            self.smooth_steps,
+            zero_init=False,
+        )
+
+    def solve_into(self, rhs: np.ndarray, out: np.ndarray) -> np.ndarray:
+        """Apply one symmetric V-cycle into preallocated float64 buffer ``out``."""
+        rhs_arr = np.asarray(rhs, dtype=np.float64).reshape(-1)
+        np.copyto(self._rhs_bufs[0], rhs_arr, casting="unsafe")
+        self._cycle(0)
+        np.copyto(out, self._x_bufs[0])
+        return out
+
+    def solve(self, rhs: np.ndarray) -> np.ndarray:
+        """Apply one symmetric V-cycle and return a fresh float64 array."""
+        out = np.empty(self._rhs_bufs[0].size, dtype=np.float64)
+        return self.solve_into(rhs, out)
+
+
+@dataclass
+class CompactStructuredThermalOperator:
+    """Ultra-compact matrix-free operator storing only masks, 2D via map, and LUTs."""
+
+    layer_count: int
+    rows: int
+    cols: int
+    copper_mask: np.ndarray
+    via_enh: np.ndarray
+    heatsink_mask: np.ndarray
+    gx_lut: np.ndarray
+    gy_lut: np.ndarray
+    gz_scale: np.ndarray
+    cap_lut: np.ndarray
+    pad_cap_cell: float
+    top_diag: float
+    bot_air_diag: float
+    bot_pad_diag: float
+    top_rhs: float
+    bot_air_rhs: float
+    bot_pad_rhs: float
+    top_ha: float
+    bot_air_ha: float
+    bot_pad_ha: float
+    heatsink_mode_active: bool
+
+    def __post_init__(self):
+        self.copper_mask = np.ascontiguousarray(
+            np.asarray(self.copper_mask, dtype=bool), dtype=np.uint8
+        )
+        self.via_enh = np.ascontiguousarray(self.via_enh, dtype=np.float32)
+        self.heatsink_mask = np.ascontiguousarray(
+            np.asarray(self.heatsink_mask, dtype=bool), dtype=np.uint8
+        )
+        self.gx_lut = np.ascontiguousarray(self.gx_lut, dtype=np.float64)
+        self.gy_lut = np.ascontiguousarray(self.gy_lut, dtype=np.float64)
+        self.gz_scale = np.ascontiguousarray(self.gz_scale, dtype=np.float64)
+        self.cap_lut = np.ascontiguousarray(self.cap_lut, dtype=np.float64)
+        self._coarse_operators = None
+        self._preconditioner_cache = {}
+
+    @property
+    def shape(self):
+        """Return the equivalent square matrix shape."""
+        node_count = self.layer_count * self.rows * self.cols
+        return node_count, node_count
+
+    @property
+    def nnz_estimate(self):
+        """Return the non-zero count of the equivalent assembled matrix."""
+        x_edges = self.layer_count * self.rows * max(self.cols - 1, 0)
+        y_edges = self.layer_count * max(self.rows - 1, 0) * self.cols
+        z_edges = (
+            (self.layer_count - 1) * self.rows * self.cols
+            if (self.layer_count > 1 and self.gz_scale.size)
+            else 0
+        )
+        return int(self.shape[0] + 2 * (x_edges + y_edges + z_edges))
+
+    def clear_caches(self):
+        """Release cached coarse operator hierarchies and preconditioners."""
+        self._preconditioner_cache.clear()
+        self._coarse_operators = None
+
+    def _apply_with_scale(
+        self, scale: float, vector, out: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """Apply ``(K + scale * C) * vector`` without materializing 3D conductance arrays."""
+        if (
+            isinstance(vector, np.ndarray)
+            and vector.dtype == np.float64
+            and vector.ndim == 1
+            and vector.flags.c_contiguous
+        ):
+            flat_vector = vector
+        else:
+            flat_vector = np.ascontiguousarray(vector, dtype=np.float64).reshape(-1)
+
+        if out is None:
+            out = np.empty(self.shape[0], dtype=np.float64)
+
+        if HAS_NATIVE_COMPACT and apply_compact_native is not None:
+            native_result = apply_compact_native(
+                self.layer_count,
+                self.rows,
+                self.cols,
+                self.copper_mask,
+                self.via_enh,
+                self.heatsink_mask,
+                self.gx_lut,
+                self.gy_lut,
+                self.gz_scale,
+                self.cap_lut,
+                self.pad_cap_cell,
+                self.top_diag,
+                self.bot_air_diag,
+                self.bot_pad_diag,
+                float(scale),
+                flat_vector,
+                out=out,
+            )
+            if native_result is not None:
+                if native_result is not out:
+                    np.copyto(out, native_result)
+                return out
+
+        layers, rows, cols = self.layer_count, self.rows, self.cols
+        values = flat_vector.reshape(layers, rows, cols)
+        res_view = out.reshape(layers, rows, cols)
+        hs_bool = self.heatsink_mask.astype(bool, copy=False)
+        scale_f = float(scale)
+
+        for l in range(layers):
+            mask_l = self.copper_mask[l]
+            v_l = values[l]
+            r_l = res_view[l]
+            if scale_f != 0.0:
+                diag_2d = np.where(mask_l, self.cap_lut[l, 1], self.cap_lut[l, 0])
+                if l == layers - 1 and self.pad_cap_cell != 0.0:
+                    diag_2d[hs_bool] += self.pad_cap_cell
+                diag_2d *= scale_f
+            else:
+                diag_2d = np.zeros((rows, cols), dtype=np.float64)
+            if l == 0:
+                diag_2d += self.top_diag
+            if l == layers - 1:
+                diag_2d += np.where(hs_bool, self.bot_pad_diag, self.bot_air_diag)
+            np.multiply(diag_2d, v_l, out=r_l)
+
+            if cols > 1:
+                gx_l = self.gx_lut[l][mask_l[:, :-1] + mask_l[:, 1:]]
+                flux_x = gx_l * (v_l[:, :-1] - v_l[:, 1:])
+                r_l[:, :-1] += flux_x
+                r_l[:, 1:] -= flux_x
+            if rows > 1:
+                gy_l = self.gy_lut[l][mask_l[:-1, :] + mask_l[1:, :]]
+                flux_y = gy_l * (v_l[:-1, :] - v_l[1:, :])
+                r_l[:-1, :] += flux_y
+                r_l[1:, :] -= flux_y
+
+        if layers > 1 and self.gz_scale.size:
+            via_f64 = self.via_enh.astype(np.float64)
+            for l in range(layers - 1):
+                gz_l = self.gz_scale[l] * via_f64
+                flux_z = gz_l * (values[l] - values[l + 1])
+                res_view[l] += flux_z
+                res_view[l + 1] -= flux_z
+        return out
+
+    def dot(self, vector):
+        """Apply the stiffness operator ``K * vector``."""
+        return self._apply_with_scale(0.0, vector)
+
+    def add_boundary_rhs(self, out: np.ndarray) -> np.ndarray:
+        """Add boundary condition RHS ``b`` in-place (only touches layers 0 and L-1)."""
+        plane_size = self.rows * self.cols
+        out[:plane_size] += self.top_rhs
+        if self.bot_air_rhs != 0.0 or self.bot_pad_rhs != 0.0:
+            hs_bool = self.heatsink_mask.reshape(-1).astype(bool, copy=False)
+            out[-plane_size:] += np.where(hs_bool, self.bot_pad_rhs, self.bot_air_rhs)
+        return out
+
+    def add_scaled_capacity(
+        self, out: np.ndarray, vec: np.ndarray, scale: float
+    ) -> np.ndarray:
+        """Accumulate ``scale * C * vec`` into ``out`` layer-by-layer without a 3D C array."""
+        scale_f = float(scale)
+        if scale_f == 0.0:
+            return out
+        plane_size = self.rows * self.cols
+        out_layers = out.reshape(self.layer_count, plane_size)
+        vec_layers = np.asarray(vec, dtype=np.float64).reshape(
+            self.layer_count, plane_size
+        )
+        hs_bool = self.heatsink_mask.reshape(-1).astype(bool, copy=False)
+        for l in range(self.layer_count):
+            c0 = self.cap_lut[l, 0] * scale_f
+            c1 = self.cap_lut[l, 1] * scale_f
+            cap_scaled = np.where(self.copper_mask[l].reshape(-1), c1, c0)
+            if l == self.layer_count - 1 and self.pad_cap_cell != 0.0:
+                cap_scaled[hs_bool] += self.pad_cap_cell * scale_f
+            out_layers[l] += cap_scaled * vec_layers[l]
+        return out
+
+    def divide_by_capacity(
+        self, vec: np.ndarray, out: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """Compute ``vec / C`` layer-by-layer without allocating a 3D capacity array."""
+        if out is None:
+            out = np.empty(self.shape[0], dtype=np.float64)
+        plane_size = self.rows * self.cols
+        vec_layers = np.asarray(vec, dtype=np.float64).reshape(
+            self.layer_count, plane_size
+        )
+        out_layers = out.reshape(self.layer_count, plane_size)
+        hs_bool = self.heatsink_mask.reshape(-1).astype(bool, copy=False)
+        for l in range(self.layer_count):
+            cap_l = np.where(
+                self.copper_mask[l].reshape(-1),
+                self.cap_lut[l, 1],
+                self.cap_lut[l, 0],
+            )
+            if l == self.layer_count - 1 and self.pad_cap_cell != 0.0:
+                cap_l[hs_bool] += self.pad_cap_cell
+            np.divide(vec_layers[l], cap_l, out=out_layers[l])
+        return out
+
+    def thermal_energy(self, T: np.ndarray, amb: float) -> float:
+        """Compute ``sum(C * (T - amb))`` layer-by-layer without a 3D C array."""
+        plane_size = self.rows * self.cols
+        t_layers = np.asarray(T, dtype=np.float64).reshape(
+            self.layer_count, plane_size
+        )
+        hs_bool = self.heatsink_mask.reshape(-1).astype(bool, copy=False)
+        amb_f = float(amb)
+        total = 0.0
+        for l in range(self.layer_count):
+            cap_l = np.where(
+                self.copper_mask[l].reshape(-1),
+                self.cap_lut[l, 1],
+                self.cap_lut[l, 0],
+            )
+            if l == self.layer_count - 1 and self.pad_cap_cell != 0.0:
+                cap_l[hs_bool] += self.pad_cap_cell
+            total += float(np.dot(cap_l, t_layers[l] - amb_f))
+        return total
+
+    def convection_power(self, T: np.ndarray, amb: float) -> float:
+        """Compute ``sum(hA * (T - amb))`` touching only top and bottom layers."""
+        plane_size = self.rows * self.cols
+        t_flat = np.asarray(T, dtype=np.float64).reshape(-1)
+        amb_f = float(amb)
+        total = self.top_ha * float(np.sum(t_flat[:plane_size] - amb_f))
+        if self.bot_air_ha != 0.0 or self.bot_pad_ha != 0.0:
+            hs_bool = self.heatsink_mask.reshape(-1).astype(bool, copy=False)
+            ha_bot = np.where(hs_bool, self.bot_pad_ha, self.bot_air_ha)
+            total += float(np.dot(ha_bot, t_flat[-plane_size:] - amb_f))
+        return total
+
+    def build_heatsink_model(
+        self, settings: Dict, amb: float
+    ) -> Optional[HeatsinkModel]:
+        """Build a compact 2D bottom-layer HeatsinkModel when dynamic heatsink is active."""
+        if not bool(settings.get("use_heatsink", True)):
+            return None
+        sink_mode = str(settings.get("pad_sink_mode", "fixed") or "fixed").strip().lower()
+        if sink_mode != "heatsink":
+            return None
+        if not np.any(self.heatsink_mask):
+            return None
+        rth_val = settings.get("heatsink_rth_kw", 5.0)
+        rth_kw = max(1e-6, float(5.0 if rth_val is None else rth_val))
+        pad_conductance = (
+            self.heatsink_mask.astype(np.float64).reshape(-1) * self.bot_pad_diag
+        )
+        return HeatsinkModel(
+            pad_conductance=pad_conductance,
+            rth_kw=rth_kw,
+            capacity_j_k=compute_heatsink_capacity_j_k(settings),
+            initial_temp_c=float(amb),
+            bottom_layer_only=True,
+        )
+
+    def _get_coarse_operators(
+        self, coarse_max_nodes: int = 1024, max_levels: int = 10
+    ):
+        """Build and cache float32 coarse operators (Levels >= 1) and Level-1 capacity."""
+        if self._coarse_operators is not None:
+            return self._coarse_operators
+
+        coarsened = None
+        if HAS_NATIVE_COMPACT and coarsen_compact_to_f32_native is not None:
+            coarsened = coarsen_compact_to_f32_native(
+                self.layer_count,
+                self.rows,
+                self.cols,
+                self.copper_mask,
+                self.via_enh,
+                self.heatsink_mask,
+                self.gx_lut,
+                self.gy_lut,
+                self.gz_scale,
+                self.cap_lut,
+                self.pad_cap_cell,
+                self.top_diag,
+                self.bot_air_diag,
+                self.bot_pad_diag,
+            )
+        if coarsened is None:
+            coarsened = _coarsen_compact_to_f32_numpy(self)
+
+        gx_c, gy_c, gz_c, boundary_c, stiffness_diag_c, level1_cap_f32 = coarsened
+        c_rows = (self.rows + 1) // 2
+        c_cols = (self.cols + 1) // 2
+        level1_op = StructuredThermalOperator(
+            layer_count=self.layer_count,
+            rows=c_rows,
+            cols=c_cols,
+            gx=np.ascontiguousarray(gx_c, dtype=np.float32),
+            gy=np.ascontiguousarray(gy_c, dtype=np.float32),
+            gz=np.ascontiguousarray(gz_c, dtype=np.float32),
+            boundary_diag=np.ascontiguousarray(boundary_c, dtype=np.float32),
+            stiffness_diag=np.ascontiguousarray(stiffness_diag_c, dtype=np.float32),
+        )
+        coarse_levels = [level1_op]
+        current = level1_op
+        for _ in range(1, max_levels - 1):
+            if current.shape[0] <= coarse_max_nodes:
+                break
+            if current.rows <= 2 and current.cols <= 2:
+                break
+            current = _coarsen_structured_operator(current, dtype=np.float32)
+            coarse_levels.append(current)
+
+        self._coarse_operators = (
+            coarse_levels,
+            np.ascontiguousarray(level1_cap_f32, dtype=np.float32).reshape(-1),
+        )
+        return self._coarse_operators
+
+    def implicit_linear_operator(self, capacity, derivative_scale):
+        """Return ``K + derivative_scale * C`` as a SciPy LinearOperator and MG preconditioner."""
+        scale = float(derivative_scale)
+        shape = self.shape
+
+        def matvec(vector):
+            return self._apply_with_scale(scale, vector)
+
+        operator = spla.LinearOperator(shape, matvec=matvec, dtype=np.float64)
+        operator._matvec_into = lambda vector, out: self._apply_with_scale(
+            scale, vector, out=out
+        )
+
+        if self.rows < 8 or self.cols < 8:
+            hs_bool = self.heatsink_mask.astype(bool, copy=False)
+            inv_diag = np.empty(shape[0], dtype=np.float64)
+            inv_view = inv_diag.reshape(self.layer_count, self.rows, self.cols)
+            for l in range(self.layer_count):
+                full_diag = _compact_layer_full_diag(self, l, scale, hs_bool)
+                np.divide(
+                    1.0,
+                    full_diag,
+                    out=inv_view[l],
+                    where=np.abs(full_diag) > 1e-30,
+                )
+            preconditioner = spla.LinearOperator(
+                shape,
+                matvec=lambda vector: inv_diag * vector,
+                dtype=np.float64,
+            )
+            preconditioner._solve_into = lambda v, out: np.multiply(
+                inv_diag, v, out=out
+            )
+            return operator, preconditioner
+
+        cap_key = _capacity_cache_key(capacity)
+        cached = self._preconditioner_cache.get(scale)
+        if cached is not None and cached[0] == cap_key:
+            multigrid = cached[1]
+        else:
+            coarse_levels, level1_cap_f32 = self._get_coarse_operators()
+            if capacity is not None:
+                cap_arr = np.asarray(capacity, dtype=np.float64).reshape(
+                    self.layer_count, self.rows, self.cols
+                )
+                level1_cap_used = _restrict_2x2(
+                    cap_arr, dtype=np.float32
+                ).reshape(-1)
+            else:
+                level1_cap_used = level1_cap_f32
+            multigrid = _CompactGeometricMultigrid(
+                self,
+                coarse_levels,
+                level1_cap_used,
+                scale,
+            )
+            self._preconditioner_cache.clear()
+            self._preconditioner_cache[scale] = (cap_key, multigrid)
+
+        preconditioner = spla.LinearOperator(
+            shape,
+            matvec=multigrid.solve,
+            dtype=np.float64,
+        )
+        preconditioner._solve_into = multigrid.solve_into
+        return operator, preconditioner
+
+
+def build_compact_structured_operator(
+    layer_count: int,
+    rows: int,
+    cols: int,
+    copper_mask: np.ndarray,
+    t_cu: np.ndarray,
+    t_fr4_eff: np.ndarray,
+    k_cu: float,
+    k_fr4: float,
+    dx: float,
+    dy: float,
+    V_map: np.ndarray,
+    gap_m: List[float],
+    H_map: np.ndarray,
+    settings: Dict,
+    amb: float,
+    rho_cu: float = 8960.0,
+    cp_cu: float = 385.0,
+    rho_fr4: float = 1850.0,
+    cp_fr4: float = 1100.0,
+    pad_cap_areal: float = 0.0,
+) -> CompactStructuredThermalOperator:
+    """Build an ultra-compact Level-0 operator from geometry masks and LUTs."""
+    layer_count = int(layer_count)
+    rows = int(rows)
+    cols = int(cols)
+    pixel_area = float(dx) * float(dy)
+    gx_lut, gy_lut, gz_scale, cap_lut, pad_cap_cell = _compute_layer_luts(
+        layer_count=layer_count,
+        t_cu=t_cu,
+        t_fr4_eff=t_fr4_eff,
+        k_cu=k_cu,
+        k_fr4=k_fr4,
+        dx=dx,
+        dy=dy,
+        gap_m=gap_m,
+        rho_cu=rho_cu,
+        cp_cu=cp_cu,
+        rho_fr4=rho_fr4,
+        cp_fr4=cp_fr4,
+        pad_cap_areal=pad_cap_areal,
+    )
+
+    hs_mask_u8 = np.ascontiguousarray(np.asarray(H_map, dtype=bool), dtype=np.uint8)
+    via_enh = np.ascontiguousarray(
+        np.clip(np.asarray(V_map, dtype=np.float32), 1.0, 50.0),
+        dtype=np.float32,
+    )
+    copper_u8 = np.ascontiguousarray(
+        np.asarray(copper_mask, dtype=bool), dtype=np.uint8
+    )
+
+    h_top = float(settings.get("h_conv", 10.0))
+    top_diag = h_top * pixel_area
+    top_rhs = top_diag * float(amb)
+    top_ha = top_diag
+
+    h_air_bot = float(settings.get("h_conv", 10.0))
+    pad_thick_m = max(0.0001, float(settings.get("pad_th", 1.0)) * 1e-3)
+    pad_k = float(settings.get("pad_k", 3.0))
+    contact_factor = max(1e-6, float(settings.get("pad_contact_factor", 0.2)))
+    h_sink = (pad_k / pad_thick_m) * contact_factor
+    bot_air_diag = h_air_bot * pixel_area
+    bot_pad_diag = h_sink * pixel_area
+
+    sink_mode = str(settings.get("pad_sink_mode", "fixed") or "fixed").strip().lower()
+    use_heatsink = bool(settings.get("use_heatsink", True))
+    heatsink_mode_active = bool(
+        use_heatsink and sink_mode == "heatsink" and np.any(hs_mask_u8)
+    )
+    if heatsink_mode_active:
+        bot_air_rhs = bot_air_diag * float(amb)
+        bot_pad_rhs = 0.0
+        bot_air_ha = bot_air_diag
+        bot_pad_ha = 0.0
+    else:
+        use_amb = bool(settings.get("pad_sink_temp_use_ambient", True))
+        sink_temp_raw = settings.get("pad_sink_temp_c")
+        sink_temp = (
+            float(amb)
+            if (use_amb or sink_temp_raw is None)
+            else float(sink_temp_raw)
+        )
+        bot_air_rhs = bot_air_diag * float(amb)
+        bot_pad_rhs = bot_pad_diag * sink_temp
+        bot_air_ha = bot_air_diag
+        bot_pad_ha = bot_pad_diag
+
+    return CompactStructuredThermalOperator(
+        layer_count=layer_count,
+        rows=rows,
+        cols=cols,
+        copper_mask=copper_u8,
+        via_enh=via_enh,
+        heatsink_mask=hs_mask_u8,
+        gx_lut=gx_lut,
+        gy_lut=gy_lut,
+        gz_scale=gz_scale,
+        cap_lut=cap_lut,
+        pad_cap_cell=pad_cap_cell,
+        top_diag=top_diag,
+        bot_air_diag=bot_air_diag,
+        bot_pad_diag=bot_pad_diag,
+        top_rhs=top_rhs,
+        bot_air_rhs=bot_air_rhs,
+        bot_pad_rhs=bot_pad_rhs,
+        top_ha=top_ha,
+        bot_air_ha=bot_air_ha,
+        bot_pad_ha=bot_pad_ha,
+        heatsink_mode_active=heatsink_mode_active,
+    )
 
 
 def _compute_bottom_boundary_terms(
@@ -1250,52 +2545,117 @@ def _solve_pcg(
     relative_tolerance=1e-6,
     maxiter=100,
     retry_maxiter=200,
+    out=None,
+    workspaces=None,
 ):
     """Solve one implicit step with preconditioned conjugate gradients."""
+    rhs_arr = np.asarray(rhs, dtype=np.float64).reshape(-1)
+    n = rhs_arr.shape[0]
+    if workspaces is None:
+        r = np.empty(n, dtype=np.float64)
+        z = np.empty(n, dtype=np.float64)
+        p = np.empty(n, dtype=np.float64)
+        ap = np.empty(n, dtype=np.float64)
+    else:
+        r, z, p, ap = workspaces
+
+    if out is None:
+        x = np.array(initial, dtype=np.float64, copy=True).reshape(-1)
+    else:
+        x = out
+        if x is not initial:
+            np.copyto(x, np.asarray(initial, dtype=np.float64).reshape(-1))
+
+    bnorm = float(np.linalg.norm(rhs_arr))
+    if bnorm == 0.0:
+        x.fill(0.0)
+        return x, 0, False, 0.0
+
+    tol = float(relative_tolerance) * bnorm
+    matvec_into = getattr(operator, "_matvec_into", None)
+    solve_into = getattr(preconditioner, "_solve_into", None)
+
+    def apply_a(vec, dst):
+        if matvec_into is not None:
+            matvec_into(vec, dst)
+        else:
+            np.copyto(dst, operator.matvec(vec))
+
+    def apply_m(vec, dst):
+        if solve_into is not None:
+            solve_into(vec, dst)
+        else:
+            np.copyto(dst, preconditioner.matvec(vec))
+
+    apply_a(x, ap)
+    np.subtract(rhs_arr, ap, out=r)
+    rnorm = float(np.linalg.norm(r))
+    if rnorm <= tol:
+        return x, 0, False, rnorm / bnorm
+
     iterations = 0
-
-    def callback(_value):
-        nonlocal iterations
-        iterations += 1
-        if cancel_check and cancel_check():
-            raise _CancelledIterativeSolve()
-
-    solution, info = spla.cg(
-        operator,
-        rhs,
-        x0=initial,
-        M=preconditioner,
-        rtol=relative_tolerance,
-        atol=0.0,
-        maxiter=maxiter,
-        callback=callback,
-    )
     retried = False
-    if info > 0:
-        retried = True
-        solution, retry_info = spla.cg(
-            operator,
-            rhs,
-            x0=solution,
-            M=preconditioner,
-            rtol=relative_tolerance,
-            atol=0.0,
-            maxiter=retry_maxiter,
-            callback=callback,
-        )
-        info = retry_info
-    if info < 0:
-        raise RuntimeError(f"PCG failed with solver status {info}.")
-    if info > 0:
+    converged = False
+
+    for attempt, limit in ((False, int(maxiter)), (True, int(retry_maxiter))):
+        if attempt:
+            retried = True
+            apply_a(x, ap)
+            np.subtract(rhs_arr, ap, out=r)
+            rnorm = float(np.linalg.norm(r))
+            if rnorm <= tol:
+                converged = True
+                break
+
+        rz_old = 0.0
+        for it in range(limit):
+            apply_m(r, z)
+            rz_new = float(np.dot(r, z))
+            if rz_new < 0.0:
+                raise RuntimeError("PCG failed with solver status -1.")
+            if rz_new == 0.0:
+                break
+            if it == 0:
+                np.copyto(p, z)
+            else:
+                beta = rz_new / rz_old
+                np.multiply(p, beta, out=p)
+                np.add(p, z, out=p)
+
+            apply_a(p, ap)
+            p_ap = float(np.dot(p, ap))
+            if p_ap <= 0.0:
+                raise RuntimeError("PCG failed with solver status -1.")
+            alpha = rz_new / p_ap
+
+            np.multiply(p, alpha, out=z)
+            np.add(x, z, out=x)
+            np.multiply(ap, alpha, out=z)
+            np.subtract(r, z, out=r)
+
+            rz_old = rz_new
+            iterations += 1
+            if cancel_check and cancel_check():
+                raise _CancelledIterativeSolve()
+
+            rnorm = float(np.linalg.norm(r))
+            if rnorm <= tol:
+                converged = True
+                break
+
+        if converged:
+            break
+
+    if not converged:
         raise RuntimeError(
             f"PCG did not converge after {iterations} iterations "
             f"(relative tolerance {relative_tolerance:g})."
         )
-    residual = operator.matvec(solution) - rhs
-    relative_residual = float(
-        np.linalg.norm(residual) / max(np.linalg.norm(rhs), 1e-30)
-    )
-    return solution, iterations, retried, relative_residual
+
+    apply_a(x, ap)
+    np.subtract(rhs_arr, ap, out=r)
+    relative_residual = float(np.linalg.norm(r)) / max(bnorm, 1e-30)
+    return x, iterations, retried, relative_residual
 
 
 @dataclass
@@ -1309,6 +2669,22 @@ class _HeatsinkPhaseState:
     alpha_hs: float
     u: np.ndarray
     delta: float
+    bottom_layer_only: bool = False
+
+    def dot_g(self, vec: np.ndarray) -> float:
+        """Compute ``dot(g, vec)`` supporting both 3D and 2D bottom-layer g."""
+        v = np.asarray(vec, dtype=np.float64).reshape(-1)
+        if self.bottom_layer_only:
+            return float(np.dot(self.g, v[-self.g.size :]))
+        return float(np.dot(self.g, v))
+
+    def add_scaled_g(self, out: np.ndarray, coeff: float) -> np.ndarray:
+        """Add ``coeff * g`` in-place into ``out``."""
+        if self.bottom_layer_only:
+            out[-self.g.size :] += coeff * self.g
+        else:
+            out += coeff * self.g
+        return out
 
     @classmethod
     def from_u(
@@ -1317,13 +2693,19 @@ class _HeatsinkPhaseState:
         gamma: float,
         u: np.ndarray,
     ) -> "_HeatsinkPhaseState":
+        bottom_only = bool(getattr(heatsink_model, "bottom_layer_only", False))
         g = heatsink_model.pad_conductance
         g_sum = float(np.sum(g))
         g_hs_amb = heatsink_model.g_hs_amb
         c_hs = max(0.0, float(heatsink_model.capacity_j_k))
         alpha_hs = (gamma * c_hs if c_hs > 0.0 else 0.0) + g_hs_amb + g_sum
         u_vec = np.asarray(u, dtype=np.float64).reshape(-1)
-        delta = alpha_hs - float(np.dot(g, u_vec))
+        g_dot_u = (
+            float(np.dot(g, u_vec[-g.size :]))
+            if bottom_only
+            else float(np.dot(g, u_vec))
+        )
+        delta = alpha_hs - g_dot_u
         if delta <= 1e-18:
             raise RuntimeError(
                 f"Sherman-Morrison heatsink denominator is non-positive ({delta:.3e})."
@@ -1336,6 +2718,7 @@ class _HeatsinkPhaseState:
             alpha_hs=alpha_hs,
             u=u_vec,
             delta=delta,
+            bottom_layer_only=bottom_only,
         )
 
     @classmethod
@@ -1344,8 +2727,18 @@ class _HeatsinkPhaseState:
         heatsink_model: HeatsinkModel,
         gamma: float,
         solve_fn: Callable[[np.ndarray], np.ndarray],
+        node_count: Optional[int] = None,
     ) -> "_HeatsinkPhaseState":
-        return cls.from_u(heatsink_model, gamma, solve_fn(heatsink_model.pad_conductance))
+        g = heatsink_model.pad_conductance
+        if getattr(heatsink_model, "bottom_layer_only", False):
+            if node_count is None:
+                raise ValueError("node_count is required for bottom_layer_only heatsink.")
+            g_rhs = np.zeros(node_count, dtype=np.float64)
+            g_rhs[-g.size :] = g
+            u = solve_fn(g_rhs)
+        else:
+            u = solve_fn(g)
+        return cls.from_u(heatsink_model, gamma, u)
 
     @classmethod
     def prepare_pcg(
@@ -1356,17 +2749,27 @@ class _HeatsinkPhaseState:
         preconditioner,
         cancel_check=None,
         rtol: float = 1e-8,
+        workspaces=None,
     ):
         g = heatsink_model.pad_conductance
-        u, _, _, rel_res = _solve_pcg(
+        node_count = operator.shape[0]
+        if getattr(heatsink_model, "bottom_layer_only", False):
+            g_rhs = np.zeros(node_count, dtype=np.float64)
+            g_rhs[-g.size :] = g
+        else:
+            g_rhs = g
+        u = np.zeros(node_count, dtype=np.float64)
+        _, _, _, rel_res = _solve_pcg(
             operator,
             preconditioner,
-            g,
-            np.zeros_like(g),
+            g_rhs,
+            u,
             cancel_check=cancel_check,
             relative_tolerance=rtol,
             maxiter=300,
             retry_maxiter=600,
+            out=u,
+            workspaces=workspaces,
         )
         return cls.from_u(heatsink_model, gamma, u), rel_res
 
@@ -1387,28 +2790,78 @@ class _HeatsinkPhaseState:
                 r_hs += d_hs * t_hs_n
         return float(r_hs)
 
-    def modified_rhs(self, pcb_rhs: np.ndarray, r_hs: float) -> np.ndarray:
-        return pcb_rhs + (r_hs / self.alpha_hs) * self.g
+    def modified_rhs(
+        self, pcb_rhs: np.ndarray, r_hs: float, out: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        if out is None:
+            dst = np.array(pcb_rhs, dtype=np.float64, copy=True)
+        else:
+            dst = out
+            if dst is not pcb_rhs:
+                np.copyto(dst, pcb_rhs)
+        return self.add_scaled_g(dst, r_hs / self.alpha_hs)
 
-    def warm_start_x1(self, t_guess: np.ndarray) -> np.ndarray:
-        coeff = float(np.dot(self.g, t_guess)) / self.alpha_hs
-        return t_guess - coeff * self.u
+    def warm_start_x1(
+        self, t_guess: np.ndarray, out: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        coeff = self.dot_g(t_guess) / self.alpha_hs
+        if out is None:
+            return t_guess - coeff * self.u
+        if out is t_guess:
+            out -= coeff * self.u
+            return out
+        np.multiply(self.u, -coeff, out=out)
+        np.add(t_guess, out, out=out)
+        return out
 
-    def recover(self, x1: np.ndarray, r_hs: float):
+    def recover(
+        self,
+        x1: np.ndarray,
+        r_hs: float,
+        out: Optional[np.ndarray] = None,
+        scratch: Optional[np.ndarray] = None,
+    ):
         x1_vec = np.asarray(x1, dtype=np.float64).reshape(-1)
-        g_dot_x1 = float(np.dot(self.g, x1_vec))
-        t_new = x1_vec + (g_dot_x1 / self.delta) * self.u
-        t_hs_new = (r_hs + float(np.dot(self.g, t_new))) / self.alpha_hs
+        g_dot_x1 = self.dot_g(x1_vec)
+        scale = g_dot_x1 / self.delta
+        if out is None:
+            t_new = x1_vec + scale * self.u
+        elif scratch is not None:
+            np.multiply(self.u, scale, out=scratch)
+            np.add(x1_vec, scratch, out=out)
+            t_new = out
+        else:
+            t_new = out
+            if t_new is not x1_vec:
+                np.multiply(self.u, scale, out=t_new)
+                np.add(x1_vec, t_new, out=t_new)
+            else:
+                t_new += scale * self.u
+        t_hs_new = (r_hs + self.dot_g(t_new)) / self.alpha_hs
         return t_new, float(t_hs_new)
 
 
 def _validate_heatsink_model(
     heatsink_model: Optional[HeatsinkModel],
     node_count: int,
+    plane_size: Optional[int] = None,
 ) -> bool:
     """Return True if heatsink_model is active, validating vector shape."""
     if heatsink_model is None or not heatsink_model.is_active:
         return False
+    if getattr(heatsink_model, "bottom_layer_only", False):
+        expected = (plane_size,) if plane_size is not None else None
+        if expected is not None and heatsink_model.pad_conductance.shape != expected:
+            raise ValueError(
+                f"heatsink_model.pad_conductance shape {heatsink_model.pad_conductance.shape} "
+                f"does not match bottom layer size {expected}."
+            )
+        if heatsink_model.pad_conductance.size > node_count:
+            raise ValueError(
+                f"heatsink_model.pad_conductance size {heatsink_model.pad_conductance.size} "
+                f"exceeds node count ({node_count})."
+            )
+        return True
     if heatsink_model.pad_conductance.shape != (node_count,):
         raise ValueError(
             f"heatsink_model.pad_conductance shape {heatsink_model.pad_conductance.shape} "
@@ -1421,18 +2874,25 @@ def _heatsink_diagnostics(
     heatsink_model: Optional[HeatsinkModel],
     T_flat: np.ndarray,
     t_hs: float,
-    hA: np.ndarray,
+    hA: Optional[np.ndarray],
     amb: float,
+    operator: Optional[Any] = None,
 ):
     """Compute total heat output (W) and heatsink metadata for k_norm_info."""
-    p_pcb_air = float(np.dot(hA, T_flat - amb))
+    if hA is None and operator is not None and hasattr(operator, "convection_power"):
+        p_pcb_air = float(operator.convection_power(T_flat, amb))
+    else:
+        p_pcb_air = float(np.dot(hA, T_flat - amb))
     if heatsink_model is None or not heatsink_model.is_active:
         return p_pcb_air, {}
     g = heatsink_model.pad_conductance
     g_hs_amb = heatsink_model.g_hs_amb
     c_hs = max(0.0, float(heatsink_model.capacity_j_k))
     p_hs_amb = float(g_hs_amb * (t_hs - amb))
-    p_pcb_to_hs = float(np.dot(g, T_flat - t_hs))
+    if getattr(heatsink_model, "bottom_layer_only", False):
+        p_pcb_to_hs = float(np.dot(g, T_flat[-g.size :] - t_hs))
+    else:
+        p_pcb_to_hs = float(np.dot(g, T_flat - t_hs))
     p_total = p_pcb_air + p_hs_amb
     hs_frac = float(p_hs_amb / p_total) if p_total > 1e-12 else 0.0
     return p_total, {
@@ -1448,6 +2908,15 @@ def _heatsink_diagnostics(
         "pcb_convection_power_w": p_pcb_air,
         "heatsink_power_fraction": hs_frac,
     }
+
+
+def _power_sum(source) -> float:
+    """Return total power (W) for either a SparsePowerVector or dense ndarray."""
+    if source is None:
+        return 0.0
+    if isinstance(source, SparsePowerVector):
+        return source.total_power()
+    return float(np.sum(source))
 
 
 def run_steady_state(
@@ -1466,8 +2935,8 @@ def run_steady_state(
     """Solve the steady-state thermal system ``K * T = Q + b`` directly."""
     N = K.shape[0]
     amb = config.amb
-    pin = float(np.sum(Q))
-    hs_active = _validate_heatsink_model(heatsink_model, N)
+    pin = _power_sum(Q)
+    hs_active = _validate_heatsink_model(heatsink_model, N, plane_size=rows * cols)
     t_hs = (
         float(amb if heatsink_model.initial_temp_c is None else heatsink_model.initial_temp_c)
         if hs_active
@@ -1518,14 +2987,17 @@ def run_steady_state(
             k_norm_info=k_norm_info,
         )
 
-    rhs = np.asarray(Q, dtype=np.float64) + np.asarray(b, dtype=np.float64)
+    q_dense = Q.to_dense() if isinstance(Q, SparsePowerVector) else np.asarray(Q, dtype=np.float64)
+    rhs = q_dense + np.asarray(b, dtype=np.float64)
     factor_start = time.perf_counter()
     solve_fn, owner, backend, _ = _factor_linear_system(K)
     factor_time = time.perf_counter() - factor_start
     try:
         solve_start = time.perf_counter()
         if hs_active:
-            phase_hs = _HeatsinkPhaseState.prepare_direct(heatsink_model, 0.0, solve_fn)
+            phase_hs = _HeatsinkPhaseState.prepare_direct(
+                heatsink_model, 0.0, solve_fn, node_count=N
+            )
             r_hs = phase_hs.scalar_rhs(amb)
             x1 = solve_fn(phase_hs.modified_rhs(rhs, r_hs))
             Tn, t_hs = phase_hs.recover(x1, r_hs)
@@ -1593,10 +3065,10 @@ def run_steady_state(
 def run_steady_state_matrix_free(
     config: SolverConfig,
     operator: StructuredThermalOperator,
-    C: np.ndarray,
-    Q: np.ndarray,
-    b: np.ndarray,
-    hA: np.ndarray,
+    C: Optional[np.ndarray],
+    Q,
+    b: Optional[np.ndarray],
+    hA: Optional[np.ndarray],
     progress_callback: Optional[Callable[[int, int], bool]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     heatsink_model: Optional[HeatsinkModel] = None,
@@ -1606,9 +3078,12 @@ def run_steady_state_matrix_free(
     rows = operator.rows
     cols = operator.cols
     node_count = operator.shape[0]
+    is_compact = isinstance(operator, CompactStructuredThermalOperator)
     amb = config.amb
-    pin = float(np.sum(Q))
-    hs_active = _validate_heatsink_model(heatsink_model, node_count)
+    pin = _power_sum(Q)
+    hs_active = _validate_heatsink_model(
+        heatsink_model, node_count, plane_size=rows * cols
+    )
     t_hs = (
         float(amb if heatsink_model.initial_temp_c is None else heatsink_model.initial_temp_c)
         if hs_active
@@ -1629,6 +3104,7 @@ def run_steady_state_matrix_free(
             t_hs,
             hA,
             amb,
+            operator=operator,
         )
         k_norm_info = {
             "strategy": "direct_steady_state",
@@ -1669,12 +3145,32 @@ def run_steady_state_matrix_free(
         )
 
     capacity = (
-        np.zeros(node_count, dtype=np.float64)
-        if C is None
-        else np.asarray(C, dtype=np.float64)
+        None
+        if (C is None and is_compact)
+        else (
+            np.zeros(node_count, dtype=np.float64)
+            if C is None
+            else np.asarray(C, dtype=np.float64)
+        )
     )
-    rhs = np.asarray(Q, dtype=np.float64) + np.asarray(b, dtype=np.float64)
+    rhs = np.zeros(node_count, dtype=np.float64)
+    if isinstance(Q, SparsePowerVector):
+        Q.add_to(rhs)
+    elif Q is not None:
+        rhs += np.asarray(Q, dtype=np.float64)
+    if b is not None:
+        rhs += np.asarray(b, dtype=np.float64)
+    elif is_compact:
+        operator.add_boundary_rhs(rhs)
+
     initial = np.full(node_count, amb, dtype=np.float64)
+    sol_buf = np.empty(node_count, dtype=np.float64)
+    pcg_workspaces = (
+        np.empty(node_count, dtype=np.float64),
+        np.empty(node_count, dtype=np.float64),
+        np.empty(node_count, dtype=np.float64),
+        np.empty(node_count, dtype=np.float64),
+    )
 
     setup_start = time.perf_counter()
     aborted = False
@@ -1708,30 +3204,35 @@ def run_steady_state_matrix_free(
                     steady_preconditioner,
                     cancel_check=cancel_check,
                     rtol=1e-8,
+                    workspaces=pcg_workspaces,
                 )
             setup_time = time.perf_counter() - setup_start
 
             solve_start = time.perf_counter()
             if phase_hs is not None:
                 r_hs = phase_hs.scalar_rhs(amb)
-                solve_rhs = phase_hs.modified_rhs(rhs, r_hs)
-                solve_init = phase_hs.warm_start_x1(initial)
+                phase_hs.modified_rhs(rhs, r_hs, out=rhs)
+                phase_hs.warm_start_x1(initial, out=sol_buf)
+                solve_init = sol_buf
             else:
                 r_hs = 0.0
-                solve_rhs = rhs
                 solve_init = initial
             solution, iterations, retried, relative_residual = _solve_pcg(
                 steady_operator,
                 steady_preconditioner,
-                solve_rhs,
+                rhs,
                 solve_init,
                 cancel_check=cancel_check,
                 relative_tolerance=1e-7,
                 maxiter=250,
                 retry_maxiter=500,
+                out=sol_buf,
+                workspaces=pcg_workspaces,
             )
             if phase_hs is not None:
-                temperature, t_hs = phase_hs.recover(solution, r_hs)
+                temperature, t_hs = phase_hs.recover(
+                    solution, r_hs, out=sol_buf, scratch=pcg_workspaces[1]
+                )
                 relative_residual = max(relative_residual, u_rel_res)
             else:
                 temperature = solution
@@ -1746,7 +3247,12 @@ def run_steady_state_matrix_free(
 
     final_view = temperature.reshape(layer_count, rows, cols)
     pout_final, hs_info = _heatsink_diagnostics(
-        heatsink_model if hs_active else None, temperature, t_hs, hA, amb
+        heatsink_model if hs_active else None,
+        temperature,
+        t_hs,
+        hA,
+        amb,
+        operator=operator,
     )
     steady_rel_diff = (
         abs(pin - pout_final) / max(abs(pin), 1e-9) if step_counter > 0 else None
@@ -1804,10 +3310,10 @@ def run_steady_state_matrix_free(
 def run_simulation_matrix_free(
     config: SolverConfig,
     operator: StructuredThermalOperator,
-    C: np.ndarray,
-    Q: np.ndarray,
-    b: np.ndarray,
-    hA: np.ndarray,
+    C: Optional[np.ndarray],
+    Q,
+    b: Optional[np.ndarray],
+    hA: Optional[np.ndarray],
     progress_callback: Optional[Callable[[int, int], bool]] = None,
     snapshot_callback: Optional[Callable[[np.ndarray, float, int], str]] = None,
     Q_func: Optional[Callable[[float], np.ndarray]] = None,
@@ -1832,8 +3338,13 @@ def run_simulation_matrix_free(
     rows = operator.rows
     cols = operator.cols
     node_count = operator.shape[0]
+    is_compact = isinstance(operator, CompactStructuredThermalOperator)
+    if C is None and not is_compact:
+        raise ValueError("C cannot be None unless operator is CompactStructuredThermalOperator.")
     ambient = config.amb
-    hs_active = _validate_heatsink_model(heatsink_model, node_count)
+    hs_active = _validate_heatsink_model(
+        heatsink_model, node_count, plane_size=rows * cols
+    )
     c_hs = max(0.0, float(heatsink_model.capacity_j_k)) if hs_active else 0.0
     t_hs = (
         float(ambient if heatsink_model.initial_temp_c is None else heatsink_model.initial_temp_c)
@@ -1843,10 +3354,47 @@ def run_simulation_matrix_free(
     t_hs_prev = t_hs
     temperature = np.full(node_count, ambient, dtype=np.float64)
     previous_temperature = temperature.copy()
+    next_temperature = np.empty(node_count, dtype=np.float64)
     guess_workspace = np.empty(node_count, dtype=np.float64)
-    initial_energy = float(np.sum(C * (temperature - ambient))) + (
-        c_hs * (t_hs - ambient) if hs_active else 0.0
+    rhs_workspace = np.empty(node_count, dtype=np.float64)
+    pcg_workspaces = (
+        np.empty(node_count, dtype=np.float64),
+        np.empty(node_count, dtype=np.float64),
+        np.empty(node_count, dtype=np.float64),
+        np.empty(node_count, dtype=np.float64),
     )
+
+    def compute_energy(temp_vec: np.ndarray) -> float:
+        if C is None and is_compact:
+            pcb_energy = operator.thermal_energy(temp_vec, ambient)
+        else:
+            np.subtract(temp_vec, ambient, out=pcg_workspaces[0])
+            pcb_energy = float(np.dot(C, pcg_workspaces[0]))
+        return pcb_energy + (c_hs * (t_hs - ambient) if hs_active else 0.0)
+
+    def compute_pout(temp_vec: np.ndarray) -> float:
+        if hA is None and is_compact:
+            pcb_pout = operator.convection_power(temp_vec, ambient)
+        else:
+            np.subtract(temp_vec, ambient, out=pcg_workspaces[0])
+            pcb_pout = float(np.dot(hA, pcg_workspaces[0]))
+        return pcb_pout + (
+            heatsink_model.g_hs_amb * (t_hs - ambient) if hs_active else 0.0
+        )
+
+    def add_b(dst: np.ndarray) -> None:
+        if b is not None:
+            dst += b
+        elif is_compact:
+            operator.add_boundary_rhs(dst)
+
+    def add_q(dst: np.ndarray, q_src) -> None:
+        if isinstance(q_src, SparsePowerVector):
+            q_src.add_to(dst)
+        elif q_src is not None:
+            dst += q_src
+
+    initial_energy = compute_energy(temperature)
     current_time = 0.0
     step_counter = 0
     aborted = False
@@ -1862,11 +3410,9 @@ def run_simulation_matrix_free(
     previous_snapshot_time = 0.0
     previous_snapshot_energy = initial_energy
     balance_integral = 0.0
-    pout_step = float(np.sum(hA * (temperature - ambient))) + (
-        heatsink_model.g_hs_amb * (t_hs - ambient) if hs_active else 0.0
-    )
+    pout_step = compute_pout(temperature)
     source = Q_func(0.0) if Q_func is not None else Q
-    pin = float(np.sum(source))
+    pin = _power_sum(source)
     next_snapshot_idx = 0
     snapshot_number = 1
     if bool(getattr(operator, "prefer_derivative_start", False)):
@@ -1892,7 +3438,9 @@ def run_simulation_matrix_free(
             return False
         if abs(pin - pout_step) / pin >= 1e-4:
             return False
-        max_delta = float(np.max(np.abs(temperature - previous_temperature)))
+        np.subtract(temperature, previous_temperature, out=pcg_workspaces[0])
+        np.abs(pcg_workspaces[0], out=pcg_workspaces[0])
+        max_delta = float(np.max(pcg_workspaces[0]))
         if hs_active:
             max_delta = max(max_delta, abs(t_hs - t_hs_prev))
         return max_delta < 1e-4
@@ -1900,9 +3448,7 @@ def run_simulation_matrix_free(
     def record_snapshot(t_elapsed):
         nonlocal previous_snapshot_time, previous_snapshot_energy, snapshot_number
         view = temperature.reshape(layer_count, rows, cols)
-        energy = float(np.sum(C * (temperature - ambient))) + (
-            c_hs * (t_hs - ambient) if hs_active else 0.0
-        )
+        energy = compute_energy(temperature)
         energy_delta = energy - initial_energy
         absolute_error = abs(energy_delta - balance_integral)
         relative_error = absolute_error / max(abs(t_elapsed * pin), 1e-9)
@@ -1943,7 +3489,7 @@ def run_simulation_matrix_free(
         phase_hs: Optional[_HeatsinkPhaseState] = None,
         bdf2_hs: bool = False,
     ):
-        nonlocal temperature, previous_temperature, t_hs, t_hs_prev
+        nonlocal temperature, previous_temperature, next_temperature, t_hs, t_hs_prev
         nonlocal current_time, step_counter
         nonlocal total_solve_time, total_iterations, retry_count
         nonlocal max_relative_residual, pout_step, balance_integral
@@ -1957,8 +3503,8 @@ def run_simulation_matrix_free(
             r_hs = phase_hs.scalar_rhs(
                 ambient, t_hs, t_hs_prev, dt_value, bdf2=bdf2_hs
             )
-            solve_rhs = phase_hs.modified_rhs(rhs, r_hs)
-            initial_guess = phase_hs.warm_start_x1(t_guess)
+            solve_rhs = phase_hs.modified_rhs(rhs, r_hs, out=rhs)
+            initial_guess = phase_hs.warm_start_x1(t_guess, out=next_temperature)
         else:
             r_hs = 0.0
             solve_rhs = rhs
@@ -1970,21 +3516,27 @@ def run_simulation_matrix_free(
             solve_rhs,
             initial_guess,
             cancel_check=cancel_check,
+            out=next_temperature,
+            workspaces=pcg_workspaces,
         )
         elapsed = time.perf_counter() - solve_started
         if phase_hs is not None:
-            solution, t_hs_new = phase_hs.recover(solution, r_hs)
+            solution, t_hs_new = phase_hs.recover(
+                solution, r_hs, out=solution, scratch=pcg_workspaces[1]
+            )
             t_hs_prev, t_hs = t_hs, t_hs_new
-        previous_temperature, temperature = temperature, solution
+        old_prev = previous_temperature
+        previous_temperature = temperature
+        temperature = solution
+        if solution is next_temperature:
+            next_temperature = old_prev
         current_time += dt_value
         step_counter += 1
         total_solve_time += elapsed
         total_iterations += iterations
         retry_count += int(retried)
         max_relative_residual = max(max_relative_residual, relative_residual)
-        pout_step = float(np.sum(hA * (temperature - ambient))) + (
-            heatsink_model.g_hs_amb * (t_hs - ambient) if hs_active else 0.0
-        )
+        pout_step = compute_pout(temperature)
         balance_integral += dt_value * (pin - pout_step)
         return elapsed, iterations
 
@@ -2001,7 +3553,7 @@ def run_simulation_matrix_free(
             if phase_steps <= 0 or aborted or early_stopped:
                 continue
             phase_started = time.perf_counter()
-            derivative = C / phase_dt
+            inv_dt = 1.0 / phase_dt
             phase_solve_time = 0.0
             phase_iterations = 0
             phase_steps_done = 0
@@ -2015,6 +3567,33 @@ def run_simulation_matrix_free(
                     )
                 )
             )
+
+            def build_be_rhs(q_src):
+                if C is None and is_compact:
+                    rhs_workspace.fill(0.0)
+                    operator.add_scaled_capacity(rhs_workspace, temperature, inv_dt)
+                else:
+                    np.multiply(C, inv_dt, out=rhs_workspace)
+                    np.multiply(rhs_workspace, temperature, out=rhs_workspace)
+                add_q(rhs_workspace, q_src)
+                add_b(rhs_workspace)
+                return rhs_workspace
+
+            def build_bdf2_rhs(q_src):
+                if C is None and is_compact:
+                    rhs_workspace.fill(0.0)
+                    operator.add_scaled_capacity(rhs_workspace, temperature, 2.0 * inv_dt)
+                    operator.add_scaled_capacity(
+                        rhs_workspace, previous_temperature, -0.5 * inv_dt
+                    )
+                else:
+                    np.multiply(temperature, 2.0 * inv_dt, out=rhs_workspace)
+                    np.multiply(previous_temperature, -0.5 * inv_dt, out=pcg_workspaces[0])
+                    np.add(rhs_workspace, pcg_workspaces[0], out=rhs_workspace)
+                    np.multiply(rhs_workspace, C, out=rhs_workspace)
+                add_q(rhs_workspace, q_src)
+                add_b(rhs_workspace)
+                return rhs_workspace
 
             try:
                 if derivative_start:
@@ -2030,54 +3609,62 @@ def run_simulation_matrix_free(
                             bdf_preconditioner,
                             cancel_check=cancel_check,
                             rtol=1e-8,
+                            workspaces=pcg_workspaces,
                         )
                         max_relative_residual = max(max_relative_residual, u_rel)
                     if Q_func is not None:
                         source = Q_func(current_time)
-                        pin = float(np.sum(source))
+                        pin = _power_sum(source)
+                    if is_compact:
+                        operator._apply_with_scale(0.0, temperature, out=rhs_workspace)
+                    else:
+                        np.copyto(rhs_workspace, operator.dot(temperature))
+                    rhs_workspace *= -1.0
+                    add_q(rhs_workspace, source)
+                    add_b(rhs_workspace)
                     if hs_active:
                         g = heatsink_model.pad_conductance
+                        bottom_only = bool(getattr(heatsink_model, "bottom_layer_only", False))
+                        t_dot_g = (
+                            float(np.dot(g, temperature[-g.size :]))
+                            if bottom_only
+                            else float(np.dot(g, temperature))
+                        )
                         t_hs_0 = (
                             t_hs
                             if c_hs > 0.0
-                            else (
-                                heatsink_model.g_hs_amb * ambient
-                                + float(np.dot(g, temperature))
-                            )
+                            else (heatsink_model.g_hs_amb * ambient + t_dot_g)
                             / (heatsink_model.g_hs_amb + float(np.sum(g)))
                         )
-                        initial_derivative = (
-                            source + b + g * t_hs_0 - operator.dot(temperature)
-                        ) / C
-                        previous_temperature = (
-                            temperature - phase_dt * initial_derivative
-                        )
+                        if bottom_only:
+                            rhs_workspace[-g.size :] += g * t_hs_0
+                        else:
+                            rhs_workspace += g * t_hs_0
                         if c_hs > 0.0:
+                            t_diff_g = (
+                                float(np.dot(g, temperature[-g.size :] - t_hs))
+                                if bottom_only
+                                else float(np.dot(g, temperature - t_hs))
+                            )
                             d_t_hs = (
-                                heatsink_model.g_hs_amb * (ambient - t_hs)
-                                + float(np.dot(g, temperature - t_hs))
+                                heatsink_model.g_hs_amb * (ambient - t_hs) + t_diff_g
                             ) / c_hs
                             t_hs_prev = t_hs - phase_dt * d_t_hs
+                    if C is None and is_compact:
+                        operator.divide_by_capacity(rhs_workspace, out=rhs_workspace)
                     else:
-                        initial_derivative = (
-                            source + b - operator.dot(temperature)
-                        ) / C
-                        previous_temperature = (
-                            temperature - phase_dt * initial_derivative
-                        )
+                        rhs_workspace /= C
+                    np.multiply(rhs_workspace, phase_dt, out=rhs_workspace)
+                    np.subtract(temperature, rhs_workspace, out=previous_temperature)
+
                     while phase_steps_done < phase_steps and not aborted and not early_stopped:
                         if cancel_check and cancel_check():
                             aborted = True
                             break
                         if Q_func is not None:
                             source = Q_func(current_time + phase_dt)
-                            pin = float(np.sum(source))
-                        rhs = (
-                            2.0 * derivative * temperature
-                            - 0.5 * derivative * previous_temperature
-                            + source
-                            + b
-                        )
+                            pin = _power_sum(source)
+                        rhs = build_bdf2_rhs(source)
                         elapsed, iterations = advance(
                             rhs,
                             bdf_operator,
@@ -2134,6 +3721,7 @@ def run_simulation_matrix_free(
                         be_preconditioner,
                         cancel_check=cancel_check,
                         rtol=1e-8,
+                        workspaces=pcg_workspaces,
                     )
                     max_relative_residual = max(max_relative_residual, u_rel)
                 bdf_operator = None
@@ -2151,12 +3739,13 @@ def run_simulation_matrix_free(
                             bdf_preconditioner,
                             cancel_check=cancel_check,
                             rtol=1e-8,
+                            workspaces=pcg_workspaces,
                         )
                         max_relative_residual = max(max_relative_residual, u_rel)
                 if Q_func is not None:
                     source = Q_func(current_time + phase_dt)
-                    pin = float(np.sum(source))
-                rhs = derivative * temperature + source + b
+                    pin = _power_sum(source)
+                rhs = build_be_rhs(source)
                 elapsed, iterations = advance(
                     rhs,
                     be_operator,
@@ -2188,13 +3777,8 @@ def run_simulation_matrix_free(
                         break
                     if Q_func is not None:
                         source = Q_func(current_time + phase_dt)
-                        pin = float(np.sum(source))
-                    rhs = (
-                        2.0 * derivative * temperature
-                        - 0.5 * derivative * previous_temperature
-                        + source
-                        + b
-                    )
+                        pin = _power_sum(source)
+                    rhs = build_bdf2_rhs(source)
                     elapsed, iterations = advance(
                         rhs,
                         bdf_operator,
@@ -2238,7 +3822,12 @@ def run_simulation_matrix_free(
 
     final_view = temperature.reshape(layer_count, rows, cols)
     pout_final, hs_info = _heatsink_diagnostics(
-        heatsink_model if hs_active else None, temperature, t_hs, hA, ambient
+        heatsink_model if hs_active else None,
+        temperature,
+        t_hs,
+        hA,
+        ambient,
+        operator=operator,
     )
     average_solve = total_solve_time / max(step_counter, 1)
     steady_rel_diff = (
@@ -2365,7 +3954,7 @@ def run_simulation(
     RC = rows * cols
     sim_time = config.sim_time
     amb = config.amb
-    hs_active = _validate_heatsink_model(heatsink_model, N)
+    hs_active = _validate_heatsink_model(heatsink_model, N, plane_size=RC)
     c_hs = max(0.0, float(heatsink_model.capacity_j_k)) if hs_active else 0.0
     t_hs = (
         float(amb if heatsink_model.initial_temp_c is None else heatsink_model.initial_temp_c)
@@ -2388,7 +3977,7 @@ def run_simulation(
     prev_snap_time = 0.0
     prev_snap_energy = e0
     Q_current = Q_func(0.0) if Q_func is not None else Q
-    pin = float(np.sum(Q_current))
+    pin = _power_sum(Q_current)
 
     # Tracking variables
     step_counter = 0
@@ -2543,21 +4132,36 @@ def run_simulation(
             # second-order startup without a separate one-shot BE matrix.
             # This is used by Auto on large uniform direct-solver systems.
             Q_current = Q_func(current_time) if Q_func is not None else Q
-            pin = float(np.sum(Q_current))
+            pin = _power_sum(Q_current)
             if hs_active:
                 g = heatsink_model.pad_conductance
+                bottom_only = bool(getattr(heatsink_model, "bottom_layer_only", False))
+                t_dot_g = (
+                    float(np.dot(g, Tn[-g.size :]))
+                    if bottom_only
+                    else float(np.dot(g, Tn))
+                )
                 t_hs_0 = (
                     t_hs
                     if c_hs > 0.0
-                    else (heatsink_model.g_hs_amb * amb + float(np.dot(g, Tn)))
+                    else (heatsink_model.g_hs_amb * amb + t_dot_g)
                     / (heatsink_model.g_hs_amb + float(np.sum(g)))
                 )
-                derivative0 = (Q_current + b + g * t_hs_0 - K.dot(Tn)) / C
+                rhs0 = Q_current + b - K.dot(Tn)
+                if bottom_only:
+                    rhs0[-g.size :] += g * t_hs_0
+                else:
+                    rhs0 += g * t_hs_0
+                derivative0 = rhs0 / C
                 Tnm1 = Tn - phase_dt * derivative0
                 if c_hs > 0.0:
+                    t_diff_g = (
+                        float(np.dot(g, Tn[-g.size :] - t_hs))
+                        if bottom_only
+                        else float(np.dot(g, Tn - t_hs))
+                    )
                     d_t_hs = (
-                        heatsink_model.g_hs_amb * (amb - t_hs)
-                        + float(np.dot(g, Tn - t_hs))
+                        heatsink_model.g_hs_amb * (amb - t_hs) + t_diff_g
                     ) / c_hs
                     t_hs_prev = t_hs - phase_dt * d_t_hs
             else:
@@ -2593,7 +4197,7 @@ def run_simulation(
                     factor_cached = True
             phase_hs_bdf = (
                 _HeatsinkPhaseState.prepare_direct(
-                    heatsink_model, 1.5 / phase_dt, solve_bdf2
+                    heatsink_model, 1.5 / phase_dt, solve_bdf2, node_count=N
                 )
                 if hs_active
                 else None
@@ -2608,7 +4212,7 @@ def run_simulation(
                     break
                 if Q_func is not None:
                     Q_current = Q_func(current_time + phase_dt)
-                    pin = float(np.sum(Q_current))
+                    pin = _power_sum(Q_current)
                 rhs = build_bdf2_rhs(Q_current)
                 phase_solve_time += advance_step(
                     rhs,
@@ -2666,14 +4270,16 @@ def run_simulation(
         backend_modes.append(be_backend)
         phase_backend = be_backend
         phase_hs_be = (
-            _HeatsinkPhaseState.prepare_direct(heatsink_model, 1.0 / phase_dt, solve_be)
+            _HeatsinkPhaseState.prepare_direct(
+                heatsink_model, 1.0 / phase_dt, solve_be, node_count=N
+            )
             if hs_active
             else None
         )
 
         if Q_func is not None:
             Q_current = Q_func(current_time + phase_dt)
-            pin = float(np.sum(Q_current))
+            pin = _power_sum(Q_current)
         np.multiply(D, Tn, out=rhs_workspace)
         rhs_workspace += Q_current
         rhs_workspace += b
@@ -2723,7 +4329,7 @@ def run_simulation(
             phase_backend = bdf_backend
             if hs_active:
                 phase_hs_bdf = _HeatsinkPhaseState.prepare_direct(
-                    heatsink_model, 1.5 / phase_dt, solve_bdf2
+                    heatsink_model, 1.5 / phase_dt, solve_bdf2, node_count=N
                 )
 
         while not aborted and not early_stopped and phase_steps_done < phase_step_count:

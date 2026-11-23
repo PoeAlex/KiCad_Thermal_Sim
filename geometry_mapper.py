@@ -852,7 +852,7 @@ def build_geometry_state(
 
     state = GeometryState(
         copper_mask=np.zeros((num_layers, rows, cols), dtype=bool),
-        via_map=np.ones((rows, cols), dtype=np.float64),
+        via_map=np.ones((rows, cols), dtype=np.float32),
         heatsink_mask=np.zeros((rows, cols), dtype=bool),
         area_mask=area_mask,
         x_min=x_min,

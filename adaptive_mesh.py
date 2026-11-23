@@ -14,7 +14,12 @@ import scipy.ndimage as ndi
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
-from .thermal_solver import HeatsinkModel
+from .thermal_solver import (
+    HeatsinkModel,
+    SparsePowerVector,
+    _compute_bottom_boundary_terms,
+    _compute_layer_luts,
+)
 
 
 @dataclass
@@ -97,6 +102,10 @@ class AdaptiveSparseOperator:
     @property
     def nnz_estimate(self):
         return int(self.matrix.nnz)
+
+    def clear_caches(self):
+        """Release cached multigrid preconditioners."""
+        self._preconditioner_cache.clear()
 
     def dot(self, vector):
         """Apply the reduced stiffness matrix."""
@@ -551,6 +560,203 @@ def build_adaptive_system(
     )
 
 
+def build_adaptive_system_compact(
+    layer_count,
+    rows,
+    cols,
+    copper_mask,
+    t_cu,
+    t_fr4_eff,
+    k_cu,
+    k_fr4,
+    dx,
+    dy,
+    V_map,
+    gap_m,
+    H_map,
+    settings,
+    amb,
+    mesh,
+    power,
+    rho_cu=8960.0,
+    cp_cu=385.0,
+    rho_fr4=1850.0,
+    cp_fr4=1100.0,
+    pad_cap_areal=0.0,
+) -> AdaptiveThermalSystem:
+    """Build an adaptive thermal system directly from compact geometry without 3D fine arrays."""
+    layer_count = int(layer_count)
+    rows = int(rows)
+    cols = int(cols)
+    leaf_count = mesh.leaf_count
+    node_count = layer_count * leaf_count
+    leaf_map = mesh.leaf_map
+    ids = leaf_map.reshape(-1)
+    leaf_heights = (mesh.leaves[:, 1] - mesh.leaves[:, 0]).astype(np.float64)
+    leaf_widths = (mesh.leaves[:, 3] - mesh.leaves[:, 2]).astype(np.float64)
+
+    copper_u8 = np.asarray(copper_mask, dtype=bool).astype(np.uint8, copy=False)
+    gx_lut, gy_lut, gz_scale, cap_lut, pad_cap_cell = _compute_layer_luts(
+        layer_count=layer_count,
+        t_cu=t_cu,
+        t_fr4_eff=t_fr4_eff,
+        k_cu=k_cu,
+        k_fr4=k_fr4,
+        dx=dx,
+        dy=dy,
+        gap_m=gap_m,
+        rho_cu=rho_cu,
+        cp_cu=cp_cu,
+        rho_fr4=rho_fr4,
+        cp_fr4=cp_fr4,
+        pad_cap_areal=pad_cap_areal,
+    )
+
+    if cols > 1:
+        x_left = leaf_map[:, :-1]
+        x_right = leaf_map[:, 1:]
+        x_boundary = x_left != x_right
+        x_left_ids = x_left[x_boundary]
+        x_right_ids = x_right[x_boundary]
+        x_dist = 0.5 * (leaf_widths[x_left_ids] + leaf_widths[x_right_ids])
+    else:
+        x_boundary = None
+        x_left_ids = x_right_ids = x_dist = None
+
+    if rows > 1:
+        y_upper = leaf_map[:-1, :]
+        y_lower = leaf_map[1:, :]
+        y_boundary = y_upper != y_lower
+        y_upper_ids = y_upper[y_boundary]
+        y_lower_ids = y_lower[y_boundary]
+        y_dist = 0.5 * (leaf_heights[y_upper_ids] + leaf_heights[y_lower_ids])
+    else:
+        y_boundary = None
+        y_upper_ids = y_lower_ids = y_dist = None
+
+    global_first = []
+    global_second = []
+    global_conductance = []
+    leaf_counts = np.bincount(ids, minlength=leaf_count).astype(np.float64)
+    reduced_capacity = np.empty(node_count, dtype=np.float64)
+
+    for layer_idx in range(layer_count):
+        mask_l = copper_u8[layer_idx]
+        first_parts = []
+        second_parts = []
+        conductance_parts = []
+        if x_boundary is not None and x_left_ids.size:
+            edge_idx = mask_l[:, :-1][x_boundary] + mask_l[:, 1:][x_boundary]
+            first_parts.append(x_left_ids)
+            second_parts.append(x_right_ids)
+            conductance_parts.append(gx_lut[layer_idx][edge_idx] / x_dist)
+        if y_boundary is not None and y_upper_ids.size:
+            edge_idx = mask_l[:-1, :][y_boundary] + mask_l[1:, :][y_boundary]
+            first_parts.append(y_upper_ids)
+            second_parts.append(y_lower_ids)
+            conductance_parts.append(gy_lut[layer_idx][edge_idx] / y_dist)
+        if first_parts:
+            first_l, second_l, cond_l = _aggregate_edges(
+                np.concatenate(first_parts),
+                np.concatenate(second_parts),
+                np.concatenate(conductance_parts),
+                leaf_count,
+            )
+            global_first.append(layer_idx * leaf_count + first_l)
+            global_second.append(layer_idx * leaf_count + second_l)
+            global_conductance.append(cond_l)
+
+        cu_counts = np.bincount(
+            ids, weights=mask_l.reshape(-1), minlength=leaf_count
+        )
+        fr4_counts = leaf_counts - cu_counts
+        reduced_capacity[
+            layer_idx * leaf_count : (layer_idx + 1) * leaf_count
+        ] = fr4_counts * cap_lut[layer_idx, 0] + cu_counts * cap_lut[layer_idx, 1]
+
+    if layer_count > 1 and gz_scale.size:
+        via_enh = np.clip(np.asarray(V_map, dtype=np.float64), 1.0, 50.0).reshape(-1)
+        via_sum = np.bincount(ids, weights=via_enh, minlength=leaf_count)
+        for layer_idx in range(layer_count - 1):
+            conductance_z = gz_scale[layer_idx] * via_sum
+            active = conductance_z > 0.0
+            leaves_z = np.flatnonzero(active)
+            global_first.append(layer_idx * leaf_count + leaves_z)
+            global_second.append((layer_idx + 1) * leaf_count + leaves_z)
+            global_conductance.append(conductance_z[active])
+
+    if global_first:
+        first = np.concatenate(global_first).astype(np.int64, copy=False)
+        second = np.concatenate(global_second).astype(np.int64, copy=False)
+        conductance = np.concatenate(global_conductance).astype(np.float64, copy=False)
+    else:
+        first = np.empty(0, dtype=np.int64)
+        second = np.empty(0, dtype=np.int64)
+        conductance = np.empty(0, dtype=np.float64)
+
+    pixel_area = float(dx) * float(dy)
+    hs_arr = np.asarray(H_map, dtype=np.float64)
+    if pad_cap_cell != 0.0 and np.any(hs_arr):
+        hs_leaf = np.bincount(ids, weights=hs_arr.reshape(-1), minlength=leaf_count)
+        reduced_capacity[(layer_count - 1) * leaf_count :] += pad_cap_cell * hs_leaf
+
+    reduced_boundary_diag = np.zeros(node_count, dtype=np.float64)
+    reduced_boundary_rhs = np.zeros(node_count, dtype=np.float64)
+    reduced_h_area = np.zeros(node_count, dtype=np.float64)
+
+    top_addition = float(settings.get("h_conv", 10.0)) * pixel_area * leaf_counts
+    reduced_boundary_diag[:leaf_count] += top_addition
+    reduced_boundary_rhs[:leaf_count] += top_addition * float(amb)
+    reduced_h_area[:leaf_count] += top_addition
+
+    diag_add_bot, b_add_bot, hA_add_bot = _compute_bottom_boundary_terms(
+        hs_arr, pixel_area, settings, amb
+    )
+    bot_slice = slice((layer_count - 1) * leaf_count, layer_count * leaf_count)
+    reduced_boundary_diag[bot_slice] += np.bincount(
+        ids, weights=diag_add_bot, minlength=leaf_count
+    )
+    reduced_boundary_rhs[bot_slice] += np.bincount(
+        ids, weights=b_add_bot, minlength=leaf_count
+    )
+    reduced_h_area[bot_slice] += np.bincount(
+        ids, weights=hA_add_bot, minlength=leaf_count
+    )
+
+    diagonal = reduced_boundary_diag.copy()
+    np.add.at(diagonal, first, conductance)
+    np.add.at(diagonal, second, conductance)
+    row_indices = np.concatenate((first, second, np.arange(node_count)))
+    col_indices = np.concatenate((second, first, np.arange(node_count)))
+    data = np.concatenate((-conductance, -conductance, diagonal))
+    matrix = sp.coo_matrix(
+        (data, (row_indices, col_indices)),
+        shape=(node_count, node_count),
+    ).tocsr()
+
+    if isinstance(power, SparsePowerVector):
+        reduced_power = np.zeros(node_count, dtype=np.float64)
+        if power.indices.size:
+            plane_size = rows * cols
+            l_idx = power.indices // plane_size
+            rc_idx = power.indices % plane_size
+            leaf_idx = l_idx * leaf_count + ids[rc_idx]
+            np.add.at(reduced_power, leaf_idx, power.values)
+    else:
+        reduced_power = mesh.restrict_sum(power, layer_count)
+
+    return AdaptiveThermalSystem(
+        mesh=mesh,
+        operator=AdaptiveSparseOperator(
+            matrix, layer_count, leaf_count, mesh
+        ),
+        capacity=reduced_capacity,
+        power=reduced_power,
+        boundary_rhs=reduced_boundary_rhs,
+        h_area=reduced_h_area,
+    )
+
+
 def restrict_heatsink_model(
     heatsink_model: Optional[HeatsinkModel],
     mesh: AdaptiveMesh,
@@ -559,12 +765,16 @@ def restrict_heatsink_model(
     """Restrict a fine-grid HeatsinkModel conservatively onto an adaptive mesh."""
     if heatsink_model is None:
         return None
+    bottom_only = bool(getattr(heatsink_model, "bottom_layer_only", False))
+    restricted_conductance = mesh.restrict_sum(
+        heatsink_model.pad_conductance,
+        1 if bottom_only else layer_count,
+    )
     return HeatsinkModel(
-        pad_conductance=mesh.restrict_sum(
-            heatsink_model.pad_conductance, layer_count
-        ),
+        pad_conductance=restricted_conductance,
         rth_kw=heatsink_model.rth_kw,
         capacity_j_k=heatsink_model.capacity_j_k,
         initial_temp_c=heatsink_model.initial_temp_c,
         mode=heatsink_model.mode,
+        bottom_layer_only=bottom_only,
     )

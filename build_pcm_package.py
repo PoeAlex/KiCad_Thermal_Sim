@@ -17,7 +17,7 @@ import os
 import sys
 import zipfile
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 
 IDENTIFIER = "com.github.poealex.kicad-thermal-sim"
 
@@ -73,8 +73,9 @@ def build_metadata(version):
             "- KiCad 9.0 & 10.0 compatibility\n"
             "- Direct Steady-State mode (single-solve final temperature) and "
             "BDF2 transient time integration with early steady-state stop\n"
-            "- Native C++/OpenMP v2 Multigrid CPU core (Windows, Linux, macOS) "
-            "with automatic NumPy/SciPy fallback\n"
+            "- Native C++/OpenMP v3 Compact Low-RAM Multigrid CPU core "
+            "(Windows, Linux, macOS) with mixed-precision V-cycles and "
+            "automatic NumPy/SciPy fallback\n"
             "- Automatic stackup detection from board file\n"
             "- Multi-layer heat spreading with via coupling\n"
             "- DC current-flow Joule heating in traces, vias, and zones\n"

@@ -709,3 +709,28 @@ class TestCreateMultilayerMaps:
         assert state.via_map[5, 5] == 1300.0
         assert state.copper_mask[0, 5, 5]
         assert state.copper_mask[1, 5, 5]
+
+    def test_geometry_state_uses_compact_dtypes(self):
+        """GeometryState uses bool masks and float32 via_map for low RAM."""
+        board = MockBoard(layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"})
+        state = build_geometry_state(
+            board=board,
+            copper_ids=[F_Cu, B_Cu],
+            rows=8,
+            cols=8,
+            x_min=0.0,
+            y_min=0.0,
+            res=1.0,
+            settings={
+                "ignore_traces": False,
+                "ignore_polygons": False,
+                "use_heatsink": False,
+            },
+            via_factor=1300.0,
+            pads_list=[],
+        )
+
+        assert state.copper_mask.dtype == bool
+        assert state.heatsink_mask.dtype == bool
+        assert state.via_map.dtype == np.float32
+        assert state.via_map.nbytes == 8 * 8 * 4

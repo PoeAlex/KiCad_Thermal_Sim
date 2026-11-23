@@ -21,7 +21,7 @@ This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineer
 - **Vertical coupling** between adjacent copper layers through FR4 and via enhancement.
 - **Direct Steady-State (final temperature)** mode solving $K \cdot T = Q + b$ directly in a single solve for constant heat sources (solves 160k+ node multilayer PCBs in well under a second).
 - **Transient BDF2 time integration** with linear PCG warm-start extrapolation and lossless early steady-state stop.
-- **Native C++/OpenMP v2 Multigrid CPU core** (`thermalsim_core.dll`, `libthermalsim_core.so`, `libthermalsim_core.dylib`) with automatic fallback to a pure NumPy/SciPy implementation.
+- **Native C++/OpenMP v3 Compact Low-RAM CPU core** (`thermalsim_core.dll`, `libthermalsim_core.so`, `libthermalsim_core.dylib`) with on-the-fly Level-0 evaluation, mixed-precision `float32` multigrid V-cycles, and automatic fallback to a pure NumPy/SciPy implementation.
 - **Manual power injection** from explicitly configured **Heat Sources** (constant power or time-varying **PWL power profiles**).
 - Optional **DC current-flow heating** from source/sink pads on KiCad nets.
 - **Convection** to ambient on top and bottom outer surfaces.
@@ -230,17 +230,17 @@ The preflight status shows the effective dimensions and percentage of the board.
 
 - **Convection h (W/m2K)** - convection coefficient for top/bottom surfaces. Default is 10.
 - **PCB Thickness (mm)** - overall board thickness. Stackup thickness is used when available.
-- **Compute Engine** - `Auto` selects the matrix-free CPU engine (with geometric multigrid PCG) for larger jobs (starting at 50k nodes when the Native C++/OpenMP v2 multigrid core is active, or 250k nodes without it) and keeps the sparse SciPy direct solver for small jobs. Both engines remain manually selectable.
+- **Compute Engine** - `Auto` selects the matrix-free CPU engine (with geometric multigrid PCG) for larger jobs (starting at 50k nodes when the Native C++/OpenMP v3 Compact Low-RAM core is active, or 250k nodes without it) and keeps the sparse SciPy direct solver for small jobs. Both engines remain manually selectable.
 - **Spatial Mesh** - `Auto`, `Uniform`, or `Adaptive`:
-  - **`Auto`** (default) uses `Uniform` with the Native C++/OpenMP v2 multigrid solver up to **5M nodes** for maximum speed and zero coarsening error, and switches to `Adaptive` above 5M nodes or when running without the native multigrid core.
+  - **`Auto`** (default) uses `Uniform` with the Native C++/OpenMP v3 Compact Low-RAM multigrid solver up to **5M nodes** for maximum speed and zero coarsening error, and switches to `Adaptive` above 5M nodes or when running without the native multigrid core.
   - **`Uniform`** keeps the full regular grid.
   - **`Adaptive`** keeps the requested cell size at copper edges, pads, vias, sources, and thermal-pad boundaries while merging homogeneous interiors.
 - **Adaptive Max Cell Ratio** - largest adaptive cell relative to the requested cell size. The default is 8.
-- **Capabilities** - detected solver backend, including the Native C++/OpenMP v2 multigrid core (`thermalsim_core.dll`, `libthermalsim_core.so`, or `libthermalsim_core.dylib`).
+- **Capabilities** - detected solver backend, including the Native C++/OpenMP v3 Compact Low-RAM core (`thermalsim_core.dll`, `libthermalsim_core.so`, or `libthermalsim_core.dylib`).
 
 The **Balanced** compute budget (1.2M nodes) is the default. Presets use total solver nodes, so a four-layer board automatically receives fewer 2D cells than a two-layer board at the same budget. When auto-coarsening is needed, ThermalSim targets 85% of the budget so headroom is preserved without sacrificing unnecessary resolution.
 
-The fast engine applies the finite-volume operator without constructing a large global COO/CSR matrix. Uniform native runs use C++/OpenMP v2 structured geometric multigrid V-cycles; adaptive runs use a conservative reduced graph with geometrically coarsened multigrid preconditioning. Reports show the equivalent uniform nodes, actual adaptive nodes, reduction factor, PCG iterations, and residual.
+The fast engine applies the finite-volume operator without constructing a large global COO/CSR matrix. Uniform native runs use the **Native C++/OpenMP v3 Compact Low-RAM Core** — evaluating Level-0 stencil conductances and capacities on the fly from compact `bool`/`float32` masks and per-layer lookup tables (LUTs), solving mixed-precision `float32` multigrid V-cycle preconditioners inside a `float64` outer PCG loop, and releasing solver scratch/operator caches automatically after each run (and in-memory caches when the dialog closes). Adaptive runs assemble the reduced graph directly from the compact geometry state without materializing fine 3D conductance/capacity arrays. Reports show the equivalent uniform nodes, actual adaptive nodes, reduction factor, PCG iterations, and residual.
 
 ---
 
@@ -305,7 +305,7 @@ The plugin is split into focused modules:
 
 | Module | Purpose |
 |--------|---------|
-| `capabilities.py` | Runtime detection of `numpy`, `scipy`, `matplotlib`, and the Native C++/OpenMP v2 core |
+| `capabilities.py` | Runtime detection of `numpy`, `scipy`, `matplotlib`, and the Native C++/OpenMP v3 core |
 | `dependency_installer.py` | Auto-install dialog for missing packages via pip |
 | `stackup_parser.py` | Parse copper/dielectric layers from `.kicad_pcb` S-expressions |
 | `gui_dialogs.py` | wxPython dialog for simulation parameters |
@@ -313,7 +313,7 @@ The plugin is split into focused modules:
 | `adaptive_mesh.py` | Build conservative adaptive meshes and multigrid operators |
 | `electrical_solver.py` | Solve DC current flow and convert copper losses to heat sources |
 | `thermal_solver.py` | Direct steady-state, transient BDF2, and matrix-free multigrid PCG thermal solvers |
-| `native_core.py` | Cross-platform loader for the optional C++/OpenMP v2 Multigrid CPU core |
+| `native_core.py` | Cross-platform loader for the optional C++/OpenMP v3 Compact Low-RAM CPU core |
 | `workflow.py` | Safe compressed `.npz` disk geometry caching, operator caching, and solver phase planning |
 | `pwl_parser.py` | Parse LTspice-style PWL power profiles |
 | `visualization.py` | Generate thermal plots, previews, hotspot-preserving interactive heatmaps, and Joule loss maps |
@@ -351,9 +351,16 @@ The plugin is split into focused modules:
 
 ---
 
-## Building the Native C++/OpenMP v2 Multigrid Core
+## Building the Native C++/OpenMP v3 Compact Low-RAM Core
 
-The optional native C++/OpenMP v2 core accelerates matrix-free stencil evaluation and geometric multigrid V-cycles (damped Jacobi smoothing, 2x2 residual restriction, and prolongation) across all CPU cores. Without it, the same fast-engine interface runs seamlessly on NumPy/SciPy.
+The optional native C++/OpenMP v3 Compact Low-RAM core accelerates matrix-free stencil evaluation and geometric multigrid V-cycles across all CPU cores while minimizing peak RAM:
+
+- **On-the-fly Level-0 mask + LUT evaluation** avoids allocating dense 3D `float64` conductance (`gx`/`gy`/`gz`), capacity (`C`), boundary (`b`), and convection (`hA`) arrays.
+- **Mixed-precision multigrid** runs `float32` V-cycle smoothing, restriction, and prolongation inside a `float64` outer PCG loop.
+- **Direct adaptive mesh assembly** builds reduced adaptive graphs straight from compact masks and layer lookup tables without building a full fine operator first.
+- **Automatic post-run cache cleanup** frees native scratch buffers and operator caches after each solve, and releases in-memory caches when the plugin dialog closes.
+
+Without the native library, the same fast-engine interface runs seamlessly on NumPy/SciPy.
 
 ### Windows (CMake / MSVC)
 

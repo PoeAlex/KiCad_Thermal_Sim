@@ -19,14 +19,17 @@ import scipy.sparse.linalg as spla
 from ThermalSim import thermal_solver
 from ThermalSim.thermal_solver import (
     HEATSINK_MATERIAL_CP,
+    CompactStructuredThermalOperator,
     HeatsinkModel,
     SolverConfig,
     SolverResult,
+    SparsePowerVector,
     _assemble_structured_csc,
     _build_phase_plan,
     _coarsen_structured_operator,
     _factor_linear_system,
     _solve_pcg,
+    build_compact_structured_operator,
     build_heatsink_coupling_vector,
     build_heatsink_model,
     build_stiffness_matrix,
@@ -1340,7 +1343,7 @@ class TestStructuredMultigridPreconditioner:
         Mx = M_mg.matvec(x)
         My = M_mg.matvec(y)
         assert float(np.dot(x, Mx)) > 0.0
-        np.testing.assert_allclose(np.dot(x, My), np.dot(y, Mx), rtol=1e-10, atol=1e-12)
+        np.testing.assert_allclose(np.dot(x, My), np.dot(y, Mx), rtol=1e-5, atol=1e-6)
 
         # Compare MG PCG vs diagonal Jacobi PCG and direct sparse solve
         rhs = (scale * capacity) * 25.0 + power + fast_b
@@ -1535,7 +1538,7 @@ class TestSteadyStateAndSpeedups:
         Mx = M_mg.matvec(x)
         My = M_mg.matvec(y)
         assert float(np.dot(x, Mx)) > 0.0
-        np.testing.assert_allclose(np.dot(x, My), np.dot(y, Mx), rtol=1e-10, atol=1e-12)
+        np.testing.assert_allclose(np.dot(x, My), np.dot(y, Mx), rtol=1e-5, atol=1e-6)
 
         rhs = power + fast_b
         initial = np.full(op.shape[0], 25.0, dtype=np.float64)
@@ -1548,7 +1551,7 @@ class TestSteadyStateAndSpeedups:
         np.testing.assert_allclose(sol, sol_direct, rtol=1e-4, atol=1e-3)
 
     def test_native_mg_kernels_match_numpy_fallback(self, monkeypatch):
-        """V-cycle with native C++ v2 MG kernels matches pure-NumPy fallback to ~1e-12."""
+        """V-cycle with native float32 MG kernels matches pure-NumPy fallback."""
         args, capacity, power = self._build_problem(layers=2, rows=33, cols=37)
         op, fast_b, _, _ = build_structured_operator(*args)
         _, M_mg = op.implicit_linear_operator(capacity, 0.5)
@@ -1556,12 +1559,12 @@ class TestSteadyStateAndSpeedups:
 
         native_out = M_mg.matvec(rhs)
 
-        monkeypatch.setattr(thermal_solver, "damped_jacobi_native", None)
-        monkeypatch.setattr(thermal_solver, "residual_restrict_2x2_native", None)
-        monkeypatch.setattr(thermal_solver, "prolong_add_2x2_native", None)
+        monkeypatch.setattr(thermal_solver, "damped_jacobi_f32_native", None)
+        monkeypatch.setattr(thermal_solver, "residual_restrict_2x2_f32_native", None)
+        monkeypatch.setattr(thermal_solver, "prolong_add_2x2_f32_native", None)
         numpy_out = M_mg.matvec(rhs)
 
-        np.testing.assert_allclose(native_out, numpy_out, rtol=1e-11, atol=1e-11)
+        np.testing.assert_allclose(native_out, numpy_out, rtol=1e-5, atol=1e-5)
 
     def test_pcg_linear_extrapolation_reduces_iterations(self, monkeypatch):
         """Linear PCG warm-start extrapolation reduces total PCG iterations without losing accuracy."""
@@ -2138,3 +2141,291 @@ class TestDynamicHeatsinkModel:
         assert res_deriv.k_norm_info["heatsink_temp_c"] == pytest.approx(
             res_std.k_norm_info["heatsink_temp_c"], abs=0.05
         )
+
+
+class TestCompactLowRamOperatorAndHeatsink2D:
+    """Tests for CompactStructuredThermalOperator, SparsePowerVector, cache caps, and 2D HeatsinkModel."""
+
+    @staticmethod
+    def _build_compact_problem(
+        layers=4,
+        rows=25,
+        cols=29,
+        res_mm=0.4,
+        heatsink_mode=False,
+        pad_cap_areal=250.0,
+    ):
+        dx = dy = res_mm * 1e-3
+        yy, xx = np.ogrid[:rows, :cols]
+        copper = np.zeros((layers, rows, cols), dtype=bool)
+        for l in range(layers):
+            copper[l] = (
+                ((yy + 3 * l) % 7 < 2)
+                | ((xx + 5 * l) % 11 < 2)
+                | (
+                    (xx >= cols // 4) & (xx < (3 * cols) // 4)
+                    & (yy >= rows // 4) & (yy < (3 * rows) // 4)
+                )
+            )
+        t_cu = np.full(layers, 35e-6, dtype=np.float64)
+        t_fr4_eff = np.full(layers, 1.6e-3 / layers, dtype=np.float64)
+        gap_m = [1.6e-3 / max(layers - 1, 1)] * max(0, layers - 1)
+        V_map = np.ones((rows, cols), dtype=np.float32)
+        V_map[(yy % 8 == 3) & (xx % 8 == 3)] = 15.0
+        H_map = np.zeros((rows, cols), dtype=np.float64)
+        H_map[rows // 3 : (2 * rows) // 3, cols // 3 : (2 * cols) // 3] = 1.0
+        settings = {
+            "h_conv": 12.0,
+            "pad_th": 1.0,
+            "pad_k": 3.0,
+            "pad_contact_factor": 0.3,
+            "use_heatsink": True,
+            "pad_sink_mode": "heatsink" if heatsink_mode else "fixed",
+            "pad_sink_temp_use_ambient": False,
+            "pad_sink_temp_c": 30.0,
+            "heatsink_rth_kw": 3.5,
+            "heatsink_material": "aluminium",
+            "heatsink_mass_g": 45.0,
+        }
+        amb = 25.0
+        k_cu = 390.0
+        k_fr4 = 0.3
+        rho_cu, cp_cu = 8960.0, 385.0
+        rho_fr4, cp_fr4 = 1850.0, 1100.0
+        pixel_area = dx * dy
+
+        C_layers = np.empty((layers, rows, cols), dtype=np.float64)
+        for l in range(layers):
+            v_cu = pixel_area * t_cu[l]
+            v_fr4 = pixel_area * t_fr4_eff[l]
+            mask = copper[l]
+            c_l = np.where(mask, rho_cu * cp_cu * v_cu, rho_fr4 * cp_fr4 * v_fr4)
+            c_l += mask * (rho_fr4 * cp_fr4 * v_fr4)
+            C_layers[l] = c_l
+        if pad_cap_areal > 0.0 and np.any(H_map):
+            C_layers[-1] += pad_cap_areal * pixel_area * H_map
+        C = C_layers.reshape(-1)
+
+        src_indices = np.array(
+            [
+                (rows // 2) * cols + (cols // 2),
+                (rows // 2) * cols + (cols // 2) + 1,
+                (layers - 1) * rows * cols + (rows // 3) * cols + (cols // 3),
+            ],
+            dtype=np.int64,
+        )
+        src_values = np.array([0.08, 0.05, 0.03], dtype=np.float64)
+        Q_sparse = SparsePowerVector(indices=src_indices, values=src_values, size=C.size)
+        Q_dense = Q_sparse.to_dense()
+
+        args = (
+            layers, rows, cols, copper, t_cu, t_fr4_eff,
+            k_cu, k_fr4, dx, dy, V_map.astype(np.float64), gap_m, H_map, settings, amb,
+        )
+        compact_op = build_compact_structured_operator(
+            layers, rows, cols, copper, t_cu, t_fr4_eff,
+            k_cu, k_fr4, dx, dy, V_map, gap_m, H_map, settings, amb,
+            rho_cu=rho_cu, cp_cu=cp_cu, rho_fr4=rho_fr4, cp_fr4=cp_fr4,
+            pad_cap_areal=pad_cap_areal,
+        )
+        return args, compact_op, C, Q_sparse, Q_dense, settings, amb
+
+    def test_sparse_power_vector_operations(self):
+        spv = SparsePowerVector(
+            indices=np.array([2, 5, 2], dtype=np.int64),
+            values=np.array([1.5, 2.0, 0.5], dtype=np.float64),
+            size=8,
+        )
+        assert spv.total_power() == pytest.approx(4.0)
+        dense = spv.to_dense()
+        np.testing.assert_allclose(dense, [0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 0.0, 0.0])
+        out = np.ones(8, dtype=np.float64)
+        spv.add_to(out)
+        np.testing.assert_allclose(out, 1.0 + dense)
+
+    @pytest.mark.parametrize(
+        "shape,heatsink_mode",
+        [
+            ((1, 24, 24), False),
+            ((1, 25, 29), True),
+            ((4, 24, 24), False),
+            ((4, 25, 29), True),
+        ],
+    )
+    def test_compact_operator_matches_structured_and_direct_ss_and_transient(
+        self, shape, heatsink_mode
+    ):
+        layers, rows, cols = shape
+        args, compact_op, C, Q_sparse, Q_dense, settings, amb = self._build_compact_problem(
+            layers=layers, rows=rows, cols=cols, heatsink_mode=heatsink_mode
+        )
+        K, b, hA, _ = build_stiffness_matrix(*args)
+        struct_op, sb, shA, _ = build_structured_operator(*args)
+
+        # Operator matvec agreement
+        vec = np.linspace(20.0, 75.0, compact_op.shape[0], dtype=np.float64)
+        np.testing.assert_allclose(
+            compact_op.dot(vec), struct_op.dot(vec), rtol=1e-6, atol=1e-9
+        )
+
+        hs_3d = (
+            build_heatsink_model(layers, rows, cols, args[8], args[9], args[12], settings, amb)
+            if heatsink_mode
+            else None
+        )
+        hs_2d = compact_op.build_heatsink_model(settings, amb)
+        assert (hs_2d is not None) == heatsink_mode
+        if hs_2d is not None:
+            assert hs_2d.bottom_layer_only is True
+            assert hs_2d.pad_conductance.size == rows * cols
+
+        # Steady-state: compact (C=None, b=None, hA=None, SparsePowerVector) vs direct & structured
+        ss_cfg = SolverConfig(
+            sim_time=50.0, amb=amb, dt_base=1.0, steps_target=50, steady_state=True
+        )
+        res_direct_ss = run_steady_state(
+            ss_cfg, K, Q_dense, b, hA, layers, rows, cols, heatsink_model=hs_3d
+        )
+        res_struct_ss = run_steady_state_matrix_free(
+            ss_cfg, struct_op, C, Q_dense, sb, shA, heatsink_model=hs_3d
+        )
+        res_compact_sparse_ss = run_steady_state_matrix_free(
+            ss_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+        res_compact_dense_ss = run_steady_state_matrix_free(
+            ss_cfg, compact_op, None, Q_dense, None, None, heatsink_model=hs_2d
+        )
+
+        assert float(np.max(np.abs(res_compact_sparse_ss.T - res_direct_ss.T))) < 1e-5
+        assert float(np.max(np.abs(res_compact_dense_ss.T - res_direct_ss.T))) < 1e-5
+        assert float(np.max(np.abs(res_compact_sparse_ss.T - res_struct_ss.T))) < 1e-5
+        if heatsink_mode:
+            assert abs(
+                res_compact_sparse_ss.k_norm_info["heatsink_temp_c"]
+                - res_direct_ss.k_norm_info["heatsink_temp_c"]
+            ) < 1e-5
+
+        # Transient: compact vs direct & structured
+        tr_cfg = SolverConfig(
+            sim_time=4.0,
+            amb=amb,
+            dt_base=0.4,
+            steps_target=10,
+            use_multi_phase=False,
+            time_stepping="uniform",
+            snapshots_enabled=True,
+            snap_times=[1.5, 3.5],
+            early_stop=False,
+        )
+        res_direct_tr = run_simulation(
+            tr_cfg, K, C, Q_dense, b, hA, layers, rows, cols, heatsink_model=hs_3d
+        )
+        res_struct_tr = run_simulation_matrix_free(
+            tr_cfg, struct_op, C, Q_dense, sb, shA, heatsink_model=hs_3d
+        )
+        res_compact_sparse_tr = run_simulation_matrix_free(
+            tr_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+        res_compact_dense_tr = run_simulation_matrix_free(
+            tr_cfg, compact_op, None, Q_dense, None, None, heatsink_model=hs_2d
+        )
+
+        assert float(np.max(np.abs(res_compact_sparse_tr.T - res_struct_tr.T))) < 1e-5
+        assert float(np.max(np.abs(res_compact_dense_tr.T - res_struct_tr.T))) < 1e-5
+        assert float(np.max(np.abs(res_compact_sparse_tr.T - res_direct_tr.T))) < 1e-4
+        assert float(np.max(np.abs(res_compact_dense_tr.T - res_direct_tr.T))) < 1e-4
+        assert len(res_compact_sparse_tr.snapshot_stats) == 2
+        if heatsink_mode:
+            assert abs(
+                res_compact_sparse_tr.k_norm_info["heatsink_temp_c"]
+                - res_direct_tr.k_norm_info["heatsink_temp_c"]
+            ) < 1e-5
+
+    def test_compact_numpy_fallback_matches_native_v3(self, monkeypatch):
+        """Compact operator pure-NumPy fallback matches live native v3 kernels."""
+        args, compact_op, _, Q_sparse, _, settings, amb = self._build_compact_problem(
+            layers=2, rows=25, cols=29, heatsink_mode=True
+        )
+        hs_2d = compact_op.build_heatsink_model(settings, amb)
+        cfg = SolverConfig(
+            sim_time=2.0, amb=amb, dt_base=0.5, steps_target=4,
+            use_multi_phase=False, early_stop=False,
+        )
+        res_native = run_simulation_matrix_free(
+            cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+        compact_op.clear_caches()
+
+        for attr in (
+            "apply_compact_native",
+            "damped_jacobi_compact_f32_native",
+            "residual_restrict_2x2_compact_f32_native",
+            "coarsen_compact_to_f32_native",
+            "damped_jacobi_f32_native",
+            "residual_restrict_2x2_f32_native",
+            "prolong_add_2x2_f32_native",
+        ):
+            monkeypatch.setattr(thermal_solver, attr, None)
+        monkeypatch.setattr(thermal_solver, "HAS_NATIVE_COMPACT", False)
+
+        res_numpy = run_simulation_matrix_free(
+            cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+        np.testing.assert_allclose(res_native.T, res_numpy.T, rtol=1e-5, atol=1e-5)
+
+    def test_preconditioner_cache_caps_at_one_without_capacity_copy_and_clear_caches(self):
+        """_preconditioner_cache holds at most 1 entry, stores no capacity.copy(), and clears."""
+        args, compact_op, capacity, _, _, _, _ = self._build_compact_problem(
+            layers=2, rows=16, cols=16, heatsink_mode=False
+        )
+        struct_op, _, _, _ = build_structured_operator(*args)
+
+        for op in (struct_op, compact_op):
+            cap_arg = capacity if op is struct_op else None
+            op.implicit_linear_operator(cap_arg, 1.0)
+            assert len(op._preconditioner_cache) == 1
+            cached_key, _ = op._preconditioner_cache[1.0]
+            assert not isinstance(cached_key, np.ndarray)
+
+            op.implicit_linear_operator(cap_arg, 2.0)
+            assert len(op._preconditioner_cache) == 1
+            assert 1.0 not in op._preconditioner_cache
+            assert 2.0 in op._preconditioner_cache
+            assert op._coarse_operators is not None
+
+            op.clear_caches()
+            assert op._preconditioner_cache == {}
+            assert op._coarse_operators is None
+
+    def test_bottom_layer_heatsink_model_matches_3d_bit_identical(self):
+        """2D bottom_layer_only HeatsinkModel gives identical results to 3D HeatsinkModel."""
+        args, compact_op, C, _, Q_dense, settings, amb = self._build_compact_problem(
+            layers=3, rows=16, cols=16, heatsink_mode=True
+        )
+        layers, rows, cols = args[0], args[1], args[2]
+        K, b, hA, _ = build_stiffness_matrix(*args)
+        hs_3d = build_heatsink_model(
+            layers, rows, cols, args[8], args[9], args[12], settings, amb
+        )
+        hs_2d = compact_op.build_heatsink_model(settings, amb)
+        assert hs_2d.bottom_layer_only is True
+        np.testing.assert_allclose(
+            hs_2d.pad_conductance,
+            hs_3d.pad_conductance[-rows * cols :],
+            atol=1e-15,
+        )
+
+        ss_cfg = SolverConfig(sim_time=10.0, amb=amb, dt_base=1.0, steps_target=10, steady_state=True)
+        res_ss_3d = run_steady_state(ss_cfg, K, Q_dense, b, hA, layers, rows, cols, heatsink_model=hs_3d)
+        res_ss_2d = run_steady_state(ss_cfg, K, Q_dense, b, hA, layers, rows, cols, heatsink_model=hs_2d)
+        np.testing.assert_array_equal(res_ss_2d.T, res_ss_3d.T)
+        assert res_ss_2d.k_norm_info["heatsink_temp_c"] == res_ss_3d.k_norm_info["heatsink_temp_c"]
+
+        tr_cfg = SolverConfig(
+            sim_time=4.0, amb=amb, dt_base=0.5, steps_target=8,
+            use_multi_phase=False, time_stepping="uniform", early_stop=False,
+        )
+        res_tr_3d = run_simulation(tr_cfg, K, C, Q_dense, b, hA, layers, rows, cols, heatsink_model=hs_3d)
+        res_tr_2d = run_simulation(tr_cfg, K, C, Q_dense, b, hA, layers, rows, cols, heatsink_model=hs_2d)
+        np.testing.assert_array_equal(res_tr_2d.T, res_tr_3d.T)
+        assert res_tr_2d.k_norm_info["heatsink_temp_c"] == res_tr_3d.k_norm_info["heatsink_temp_c"]
