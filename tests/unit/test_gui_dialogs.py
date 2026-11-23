@@ -1415,3 +1415,38 @@ class TestDynamicHeatsinkSettings:
         assert restored["heatsink_mass_g"] == 50.0
         assert restored["heatsink_cp_j_kgk"] == 897.0
         assert dlg.lbl_heatsink_summary.GetLabel() == "Fixed sink temperature (infinite thermal mass)"
+
+    def test_set_run_state_refreshes_dialog_and_yields_app(self, monkeypatch):
+        """set_run_state should immediately refresh/update the dialog and yield wx events."""
+        import ThermalSim.gui_dialogs as gui_mod
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
+        calls = {"refresh": 0, "update": 0, "yield": []}
+
+        class DummyApp:
+            def Yield(self, only_if_needed=False):
+                calls["yield"].append(only_if_needed)
+
+        dlg.Refresh = lambda: calls.__setitem__("refresh", calls["refresh"] + 1)
+        dlg.Update = lambda: calls.__setitem__("update", calls["update"] + 1)
+        monkeypatch.setattr(gui_mod.wx, "GetApp", lambda: DummyApp(), raising=False)
+
+        dlg.set_run_state("running", "Mapping exact PCB geometry...")
+        assert calls["refresh"] == 1
+        assert calls["update"] == 1
+        assert calls["yield"] == [True]
+        assert dlg.lbl_preflight_status.GetLabel() == "Running"
+        assert dlg.lbl_preflight.GetLabel() == "Mapping exact PCB geometry..."
+        assert not dlg.btn_run.IsEnabled()
+
+        # Defensive when Refresh/Update raise and GetApp returns None
+        def _boom():
+            raise RuntimeError("wx gone")
+
+        dlg.Refresh = _boom
+        dlg.Update = _boom
+        monkeypatch.setattr(gui_mod.wx, "GetApp", lambda: None, raising=False)
+        dlg.set_run_state("cancelled")
+        assert dlg.lbl_preflight_status.GetLabel() == "Cancelled"
+        assert dlg.btn_run.IsEnabled()

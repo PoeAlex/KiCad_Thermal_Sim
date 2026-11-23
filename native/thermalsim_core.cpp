@@ -1,7 +1,10 @@
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <new>
 
 #if defined(_OPENMP)
@@ -25,16 +28,58 @@
 namespace {
 
 #if defined(_OPENMP)
+static inline int get_omp_thread_override() {
+    static const int override_threads = []() -> int {
+        const char* raw = std::getenv("THERMALSIM_OMP_THREADS");
+        if (raw == nullptr || *raw == '\0') {
+            return 0;
+        }
+        char* end = nullptr;
+        long val = std::strtol(raw, &end, 10);
+        if (end == raw || val <= 0) {
+            return 0;
+        }
+        while (*end != '\0') {
+            if (!std::isspace(static_cast<unsigned char>(*end))) {
+                return 0;
+            }
+            ++end;
+        }
+        if (val > 256) {
+            val = 256;
+        }
+        return static_cast<int>(val);
+    }();
+    return override_threads;
+}
+
 static inline int choose_num_threads(std::ptrdiff_t node_count) {
     if (node_count < 32768) {
         return 1;
     }
     const std::ptrdiff_t work_threads = node_count / 32768;
-    int cap = work_threads >= 4 ? 4 : static_cast<int>(work_threads);
-    const int max_threads = omp_get_max_threads();
-    if (max_threads < cap) {
-        cap = max_threads;
+    const int override_threads = get_omp_thread_override();
+    const int max_cap = (override_threads > 0)
+        ? override_threads
+        : std::min(omp_get_max_threads(), 12);
+    const int cap = (work_threads >= static_cast<std::ptrdiff_t>(max_cap))
+        ? max_cap
+        : static_cast<int>(work_threads);
+    return cap > 1 ? cap : 1;
+}
+
+static inline int choose_vec_num_threads(std::ptrdiff_t n) {
+    if (n < 65536) {
+        return 1;
     }
+    const std::ptrdiff_t work_threads = n / 65536;
+    const int override_threads = get_omp_thread_override();
+    const int max_cap = (override_threads > 0)
+        ? override_threads
+        : std::min(omp_get_max_threads(), 12);
+    const int cap = (work_threads >= static_cast<std::ptrdiff_t>(max_cap))
+        ? max_cap
+        : static_cast<int>(work_threads);
     return cap > 1 ? cap : 1;
 }
 #endif
@@ -526,7 +571,7 @@ static inline int prolong_add_2x2_impl(
 }  // namespace
 
 THERMALSIM_EXPORT int thermalsim_core_version() {
-    return 3;
+    return 4;
 }
 
 THERMALSIM_EXPORT int thermalsim_apply_structured(
@@ -1796,4 +1841,268 @@ THERMALSIM_EXPORT int thermalsim_prolong_add_2x2_f32(
     float* fine_x
 ) {
     return prolong_add_2x2_impl<float>(layer_count, rows, cols, coarse_x, fine_x);
+}
+
+THERMALSIM_EXPORT int thermalsim_apply_compact_dot(
+    int layer_count,
+    int rows,
+    int cols,
+    const std::uint8_t* copper_mask,
+    const float* via_enh,
+    const std::uint8_t* hs_mask,
+    const double* gx_lut,
+    const double* gy_lut,
+    const double* gz_scale,
+    const double* cap_lut,
+    double pad_cap_cell,
+    double top_diag,
+    double bot_air_diag,
+    double bot_pad_diag,
+    double scale,
+    const double* input,
+    double* output,
+    double* out_dot
+) {
+    if (
+        !has_valid_compact_inputs(
+            layer_count, rows, cols, copper_mask, via_enh, hs_mask, gx_lut, gy_lut, gz_scale, cap_lut
+        )
+        || input == nullptr || output == nullptr || out_dot == nullptr
+    ) {
+        return 1;
+    }
+
+    const std::ptrdiff_t n_layers = static_cast<std::ptrdiff_t>(layer_count);
+    const std::ptrdiff_t n_rows = static_cast<std::ptrdiff_t>(rows);
+    const std::ptrdiff_t n_cols = static_cast<std::ptrdiff_t>(cols);
+    const std::ptrdiff_t plane = n_rows * n_cols;
+    const std::ptrdiff_t total_rows = n_layers * n_rows;
+
+    double dot_acc = 0.0;
+
+#if defined(_OPENMP)
+    const int n_threads = choose_num_threads(n_layers * plane);
+    #pragma omp parallel for schedule(static) reduction(+:dot_acc) if(n_threads > 1) num_threads(n_threads)
+#endif
+    for (std::ptrdiff_t lr = 0; lr < total_rows; ++lr) {
+        const std::ptrdiff_t layer = lr / n_rows;
+        const std::ptrdiff_t row = lr - layer * n_rows;
+        const std::ptrdiff_t row_offset = lr * n_cols;
+        const double* THERMALSIM_RESTRICT in_row = input + row_offset;
+        double* THERMALSIM_RESTRICT out_row = output + row_offset;
+        eval_compact_row<double, false>(
+            n_layers,
+            n_rows,
+            n_cols,
+            plane,
+            layer,
+            row,
+            lr,
+            copper_mask,
+            via_enh,
+            hs_mask,
+            gx_lut,
+            gy_lut,
+            gz_scale,
+            cap_lut,
+            pad_cap_cell,
+            top_diag,
+            bot_air_diag,
+            bot_pad_diag,
+            scale,
+            input,
+            out_row,
+            nullptr
+        );
+        double row_dot = 0.0;
+        for (std::ptrdiff_t col = 0; col < n_cols; ++col) {
+            row_dot += in_row[col] * out_row[col];
+        }
+        dot_acc += row_dot;
+    }
+
+    *out_dot = dot_acc;
+    return 0;
+}
+
+THERMALSIM_EXPORT int thermalsim_pcg_update_xr_norm2(
+    std::int64_t n,
+    double* x,
+    double* r,
+    const double* p,
+    const double* ap,
+    double alpha,
+    double* out_r_norm2
+) {
+    if (n < 0 || out_r_norm2 == nullptr) {
+        return 1;
+    }
+    if (n == 0) {
+        *out_r_norm2 = 0.0;
+        return 0;
+    }
+    if (x == nullptr || r == nullptr || p == nullptr || ap == nullptr) {
+        return 1;
+    }
+
+    double* THERMALSIM_RESTRICT x_ptr = x;
+    double* THERMALSIM_RESTRICT r_ptr = r;
+    const double* THERMALSIM_RESTRICT p_ptr = p;
+    const double* THERMALSIM_RESTRICT ap_ptr = ap;
+    double norm2 = 0.0;
+
+#if defined(_OPENMP)
+    const int n_threads = choose_vec_num_threads(static_cast<std::ptrdiff_t>(n));
+    #pragma omp parallel for schedule(static) reduction(+:norm2) if(n_threads > 1) num_threads(n_threads)
+#endif
+    for (std::int64_t i = 0; i < n; ++i) {
+        x_ptr[i] += alpha * p_ptr[i];
+        const double ri = r_ptr[i] - alpha * ap_ptr[i];
+        r_ptr[i] = ri;
+        norm2 += ri * ri;
+    }
+
+    *out_r_norm2 = norm2;
+    return 0;
+}
+
+THERMALSIM_EXPORT int thermalsim_pcg_update_p(
+    std::int64_t n,
+    double* p,
+    const double* z,
+    double beta
+) {
+    if (n < 0) {
+        return 1;
+    }
+    if (n == 0) {
+        return 0;
+    }
+    if (p == nullptr || z == nullptr) {
+        return 1;
+    }
+
+    double* THERMALSIM_RESTRICT p_ptr = p;
+    const double* THERMALSIM_RESTRICT z_ptr = z;
+
+#if defined(_OPENMP)
+    const int n_threads = choose_vec_num_threads(static_cast<std::ptrdiff_t>(n));
+    #pragma omp parallel for schedule(static) if(n_threads > 1) num_threads(n_threads)
+#endif
+    for (std::int64_t i = 0; i < n; ++i) {
+        p_ptr[i] = z_ptr[i] + beta * p_ptr[i];
+    }
+
+    return 0;
+}
+
+THERMALSIM_EXPORT int thermalsim_f64_to_f32(
+    std::int64_t n,
+    const double* src,
+    float* dst
+) {
+    if (n < 0) {
+        return 1;
+    }
+    if (n == 0) {
+        return 0;
+    }
+    if (src == nullptr || dst == nullptr) {
+        return 1;
+    }
+
+    const double* THERMALSIM_RESTRICT src_ptr = src;
+    float* THERMALSIM_RESTRICT dst_ptr = dst;
+
+#if defined(_OPENMP)
+    const int n_threads = choose_vec_num_threads(static_cast<std::ptrdiff_t>(n));
+    #pragma omp parallel for schedule(static) if(n_threads > 1) num_threads(n_threads)
+#endif
+    for (std::int64_t i = 0; i < n; ++i) {
+        dst_ptr[i] = static_cast<float>(src_ptr[i]);
+    }
+
+    return 0;
+}
+
+THERMALSIM_EXPORT int thermalsim_f32_to_f64_dot(
+    std::int64_t n,
+    const float* src,
+    const double* r,
+    double* dst,
+    double* out_dot
+) {
+    if (n < 0 || out_dot == nullptr) {
+        return 1;
+    }
+    if (n == 0) {
+        *out_dot = 0.0;
+        return 0;
+    }
+    if (src == nullptr || r == nullptr || dst == nullptr) {
+        return 1;
+    }
+
+    const float* THERMALSIM_RESTRICT src_ptr = src;
+    const double* THERMALSIM_RESTRICT r_ptr = r;
+    double* THERMALSIM_RESTRICT dst_ptr = dst;
+    double dot_acc = 0.0;
+
+#if defined(_OPENMP)
+    const int n_threads = choose_vec_num_threads(static_cast<std::ptrdiff_t>(n));
+    #pragma omp parallel for schedule(static) reduction(+:dot_acc) if(n_threads > 1) num_threads(n_threads)
+#endif
+    for (std::int64_t i = 0; i < n; ++i) {
+        const double zi = static_cast<double>(src_ptr[i]);
+        dst_ptr[i] = zi;
+        dot_acc += r_ptr[i] * zi;
+    }
+
+    *out_dot = dot_acc;
+    return 0;
+}
+
+THERMALSIM_EXPORT int thermalsim_dot_f64(
+    std::int64_t n,
+    const double* a,
+    const double* b,
+    double* out_dot
+) {
+    if (n < 0 || out_dot == nullptr) {
+        return 1;
+    }
+    if (n == 0) {
+        *out_dot = 0.0;
+        return 0;
+    }
+    if (a == nullptr || b == nullptr) {
+        return 1;
+    }
+
+    double dot_acc = 0.0;
+#if defined(_OPENMP)
+    const int n_threads = choose_vec_num_threads(static_cast<std::ptrdiff_t>(n));
+#endif
+    if (a == b) {
+        const double* THERMALSIM_RESTRICT a_ptr = a;
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static) reduction(+:dot_acc) if(n_threads > 1) num_threads(n_threads)
+#endif
+        for (std::int64_t i = 0; i < n; ++i) {
+            const double ai = a_ptr[i];
+            dot_acc += ai * ai;
+        }
+    } else {
+        const double* THERMALSIM_RESTRICT a_ptr = a;
+        const double* THERMALSIM_RESTRICT b_ptr = b;
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static) reduction(+:dot_acc) if(n_threads > 1) num_threads(n_threads)
+#endif
+        for (std::int64_t i = 0; i < n; ++i) {
+            dot_acc += a_ptr[i] * b_ptr[i];
+        }
+    }
+
+    *out_dot = dot_acc;
+    return 0;
 }

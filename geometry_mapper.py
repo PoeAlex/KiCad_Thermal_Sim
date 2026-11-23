@@ -6,11 +6,60 @@ discretized conductivity arrays for thermal simulation.
 """
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Set
 
 import numpy as np
 import pcbnew
+
+
+class GeometryCancelledError(RuntimeError):
+    """Raised when geometry mapping or rasterization is cancelled."""
+
+
+class _ProgressEmitter:
+    """Throttled progress reporting and cancellation check helper."""
+
+    def __init__(
+        self,
+        progress_callback: Optional[Callable[[int, int, str], Optional[bool]]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        interval_s: float = 0.05,
+    ):
+        self.progress_callback = progress_callback
+        self.cancel_check = cancel_check
+        self.interval_s = float(interval_s)
+        self._last_emit = 0.0
+        self._last_check = 0.0
+        self.active = (progress_callback is not None) or (cancel_check is not None)
+
+    def check_cancel(self, force: bool = False) -> None:
+        """Raise GeometryCancelledError if cancellation was requested."""
+        if self.cancel_check is None:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_check) < self.interval_s:
+            return
+        self._last_check = now
+        if self.cancel_check():
+            raise GeometryCancelledError("Geometry mapping cancelled.")
+
+    def emit(self, done: int, total: int, message: str, force: bool = False) -> None:
+        """Emit throttled progress and check cancellation."""
+        if not self.active:
+            return
+        now = time.monotonic()
+        if self.cancel_check is not None:
+            if force or (now - self._last_check) >= self.interval_s:
+                self._last_check = now
+                if self.cancel_check():
+                    raise GeometryCancelledError("Geometry mapping cancelled.")
+        if self.progress_callback is not None:
+            if force or (now - self._last_emit) >= self.interval_s:
+                self._last_emit = now
+                if self.progress_callback(int(done), int(total), message) is False:
+                    raise GeometryCancelledError("Geometry mapping cancelled.")
 
 
 @dataclass
@@ -595,20 +644,43 @@ def _state_fill_heatsink(state, bbox):
         target |= region_mask
 
 
-def _fill_zone_mask_hit_test_filled(mask, area_mask, x_vals, y_vals, lid, zone):
+def _fill_zone_mask_hit_test_filled(
+    mask,
+    area_mask,
+    x_vals,
+    y_vals,
+    lid,
+    zone,
+    progress_callback=None,
+    cancel_check=None,
+):
     """Populate a boolean mask using HitTestFilledArea."""
     hit_test = zone.HitTestFilledArea
     vector_ctor = pcbnew.VECTOR2I
     margin_iu = 1
+    tracker = _ProgressEmitter(progress_callback, cancel_check)
+    total_rows = max(1, len(y_vals))
 
     try:
         if area_mask is None:
             for r_idx, y_iu in enumerate(y_vals):
+                tracker.emit(
+                    r_idx,
+                    total_rows,
+                    f"Hit-testing zone row {r_idx + 1} / {total_rows}...",
+                    force=(r_idx == 0),
+                )
                 row_mask = mask[r_idx]
                 for c_idx, x_iu in enumerate(x_vals):
                     row_mask[c_idx] = bool(hit_test(lid, vector_ctor(int(x_iu), int(y_iu)), margin_iu))
         else:
             for r_idx, y_iu in enumerate(y_vals):
+                tracker.emit(
+                    r_idx,
+                    total_rows,
+                    f"Hit-testing zone row {r_idx + 1} / {total_rows}...",
+                    force=(r_idx == 0),
+                )
                 allowed = area_mask[r_idx]
                 if not np.any(allowed):
                     continue
@@ -616,8 +688,16 @@ def _fill_zone_mask_hit_test_filled(mask, area_mask, x_vals, y_vals, lid, zone):
                 for c_idx, x_iu in enumerate(x_vals):
                     if allowed[c_idx]:
                         row_mask[c_idx] = bool(hit_test(lid, vector_ctor(int(x_iu), int(y_iu)), margin_iu))
+    except GeometryCancelledError:
+        raise
     except Exception:
         for r_idx, y_iu in enumerate(y_vals):
+            tracker.emit(
+                r_idx,
+                total_rows,
+                f"Hit-testing zone row {r_idx + 1} / {total_rows}...",
+                force=(r_idx == 0),
+            )
             try:
                 row_mask = mask[r_idx]
                 if area_mask is None:
@@ -630,23 +710,47 @@ def _fill_zone_mask_hit_test_filled(mask, area_mask, x_vals, y_vals, lid, zone):
                     for c_idx, x_iu in enumerate(x_vals):
                         if allowed[c_idx]:
                             row_mask[c_idx] = bool(hit_test(lid, vector_ctor(int(x_iu), int(y_iu)), margin_iu))
+            except GeometryCancelledError:
+                raise
             except Exception:
                 continue
 
 
-def _fill_zone_mask_hit_test(mask, area_mask, x_vals, y_vals, zone):
+def _fill_zone_mask_hit_test(
+    mask,
+    area_mask,
+    x_vals,
+    y_vals,
+    zone,
+    progress_callback=None,
+    cancel_check=None,
+):
     """Populate a boolean mask using generic HitTest."""
     hit_test = zone.HitTest
     vector_ctor = pcbnew.VECTOR2I
+    tracker = _ProgressEmitter(progress_callback, cancel_check)
+    total_rows = max(1, len(y_vals))
 
     try:
         if area_mask is None:
             for r_idx, y_iu in enumerate(y_vals):
+                tracker.emit(
+                    r_idx,
+                    total_rows,
+                    f"Hit-testing zone row {r_idx + 1} / {total_rows}...",
+                    force=(r_idx == 0),
+                )
                 row_mask = mask[r_idx]
                 for c_idx, x_iu in enumerate(x_vals):
                     row_mask[c_idx] = bool(hit_test(vector_ctor(int(x_iu), int(y_iu))))
         else:
             for r_idx, y_iu in enumerate(y_vals):
+                tracker.emit(
+                    r_idx,
+                    total_rows,
+                    f"Hit-testing zone row {r_idx + 1} / {total_rows}...",
+                    force=(r_idx == 0),
+                )
                 allowed = area_mask[r_idx]
                 if not np.any(allowed):
                     continue
@@ -654,8 +758,16 @@ def _fill_zone_mask_hit_test(mask, area_mask, x_vals, y_vals, zone):
                 for c_idx, x_iu in enumerate(x_vals):
                     if allowed[c_idx]:
                         row_mask[c_idx] = bool(hit_test(vector_ctor(int(x_iu), int(y_iu))))
+    except GeometryCancelledError:
+        raise
     except Exception:
         for r_idx, y_iu in enumerate(y_vals):
+            tracker.emit(
+                r_idx,
+                total_rows,
+                f"Hit-testing zone row {r_idx + 1} / {total_rows}...",
+                force=(r_idx == 0),
+            )
             try:
                 row_mask = mask[r_idx]
                 if area_mask is None:
@@ -668,16 +780,41 @@ def _fill_zone_mask_hit_test(mask, area_mask, x_vals, y_vals, zone):
                     for c_idx, x_iu in enumerate(x_vals):
                         if allowed[c_idx]:
                             row_mask[c_idx] = bool(hit_test(vector_ctor(int(x_iu), int(y_iu))))
+            except GeometryCancelledError:
+                raise
             except Exception:
                 continue
 
 
-def _scanline_fill_polygon(target, x_vals, y_vals, vertices, value=True):
-    """Fill one polygon chain using an even/odd scanline rule."""
-    if len(vertices) < 3:
+def _scanline_fill_polygon(target, x_vals, y_vals, vertices, value=True, row_offset=0):
+    """Fill one polygon chain using a bounding-box-sliced even/odd scanline rule."""
+    if len(vertices) < 3 or len(x_vals) == 0 or len(y_vals) == 0:
         return
-    x0 = vertices[:, 0]
-    y0 = vertices[:, 1]
+
+    verts = np.asarray(vertices, dtype=np.float64)
+    x_min = float(np.min(verts[:, 0]))
+    x_max = float(np.max(verts[:, 0]))
+    y_min = float(np.min(verts[:, 1]))
+    y_max = float(np.max(verts[:, 1]))
+
+    if (
+        x_max < float(x_vals[0])
+        or x_min > float(x_vals[-1])
+        or y_max < float(y_vals[0])
+        or y_min > float(y_vals[-1])
+    ):
+        return
+
+    r_start = max(int(row_offset), int(np.searchsorted(y_vals, y_min, side="left")))
+    r_end = min(
+        int(row_offset) + int(target.shape[0]),
+        int(np.searchsorted(y_vals, y_max, side="right")),
+    )
+    if r_start >= r_end:
+        return
+
+    x0 = verts[:, 0]
+    y0 = verts[:, 1]
     x1 = np.roll(x0, -1)
     y1 = np.roll(y0, -1)
     non_horizontal = y0 != y1
@@ -688,34 +825,84 @@ def _scanline_fill_polygon(target, x_vals, y_vals, vertices, value=True):
     x1 = x1[non_horizontal]
     y1 = y1[non_horizontal]
 
-    for row_idx, y_value in enumerate(y_vals):
-        crosses = ((y0 <= y_value) & (y_value < y1)) | (
-            (y1 <= y_value) & (y_value < y0)
-        )
-        if not np.any(crosses):
-            continue
-        intersections = x0[crosses] + (
-            (float(y_value) - y0[crosses])
-            * (x1[crosses] - x0[crosses])
-            / (y1[crosses] - y0[crosses])
-        )
-        intersections.sort()
-        pair_count = intersections.size // 2
-        if pair_count <= 0:
-            continue
-        intersections = intersections[:pair_count * 2]
-        starts = np.searchsorted(x_vals, intersections[0::2], side="left")
-        ends = np.searchsorted(x_vals, intersections[1::2], side="right")
-        row = target[row_idx]
-        for start, end in zip(starts, ends):
-            if start < end:
-                row[int(start):int(end)] = value
+    e_ymin = np.minimum(y0, y1)
+    e_ymax = np.maximum(y0, y1)
+    dx = x1 - x0
+    dy = y1 - y0
+
+    def _fill_row_range(row_from, row_to, rx0, ry0, rymin, rymax, rdx, rdy):
+        for row_idx in range(row_from, row_to):
+            y_val = float(y_vals[row_idx])
+            crosses = (rymin <= y_val) & (y_val < rymax)
+            if not np.any(crosses):
+                continue
+            intersections = rx0[crosses] + (
+                (y_val - ry0[crosses]) * rdx[crosses] / rdy[crosses]
+            )
+            intersections.sort()
+            pair_count = intersections.size // 2
+            if pair_count <= 0:
+                continue
+            if intersections.size != pair_count * 2:
+                intersections = intersections[: pair_count * 2]
+            starts = np.searchsorted(x_vals, intersections[0::2], side="left")
+            ends = np.searchsorted(x_vals, intersections[1::2], side="right")
+            row = target[row_idx - row_offset]
+            for start, end in zip(starts, ends):
+                s_i = int(start)
+                e_i = int(end)
+                if s_i < e_i:
+                    row[s_i:e_i] = value
+
+    n_edges = x0.size
+    n_active_rows = r_end - r_start
+    if n_edges > 64 and n_active_rows > 16:
+        order = np.argsort(e_ymin, kind="mergesort")
+        x0 = x0[order]
+        y0 = y0[order]
+        e_ymin = e_ymin[order]
+        e_ymax = e_ymax[order]
+        dx = dx[order]
+        dy = dy[order]
+        strip_size = 32
+        for s_start in range(r_start, r_end, strip_size):
+            s_end = min(r_end, s_start + strip_size)
+            strip_ymin = float(y_vals[s_start])
+            strip_ymax = float(y_vals[s_end - 1])
+            hi = int(np.searchsorted(e_ymin, strip_ymax, side="right"))
+            if hi <= 0:
+                continue
+            active = e_ymax[:hi] > strip_ymin
+            if not np.any(active):
+                continue
+            _fill_row_range(
+                s_start,
+                s_end,
+                x0[:hi][active],
+                y0[:hi][active],
+                e_ymin[:hi][active],
+                e_ymax[:hi][active],
+                dx[:hi][active],
+                dy[:hi][active],
+            )
+    else:
+        _fill_row_range(r_start, r_end, x0, y0, e_ymin, e_ymax, dx, dy)
 
 
-def _fill_zone_mask_polygons(mask, area_mask, x_vals, y_vals, lid, zone):
-    """Rasterize filled zone polygons using a memory-bounded scanline fill."""
+def _fill_zone_mask_polygons(
+    mask,
+    area_mask,
+    x_vals,
+    y_vals,
+    lid,
+    zone,
+    progress_callback=None,
+    cancel_check=None,
+):
+    """Rasterize filled zone polygons using local-bbox scanline fill."""
     if not hasattr(zone, "GetFilledPolysList"):
         return False
+    tracker = _ProgressEmitter(progress_callback, cancel_check)
     try:
         if hasattr(zone, "IsFilled") and not zone.IsFilled():
             return False
@@ -725,43 +912,98 @@ def _fill_zone_mask_polygons(mask, area_mask, x_vals, y_vals, lid, zone):
         outline_count = int(poly_set.OutlineCount())
         if outline_count <= 0:
             return False
+        if len(x_vals) == 0 or len(y_vals) == 0:
+            mask[...] = False
+            return True
+
         filled = np.zeros(mask.shape, dtype=bool)
+        x_first = float(x_vals[0])
+        x_last = float(x_vals[-1])
+        y_first = float(y_vals[0])
+        y_last = float(y_vals[-1])
 
         def chain_vertices(chain):
             count = int(chain.PointCount())
-            vertices = np.empty((count, 2), dtype=np.float64)
+            if count <= 0:
+                return np.empty((0, 2), dtype=np.float64)
+            cpoint = chain.CPoint
+            pts = [None] * count
             for idx in range(count):
-                point = chain.CPoint(idx)
-                vertices[idx] = (point.x, point.y)
-            return vertices
+                point = cpoint(idx)
+                pts[idx] = (point.x, point.y)
+            return np.asarray(pts, dtype=np.float64)
 
         for outline_idx in range(outline_count):
+            tracker.emit(
+                outline_idx,
+                outline_count,
+                f"Rasterizing zone outline {outline_idx + 1} / {outline_count}...",
+                force=(outline_idx == 0),
+            )
             outer = chain_vertices(poly_set.Outline(outline_idx))
             if len(outer) < 3:
                 continue
-            inside = np.zeros(mask.shape, dtype=bool)
-            _scanline_fill_polygon(inside, x_vals, y_vals, outer, True)
+
+            ox_min = float(np.min(outer[:, 0]))
+            ox_max = float(np.max(outer[:, 0]))
+            oy_min = float(np.min(outer[:, 1]))
+            oy_max = float(np.max(outer[:, 1]))
+            if ox_max < x_first or ox_min > x_last or oy_max < y_first or oy_min > y_last:
+                continue
+
+            rs_o = int(np.searchsorted(y_vals, oy_min, side="left"))
+            re_o = int(np.searchsorted(y_vals, oy_max, side="right"))
+            cs_o = int(np.searchsorted(x_vals, ox_min, side="left"))
+            ce_o = int(np.searchsorted(x_vals, ox_max, side="right"))
+            if rs_o >= re_o or cs_o >= ce_o:
+                continue
+            if area_mask is not None and not np.any(area_mask[rs_o:re_o, cs_o:ce_o]):
+                continue
+
+            x_local = x_vals[cs_o:ce_o]
+            y_local = y_vals[rs_o:re_o]
+            inside = np.zeros((re_o - rs_o, ce_o - cs_o), dtype=bool)
+            _scanline_fill_polygon(inside, x_local, y_local, outer, True)
+            if not np.any(inside):
+                continue
+
             try:
                 hole_count = int(poly_set.HoleCount(outline_idx))
             except Exception:
                 hole_count = 0
             for hole_idx in range(hole_count):
+                if tracker.active:
+                    tracker.emit(
+                        hole_idx + 1 if outline_count == 1 else outline_idx + 1,
+                        hole_count if outline_count == 1 else outline_count,
+                        f"Rasterizing zone outline {outline_idx + 1} / {outline_count} "
+                        f"(hole {hole_idx + 1} / {hole_count})...",
+                    )
                 hole = chain_vertices(poly_set.Hole(outline_idx, hole_idx))
                 if len(hole) >= 3:
-                    _scanline_fill_polygon(inside, x_vals, y_vals, hole, False)
-            filled |= inside
+                    _scanline_fill_polygon(inside, x_local, y_local, hole, False)
+            filled[rs_o:re_o, cs_o:ce_o] |= inside
 
         if area_mask is not None:
             filled &= area_mask
         mask[...] = filled
         return True
+    except GeometryCancelledError:
+        raise
     except Exception:
         return False
 
 
-def _state_fill_zone(state, l_idx, lid, zone):
+def _state_fill_zone(
+    state,
+    l_idx,
+    lid,
+    zone,
+    progress_callback=None,
+    cancel_check=None,
+):
     """
-    Mark copper occupancy for a zone using KiCad hit testing.
+    Mark copper occupancy for a zone using KiCad polygon scanline or hit testing.
 
     This keeps the current authoritative geometry path while reducing
     Python overhead in the inner loops.
@@ -776,12 +1018,38 @@ def _state_fill_zone(state, l_idx, lid, zone):
     x_vals = state.x_centers_iu[cs:ce]
     y_vals = state.y_centers_iu[rs:re]
 
-    if _fill_zone_mask_polygons(zone_mask, area_mask, x_vals, y_vals, lid, zone):
+    if _fill_zone_mask_polygons(
+        zone_mask,
+        area_mask,
+        x_vals,
+        y_vals,
+        lid,
+        zone,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
+    ):
         pass
     elif hasattr(zone, "HitTestFilledArea"):
-        _fill_zone_mask_hit_test_filled(zone_mask, area_mask, x_vals, y_vals, lid, zone)
+        _fill_zone_mask_hit_test_filled(
+            zone_mask,
+            area_mask,
+            x_vals,
+            y_vals,
+            lid,
+            zone,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
     elif hasattr(zone, "HitTest"):
-        _fill_zone_mask_hit_test(zone_mask, area_mask, x_vals, y_vals, zone)
+        _fill_zone_mask_hit_test(
+            zone_mask,
+            area_mask,
+            x_vals,
+            y_vals,
+            zone,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
     else:
         return
 
@@ -799,7 +1067,9 @@ def build_geometry_state(
     res,
     settings,
     via_factor,
-    pads_list
+    pads_list,
+    progress_callback=None,
+    cancel_check=None,
 ):
     """
     Build the internal geometry representation used by the solver.
@@ -886,6 +1156,8 @@ def build_geometry_state(
     ignore_traces = settings.get('ignore_traces')
     ignore_polygons = settings.get('ignore_polygons')
     use_heatsink = settings.get('use_heatsink')
+    tracker = _ProgressEmitter(progress_callback, cancel_check)
+    tracker.check_cancel(force=True)
 
     try:
         tracks = list(board.Tracks() if hasattr(board, 'Tracks') else board.GetTracks())
@@ -893,7 +1165,20 @@ def build_geometry_state(
         zones = list(board.Zones() if hasattr(board, 'Zones') else board.GetZones())
         drawings = list(board.GetDrawings()) if use_heatsink and hasattr(board, 'GetDrawings') else []
 
-        for track in tracks:
+        total_tracks = len(tracks)
+        total_fps = len(footprints)
+        total_zones = len(zones)
+        total_drawings = len(drawings)
+        total_items = max(1, total_tracks + total_fps + total_zones + total_drawings)
+        completed = 0
+
+        for idx, track in enumerate(tracks):
+            tracker.emit(
+                completed + idx,
+                total_items,
+                f"Mapping tracks & vias ({idx + 1} / {total_tracks})...",
+                force=(idx == 0),
+            )
             is_via = "VIA" in str(type(track)).upper()
             if ignore_traces and not is_via:
                 continue
@@ -946,8 +1231,15 @@ def build_geometry_state(
                     _state_fill_arc(state, layer_idx, track)
                 else:
                     _state_fill_segment(state, layer_idx, track)
+        completed += total_tracks
 
-        for fp in footprints:
+        for fp_idx, fp in enumerate(footprints):
+            tracker.emit(
+                completed + fp_idx,
+                total_items,
+                f"Mapping footprint pads ({fp_idx + 1} / {total_fps})...",
+                force=(fp_idx == 0),
+            )
             for pad in fp.Pads():
                 bbox = pad.GetBoundingBox()
                 if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
@@ -966,8 +1258,15 @@ def build_geometry_state(
                     layer_idx = lid_to_idx.get(pad.GetLayer())
                     if layer_idx is not None:
                         _state_fill_pad(state, [layer_idx], pad)
+        completed += total_fps
 
-        for zone in zones:
+        for zone_idx, zone in enumerate(zones):
+            tracker.emit(
+                completed + zone_idx,
+                total_items,
+                f"Rasterizing copper zone {zone_idx + 1} / {total_zones}...",
+                force=(zone_idx == 0),
+            )
             if hasattr(zone, "IsFilled") and not zone.IsFilled():
                 continue
 
@@ -1010,10 +1309,34 @@ def build_geometry_state(
                 except Exception:
                     zone_layers = []
 
+            zone_progress_cb = None
+            if progress_callback is not None:
+                def _zone_sub_progress(
+                    _sub_done,
+                    _sub_total,
+                    sub_msg,
+                    _z_idx=zone_idx,
+                    _z_base=completed + zone_idx,
+                ):
+                    tracker.emit(
+                        _z_base,
+                        total_items,
+                        f"Rasterizing copper zone {_z_idx + 1} / {total_zones}: {sub_msg}",
+                        force=True,
+                    )
+                zone_progress_cb = _zone_sub_progress
+
             for lid in zone_layers:
                 layer_idx = lid_to_idx.get(lid)
                 if layer_idx is not None:
-                    _state_fill_zone(state, layer_idx, lid, zone)
+                    _state_fill_zone(
+                        state,
+                        layer_idx,
+                        lid,
+                        zone,
+                        progress_callback=zone_progress_cb,
+                        cancel_check=cancel_check,
+                    )
 
             if use_heatsink:
                 try:
@@ -1021,15 +1344,26 @@ def build_geometry_state(
                         _state_fill_heatsink(state, zone.GetBoundingBox())
                 except Exception:
                     pass
+        completed += total_zones
 
         if use_heatsink:
-            for drawing in drawings:
+            for d_idx, drawing in enumerate(drawings):
+                tracker.emit(
+                    completed + d_idx,
+                    total_items,
+                    "Mapping thermal pad regions...",
+                    force=(d_idx == 0),
+                )
                 try:
                     if drawing.GetLayer() == pcbnew.Eco1_User:
                         _state_fill_heatsink(state, drawing.GetBoundingBox())
                 except Exception:
                     continue
 
+        tracker.emit(total_items, total_items, "Geometry mapping complete.", force=True)
+
+    except GeometryCancelledError:
+        raise
     except Exception as exc:
         print(f"[ThermalSim][WARN] Geometry mapping error: {exc}")
         raise RuntimeError(

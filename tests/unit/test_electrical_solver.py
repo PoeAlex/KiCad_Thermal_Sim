@@ -7,6 +7,8 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
+import pytest
+
 import ThermalSim.electrical_solver as electrical_solver
 from ThermalSim.electrical_solver import (
     CurrentTerminal,
@@ -15,6 +17,7 @@ from ThermalSim.electrical_solver import (
     _solve_electrical_system,
     solve_electrical_heating,
 )
+from ThermalSim.geometry_mapper import GeometryCancelledError
 from tests.mocks.pcbnew_mock import (
     B_Cu,
     EDA_RECT,
@@ -599,3 +602,70 @@ def test_end_to_end_joule_loss_matches_between_direct_and_pcg(monkeypatch):
         rtol=1e-7,
         atol=1e-12,
     )
+
+
+def test_solve_electrical_heating_progress_and_cancellation():
+    """solve_electrical_heating reports progress and aborts on cancellation."""
+    pad_a = _pad(0.25, 1.25, "1")
+    pad_b = _pad(9.25, 1.25, "2")
+    track = MockTrack(
+        layer=F_Cu,
+        bbox=EDA_RECT(250000, 1250000, 9100000, 100000),
+        start=VECTOR2I(500000, 1500000),
+        end=VECTOR2I(9500000, 1500000),
+        width=1000000,
+        net_code=1,
+        net_name="PWR",
+    )
+    zone = MockZone(
+        layers=[F_Cu],
+        bbox=EDA_RECT(0, 1000000, 10000000, 1000000),
+        filled=True,
+        net_code=1,
+        net_name="PWR",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_a, pad_b])],
+        tracks=[track],
+        zones=[zone],
+    )
+    terminals = [
+        CurrentTerminal(pad_a, "J1-1", "PWR", 1, 1.0),
+        CurrentTerminal(pad_b, "J2-1", "PWR", 1, -1.0),
+    ]
+    config = _config()
+
+    events = []
+    res = solve_electrical_heating(
+        board,
+        terminals,
+        config,
+        progress_callback=lambda done, total, msg: events.append((done, total, msg)) or True,
+    )
+    assert res.valid, res.errors
+    msgs = [m.lower() for _, _, m in events]
+    assert any("pads" in m for m in msgs)
+    assert any("tracks" in m for m in msgs)
+    assert any("zone" in m for m in msgs)
+    assert any("solving electrical net" in m for m in msgs)
+
+    with pytest.raises(GeometryCancelledError):
+        solve_electrical_heating(
+            board,
+            terminals,
+            config,
+            cancel_check=lambda: True,
+        )
+
+    def cancel_on_solve(done, total, msg):
+        if "solving electrical net" in msg.lower():
+            return False
+        return True
+
+    with pytest.raises(GeometryCancelledError):
+        solve_electrical_heating(
+            board,
+            terminals,
+            config,
+            progress_callback=cancel_on_solve,
+        )

@@ -1,0 +1,328 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PoeAlex/KiCad_Thermal_Sim/schema/job.schema.json",
+  "title": "ThermalSim Job Configuration",
+  "description": "Configuration schema for ThermalSim headless simulations (accepted by headless_api.py and thermalsim_cli.py).",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "power_pads": {
+      "description": "Manual heat sources. Accepts either an array of pad descriptors or an object mapping 'REF.PAD' to Watts (number) or a PWL file path (string).",
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "ref": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Footprint reference designator (e.g. 'U1')."
+              },
+              "pad": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Pad number/identifier on the footprint (e.g. '37')."
+              },
+              "name": {
+                "type": "string",
+                "pattern": "^[^.]+\\.[^.]+$",
+                "description": "Combined 'REF.PAD' identifier (e.g. 'U1.37')."
+              },
+              "power_w": {
+                "type": ["number", "string"],
+                "description": "Constant dissipation in Watts (number or string) or PWL file path."
+              },
+              "power": {
+                "type": ["number", "string"],
+                "description": "Constant dissipation in Watts (e.g. 5.0, '5W') or PWL file path."
+              },
+              "pwl": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Path to a piecewise-linear (.pwl/.csv/.txt) time-power profile."
+              }
+            },
+            "anyOf": [
+              {"required": ["ref", "pad"]},
+              {"required": ["name"]}
+            ]
+          }
+        },
+        {
+          "type": "object",
+          "description": "Mapping of 'REF.PAD' (e.g. 'U1.37') to constant Watts (number/string) or PWL file path.",
+          "additionalProperties": {
+            "type": ["number", "string"]
+          }
+        }
+      ]
+    },
+    "steady_state": {
+      "type": "boolean",
+      "description": "Solve directly for final steady-state temperature (K*T = Q + b). Defaults to true when 'time' is omitted and no PWL profile is used; false otherwise."
+    },
+    "time": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 20.0,
+      "description": "Transient simulation duration in seconds (used when steady_state is false)."
+    },
+    "amb": {
+      "type": "number",
+      "default": 25.0,
+      "description": "Ambient surrounding temperature in degrees Celsius."
+    },
+    "res": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 0.5,
+      "description": "Desired spatial grid cell size in mm. Defaults to the board's recommended_res_mm from inspect_board."
+    },
+    "thick": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 1.6,
+      "description": "Fallback total PCB thickness in mm when stackup dielectric thickness is unavailable."
+    },
+    "h_conv": {
+      "type": "number",
+      "minimum": 0,
+      "default": 10.0,
+      "description": "Top/bottom surface convection coefficient in W/(m^2*K)."
+    },
+    "grid_detail_level": {
+      "type": "string",
+      "enum": ["fast", "balanced", "detailed", "very_detailed", "custom"],
+      "default": "balanced",
+      "description": "Total solver node budget preset: fast (500k), balanced (1.2M), detailed (3M), very_detailed (6M), or custom."
+    },
+    "grid_node_budget": {
+      "type": "integer",
+      "minimum": 1000,
+      "maximum": 100000000,
+      "description": "Explicit maximum total solver nodes across all layers (derived from grid_detail_level when omitted)."
+    },
+    "mesh_mode": {
+      "type": "string",
+      "enum": ["auto", "uniform", "adaptive"],
+      "default": "auto",
+      "description": "Spatial mesh mode. 'auto' uses uniform native multigrid up to 5M nodes and adaptive above 5M or without native MG."
+    },
+    "compute_engine": {
+      "type": "string",
+      "enum": ["auto", "fast_native", "legacy"],
+      "default": "auto",
+      "description": "Thermal linear solver engine selection."
+    },
+    "adaptive_max_cell_ratio": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16,
+      "default": 8,
+      "description": "Maximum coarse-to-fine cell ratio in adaptive mesh mode."
+    },
+    "time_stepping": {
+      "type": "string",
+      "enum": ["auto", "multi_phase", "two_phase", "uniform"],
+      "default": "auto",
+      "description": "Transient BDF2 time-stepping schedule."
+    },
+    "limit_area": {
+      "type": "boolean",
+      "default": false,
+      "description": "Crop the solver domain around active heat sources and complete active current nets."
+    },
+    "pad_dist_mm": {
+      "type": "number",
+      "minimum": 0,
+      "default": 10.0,
+      "description": "Thermal margin in mm around active sources/nets when limit_area is true."
+    },
+    "area_mode": {
+      "type": "string",
+      "enum": ["full", "active"],
+      "default": "full",
+      "description": "Domain mode ('full' for entire board, 'active' to crop around active sources/nets)."
+    },
+    "ignore_traces": {
+      "type": "boolean",
+      "default": false,
+      "description": "Exclude copper tracks from the thermal conductivity map (zones and pads remain)."
+    },
+    "show_all": {
+      "type": "boolean",
+      "default": true,
+      "description": "Include all copper layers in generated visual plots."
+    },
+    "snapshots": {
+      "type": "boolean",
+      "default": false,
+      "description": "Save intermediate transient temperature snapshot images."
+    },
+    "snap_count": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 5,
+      "description": "Number of intermediate snapshots in transient mode when snapshots is true."
+    },
+    "use_heatsink": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable thermal pad / heatsink boundary on User.Eco1 shapes. Auto-enabled if pad_sink_mode is 'heatsink' or any heatsink_* key is set."
+    },
+    "pad_sink_mode": {
+      "type": "string",
+      "enum": ["fixed", "heatsink"],
+      "default": "fixed",
+      "description": "Boundary model for User.Eco1 thermal pad: 'fixed' sink temperature or 'heatsink' (dynamic 0D lumped heatsink). Auto-defaults to 'heatsink' when heatsink_rth_kw is set."
+    },
+    "pad_th": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 1.0,
+      "description": "Thermal interface pad thickness in mm."
+    },
+    "pad_k": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 3.0,
+      "description": "Thermal interface pad thermal conductivity in W/(m*K)."
+    },
+    "pad_cap_areal": {
+      "type": "number",
+      "minimum": 0,
+      "default": 0.0,
+      "description": "Thermal interface pad areal heat capacity in J/(m^2*K)."
+    },
+    "pad_contact_factor": {
+      "type": "number",
+      "minimum": 0.05,
+      "maximum": 1.0,
+      "default": 0.2,
+      "description": "Effective thermal interface contact factor (0.05 to 1.0)."
+    },
+    "pad_sink_temp_use_ambient": {
+      "type": "boolean",
+      "default": true,
+      "description": "Use ambient temperature (amb) as the fixed sink temperature when pad_sink_mode is 'fixed'."
+    },
+    "pad_sink_temp_c": {
+      "type": "number",
+      "default": 25.0,
+      "description": "Fixed sink temperature in degrees Celsius when pad_sink_mode is 'fixed' and pad_sink_temp_use_ambient is false."
+    },
+    "heatsink_rth_kw": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 5.0,
+      "description": "Dynamic 0D heatsink-to-ambient thermal resistance in K/W."
+    },
+    "heatsink_material": {
+      "type": "string",
+      "enum": ["aluminium", "copper", "steel", "magnesium", "custom"],
+      "default": "aluminium",
+      "description": "Heatsink material preset used to determine specific heat capacity c_p."
+    },
+    "heatsink_mass_g": {
+      "type": "number",
+      "minimum": 0,
+      "default": 50.0,
+      "description": "Heatsink mass in grams (0 models an instantaneous zero-thermal-mass heatsink)."
+    },
+    "heatsink_cp_j_kgk": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 897.0,
+      "description": "Heatsink specific heat capacity c_p in J/(kg*K) (used when heatsink_material is 'custom')."
+    },
+    "current_enabled": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable DC current-flow simulation for copper Joule (I^2*R) heating."
+    },
+    "current_groups": {
+      "type": "array",
+      "default": [],
+      "description": "DC current terminal groups. Each active net must balance to 0 A.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Optional group display name."
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["per_pad", "total"],
+            "default": "per_pad",
+            "description": "Whether currents are specified per pad or split evenly from total_current_a."
+          },
+          "total_current_a": {
+            "type": "number",
+            "description": "Total group current in Amperes when mode is 'total'."
+          },
+          "pads": {
+            "type": "array",
+            "description": "Terminal pads in this current group.",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "ref": {"type": "string"},
+                "pad": {"type": "string"},
+                "name": {"type": "string"},
+                "net": {"type": "string"},
+                "current_a": {
+                  "type": "number",
+                  "description": "Signed DC current in Amperes (+ enters PCB, - leaves PCB)."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "limits": {
+      "type": ["object", "null"],
+      "description": "Optional thermal pass/fail limits evaluated against simulation results.",
+      "additionalProperties": false,
+      "properties": {
+        "max_board_c": {
+          "type": ["number", "null"],
+          "description": "Maximum allowed board peak temperature in degrees Celsius."
+        },
+        "max_heatsink_c": {
+          "type": ["number", "null"],
+          "description": "Maximum allowed dynamic heatsink temperature in degrees Celsius."
+        },
+        "components": {
+          "type": "object",
+          "description": "Mapping of component reference glob pattern (e.g. 'U1', 'C*') to max allowed temperature in degrees Celsius.",
+          "additionalProperties": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "power_scale": {
+      "type": "number",
+      "minimum": 0,
+      "default": 1.0,
+      "description": "Optional multiplier applied to constant pad powers for what-if studies."
+    },
+    "copper_thickness_scale": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 1.0,
+      "description": "Optional multiplier applied to stackup copper thicknesses for what-if studies."
+    },
+    "refill_zones": {
+      "type": "boolean",
+      "default": false,
+      "description": "Automatically refill unfilled copper zones in memory via pcbnew.ZONE_FILLER before simulating."
+    }
+  }
+}

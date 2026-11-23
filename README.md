@@ -286,6 +286,73 @@ The report records requested and actual grid resolution, grid size, compute-budg
 
 ---
 
+## Headless CLI & AI Agent Automation
+
+ThermalSim provides a zero-GUI headless CLI and Python API (`headless_api.py`) for AI agents, design-space sweeps, and CI checks. Every CLI command writes **pure JSON to `stdout`** (diagnostic logs go to `stderr`) and requires **no `wxPython` or display server**.
+
+Invoke via module (from the plugin parent directory or with `PYTHONPATH` pointing to the KiCad plugins folder) or directly via `thermalsim_cli.py`:
+
+```bash
+python3 -m KiCad_Thermal_Sim <command> ...
+# or directly from the repository root:
+python3 thermalsim_cli.py <command> ...
+```
+
+### Subcommands
+
+1. **`inspect`** — discover stackup, board bounds, zones, `User.Eco1` thermal pads, thermal candidate pads, and solver capabilities:
+
+   ```bash
+   python3 -m KiCad_Thermal_Sim inspect board.kicad_pcb --pretty
+   ```
+
+2. **`validate`** — preflight-check a job config or CLI flags without running the solver (returns structured errors such as `PAD_NOT_FOUND` with available pad hints):
+
+   ```bash
+   python3 -m KiCad_Thermal_Sim validate board.kicad_pcb \
+     --pad U1.37=5 --steady-state --amb 115
+   ```
+
+3. **`run`** — run a simulation, check thermal limits, and write `summary.json` (plus optional HTML report/plots):
+
+   ```bash
+   python3 -m KiCad_Thermal_Sim run board.kicad_pcb \
+     --pad U1.37=5 --steady-state --amb 115 \
+     --heatsink-rth 3.0 --heatsink-mass 100 --contact-factor 1.0 \
+     --limit-board 160 --limit-comp "U1=160" --no-plots --out ./out_a
+   ```
+
+4. **`sweep`** — sweep a thermal/design parameter while reusing cached board geometry (defaults to `--no-plots` for speed):
+
+   ```bash
+   python3 -m KiCad_Thermal_Sim sweep board.kicad_pcb \
+     --param heatsink_rth_kw --values 1,3,5,10 \
+     --pad U1.37=5 --amb 115 --steady-state --limit-board 155 --out ./sweep_out
+   ```
+
+5. **`compare`** — diff two run directories or `summary.json` files (`delta = B - A` for board, heatsink, layer, and component temperatures plus limit changes):
+
+   ```bash
+   python3 -m KiCad_Thermal_Sim compare ./out_a ./out_b --pretty
+   ```
+
+### Exit Codes
+
+| Exit Code | Meaning |
+|-----------|---------|
+| `0` | Success (validation passed, or simulation passed all configured thermal limits) |
+| `1` | Unexpected runtime error (`status: "error"`) |
+| `2` | Validation error or invalid CLI/config arguments (`valid: false` or `status: "validation_error"`) |
+| `3` | Simulation succeeded, but one or more thermal limits were violated (`status: "limit_violation"`) |
+
+### Schemas & `summary.json`
+
+- Input job schema: [`schema/job.schema.json`](schema/job.schema.json) (JSON Schema Draft 2020-12; can be passed via `--config job.json` and overridden with CLI flags).
+- Output summary schema: [`schema/summary.schema.json`](schema/summary.schema.json).
+- Every `run` writes `summary.json` containing global/per-layer `temperatures`, `heatsink` metrics, `components` & `top_components`, spatially separated `hotspots` with `nearest_component` attribution, `limits_check` pass/fail details, `electrical` metrics, and `solver` diagnostics.
+
+---
+
 ## How to Interpret Results
 
 This tool is most reliable for:
@@ -319,6 +386,9 @@ The plugin is split into focused modules:
 | `visualization.py` | Generate thermal plots, previews, hotspot-preserving interactive heatmaps, and Joule loss maps |
 | `thermal_report.py` | Generate the HTML report |
 | `thermal_plugin.py` | Orchestrate workflow and KiCad ActionPlugin integration |
+| `headless_api.py` | Zero-GUI headless API (`inspect`, `validate`, `run`, `sweep`, `compare`) and semantic `summary.json` builder |
+| `thermalsim_cli.py` | Agent-friendly JSON CLI entrypoint with strict stdout/stderr separation and semantic exit codes |
+| `__main__.py` | Module entrypoint for `python3 -m KiCad_Thermal_Sim` |
 
 ---
 

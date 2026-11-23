@@ -1747,3 +1747,417 @@ class TestCompactLowRamPluginWiring:
         assert plugin.geometry_cache.value is None
         # Disk .npz cache file must remain intact
         assert list(disk_dir.glob("*.npz")) == npz_files_before
+
+
+class TestGuiResponsivenessAndProgress:
+    """Tests for end-to-end progress reporting, cancellation, and fast snapshots."""
+
+    def _make_board_and_plugin(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+        from ThermalSim.workflow import GeometryCache
+
+        pad = MockPad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(4_500_000, 4_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        board = MockBoard(
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+            footprints=[MockFootprint("U1", [pad])],
+        )
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        plugin.geometry_cache = GeometryCache(persistent=False)
+        plugin.board = board
+        plugin.copper_ids = [F_Cu, B_Cu]
+        plugin.bbox = EDA_RECT(0, 0, 10_000_000, 10_000_000)
+        plugin.pads_list = [pad]
+        plugin.stack_info = {}
+        desc = plugin._pad_descriptor(board, "U1", pad)
+        return plugin, board, pad, desc
+
+    def _make_settings(self, tmp_path, desc, **overrides):
+        base = {
+            "res": 2.0,
+            "time": 20.0,
+            "amb": 25.0,
+            "thick": 1.6,
+            "h_conv": 10.0,
+            "pad_th": 1.0,
+            "pad_k": 3.0,
+            "show_all": True,
+            "snapshots": False,
+            "steady_state": True,
+            "compute_engine": "legacy",
+            "output_dir": str(tmp_path),
+            "power_pads": [{**desc, "power": "2.0"}],
+        }
+        base.update(overrides)
+        return base
+
+    def test_run_simulation_drives_progress_across_all_stages(self, tmp_path, monkeypatch):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_solver import SolverResult
+
+        plugin, board, pad, desc = self._make_board_and_plugin()
+        updates = []
+        lifecycle = {"hidden": 0, "destroyed": 0}
+        yield_calls = []
+
+        class RecordingProgressDialog:
+            def __init__(self, title, message, maximum=100, **kwargs):
+                updates.append((0, message))
+
+            def Update(self, value, newmsg=""):
+                updates.append((int(value), newmsg))
+                return (True, False)
+
+            def WasCancelled(self):
+                return False
+
+            def Hide(self):
+                lifecycle["hidden"] += 1
+
+            def Destroy(self):
+                lifecycle["destroyed"] += 1
+
+        class DummyApp:
+            def Yield(self, only_if_needed=False):
+                yield_calls.append(only_if_needed)
+
+        def fake_solver(config, K, C, Q, b, hA, layer_count, rows, cols,
+                        progress_cb, snap_cb, **kwargs):
+            progress_cb(1, 2)
+            progress_cb(2, 2)
+            return SolverResult(
+                T=np.full((layer_count, rows, cols), 42.0),
+                aborted=False,
+                step_counter=2,
+                total_solve_time=0.01,
+                total_factor_time=0.01,
+                factor_count=1,
+                snapshot_stats=[],
+                snapshot_files=[],
+                phase_metrics=[],
+                balance_history=[],
+                k_norm_info={},
+            )
+
+        # Also verify build_geometry_state without progress_callback/cancel_check kwargs works
+        orig_build_geom = plugin_mod.build_geometry_state
+
+        def no_kw_build_geom(board, copper_ids, rows, cols, x_min, y_min, res,
+                              settings, via_factor, pads_list):
+            return orig_build_geom(
+                board, copper_ids, rows, cols, x_min, y_min, res,
+                settings, via_factor, pads_list,
+            )
+
+        monkeypatch.setattr(plugin_mod, "build_geometry_state", no_kw_build_geom)
+        monkeypatch.setattr(plugin_mod, "run_simulation", fake_solver)
+        monkeypatch.setattr(plugin_mod.wx, "ProgressDialog", RecordingProgressDialog, raising=False)
+        monkeypatch.setattr(plugin_mod.wx, "GetApp", lambda: DummyApp(), raising=False)
+        monkeypatch.setattr(plugin_mod, "show_results_all_layers", lambda *a, **k: str(tmp_path / "hm.png"))
+        monkeypatch.setattr(plugin_mod, "save_preview_image", lambda *a, **k: str(tmp_path / "prev.png"))
+        monkeypatch.setattr(plugin_mod, "build_interactive_heatmap_payload", lambda *a, **k: {})
+        monkeypatch.setattr(plugin_mod, "write_html_report", lambda *a, **k: str(tmp_path / "rep.html"))
+        import webbrowser
+        monkeypatch.setattr(webbrowser, "open", lambda *a, **k: True)
+
+        plugin._run_simulation(
+            board, [F_Cu, B_Cu], ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad], self._make_settings(tmp_path, desc), {}, ["U1-1"],
+        )
+
+        messages = [msg for _, msg in updates]
+        percents = [pct for pct, _ in updates]
+        assert any("Mapping exact PCB geometry" in m for m in messages)
+        assert any("Building thermal operator" in m for m in messages)
+        assert any("Solving steady-state thermal model" in m for m in messages)
+        assert any("Rendering layer heatmaps" in m for m in messages)
+        assert any("Generating board preview" in m for m in messages)
+        assert any("Building interactive heatmap" in m for m in messages)
+        assert any("Writing HTML report" in m for m in messages)
+        assert percents[-1] == 100
+        assert lifecycle["hidden"] >= 1
+        assert lifecycle["destroyed"] >= 1
+        assert len(yield_calls) > 0
+
+    def test_run_simulation_cancels_cleanly_on_geometry_cancelled_error(
+        self, tmp_path, monkeypatch
+    ):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_plugin import GeometryCancelledError
+
+        plugin, board, pad, desc = self._make_board_and_plugin()
+        destroyed = []
+        message_boxes = []
+        dialog_states = []
+
+        class DummyDialog:
+            def set_run_state(self, status, message=""):
+                dialog_states.append((status, message))
+
+        class DummyProgressDialog:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def Update(self, value, newmsg=""):
+                return (True, False)
+
+            def WasCancelled(self):
+                return False
+
+            def Hide(self):
+                pass
+
+            def Destroy(self):
+                destroyed.append(True)
+
+        def cancelling_geom(*args, **kwargs):
+            raise GeometryCancelledError("user cancelled geometry")
+
+        plugin.settings_dialog = DummyDialog()
+        monkeypatch.setattr(plugin_mod, "build_geometry_state", cancelling_geom)
+        monkeypatch.setattr(plugin_mod.wx, "ProgressDialog", DummyProgressDialog, raising=False)
+        monkeypatch.setattr(plugin_mod.wx, "GetApp", lambda: None, raising=False)
+        monkeypatch.setattr(
+            plugin_mod.wx, "MessageBox",
+            lambda *a, **k: message_boxes.append(a), raising=False,
+        )
+
+        plugin._run_simulation(
+            board, [F_Cu, B_Cu], ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad], self._make_settings(tmp_path, desc), {}, ["U1-1"],
+        )
+
+        assert message_boxes == []
+        assert destroyed == [True]
+        assert dialog_states[-1][0] == "cancelled"
+        manifests = list(tmp_path.glob("Thermalsim_*/run_manifest.json"))
+        assert len(manifests) == 1
+        assert json.loads(manifests[0].read_text(encoding="utf-8"))["status"] == "cancelled"
+
+    def test_run_simulation_cancels_cleanly_during_operator_and_solver(
+        self, tmp_path, monkeypatch
+    ):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_solver import SolverResult
+
+        plugin, board, pad, desc = self._make_board_and_plugin()
+        message_boxes = []
+        dialog_states = []
+        solver_called = []
+
+        class DummyDialog:
+            def set_run_state(self, status, message=""):
+                dialog_states.append((status, message))
+
+        class CancelOnOperatorDialog:
+            def __init__(self, *args, **kwargs):
+                self.destroyed = False
+
+            def Update(self, value, newmsg=""):
+                if "thermal operator" in newmsg.lower():
+                    return (False, False)
+                return (True, False)
+
+            def WasCancelled(self):
+                return False
+
+            def Hide(self):
+                pass
+
+            def Destroy(self):
+                self.destroyed = True
+
+        plugin.settings_dialog = DummyDialog()
+        monkeypatch.setattr(plugin_mod.wx, "ProgressDialog", CancelOnOperatorDialog, raising=False)
+        monkeypatch.setattr(plugin_mod.wx, "GetApp", lambda: None, raising=False)
+        monkeypatch.setattr(
+            plugin_mod.wx, "MessageBox",
+            lambda *a, **k: message_boxes.append(a), raising=False,
+        )
+        monkeypatch.setattr(
+            plugin_mod, "run_simulation",
+            lambda *a, **k: solver_called.append(True),
+        )
+
+        plugin._run_simulation(
+            board, [F_Cu, B_Cu], ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad], self._make_settings(tmp_path, desc), {}, ["U1-1"],
+        )
+
+        assert solver_called == []
+        assert message_boxes == []
+        assert dialog_states[-1][0] == "cancelled"
+
+        # Now test cancelling mid-solver
+        dialog_states.clear()
+
+        class CancelDuringSolverDialog:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def Update(self, value, newmsg=""):
+                if "Solving" in newmsg:
+                    return (False, False)
+                return (True, False)
+
+            def WasCancelled(self):
+                return False
+
+            def Hide(self):
+                pass
+
+            def Destroy(self):
+                pass
+
+        def aborting_solver(config, K, C, Q, b, hA, layer_count, rows, cols,
+                            progress_cb, snap_cb, cancel_check=None, **kwargs):
+            assert cancel_check is not None and cancel_check() is True
+            return SolverResult(
+                T=np.full((layer_count, rows, cols), 25.0),
+                aborted=True,
+                step_counter=0,
+                total_solve_time=0.0,
+                total_factor_time=0.0,
+                factor_count=0,
+                snapshot_stats=[],
+                snapshot_files=[],
+                phase_metrics=[],
+                balance_history=[],
+                k_norm_info={},
+            )
+
+        monkeypatch.setattr(plugin_mod.wx, "ProgressDialog", CancelDuringSolverDialog, raising=False)
+        monkeypatch.setattr(plugin_mod, "run_simulation", aborting_solver)
+
+        plugin._run_simulation(
+            board, [F_Cu, B_Cu], ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad], self._make_settings(tmp_path, desc), {}, ["U1-1"],
+        )
+
+        assert message_boxes == []
+        assert dialog_states[-1][0] == "cancelled"
+
+    def test_capture_board_snapshot_avoids_exceptions_and_supports_progress_callback(self):
+        from ThermalSim.thermal_plugin import GeometryCancelledError, ThermalPlugin
+
+        class PCB_ARC(MockTrack):
+            def __init__(self):
+                super().__init__(layer=F_Cu, bbox=EDA_RECT(0, 0, 2_000_000, 2_000_000))
+
+            def GetMid(self):
+                return VECTOR2I(1_000_000, 1_500_000)
+
+        track = MockTrack(layer=F_Cu, bbox=EDA_RECT(0, 0, 4_000_000, 200_000))
+        arc = PCB_ARC()
+        pad = MockPad(position=VECTOR2I(2_000_000, 2_000_000), layer=F_Cu, number="1")
+        zone = MockZone(layers=[F_Cu], filled=True)
+        board = MockBoard(
+            tracks=[track, arc],
+            zones=[zone],
+            footprints=[MockFootprint("U1", [pad])],
+        )
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        bbox = EDA_RECT(0, 0, 10_000_000, 10_000_000)
+
+        events = []
+        snap1 = plugin._capture_board_snapshot(
+            board, [F_Cu, B_Cu], bbox,
+            progress_callback=lambda d, t, m: events.append((d, t, m)) or True,
+        )
+        snap2 = plugin._capture_board_snapshot(board, [F_Cu, B_Cu], bbox)
+        assert snap1.fingerprint == snap2.fingerprint
+        assert len(events) >= 2
+        assert events[0][0] == 0
+        assert events[-1][0] == events[-1][1]
+
+        # Cancelling via progress_callback raises GeometryCancelledError
+        import pytest
+        with pytest.raises(GeometryCancelledError):
+            plugin._capture_board_snapshot(
+                board, [F_Cu, B_Cu], bbox,
+                progress_callback=lambda d, t, m: False,
+            )
+
+        # Ensure straight track without GetMid does not trigger exceptions
+        assert not hasattr(track, "GetMid")
+
+    def test_generate_preview_progress_and_cancellation(self, tmp_path, monkeypatch):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_plugin import GeometryCancelledError
+
+        plugin, board, pad, desc = self._make_board_and_plugin()
+        progress_updates = []
+        message_boxes = []
+        status_labels = []
+
+        class DummyDialog:
+            class _Lbl:
+                def SetLabel(self, text):
+                    status_labels.append(text)
+
+            lbl_preflight = _Lbl()
+
+            def _set_footer_status(self, title, msg):
+                status_labels.append(f"{title}: {msg}")
+
+        class RecordingProgressDialog:
+            def __init__(self, title, message, maximum=100, **kwargs):
+                self.cancel_on_geom = False
+                progress_updates.append((0, message))
+
+            def Update(self, value, newmsg=""):
+                progress_updates.append((int(value), newmsg))
+                return (True, False)
+
+            def WasCancelled(self):
+                return False
+
+            def Hide(self):
+                pass
+
+            def Destroy(self):
+                pass
+
+        plugin.settings_dialog = DummyDialog()
+        monkeypatch.setattr(plugin_mod.wx, "ProgressDialog", RecordingProgressDialog, raising=False)
+        monkeypatch.setattr(plugin_mod.wx, "GetApp", lambda: None, raising=False)
+        monkeypatch.setattr(
+            plugin_mod.wx, "MessageBox",
+            lambda *a, **k: message_boxes.append(a), raising=False,
+        )
+        monkeypatch.setattr(
+            plugin_mod, "save_preview_image",
+            lambda *a, **k: str(tmp_path / "preview.png"),
+        )
+
+        out = plugin.generate_preview(
+            self._make_settings(tmp_path, desc), ["F.Cu", "B.Cu"]
+        )
+        assert out == str(tmp_path / "preview.png")
+        assert progress_updates[-1][0] == 100
+        assert message_boxes == []
+
+        # Cancellation during geometry mapping returns None cleanly with no error box
+        plugin.geometry_cache.clear()
+        monkeypatch.setattr(
+            plugin_mod, "build_geometry_state",
+            lambda *a, **k: (_ for _ in ()).throw(GeometryCancelledError("cancelled")),
+        )
+        out_cancelled = plugin.generate_preview(
+            self._make_settings(tmp_path, desc), ["F.Cu", "B.Cu"]
+        )
+        assert out_cancelled is None
+        assert message_boxes == []
+        assert "Preview cancelled." in status_labels

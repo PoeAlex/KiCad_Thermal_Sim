@@ -7,6 +7,7 @@ simulation, including sparse matrix assembly and time-stepping.
 
 import contextlib
 import ctypes
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -55,6 +56,52 @@ except ImportError:
 
     def clear_native_scratch():
         pass
+
+try:
+    from .native_core import (
+        HAS_NATIVE_PCG,
+        apply_compact_dot_native,
+        pcg_update_xr_norm2_native,
+        pcg_update_p_native,
+        f64_to_f32_native,
+        f32_to_f64_dot_native,
+        dot_f64_native,
+    )
+except ImportError:
+    HAS_NATIVE_PCG = False
+    apply_compact_dot_native = None
+    pcg_update_xr_norm2_native = None
+    pcg_update_p_native = None
+    f64_to_f32_native = None
+    f32_to_f64_dot_native = None
+    dot_f64_native = None
+
+
+def _as_1d_contiguous_f64(arr) -> np.ndarray:
+    """Return ``arr`` as a 1D C-contiguous float64 array without copying when possible."""
+    if (
+        isinstance(arr, np.ndarray)
+        and arr.dtype == np.float64
+        and arr.ndim == 1
+        and arr.flags.c_contiguous
+    ):
+        return arr
+    return np.ascontiguousarray(arr, dtype=np.float64).reshape(-1)
+
+
+def _dot_f64(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute float64 dot product using native OpenMP kernel when available."""
+    if HAS_NATIVE_PCG and dot_f64_native is not None:
+        val = dot_f64_native(a, b)
+        if val is not None:
+            return float(val)
+    return float(np.dot(a, b))
+
+
+def _norm_f64(vec: np.ndarray) -> float:
+    """Compute float64 Euclidean norm using native OpenMP dot kernel when available."""
+    norm2 = _dot_f64(vec, vec)
+    return math.sqrt(norm2) if not (norm2 < 0.0) else 0.0
 
 
 HEATSINK_MATERIAL_CP = {
@@ -713,7 +760,45 @@ def _build_coarse_solver(
         return lambda rhs, _inv=coarse_inv: _inv * rhs
 
 
-class _StructuredGeometricMultigrid:
+class _BaseGeometricMultigrid:
+    """Shared float64 <-> float32 V-cycle entrypoints for multigrid preconditioners."""
+
+    def _prepare_rhs(self, rhs: np.ndarray) -> np.ndarray:
+        rhs_arr = _as_1d_contiguous_f64(rhs)
+        if not (
+            HAS_NATIVE_PCG
+            and f64_to_f32_native is not None
+            and f64_to_f32_native(rhs_arr, self._rhs_bufs[0])
+        ):
+            np.copyto(self._rhs_bufs[0], rhs_arr, casting="unsafe")
+        return rhs_arr
+
+    def solve_into(self, rhs: np.ndarray, out: np.ndarray) -> np.ndarray:
+        """Apply one symmetric V-cycle into preallocated float64 buffer ``out``."""
+        self._prepare_rhs(rhs)
+        self._cycle(0)
+        np.copyto(out, self._x_bufs[0])
+        return out
+
+    def solve_into_and_dot(self, rhs_f64: np.ndarray, out_f64: np.ndarray) -> float:
+        """Apply one V-cycle into ``out_f64`` and return ``dot(rhs_f64, out_f64)``."""
+        rhs_arr = self._prepare_rhs(rhs_f64)
+        self._cycle(0)
+        x0_f32 = self._x_bufs[0]
+        if HAS_NATIVE_PCG and f32_to_f64_dot_native is not None:
+            dot_val = f32_to_f64_dot_native(x0_f32, rhs_arr, out_f64)
+            if dot_val is not None:
+                return float(dot_val)
+        np.copyto(out_f64, x0_f32)
+        return _dot_f64(rhs_arr, out_f64.reshape(-1))
+
+    def solve(self, rhs: np.ndarray) -> np.ndarray:
+        """Apply one symmetric V-cycle and return a fresh float64 array."""
+        out = np.empty(self._rhs_bufs[0].size, dtype=np.float64)
+        return self.solve_into(rhs, out)
+
+
+class _StructuredGeometricMultigrid(_BaseGeometricMultigrid):
     """Mixed-precision float32 V-cycle geometric multigrid preconditioner."""
 
     def __init__(
@@ -871,19 +956,6 @@ class _StructuredGeometricMultigrid:
             self.smooth_steps,
             zero_init=False,
         )
-
-    def solve_into(self, rhs: np.ndarray, out: np.ndarray) -> np.ndarray:
-        """Apply one symmetric V-cycle into preallocated float64 buffer ``out``."""
-        rhs_arr = np.asarray(rhs, dtype=np.float64).reshape(-1)
-        np.copyto(self._rhs_bufs[0], rhs_arr, casting="unsafe")
-        self._cycle(0)
-        np.copyto(out, self._x_bufs[0])
-        return out
-
-    def solve(self, rhs: np.ndarray) -> np.ndarray:
-        """Apply one symmetric V-cycle and return a fresh float64 array."""
-        out = np.empty(self._rhs_bufs[0].size, dtype=np.float64)
-        return self.solve_into(rhs, out)
 
 
 def _capacity_cache_key(capacity: Optional[np.ndarray]):
@@ -1060,6 +1132,7 @@ class StructuredThermalOperator:
             dtype=np.float64,
         )
         preconditioner._solve_into = multigrid.solve_into
+        preconditioner._solve_into_and_dot = multigrid.solve_into_and_dot
         return operator, preconditioner
 
 
@@ -1283,7 +1356,7 @@ def _compact_apply_f32_into(
     return out_f32
 
 
-class _CompactGeometricMultigrid:
+class _CompactGeometricMultigrid(_BaseGeometricMultigrid):
     """Zero-Level-0-materialization mixed-precision V-cycle preconditioner."""
 
     def __init__(
@@ -1555,19 +1628,6 @@ class _CompactGeometricMultigrid:
             zero_init=False,
         )
 
-    def solve_into(self, rhs: np.ndarray, out: np.ndarray) -> np.ndarray:
-        """Apply one symmetric V-cycle into preallocated float64 buffer ``out``."""
-        rhs_arr = np.asarray(rhs, dtype=np.float64).reshape(-1)
-        np.copyto(self._rhs_bufs[0], rhs_arr, casting="unsafe")
-        self._cycle(0)
-        np.copyto(out, self._x_bufs[0])
-        return out
-
-    def solve(self, rhs: np.ndarray) -> np.ndarray:
-        """Apply one symmetric V-cycle and return a fresh float64 array."""
-        out = np.empty(self._rhs_bufs[0].size, dtype=np.float64)
-        return self.solve_into(rhs, out)
-
 
 @dataclass
 class CompactStructuredThermalOperator:
@@ -1637,15 +1697,7 @@ class CompactStructuredThermalOperator:
         self, scale: float, vector, out: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """Apply ``(K + scale * C) * vector`` without materializing 3D conductance arrays."""
-        if (
-            isinstance(vector, np.ndarray)
-            and vector.dtype == np.float64
-            and vector.ndim == 1
-            and vector.flags.c_contiguous
-        ):
-            flat_vector = vector
-        else:
-            flat_vector = np.ascontiguousarray(vector, dtype=np.float64).reshape(-1)
+        flat_vector = _as_1d_contiguous_f64(vector)
 
         if out is None:
             out = np.empty(self.shape[0], dtype=np.float64)
@@ -1717,6 +1769,40 @@ class CompactStructuredThermalOperator:
                 res_view[l] += flux_z
                 res_view[l + 1] -= flux_z
         return out
+
+    def _apply_with_scale_and_dot(
+        self, scale: float, vector, out: np.ndarray
+    ) -> float:
+        """Apply ``(K + scale * C) * vector`` into ``out`` and return ``dot(vector, out)``."""
+        flat_vector = _as_1d_contiguous_f64(vector)
+        if HAS_NATIVE_COMPACT and HAS_NATIVE_PCG and apply_compact_dot_native is not None:
+            native_result = apply_compact_dot_native(
+                self.layer_count,
+                self.rows,
+                self.cols,
+                self.copper_mask,
+                self.via_enh,
+                self.heatsink_mask,
+                self.gx_lut,
+                self.gy_lut,
+                self.gz_scale,
+                self.cap_lut,
+                self.pad_cap_cell,
+                self.top_diag,
+                self.bot_air_diag,
+                self.bot_pad_diag,
+                float(scale),
+                flat_vector,
+                out=out,
+            )
+            if native_result is not None:
+                res_arr, dot_val = native_result
+                if res_arr is not out:
+                    np.copyto(out, res_arr)
+                return float(dot_val)
+
+        self._apply_with_scale(scale, flat_vector, out=out)
+        return _dot_f64(flat_vector, out.reshape(-1))
 
     def dot(self, vector):
         """Apply the stiffness operator ``K * vector``."""
@@ -1901,6 +1987,9 @@ class CompactStructuredThermalOperator:
         operator._matvec_into = lambda vector, out: self._apply_with_scale(
             scale, vector, out=out
         )
+        operator._matvec_into_and_dot = lambda v, out: self._apply_with_scale_and_dot(
+            scale, v, out
+        )
 
         if self.rows < 8 or self.cols < 8:
             hs_bool = self.heatsink_mask.astype(bool, copy=False)
@@ -1954,6 +2043,7 @@ class CompactStructuredThermalOperator:
             dtype=np.float64,
         )
         preconditioner._solve_into = multigrid.solve_into
+        preconditioner._solve_into_and_dot = multigrid.solve_into_and_dot
         return operator, preconditioner
 
 
@@ -2549,7 +2639,7 @@ def _solve_pcg(
     workspaces=None,
 ):
     """Solve one implicit step with preconditioned conjugate gradients."""
-    rhs_arr = np.asarray(rhs, dtype=np.float64).reshape(-1)
+    rhs_arr = _as_1d_contiguous_f64(rhs)
     n = rhs_arr.shape[0]
     if workspaces is None:
         r = np.empty(n, dtype=np.float64)
@@ -2566,14 +2656,16 @@ def _solve_pcg(
         if x is not initial:
             np.copyto(x, np.asarray(initial, dtype=np.float64).reshape(-1))
 
-    bnorm = float(np.linalg.norm(rhs_arr))
+    bnorm = _norm_f64(rhs_arr)
     if bnorm == 0.0:
         x.fill(0.0)
         return x, 0, False, 0.0
 
     tol = float(relative_tolerance) * bnorm
     matvec_into = getattr(operator, "_matvec_into", None)
+    apply_a_and_dot = getattr(operator, "_matvec_into_and_dot", None)
     solve_into = getattr(preconditioner, "_solve_into", None)
+    apply_m_and_dot = getattr(preconditioner, "_solve_into_and_dot", None)
 
     def apply_a(vec, dst):
         if matvec_into is not None:
@@ -2589,7 +2681,7 @@ def _solve_pcg(
 
     apply_a(x, ap)
     np.subtract(rhs_arr, ap, out=r)
-    rnorm = float(np.linalg.norm(r))
+    rnorm = _norm_f64(r)
     if rnorm <= tol:
         return x, 0, False, rnorm / bnorm
 
@@ -2602,15 +2694,18 @@ def _solve_pcg(
             retried = True
             apply_a(x, ap)
             np.subtract(rhs_arr, ap, out=r)
-            rnorm = float(np.linalg.norm(r))
+            rnorm = _norm_f64(r)
             if rnorm <= tol:
                 converged = True
                 break
 
         rz_old = 0.0
         for it in range(limit):
-            apply_m(r, z)
-            rz_new = float(np.dot(r, z))
+            if apply_m_and_dot is not None:
+                rz_new = float(apply_m_and_dot(r, z))
+            else:
+                apply_m(r, z)
+                rz_new = _dot_f64(r, z)
             if rz_new < 0.0:
                 raise RuntimeError("PCG failed with solver status -1.")
             if rz_new == 0.0:
@@ -2619,26 +2714,41 @@ def _solve_pcg(
                 np.copyto(p, z)
             else:
                 beta = rz_new / rz_old
-                np.multiply(p, beta, out=p)
-                np.add(p, z, out=p)
+                if not (
+                    HAS_NATIVE_PCG
+                    and pcg_update_p_native is not None
+                    and pcg_update_p_native(p, z, beta)
+                ):
+                    np.multiply(p, beta, out=p)
+                    np.add(p, z, out=p)
 
-            apply_a(p, ap)
-            p_ap = float(np.dot(p, ap))
+            if apply_a_and_dot is not None:
+                p_ap = float(apply_a_and_dot(p, ap))
+            else:
+                apply_a(p, ap)
+                p_ap = _dot_f64(p, ap)
             if p_ap <= 0.0:
                 raise RuntimeError("PCG failed with solver status -1.")
             alpha = rz_new / p_ap
 
-            np.multiply(p, alpha, out=z)
-            np.add(x, z, out=x)
-            np.multiply(ap, alpha, out=z)
-            np.subtract(r, z, out=r)
+            r_norm2 = (
+                pcg_update_xr_norm2_native(x, r, p, ap, alpha)
+                if (HAS_NATIVE_PCG and pcg_update_xr_norm2_native is not None)
+                else None
+            )
+            if r_norm2 is None:
+                np.multiply(p, alpha, out=z)
+                np.add(x, z, out=x)
+                np.multiply(ap, alpha, out=z)
+                np.subtract(r, z, out=r)
+                r_norm2 = _dot_f64(r, r)
+            rnorm = math.sqrt(r_norm2) if not (r_norm2 < 0.0) else 0.0
 
             rz_old = rz_new
             iterations += 1
             if cancel_check and cancel_check():
                 raise _CancelledIterativeSolve()
 
-            rnorm = float(np.linalg.norm(r))
             if rnorm <= tol:
                 converged = True
                 break
@@ -2654,7 +2764,7 @@ def _solve_pcg(
 
     apply_a(x, ap)
     np.subtract(rhs_arr, ap, out=r)
-    relative_residual = float(np.linalg.norm(r)) / max(bnorm, 1e-30)
+    relative_residual = _norm_f64(r) / max(bnorm, 1e-30)
     return x, iterations, retried, relative_residual
 
 

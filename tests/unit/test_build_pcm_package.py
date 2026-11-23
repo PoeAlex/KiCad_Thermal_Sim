@@ -44,17 +44,27 @@ class TestBuildPcmPackage:
             assert "metadata.json" in zf.namelist()
 
     def test_zip_contains_plugin_files(self, tmp_path):
-        """Test that ZIP contains all plugin source files."""
+        """Test that ZIP contains all plugin source files and schemas."""
         self._run_build(tmp_path)
         zips = list(tmp_path.glob("*.zip"))
         with zipfile.ZipFile(zips[0], 'r') as zf:
             names = zf.namelist()
             assert "plugins/__init__.py" in names
+            assert "plugins/__main__.py" in names
             assert "plugins/thermal_plugin.py" in names
+            assert "plugins/headless_api.py" in names
+            assert "plugins/thermalsim_cli.py" in names
             assert "plugins/capabilities.py" in names
             assert "plugins/electrical_solver.py" in names
             assert "plugins/thermal_solver.py" in names
             assert "plugins/dependency_installer.py" in names
+            assert "plugins/schema/job.schema.json" in names
+            assert "plugins/schema/summary.schema.json" in names
+
+            job_schema = json.loads(zf.read("plugins/schema/job.schema.json"))
+            summary_schema = json.loads(zf.read("plugins/schema/summary.schema.json"))
+            assert "2020-12" in job_schema["$schema"]
+            assert "2020-12" in summary_schema["$schema"]
 
     def test_metadata_valid_json(self, tmp_path):
         """Test that metadata.json is valid JSON."""
@@ -143,17 +153,17 @@ class TestBuildPcmPackage:
             assert "kicad.org/pcm/schemas/v1" in meta["$schema"]
 
     def test_metadata_default_version_and_no_pypardiso(self, tmp_path):
-        """Test default version is 0.4.2, kicad_version is 9.0, and no pypardiso reference exists."""
+        """Test default version is 0.4.4, kicad_version is 9.0, and no pypardiso reference exists."""
         result = self._run_build(tmp_path)
         assert result.returncode == 0, f"Build failed: {result.stderr}"
         zips = list(tmp_path.glob("*.zip"))
         assert len(zips) == 1
-        assert zips[0].name == "ThermalSim-v0.4.2.zip"
+        assert zips[0].name == "ThermalSim-v0.4.4.zip"
         with zipfile.ZipFile(zips[0], 'r') as zf:
             raw_meta = zf.read("metadata.json").decode("utf-8")
             assert "pardiso" not in raw_meta.lower()
             meta = json.loads(raw_meta)
-            assert meta["versions"][0]["version"] == "0.4.2"
+            assert meta["versions"][0]["version"] == "0.4.4"
             assert meta["versions"][0]["kicad_version"] == "9.0"
 
     def test_zip_packages_present_native_binaries(self, tmp_path):

@@ -83,6 +83,7 @@ class NativeCore:
 
         self.has_mg = False
         self.has_compact = False
+        self.has_pcg = False
         self._damped_jacobi_fn = None
         self._residual_restrict_fn = None
         self._prolong_add_fn = None
@@ -93,6 +94,12 @@ class NativeCore:
         self._damped_jacobi_f32_fn = None
         self._residual_restrict_f32_fn = None
         self._prolong_add_f32_fn = None
+        self._apply_compact_dot_fn = None
+        self._pcg_update_xr_norm2_fn = None
+        self._pcg_update_p_fn = None
+        self._f64_to_f32_fn = None
+        self._f32_to_f64_dot_fn = None
+        self._dot_f64_fn = None
         self._tls = threading.local()
 
         if self.version >= 2:
@@ -302,6 +309,90 @@ class NativeCore:
                 self._residual_restrict_f32_fn = residual_restrict_f32
                 self._prolong_add_f32_fn = prolong_add_f32
                 self.has_compact = True
+
+        if self.version >= 4:
+            try:
+                apply_compact_dot = self.library.thermalsim_apply_compact_dot
+                pcg_update_xr_norm2 = self.library.thermalsim_pcg_update_xr_norm2
+                pcg_update_p = self.library.thermalsim_pcg_update_p
+                f64_to_f32 = self.library.thermalsim_f64_to_f32
+                f32_to_f64_dot = self.library.thermalsim_f32_to_f64_dot
+                dot_f64 = self.library.thermalsim_dot_f64
+            except AttributeError:
+                pass
+            else:
+                apply_compact_dot.argtypes = [
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    _UINT8_POINTER,
+                    _FLOAT_POINTER,
+                    _UINT8_POINTER,
+                    _DOUBLE_POINTER,
+                    _DOUBLE_POINTER,
+                    _DOUBLE_POINTER,
+                    _DOUBLE_POINTER,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    _DOUBLE_POINTER,
+                    _DOUBLE_POINTER,
+                    _DOUBLE_POINTER,
+                ]
+                apply_compact_dot.restype = ctypes.c_int
+
+                pcg_update_xr_norm2.argtypes = [
+                    ctypes.c_int64,
+                    _DOUBLE_POINTER,
+                    _DOUBLE_POINTER,
+                    _DOUBLE_POINTER,
+                    _DOUBLE_POINTER,
+                    ctypes.c_double,
+                    _DOUBLE_POINTER,
+                ]
+                pcg_update_xr_norm2.restype = ctypes.c_int
+
+                pcg_update_p.argtypes = [
+                    ctypes.c_int64,
+                    _DOUBLE_POINTER,
+                    _DOUBLE_POINTER,
+                    ctypes.c_double,
+                ]
+                pcg_update_p.restype = ctypes.c_int
+
+                f64_to_f32.argtypes = [
+                    ctypes.c_int64,
+                    _DOUBLE_POINTER,
+                    _FLOAT_POINTER,
+                ]
+                f64_to_f32.restype = ctypes.c_int
+
+                f32_to_f64_dot.argtypes = [
+                    ctypes.c_int64,
+                    _FLOAT_POINTER,
+                    _DOUBLE_POINTER,
+                    _DOUBLE_POINTER,
+                    _DOUBLE_POINTER,
+                ]
+                f32_to_f64_dot.restype = ctypes.c_int
+
+                dot_f64.argtypes = [
+                    ctypes.c_int64,
+                    _DOUBLE_POINTER,
+                    _DOUBLE_POINTER,
+                    _DOUBLE_POINTER,
+                ]
+                dot_f64.restype = ctypes.c_int
+
+                self._apply_compact_dot_fn = apply_compact_dot
+                self._pcg_update_xr_norm2_fn = pcg_update_xr_norm2
+                self._pcg_update_p_fn = pcg_update_p
+                self._f64_to_f32_fn = f64_to_f32
+                self._f32_to_f64_dot_fn = f32_to_f64_dot
+                self._dot_f64_fn = dot_f64
+                self.has_pcg = True
 
     @staticmethod
     def _pointer(array):
@@ -1116,6 +1207,196 @@ class NativeCore:
         if not direct:
             value[...] = target.reshape(value.shape)
 
+    @staticmethod
+    def _validate_writable_c_array(arr, dtype, name):
+        if (
+            not isinstance(arr, np.ndarray)
+            or not arr.flags.writeable
+            or not arr.flags.c_contiguous
+            or arr.dtype != dtype
+        ):
+            raise ValueError(
+                f"{name} must be a writable C-contiguous {dtype} numpy.ndarray."
+            )
+
+    def apply_compact_dot(
+        self,
+        layer_count,
+        rows,
+        cols,
+        copper_mask,
+        via_enh,
+        hs_mask,
+        gx_lut,
+        gy_lut,
+        gz_scale,
+        cap_lut,
+        pad_cap_cell,
+        top_diag,
+        bot_air_diag,
+        bot_pad_diag,
+        scale,
+        vector,
+        out=None,
+    ):
+        """Apply compact Level-0 float64 operator and return ``(result, dot(vector, result))``."""
+        if not self.has_pcg:
+            raise RuntimeError("Native v4 PCG kernels unavailable.")
+        lc = int(layer_count)
+        r = int(rows)
+        c = int(cols)
+        cm_array = _as_contiguous_u8(copper_mask)
+        ve_array = None if via_enh is None else _as_contiguous_f32(via_enh)
+        hs_array = _as_contiguous_u8(hs_mask)
+        gx_lut_array = _as_contiguous_f64(gx_lut)
+        gy_lut_array = _as_contiguous_f64(gy_lut)
+        gz_scale_array = None if gz_scale is None else _as_contiguous_f64(gz_scale)
+        cap_lut_array = _as_contiguous_f64(cap_lut)
+        vector_array = _as_contiguous_f64(vector)
+
+        node_count = self._validate_compact_arrays(
+            lc,
+            r,
+            c,
+            cm_array,
+            ve_array,
+            hs_array,
+            gx_lut_array,
+            gy_lut_array,
+            gz_scale_array,
+            cap_lut_array,
+            vector_array,
+        )
+        result = self._validate_output_buffer(
+            out, node_count, np.float64, shape=vector_array.shape
+        )
+        dot_out = ctypes.c_double()
+        status = self._apply_compact_dot_fn(
+            lc,
+            r,
+            c,
+            self._u8_pointer(cm_array),
+            self._f32_pointer(ve_array),
+            self._u8_pointer(hs_array),
+            self._pointer(gx_lut_array),
+            self._pointer(gy_lut_array),
+            self._pointer(gz_scale_array),
+            self._pointer(cap_lut_array),
+            float(pad_cap_cell),
+            float(top_diag),
+            float(bot_air_diag),
+            float(bot_pad_diag),
+            float(scale),
+            self._pointer(vector_array),
+            self._pointer(result),
+            ctypes.byref(dot_out),
+        )
+        if status != 0:
+            raise RuntimeError(f"Native compact operator+dot failed ({status}).")
+        return result, float(dot_out.value)
+
+    def pcg_update_xr_norm2(self, x, r, p, ap, alpha):
+        """Fused in-place ``x += alpha*p; r -= alpha*ap`` and return ``||r||_2^2``."""
+        if not self.has_pcg:
+            raise RuntimeError("Native v4 PCG kernels unavailable.")
+        self._validate_writable_c_array(x, np.float64, "x")
+        self._validate_writable_c_array(r, np.float64, "r")
+        p_array = _as_contiguous_f64(p)
+        ap_array = _as_contiguous_f64(ap)
+        n = x.size
+        if r.size != n or p_array.size != n or ap_array.size != n:
+            raise RuntimeError("Vector size mismatch.")
+        norm2_out = ctypes.c_double()
+        status = self._pcg_update_xr_norm2_fn(
+            n,
+            self._pointer(x),
+            self._pointer(r),
+            self._pointer(p_array),
+            self._pointer(ap_array),
+            float(alpha),
+            ctypes.byref(norm2_out),
+        )
+        if status != 0:
+            raise RuntimeError(f"Native PCG update_xr_norm2 failed ({status}).")
+        return float(norm2_out.value)
+
+    def pcg_update_p(self, p, z, beta):
+        """Fused in-place ``p = z + beta * p``."""
+        if not self.has_pcg:
+            raise RuntimeError("Native v4 PCG kernels unavailable.")
+        self._validate_writable_c_array(p, np.float64, "p")
+        z_array = _as_contiguous_f64(z)
+        n = p.size
+        if z_array.size != n:
+            raise RuntimeError("Vector size mismatch.")
+        status = self._pcg_update_p_fn(
+            n,
+            self._pointer(p),
+            self._pointer(z_array),
+            float(beta),
+        )
+        if status != 0:
+            raise RuntimeError(f"Native PCG update_p failed ({status}).")
+
+    def f64_to_f32(self, src, dst):
+        """Parallel float64 -> float32 conversion into ``dst``."""
+        if not self.has_pcg:
+            raise RuntimeError("Native v4 PCG kernels unavailable.")
+        self._validate_writable_c_array(dst, np.float32, "dst")
+        src_array = _as_contiguous_f64(src)
+        n = dst.size
+        if src_array.size != n:
+            raise RuntimeError("Vector size mismatch.")
+        status = self._f64_to_f32_fn(
+            n,
+            self._pointer(src_array),
+            self._f32_pointer(dst),
+        )
+        if status != 0:
+            raise RuntimeError(f"Native f64_to_f32 failed ({status}).")
+
+    def f32_to_f64_dot(self, src, r, dst):
+        """Fused float32 -> float64 copy into ``dst`` and return ``dot(r, dst)``."""
+        if not self.has_pcg:
+            raise RuntimeError("Native v4 PCG kernels unavailable.")
+        self._validate_writable_c_array(dst, np.float64, "dst")
+        src_array = _as_contiguous_f32(src)
+        r_array = _as_contiguous_f64(r)
+        n = dst.size
+        if src_array.size != n or r_array.size != n:
+            raise RuntimeError("Vector size mismatch.")
+        dot_out = ctypes.c_double()
+        status = self._f32_to_f64_dot_fn(
+            n,
+            self._f32_pointer(src_array),
+            self._pointer(r_array),
+            self._pointer(dst),
+            ctypes.byref(dot_out),
+        )
+        if status != 0:
+            raise RuntimeError(f"Native f32_to_f64_dot failed ({status}).")
+        return float(dot_out.value)
+
+    def dot_f64(self, a, b):
+        """Parallel float64 dot product ``dot(a, b)`` (supports ``a is b``)."""
+        if not self.has_pcg:
+            raise RuntimeError("Native v4 PCG kernels unavailable.")
+        a_array = _as_contiguous_f64(a)
+        b_array = a_array if b is a else _as_contiguous_f64(b)
+        n = a_array.size
+        if b_array.size != n:
+            raise RuntimeError("Vector size mismatch.")
+        dot_out = ctypes.c_double()
+        status = self._dot_f64_fn(
+            n,
+            self._pointer(a_array),
+            self._pointer(b_array),
+            ctypes.byref(dot_out),
+        )
+        if status != 0:
+            raise RuntimeError(f"Native dot_f64 failed ({status}).")
+        return float(dot_out.value)
+
 
 def _candidate_paths():
     override = os.environ.get("THERMALSIM_NATIVE_CORE")
@@ -1144,6 +1425,7 @@ NATIVE_CORE = _load_native_core()
 HAS_NATIVE_CORE = NATIVE_CORE is not None
 HAS_NATIVE_MG = bool(NATIVE_CORE is not None and NATIVE_CORE.has_mg)
 HAS_NATIVE_COMPACT = bool(NATIVE_CORE is not None and NATIVE_CORE.has_compact)
+HAS_NATIVE_PCG = bool(NATIVE_CORE is not None and NATIVE_CORE.has_pcg)
 
 
 def clear_native_scratch() -> None:
@@ -1521,3 +1803,101 @@ def prolong_add_2x2_f32_native(
         return True
     except (OSError, RuntimeError, ValueError):
         return False
+
+
+def apply_compact_dot_native(
+    layer_count,
+    rows,
+    cols,
+    copper_mask,
+    via_enh,
+    hs_mask,
+    gx_lut,
+    gy_lut,
+    gz_scale,
+    cap_lut,
+    pad_cap_cell,
+    top_diag,
+    bot_air_diag,
+    bot_pad_diag,
+    scale,
+    vector,
+    out=None,
+) -> Optional[Tuple[np.ndarray, float]]:
+    """Apply compact Level-0 operator and return ``(out, dot(vector, out))`` or ``None``."""
+    if NATIVE_CORE is None or not NATIVE_CORE.has_pcg:
+        return None
+    try:
+        return NATIVE_CORE.apply_compact_dot(
+            layer_count,
+            rows,
+            cols,
+            copper_mask,
+            via_enh,
+            hs_mask,
+            gx_lut,
+            gy_lut,
+            gz_scale,
+            cap_lut,
+            pad_cap_cell,
+            top_diag,
+            bot_air_diag,
+            bot_pad_diag,
+            scale,
+            vector,
+            out=out,
+        )
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def pcg_update_xr_norm2_native(x, r, p, ap, alpha) -> Optional[float]:
+    """Fused in-place ``x += alpha*p; r -= alpha*ap`` and return ``||r||_2^2`` or ``None``."""
+    if NATIVE_CORE is None or not NATIVE_CORE.has_pcg:
+        return None
+    try:
+        return NATIVE_CORE.pcg_update_xr_norm2(x, r, p, ap, alpha)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def pcg_update_p_native(p, z, beta) -> bool:
+    """Fused in-place ``p = z + beta * p``; return success flag."""
+    if NATIVE_CORE is None or not NATIVE_CORE.has_pcg:
+        return False
+    try:
+        NATIVE_CORE.pcg_update_p(p, z, beta)
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def f64_to_f32_native(src, dst) -> bool:
+    """Parallel float64 -> float32 copy into ``dst``; return success flag."""
+    if NATIVE_CORE is None or not NATIVE_CORE.has_pcg:
+        return False
+    try:
+        NATIVE_CORE.f64_to_f32(src, dst)
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def f32_to_f64_dot_native(src, r, dst) -> Optional[float]:
+    """Fused float32 -> float64 copy into ``dst`` and return ``dot(r, dst)`` or ``None``."""
+    if NATIVE_CORE is None or not NATIVE_CORE.has_pcg:
+        return None
+    try:
+        return NATIVE_CORE.f32_to_f64_dot(src, r, dst)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def dot_f64_native(a, b) -> Optional[float]:
+    """Parallel float64 dot product ``dot(a, b)`` or ``None``."""
+    if NATIVE_CORE is None or not NATIVE_CORE.has_pcg:
+        return None
+    try:
+        return NATIVE_CORE.dot_f64(a, b)
+    except (OSError, RuntimeError, ValueError):
+        return None

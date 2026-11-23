@@ -17,14 +17,17 @@ import os
 import sys
 import zipfile
 
-VERSION = "0.4.2"
+VERSION = "0.4.4"
 
 IDENTIFIER = "com.github.poealex.kicad-thermal-sim"
 
 # Plugin source files to include (relative to ThermalSim/)
 PLUGIN_FILES = [
     "__init__.py",
+    "__main__.py",
     "thermal_plugin.py",
+    "headless_api.py",
+    "thermalsim_cli.py",
     "capabilities.py",
     "native_core.py",
     "stackup_parser.py",
@@ -39,6 +42,11 @@ PLUGIN_FILES = [
     "dependency_installer.py",
     "workflow.py",
     "ThermalSim_icon.png",
+]
+
+SCHEMA_FILES = [
+    "schema/job.schema.json",
+    "schema/summary.schema.json",
 ]
 
 
@@ -73,8 +81,8 @@ def build_metadata(version):
             "- KiCad 9.0 & 10.0 compatibility\n"
             "- Direct Steady-State mode (single-solve final temperature) and "
             "BDF2 transient time integration with early steady-state stop\n"
-            "- Native C++/OpenMP v3 Compact Low-RAM Multigrid CPU core "
-            "(Windows, Linux, macOS) with mixed-precision V-cycles and "
+            "- Native C++/OpenMP v4 Compact Low-RAM Multigrid & Fused PCG CPU "
+            "core (Windows, Linux, macOS) with mixed-precision V-cycles and "
             "automatic NumPy/SciPy fallback\n"
             "- Automatic stackup detection from board file\n"
             "- Multi-layer heat spreading with via coupling\n"
@@ -84,7 +92,9 @@ def build_metadata(version):
             "- Heatsink/thermal-pad support (User.Eco1 layer) with fixed sink "
             "or dynamic 0D heatsink (R_th + thermal mass)\n"
             "- Compressed .npz geometry caching and HTML report with "
-            "hotspot-preserving interactive heatmaps\n\n"
+            "hotspot-preserving interactive heatmaps\n"
+            "- Headless CLI & JSON API (inspect, validate, run, sweep, compare) "
+            "with semantic summary.json for AI agents and CI automation\n\n"
             "Requires: numpy, scipy, matplotlib (auto-install dialog included)"
         ),
         "identifier": IDENTIFIER,
@@ -146,6 +156,12 @@ def build_zip(version, output_dir):
                 continue
             arc_name = f"plugins/{filename}"
             zf.write(src_path, arc_name)
+
+        # Write JSON schemas when present
+        for schema_rel in SCHEMA_FILES:
+            schema_src = os.path.join(script_dir, schema_rel)
+            if os.path.isfile(schema_src):
+                zf.write(schema_src, f"plugins/{schema_rel}")
 
         for binary_name in (
             "thermalsim_core.dll",

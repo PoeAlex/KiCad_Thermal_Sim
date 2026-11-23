@@ -1425,6 +1425,26 @@ class SettingsDialog(wx.Dialog):
         except Exception:
             pass
 
+    def _flush_ui_updates(self):
+        """Force immediate repaint and pending UI event processing safely."""
+        for method_name in ("Refresh", "Update"):
+            method = getattr(self, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    pass
+        try:
+            get_app = getattr(wx, "GetApp", None)
+            app = get_app() if callable(get_app) else None
+            if app is not None and hasattr(app, "Yield"):
+                try:
+                    app.Yield(True)
+                except TypeError:
+                    app.Yield()
+        except Exception:
+            pass
+
     def _on_preview(self, event):
         """Handle Preview button click."""
         if self.preview_callback:
@@ -1435,13 +1455,14 @@ class SettingsDialog(wx.Dialog):
                     "Extracting and rasterizing board geometry.",
                 )
                 self.btn_preview.Enable(False)
+                self._flush_ui_updates()
                 try:
                     output_path = self.preview_callback(settings, self.layer_names)
                     if output_path:
                         self._set_footer_status(
                             "Preview ready", os.path.basename(output_path)
                         )
-                    else:
+                    elif self.lbl_preflight.GetLabel() != "Preview cancelled.":
                         self._set_footer_status(
                             "Preview failed", "No preview image was created."
                         )
@@ -1453,6 +1474,7 @@ class SettingsDialog(wx.Dialog):
                     wx.MessageBox("Geometry preview failed.", "ThermalSim")
                 finally:
                     self.btn_preview.Enable(True)
+                    self._flush_ui_updates()
 
     def _on_run(self, event):
         """Handle Run button click for modal and modeless workflows."""
@@ -1593,6 +1615,7 @@ class SettingsDialog(wx.Dialog):
         title, default_message = labels.get(self.last_run_status, (self.last_run_status.title(), ""))
         self._set_footer_status(title, message or default_message)
         self.btn_run.Enable(self.last_run_status != "running")
+        self._flush_ui_updates()
 
     def set_artifacts(self, report_path, run_dir, elapsed_s=None, max_temp_c=None):
         """Expose completion summary and actions for a successful run."""

@@ -2429,3 +2429,111 @@ class TestCompactLowRamOperatorAndHeatsink2D:
         res_tr_2d = run_simulation(tr_cfg, K, C, Q_dense, b, hA, layers, rows, cols, heatsink_model=hs_2d)
         np.testing.assert_array_equal(res_tr_2d.T, res_tr_3d.T)
         assert res_tr_2d.k_norm_info["heatsink_temp_c"] == res_tr_3d.k_norm_info["heatsink_temp_c"]
+
+    @pytest.mark.parametrize("scale", [0.0, 1.5])
+    def test_fused_matvec_and_mg_solve_into_and_dot_match_reference(self, scale):
+        """_apply_with_scale_and_dot and solve_into_and_dot match separate ops + np.dot to < 1e-11."""
+        args, compact_op, capacity, _, _, _, _ = self._build_compact_problem(
+            layers=3, rows=25, cols=29, heatsink_mode=True
+        )
+        struct_op, _, _, _ = build_structured_operator(*args)
+        rng = np.random.default_rng(1234)
+        vec = rng.standard_normal(compact_op.shape[0])
+
+        # Compact _apply_with_scale_and_dot vs _apply_with_scale + np.dot
+        out_ref = np.empty_like(vec)
+        compact_op._apply_with_scale(scale, vec, out=out_ref)
+        dot_ref = float(np.dot(vec, out_ref))
+
+        out_fused = np.empty_like(vec)
+        dot_fused = compact_op._apply_with_scale_and_dot(scale, vec, out_fused)
+        np.testing.assert_allclose(out_fused, out_ref, rtol=1e-13, atol=1e-13)
+        assert abs(dot_fused - dot_ref) <= 1e-11 * max(1.0, abs(dot_ref))
+
+        # LinearOperator hooks and MG solve_into_and_dot for both Compact and Structured
+        for op, cap_arg in ((compact_op, None), (struct_op, capacity)):
+            A_op, M_op = op.implicit_linear_operator(cap_arg, scale)
+            if op is compact_op:
+                assert hasattr(A_op, "_matvec_into_and_dot")
+                out_hook = np.empty_like(vec)
+                dot_hook = A_op._matvec_into_and_dot(vec, out_hook)
+                np.testing.assert_allclose(out_hook, out_ref, rtol=1e-13, atol=1e-13)
+                assert abs(dot_hook - dot_ref) <= 1e-11 * max(1.0, abs(dot_ref))
+
+            assert hasattr(M_op, "_solve_into_and_dot")
+            mg_ref = np.empty_like(vec)
+            M_op._solve_into(vec, mg_ref)
+            mg_dot_ref = float(np.dot(vec, mg_ref))
+
+            mg_fused = np.empty_like(vec)
+            mg_dot_fused = M_op._solve_into_and_dot(vec, mg_fused)
+            np.testing.assert_allclose(mg_fused, mg_ref, rtol=1e-13, atol=1e-13)
+            assert abs(mg_dot_fused - mg_dot_ref) <= 1e-11 * max(1.0, abs(mg_dot_ref))
+
+    @pytest.mark.parametrize("heatsink_mode", [False, True])
+    def test_fused_v4_pcg_matches_fallback_ss_and_transient(self, monkeypatch, heatsink_mode):
+        """Fused v4 PCG path (HAS_NATIVE_PCG=True) matches fallback (HAS_NATIVE_PCG=False) to < 1e-10 K."""
+        args, compact_op, capacity, Q_sparse, _, settings, amb = self._build_compact_problem(
+            layers=3, rows=25, cols=29, heatsink_mode=heatsink_mode
+        )
+        hs_2d = compact_op.build_heatsink_model(settings, amb)
+
+        ss_cfg = SolverConfig(
+            sim_time=50.0, amb=amb, dt_base=1.0, steps_target=50, steady_state=True
+        )
+        tr_cfg = SolverConfig(
+            sim_time=3.0,
+            amb=amb,
+            dt_base=0.5,
+            steps_target=6,
+            use_multi_phase=False,
+            time_stepping="uniform",
+            early_stop=False,
+        )
+
+        # Native v4 path (when v4 .so is loaded, HAS_NATIVE_PCG is True)
+        res_ss_v4 = run_steady_state_matrix_free(
+            ss_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+        res_tr_v4 = run_simulation_matrix_free(
+            tr_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+
+        # Structured operator with v4 MG + dot path
+        struct_op, sb, shA, _ = build_structured_operator(*args)
+        hs_3d = (
+            build_heatsink_model(
+                args[0], args[1], args[2], args[8], args[9], args[12], settings, amb
+            )
+            if heatsink_mode
+            else None
+        )
+        Q_dense = Q_sparse.to_dense()
+        res_struct_tr_v4 = run_simulation_matrix_free(
+            tr_cfg, struct_op, capacity, Q_dense, sb, shA, heatsink_model=hs_3d
+        )
+
+        # Force fallback path (HAS_NATIVE_PCG=False)
+        monkeypatch.setattr(thermal_solver, "HAS_NATIVE_PCG", False)
+        res_ss_fb = run_steady_state_matrix_free(
+            ss_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+        res_tr_fb = run_simulation_matrix_free(
+            tr_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+        res_struct_tr_fb = run_simulation_matrix_free(
+            tr_cfg, struct_op, capacity, Q_dense, sb, shA, heatsink_model=hs_3d
+        )
+
+        assert float(np.max(np.abs(res_ss_v4.T - res_ss_fb.T))) < 1e-10
+        assert float(np.max(np.abs(res_tr_v4.T - res_tr_fb.T))) < 1e-10
+        assert float(np.max(np.abs(res_struct_tr_v4.T - res_struct_tr_fb.T))) < 1e-10
+        if heatsink_mode:
+            assert abs(
+                res_ss_v4.k_norm_info["heatsink_temp_c"]
+                - res_ss_fb.k_norm_info["heatsink_temp_c"]
+            ) < 1e-10
+            assert abs(
+                res_tr_v4.k_norm_info["heatsink_temp_c"]
+                - res_tr_fb.k_norm_info["heatsink_temp_c"]
+            ) < 1e-10

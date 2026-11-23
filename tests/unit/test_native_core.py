@@ -294,13 +294,15 @@ _MG_SHAPES = [
 
 
 @pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
-def test_compiled_core_reports_v3_and_compact_support(compiled_native_core):
-    assert compiled_native_core.version == 3
+def test_compiled_core_reports_v4_and_pcg_support(compiled_native_core):
+    assert compiled_native_core.version == 4
     assert compiled_native_core.has_mg is True
     assert compiled_native_core.has_compact is True
+    assert compiled_native_core.has_pcg is True
     assert native_core.HAS_NATIVE_CORE is True
     assert native_core.HAS_NATIVE_MG is True
     assert native_core.HAS_NATIVE_COMPACT is True
+    assert native_core.HAS_NATIVE_PCG is True
 
 
 @pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
@@ -519,6 +521,7 @@ def test_v1_library_loads_cleanly_with_mg_fallback(tmp_path, monkeypatch):
     assert v1_core.version == 1
     assert v1_core.has_mg is False
     assert v1_core.has_compact is False
+    assert v1_core.has_pcg is False
 
     empty = np.empty(0, dtype=np.float64)
     out = v1_core.apply_structured(
@@ -588,6 +591,25 @@ def test_v1_library_loads_cleanly_with_mg_fallback(tmp_path, monkeypatch):
     fine_f32 = np.zeros(1, dtype=np.float32)
     assert native_core.prolong_add_2x2_f32_native(1, 1, 1, f32_one, fine_f32) is False
     np.testing.assert_array_equal(fine_f32, np.zeros(1, dtype=np.float32))
+
+    # v4 fused PCG/vector helpers also cleanly fall back on v1 libraries.
+    f64_one = np.ones(1, dtype=np.float64)
+    assert (
+        native_core.apply_compact_dot_native(
+            1, 1, 1, u8_one, None, u8_one, lut3, lut3, None, lut2, 0.1, 0.2, 0.3, 0.4, 1.0, f64_one
+        )
+        is None
+    )
+    assert (
+        native_core.pcg_update_xr_norm2_native(
+            f64_one.copy(), f64_one.copy(), f64_one, f64_one, 0.5
+        )
+        is None
+    )
+    assert native_core.pcg_update_p_native(f64_one.copy(), f64_one, 0.5) is False
+    assert native_core.f64_to_f32_native(f64_one, f32_one.copy()) is False
+    assert native_core.f32_to_f64_dot_native(f32_one, f64_one, f64_one.copy()) is None
+    assert native_core.dot_f64_native(f64_one, f64_one) is None
 
 
 def _make_compact_problem(layer_count, rows, cols, seed, with_hs=True, with_vias=True):
@@ -1060,3 +1082,226 @@ def test_clear_native_scratch_releases_tls_buffers(compiled_native_core, monkeyp
     native_core.clear_native_scratch()
     assert not hasattr(compiled_native_core._tls, "jacobi_scratch")
     assert not hasattr(compiled_native_core._tls, "jacobi_scratch_f32")
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+@pytest.mark.parametrize("layer_count,rows,cols", _COMPACT_SHAPES + [(1, 80, 100), (4, 80, 100)])
+@pytest.mark.parametrize("scale", [0.0, 2.5])
+@pytest.mark.parametrize("with_hs,with_vias", [(True, True), (False, False)])
+def test_compiled_apply_compact_dot_matches_reference(
+    compiled_native_core, monkeypatch, layer_count, rows, cols, scale, with_hs, with_vias
+):
+    params = _make_compact_problem(
+        layer_count,
+        rows,
+        cols,
+        seed=1300 + layer_count * 100 + rows * 7 + cols,
+        with_hs=with_hs,
+        with_vias=with_vias,
+    )
+    gx, gy, gz, boundary, cap = _expand_compact_to_reference(
+        layer_count, rows, cols, *params
+    )
+    diag_mass = boundary + scale * cap
+    rng = np.random.default_rng(1400 + layer_count * 31 + rows * 3 + cols)
+    vec = rng.normal(25.0, 8.0, size=layer_count * rows * cols)
+    expected = _numpy_reference_dot(layer_count, rows, cols, gx, gy, gz, diag_mass, vec)
+    expected_dot = float(np.dot(vec, expected))
+
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+
+    def _forbid_copy(*args, **kwargs):
+        raise AssertionError("Unexpected array copy on contiguous inputs")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(native_core.np, "ascontiguousarray", _forbid_copy)
+        out_buf = np.empty_like(vec)
+        res = native_core.apply_compact_dot_native(
+            layer_count, rows, cols, *params, scale, vec, out=out_buf
+        )
+    assert res is not None
+    actual_out, actual_dot = res
+    assert actual_out is out_buf
+    np.testing.assert_allclose(actual_out, expected, rtol=1e-12, atol=1e-12)
+    assert actual_dot == pytest.approx(expected_dot, rel=1e-12, abs=1e-12)
+
+    res2 = native_core.apply_compact_dot_native(
+        layer_count, rows, cols, *params, scale, vec
+    )
+    assert res2 is not None
+    actual2, dot2 = res2
+    np.testing.assert_allclose(actual2, expected, rtol=1e-12, atol=1e-12)
+    assert dot2 == pytest.approx(expected_dot, rel=1e-12, abs=1e-12)
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+@pytest.mark.parametrize("n", [0, 1, 7, 100000])
+def test_compiled_pcg_update_xr_norm2_matches_numpy(compiled_native_core, monkeypatch, n):
+    rng = np.random.default_rng(1500 + n)
+    x = rng.normal(25.0, 5.0, size=n)
+    r = rng.normal(0.0, 2.0, size=n)
+    p = rng.normal(0.0, 3.0, size=n)
+    ap = rng.normal(0.0, 4.0, size=n)
+    alpha = 0.37
+
+    expected_x = x + alpha * p
+    expected_r = r - alpha * ap
+    expected_norm2 = float(np.dot(expected_r, expected_r))
+
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+
+    def _forbid_copy(*args, **kwargs):
+        raise AssertionError("Unexpected array copy on contiguous float64 inputs")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(native_core.np, "ascontiguousarray", _forbid_copy)
+        norm2 = native_core.pcg_update_xr_norm2_native(x, r, p, ap, alpha)
+
+    assert norm2 is not None
+    assert norm2 == pytest.approx(expected_norm2, rel=1e-12, abs=1e-12)
+    np.testing.assert_allclose(x, expected_x, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(r, expected_r, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+@pytest.mark.parametrize("n", [0, 1, 7, 100000])
+def test_compiled_pcg_update_p_matches_numpy(compiled_native_core, monkeypatch, n):
+    rng = np.random.default_rng(1600 + n)
+    p = rng.normal(1.0, 2.0, size=n)
+    z = rng.normal(-0.5, 3.0, size=n)
+    beta = 0.618
+
+    expected_p = z + beta * p
+
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+
+    def _forbid_copy(*args, **kwargs):
+        raise AssertionError("Unexpected array copy on contiguous float64 inputs")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(native_core.np, "ascontiguousarray", _forbid_copy)
+        ok = native_core.pcg_update_p_native(p, z, beta)
+
+    assert ok is True
+    np.testing.assert_allclose(p, expected_p, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+@pytest.mark.parametrize("n", [0, 1, 7, 100000])
+def test_compiled_f64_to_f32_matches_numpy(compiled_native_core, monkeypatch, n):
+    rng = np.random.default_rng(1700 + n)
+    src = rng.normal(0.0, 10.0, size=n)
+    dst = np.empty(n, dtype=np.float32)
+    expected = src.astype(np.float32)
+
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+
+    def _forbid_copy(*args, **kwargs):
+        raise AssertionError("Unexpected array copy on contiguous inputs")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(native_core.np, "ascontiguousarray", _forbid_copy)
+        ok = native_core.f64_to_f32_native(src, dst)
+
+    assert ok is True
+    np.testing.assert_array_equal(dst, expected)
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+@pytest.mark.parametrize("n", [0, 1, 7, 100000])
+def test_compiled_f32_to_f64_dot_matches_numpy(compiled_native_core, monkeypatch, n):
+    rng = np.random.default_rng(1800 + n)
+    src = rng.normal(0.0, 5.0, size=n).astype(np.float32)
+    r = rng.normal(1.0, 3.0, size=n)
+    dst = np.empty(n, dtype=np.float64)
+
+    expected_dst = src.astype(np.float64)
+    expected_dot = float(np.dot(r, expected_dst))
+
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+
+    def _forbid_copy(*args, **kwargs):
+        raise AssertionError("Unexpected array copy on contiguous inputs")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(native_core.np, "ascontiguousarray", _forbid_copy)
+        dot = native_core.f32_to_f64_dot_native(src, r, dst)
+
+    assert dot is not None
+    np.testing.assert_array_equal(dst, expected_dst)
+    assert dot == pytest.approx(expected_dot, rel=1e-12, abs=1e-12)
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+@pytest.mark.parametrize("n", [0, 1, 7, 100000])
+def test_compiled_dot_f64_matches_numpy(compiled_native_core, monkeypatch, n):
+    rng = np.random.default_rng(1900 + n)
+    a = rng.normal(2.0, 4.0, size=n)
+    b = rng.normal(-1.0, 3.0, size=n)
+
+    expected_ab = float(np.dot(a, b))
+    expected_aa = float(np.dot(a, a))
+
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+
+    def _forbid_copy(*args, **kwargs):
+        raise AssertionError("Unexpected array copy on contiguous float64 inputs")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(native_core.np, "ascontiguousarray", _forbid_copy)
+        dot_ab = native_core.dot_f64_native(a, b)
+        dot_aa = native_core.dot_f64_native(a, a)
+
+    assert dot_ab is not None
+    assert dot_aa is not None
+    assert dot_ab == pytest.approx(expected_ab, rel=1e-12, abs=1e-12)
+    assert dot_aa == pytest.approx(expected_aa, rel=1e-12, abs=1e-12)
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+def test_v4_vector_helpers_reject_invalid_buffers(compiled_native_core, monkeypatch):
+    monkeypatch.setattr(native_core, "NATIVE_CORE", compiled_native_core)
+    a = np.ones(4, dtype=np.float64)
+    ro = np.ones(4, dtype=np.float64)
+    ro.flags.writeable = False
+    f32_ro = np.ones(4, dtype=np.float32)
+    f32_ro.flags.writeable = False
+    mismatch = np.ones(3, dtype=np.float64)
+
+    assert native_core.pcg_update_xr_norm2_native(ro, a.copy(), a, a, 1.0) is None
+    assert native_core.pcg_update_xr_norm2_native(a.copy(), a.copy(), mismatch, a, 1.0) is None
+    assert native_core.pcg_update_p_native(ro, a, 1.0) is False
+    assert native_core.pcg_update_p_native(a.copy(), mismatch, 1.0) is False
+    assert native_core.f64_to_f32_native(a, f32_ro) is False
+    assert native_core.f64_to_f32_native(mismatch, np.empty(4, dtype=np.float32)) is False
+    assert native_core.f32_to_f64_dot_native(np.ones(4, dtype=np.float32), a, ro) is None
+    assert native_core.dot_f64_native(a, mismatch) is None
+
+
+@pytest.mark.skipif(not _HAS_LINUX_GPP, reason="Requires Linux with g++")
+@pytest.mark.parametrize("env_val", ["2", "0", "invalid"])
+def test_omp_threads_env_override_in_subprocess(compiled_native_core, env_val):
+    import os
+
+    pkg_dir = Path(native_core.__file__).resolve().parent
+    code = (
+        "import numpy as np\n"
+        "import native_core\n"
+        "a = np.arange(100000, dtype=np.float64) * 0.001\n"
+        "b = np.cos(a)\n"
+        "d = native_core.dot_f64_native(a, b)\n"
+        "ref = float(np.dot(a, b))\n"
+        "assert d is not None and abs(d - ref) <= 1e-12 * max(1.0, abs(ref)), (d, ref)\n"
+    )
+    env = dict(os.environ)
+    env["THERMALSIM_NATIVE_CORE"] = compiled_native_core.path
+    env["THERMALSIM_OMP_THREADS"] = env_val
+    env["PYTHONPATH"] = str(pkg_dir)
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(pkg_dir),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr

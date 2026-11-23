@@ -7,7 +7,7 @@ losses into a thermal heat-source vector.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import scipy.sparse as sp
@@ -16,7 +16,11 @@ from scipy.sparse.csgraph import connected_components
 
 import pcbnew
 
-from .geometry_mapper import _fill_zone_mask_polygons
+from .geometry_mapper import (
+    GeometryCancelledError,
+    _ProgressEmitter,
+    _fill_zone_mask_polygons,
+)
 
 _ELECTRICAL_ITERATIVE_NODE_THRESHOLD = 150_000
 _ELECTRICAL_ITERATIVE_RTOL = 1e-8
@@ -251,6 +255,8 @@ def solve_electrical_heating(
     board: Any,
     terminals: List[CurrentTerminal],
     config: ElectricalConfig,
+    progress_callback: Optional[Callable[[int, int, str], Optional[bool]]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> ElectricalResult:
     """
     Solve electrical DC current flow and return Joule heat per thermal node.
@@ -263,12 +269,19 @@ def solve_electrical_heating(
         Pad currents to solve.
     config : ElectricalConfig
         Geometry and material settings.
+    progress_callback : callable, optional
+        Callback ``(done, total, message) -> Optional[bool]``. Returning False cancels.
+    cancel_check : callable, optional
+        Callable returning True to cancel.
 
     Returns
     -------
     ElectricalResult
         Electrical diagnostics and the Joule heat vector.
     """
+    tracker = _ProgressEmitter(progress_callback, cancel_check)
+    tracker.check_cancel(force=True)
+
     layer_count = len(config.copper_ids)
     total_nodes = layer_count * config.rows * config.cols
     q_total = np.zeros(total_nodes, dtype=np.float64)
@@ -302,8 +315,19 @@ def solve_electrical_heating(
     if errors:
         return ElectricalResult(q_total, summaries, warnings, errors)
 
+    mask_progress_cb = None
+    if progress_callback is not None:
+        def _mask_progress(done, total, msg):
+            scaled = int(50 * done / max(1, total))
+            tracker.emit(scaled, 100, msg, force=True)
+        mask_progress_cb = _mask_progress
+
     net_masks, via_masks, primitive_summaries, collision_count = _build_relevant_net_masks(
-        board, config, set(terms_by_net)
+        board,
+        config,
+        set(terms_by_net),
+        progress_callback=mask_progress_cb,
+        cancel_check=cancel_check,
     )
     if collision_count:
         errors.append(
@@ -312,26 +336,36 @@ def solve_electrical_heating(
         )
         return ElectricalResult(q_total, summaries, warnings, errors)
 
-    for key, terms in terms_by_net.items():
+    total_nets = max(1, len(terms_by_net))
+    for net_idx, (key, terms) in enumerate(terms_by_net.items()):
+        net_label = net_display.get(key, key)
+        tracker.emit(
+            50 + int(50 * net_idx / total_nets),
+            100,
+            f"Solving electrical net {net_idx + 1} / {total_nets} ({net_label})...",
+            force=True,
+        )
         copper_mask = net_masks.get(key)
         if copper_mask is None or not np.any(copper_mask):
-            errors.append(f"Net {net_display.get(key, key)} has no mapped copper.")
+            errors.append(f"Net {net_label} has no mapped copper.")
             continue
 
         result = _solve_one_net(
             key,
-            net_display.get(key, key),
+            net_label,
             copper_mask,
             via_masks.get(key),
             terms,
             config,
             primitive_summaries.get(key, []),
+            cancel_check=cancel_check,
         )
         q_total += result.q_joule
         summaries.extend(result.net_summaries)
         warnings.extend(result.warnings)
         errors.extend(result.errors)
 
+    tracker.emit(100, 100, "Electrical solve complete.", force=True)
     return ElectricalResult(q_total, summaries, warnings, errors)
 
 
@@ -343,6 +377,7 @@ def _solve_one_net(
     terms: List[CurrentTerminal],
     config: ElectricalConfig,
     primitive_diagnostics: Optional[List[ElectricalPrimitiveDiagnostics]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> ElectricalResult:
     """Solve one isolated net and return a full-size heat vector."""
     layer_count = len(config.copper_ids)
@@ -430,6 +465,8 @@ def _solve_one_net(
     active_components = sorted({int(labels[node]) for node in active_nodes})
 
     for comp in active_components:
+        if cancel_check is not None and cancel_check():
+            raise GeometryCancelledError("Electrical solve cancelled.")
         comp_nodes = np.flatnonzero(labels == comp)
         if comp_nodes.size <= 1:
             continue
@@ -652,6 +689,8 @@ def _build_relevant_net_masks(
     board: Any,
     config: ElectricalConfig,
     relevant_nets: set,
+    progress_callback: Optional[Callable[[int, int, str], Optional[bool]]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Tuple[
     Dict[str, np.ndarray],
     Dict[str, np.ndarray],
@@ -659,6 +698,9 @@ def _build_relevant_net_masks(
     int,
 ]:
     """Rasterize copper geometry for only the active current nets."""
+    tracker = _ProgressEmitter(progress_callback, cancel_check)
+    tracker.check_cancel(force=True)
+
     layer_count = len(config.copper_ids)
     shape = (layer_count, config.rows, config.cols)
     net_masks = {key: np.zeros(shape, dtype=bool) for key in relevant_nets}
@@ -733,7 +775,28 @@ def _build_relevant_net_masks(
         footprints = list(board.Footprints() if hasattr(board, "Footprints") else board.GetFootprints())
     except Exception:
         footprints = []
-    for fp in footprints:
+    try:
+        tracks = list(board.Tracks() if hasattr(board, "Tracks") else board.GetTracks())
+    except Exception:
+        tracks = []
+    try:
+        zones = list(board.Zones() if hasattr(board, "Zones") else board.GetZones())
+    except Exception:
+        zones = []
+
+    total_fps = len(footprints)
+    total_tracks = len(tracks)
+    total_zones = len(zones)
+    total_items = max(1, total_fps + total_tracks + total_zones)
+    completed = 0
+
+    for fp_idx, fp in enumerate(footprints):
+        tracker.emit(
+            completed + fp_idx,
+            total_items,
+            f"Mapping electrical pads ({fp_idx + 1} / {total_fps})...",
+            force=(fp_idx == 0),
+        )
         for pad in fp.Pads():
             key, _, _ = net_key_from_obj(pad)
             if key not in net_masks:
@@ -758,12 +821,15 @@ def _build_relevant_net_masks(
                         key, "Pad", _layer_label(layer_id, config), bbox,
                         mapped_cells=max(0, mapped_cells)
                     )
+    completed += total_fps
 
-    try:
-        tracks = list(board.Tracks() if hasattr(board, "Tracks") else board.GetTracks())
-    except Exception:
-        tracks = []
-    for track in tracks:
+    for tr_idx, track in enumerate(tracks):
+        tracker.emit(
+            completed + tr_idx,
+            total_items,
+            f"Mapping electrical tracks ({tr_idx + 1} / {total_tracks})...",
+            force=(tr_idx == 0),
+        )
         key, _, _ = net_key_from_obj(track)
         if key not in net_masks:
             continue
@@ -788,12 +854,15 @@ def _build_relevant_net_masks(
                 track_length_mm=_track_length_mm(track),
                 track_width_mm=_track_width_mm(track),
             )
+    completed += total_tracks
 
-    try:
-        zones = list(board.Zones() if hasattr(board, "Zones") else board.GetZones())
-    except Exception:
-        zones = []
-    for zone in zones:
+    for z_idx, zone in enumerate(zones):
+        tracker.emit(
+            completed + z_idx,
+            total_items,
+            f"Rasterizing electrical zone {z_idx + 1} / {total_zones}...",
+            force=(z_idx == 0),
+        )
         key, _, _ = net_key_from_obj(zone)
         if key not in net_masks:
             continue
@@ -802,13 +871,37 @@ def _build_relevant_net_masks(
         bbox = zone.GetBoundingBox()
         rs, re, cs, ce = _bbox_indices(bbox, config)
         has_bbox_overlap = rs < re and cs < ce
+        zone_progress_cb = None
+        if progress_callback is not None:
+            def _zone_sub_progress(
+                _sub_done,
+                _sub_total,
+                sub_msg,
+                _z_i=z_idx,
+                _z_base=completed + z_idx,
+            ):
+                tracker.emit(
+                    _z_base,
+                    total_items,
+                    f"Rasterizing electrical zone {_z_i + 1} / {total_zones}: {sub_msg}",
+                    force=True,
+                )
+            zone_progress_cb = _zone_sub_progress
         for lid in _zone_layer_ids(zone, config.copper_ids):
             layer_idx = lid_to_idx.get(lid)
             if layer_idx is not None:
                 if has_bbox_overlap:
                     layer_slice = net_masks[key][layer_idx, rs:re, cs:ce]
                     before = int(np.count_nonzero(layer_slice))
-                    _fill_zone(net_masks[key], layer_idx, lid, zone, config)
+                    _fill_zone(
+                        net_masks[key],
+                        layer_idx,
+                        lid,
+                        zone,
+                        config,
+                        progress_callback=zone_progress_cb,
+                        cancel_check=cancel_check,
+                    )
                     mapped_cells = int(np.count_nonzero(layer_slice)) - before
                 else:
                     mapped_cells = 0
@@ -1077,7 +1170,15 @@ def _fill_track(mask: np.ndarray, layer_idx: int, track: Any, config: Electrical
     mask[layer_idx, rs:re, cs:ce] |= dist <= radius
 
 
-def _fill_zone(mask: np.ndarray, layer_idx: int, lid: int, zone: Any, config: ElectricalConfig):
+def _fill_zone(
+    mask: np.ndarray,
+    layer_idx: int,
+    lid: int,
+    zone: Any,
+    config: ElectricalConfig,
+    progress_callback: Optional[Callable[[int, int, str], Optional[bool]]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+):
     """Rasterize a filled copper zone with KiCad hit-testing where available."""
     bbox = zone.GetBoundingBox()
     rs, re, cs, ce = _bbox_indices(bbox, config)
@@ -1100,13 +1201,28 @@ def _fill_zone(mask: np.ndarray, layer_idx: int, lid: int, zone: Any, config: El
     )
     zone_mask = np.zeros((re - rs, ce - cs), dtype=bool)
     if _fill_zone_mask_polygons(
-        zone_mask, None, x_values, y_values, lid, zone
+        zone_mask,
+        None,
+        x_values,
+        y_values,
+        lid,
+        zone,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
     ):
         mask[layer_idx, rs:re, cs:ce] |= zone_mask
         return
 
     has_hit = hasattr(zone, "HitTestFilledArea")
+    tracker = _ProgressEmitter(progress_callback, cancel_check)
+    total_rows = max(1, re - rs)
     for r in range(rs, re):
+        tracker.emit(
+            r - rs,
+            total_rows,
+            f"Hit-testing electrical zone row {r - rs + 1} / {total_rows}...",
+            force=(r == rs),
+        )
         y_mm = config.y_min + (r + 0.5) * config.res
         y_iu = _to_iu(y_mm)
         for c in range(cs, ce):
