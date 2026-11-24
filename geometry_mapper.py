@@ -8,7 +8,7 @@ discretized conductivity arrays for thermal simulation.
 import math
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pcbnew
@@ -473,7 +473,7 @@ def _state_fill_circle(state, layer_indices, bbox, center, diameter_mm):
         _state_apply_shape(state, layer_idx, bbox, predicate)
 
 
-def _pad_orientation_radians(pad):
+def _pad_orientation_radians(pad) -> float:
     """Return pad rotation in radians across supported KiCad APIs."""
     try:
         return math.radians(float(pad.GetOrientationDegrees()))
@@ -488,89 +488,466 @@ def _pad_orientation_radians(pad):
         return 0.0
 
 
-def _state_fill_pad(state, layer_indices, pad):
-    """Rasterize common KiCad pad shapes, falling back safely for custom pads."""
-    bbox = pad.GetBoundingBox()
-    try:
-        center = pad.GetPosition()
-        size = pad.GetSize()
-        width_mm = max(float(size.x) * 1e-6, state.res)
-        height_mm = max(float(size.y) * 1e-6, state.res)
-        shape = pad.GetShape()
-    except Exception:
-        for layer_idx in layer_indices:
-            _state_fill_box(state, layer_idx, bbox)
-        return
+def get_pad_copper_layer_indices(
+    pad: Any,
+    copper_ids: List[int],
+    lid_to_idx: Optional[Dict[int, int]] = None,
+) -> List[int]:
+    """
+    Resolve the indices in ``copper_ids`` occupied by a KiCad pad.
 
+    KiCad 10 ``PAD.GetLayer()`` returns ``0 (F.Cu)`` even for ``B.Cu`` SMD and
+    NPTH pads, so ``GetLayerSet()`` must be inspected first before falling back
+    to attribute/layer heuristics for minimal mocks.
+    """
+    if not copper_ids:
+        return []
+    if lid_to_idx is None:
+        lid_to_idx = {lid: idx for idx, lid in enumerate(copper_ids)}
+
+    try:
+        pad_attrib = pad.GetAttribute()
+    except Exception:
+        pad_attrib = None
+
+    npth_attrib = getattr(pcbnew, "PAD_ATTRIB_NPTH", None)
+    pth_attrib = getattr(pcbnew, "PAD_ATTRIB_PTH", None)
+
+    if hasattr(pad, "GetLayerSet"):
+        try:
+            layer_set = pad.GetLayerSet()
+        except Exception:
+            layer_set = None
+        if layer_set is not None:
+            matched: List[int] = []
+            if hasattr(layer_set, "Contains"):
+                try:
+                    matched = [
+                        idx for idx, lid in enumerate(copper_ids)
+                        if layer_set.Contains(lid)
+                    ]
+                except Exception:
+                    matched = []
+            if not matched and hasattr(layer_set, "CuStack"):
+                try:
+                    matched = [
+                        lid_to_idx[int(lid)]
+                        for lid in layer_set.CuStack()
+                        if int(lid) in lid_to_idx
+                    ]
+                except Exception:
+                    matched = []
+            if matched:
+                return matched
+            if npth_attrib is not None and pad_attrib == npth_attrib:
+                return []
+
+    if pth_attrib is not None and pad_attrib == pth_attrib:
+        return list(range(len(copper_ids)))
+
+    if npth_attrib is not None and pad_attrib == npth_attrib:
+        return []
+
+    try:
+        layer_idx = lid_to_idx.get(pad.GetLayer())
+        if layer_idx is not None:
+            return [layer_idx]
+    except Exception:
+        pass
+
+    if hasattr(pad, "GetParent"):
+        try:
+            parent = pad.GetParent()
+            if parent is not None and hasattr(parent, "GetLayer"):
+                parent_idx = lid_to_idx.get(parent.GetLayer())
+                if parent_idx is not None:
+                    return [parent_idx]
+        except Exception:
+            pass
+
+    return []
+
+
+def get_pad_primary_layer_id(
+    pad: Any,
+    copper_ids: Optional[List[int]] = None,
+) -> int:
+    """Return the primary KiCad layer ID for a pad (correcting ``B.Cu`` SMD)."""
+    if copper_ids:
+        indices = get_pad_copper_layer_indices(pad, copper_ids)
+        if indices:
+            if len(indices) > 1 and hasattr(pad, "GetParent"):
+                try:
+                    parent = pad.GetParent()
+                    if parent is not None and hasattr(parent, "GetLayer"):
+                        parent_lid = int(parent.GetLayer())
+                        matched_lids = [int(copper_ids[i]) for i in indices]
+                        if parent_lid in matched_lids:
+                            return parent_lid
+                except Exception:
+                    pass
+            return int(copper_ids[indices[0]])
+
+    if hasattr(pad, "GetLayerSet"):
+        try:
+            cu_stack = list(pad.GetLayerSet().CuStack())
+            if cu_stack:
+                return int(cu_stack[0])
+        except Exception:
+            pass
+
+    try:
+        return int(pad.GetLayer())
+    except Exception:
+        return int(getattr(pcbnew, "F_Cu", 0))
+
+
+def _pad_shape_center_mm(
+    pad: Any,
+    layer_id: Optional[int] = None,
+    angle_rad: float = 0.0,
+) -> Tuple[float, float]:
+    """Return the copper shape center in millimeters, accounting for pad offset."""
+    if hasattr(pad, "ShapePos"):
+        shape_pos = None
+        if layer_id is not None:
+            try:
+                shape_pos = pad.ShapePos(int(layer_id))
+            except TypeError:
+                try:
+                    shape_pos = pad.ShapePos()
+                except Exception:
+                    shape_pos = None
+            except Exception:
+                shape_pos = None
+        else:
+            try:
+                shape_pos = pad.ShapePos()
+            except TypeError:
+                try:
+                    shape_pos = pad.ShapePos(get_pad_primary_layer_id(pad))
+                except Exception:
+                    shape_pos = None
+            except Exception:
+                shape_pos = None
+        if shape_pos is not None and hasattr(shape_pos, "x") and hasattr(shape_pos, "y"):
+            return float(shape_pos.x) * 1e-6, float(shape_pos.y) * 1e-6
+
+    try:
+        pos = pad.GetPosition()
+        cx = float(pos.x) * 1e-6
+        cy = float(pos.y) * 1e-6
+        if hasattr(pad, "GetOffset"):
+            try:
+                offset = pad.GetOffset()
+                ox = float(offset.x) * 1e-6
+                oy = float(offset.y) * 1e-6
+                if ox != 0.0 or oy != 0.0:
+                    cos_a = math.cos(angle_rad)
+                    sin_a = math.sin(angle_rad)
+                    cx += ox * cos_a + oy * sin_a
+                    cy += -ox * sin_a + oy * cos_a
+            except Exception:
+                pass
+        return cx, cy
+    except Exception:
+        bbox = pad.GetBoundingBox()
+        return (
+            (float(bbox.GetX()) + 0.5 * float(bbox.GetWidth())) * 1e-6,
+            (float(bbox.GetY()) + 0.5 * float(bbox.GetHeight())) * 1e-6,
+        )
+
+
+def _evaluate_pad_shape_mask(
+    pad: Any,
+    shape: Any,
+    xx: np.ndarray,
+    yy: np.ndarray,
+    cx: float,
+    cy: float,
+    cos_a: float,
+    sin_a: float,
+    half_w: float,
+    half_h: float,
+    x0: float,
+    y0: float,
+    w_bb: float,
+    h_bb: float,
+    layer_id: Optional[int] = None,
+) -> np.ndarray:
+    """Evaluate a KiCad pad shape mask over cell centers ``(xx, yy)`` in mm."""
+    eps = 1e-9
     circle_shape = getattr(pcbnew, "PAD_SHAPE_CIRCLE", object())
     oval_shape = getattr(pcbnew, "PAD_SHAPE_OVAL", object())
     rect_shape = getattr(pcbnew, "PAD_SHAPE_RECT", object())
+    rect_alt_shape = getattr(pcbnew, "PAD_SHAPE_RECTANGLE", object())
     roundrect_shape = getattr(pcbnew, "PAD_SHAPE_ROUNDRECT", object())
+    chamfered_shape = getattr(pcbnew, "PAD_SHAPE_CHAMFERED_RECT", object())
+
+    dx = xx - cx
+    dy = yy - cy
+
     if shape == circle_shape:
-        _state_fill_circle(state, layer_indices, bbox, center, max(width_mm, height_mm))
-        return
+        radius = max(half_w, half_h) + eps
+        return dx * dx + dy * dy <= radius * radius
 
-    cx = float(center.x) * 1e-6
-    cy = float(center.y) * 1e-6
-    angle = _pad_orientation_radians(pad)
-    cos_a = math.cos(angle)
-    sin_a = math.sin(angle)
-    half_w = 0.5 * width_mm
-    half_h = 0.5 * height_mm
-
-    def local_coordinates(xx, yy):
-        dx = xx - cx
-        dy = yy - cy
-        return cos_a * dx + sin_a * dy, -sin_a * dx + cos_a * dy
+    # KiCad uses +Y down and positive orientation CCW:
+    # local_x = cos(a)*dx - sin(a)*dy, local_y = sin(a)*dx + cos(a)*dy
+    local_x = cos_a * dx - sin_a * dy
+    local_y = sin_a * dx + cos_a * dy
 
     if shape == oval_shape:
-        if width_mm >= height_mm:
-            segment_half = max(0.0, 0.5 * (width_mm - height_mm))
-            radius = half_h
+        if half_w >= half_h:
+            segment_half = max(0.0, half_w - half_h)
+            radius = half_h + eps
+            nearest_x = np.clip(local_x, -segment_half, segment_half)
+            return (local_x - nearest_x) ** 2 + local_y ** 2 <= radius * radius
+        segment_half = max(0.0, half_h - half_w)
+        radius = half_w + eps
+        nearest_y = np.clip(local_y, -segment_half, segment_half)
+        return local_x ** 2 + (local_y - nearest_y) ** 2 <= radius * radius
 
-            def predicate(xx, yy):
-                local_x, local_y = local_coordinates(xx, yy)
-                nearest_x = np.clip(local_x, -segment_half, segment_half)
-                return (local_x - nearest_x) ** 2 + local_y ** 2 <= radius ** 2
-        else:
-            segment_half = max(0.0, 0.5 * (height_mm - width_mm))
-            radius = half_w
-
-            def predicate(xx, yy):
-                local_x, local_y = local_coordinates(xx, yy)
-                nearest_y = np.clip(local_y, -segment_half, segment_half)
-                return local_x ** 2 + (local_y - nearest_y) ** 2 <= radius ** 2
-    elif shape == roundrect_shape:
+    if shape == roundrect_shape:
         try:
             corner_radius = float(pad.GetRoundRectCornerRadius()) * 1e-6
         except Exception:
             try:
                 corner_radius = (
                     float(pad.GetRoundRectRadiusRatio())
-                    * min(width_mm, height_mm)
+                    * min(2.0 * half_w, 2.0 * half_h)
                 )
             except Exception:
-                corner_radius = 0.25 * min(width_mm, height_mm)
+                corner_radius = 0.25 * min(2.0 * half_w, 2.0 * half_h)
         corner_radius = min(max(corner_radius, 0.0), half_w, half_h)
+        qx = np.abs(local_x) - (half_w - corner_radius)
+        qy = np.abs(local_y) - (half_h - corner_radius)
+        outside = np.hypot(np.maximum(qx, 0.0), np.maximum(qy, 0.0))
+        inside = np.minimum(np.maximum(qx, qy), 0.0)
+        return (outside + inside) <= corner_radius + eps
 
-        def predicate(xx, yy):
-            local_x, local_y = local_coordinates(xx, yy)
-            qx = np.abs(local_x) - (half_w - corner_radius)
-            qy = np.abs(local_y) - (half_h - corner_radius)
-            outside = np.hypot(np.maximum(qx, 0.0), np.maximum(qy, 0.0))
-            inside = np.minimum(np.maximum(qx, qy), 0.0)
-            return outside + inside <= corner_radius
-    elif shape == rect_shape:
-        def predicate(xx, yy):
-            local_x, local_y = local_coordinates(xx, yy)
-            return (np.abs(local_x) <= half_w) & (np.abs(local_y) <= half_h)
+    if shape == rect_shape or shape == rect_alt_shape:
+        return (np.abs(local_x) <= half_w + eps) & (np.abs(local_y) <= half_h + eps)
+
+    if shape == chamfered_shape:
+        inside = (np.abs(local_x) <= half_w + eps) & (np.abs(local_y) <= half_h + eps)
+        try:
+            chamfer_ratio = float(pad.GetChamferRectRatio())
+            chamfer_pos = int(pad.GetChamferPositions())
+        except Exception:
+            chamfer_pos = 0
+            chamfer_ratio = 0.0
+        if chamfer_pos and chamfer_ratio > 0.0:
+            c_dist = min(max(chamfer_ratio, 0.0), 0.5) * min(2.0 * half_w, 2.0 * half_h)
+            limit = half_w + half_h - c_dist + eps
+            if chamfer_pos & 1:
+                inside &= ~((local_x < 0.0) & (local_y < 0.0) & ((-local_x - local_y) > limit))
+            if chamfer_pos & 2:
+                inside &= ~((local_x > 0.0) & (local_y < 0.0) & ((local_x - local_y) > limit))
+            if chamfer_pos & 4:
+                inside &= ~((local_x < 0.0) & (local_y > 0.0) & ((-local_x + local_y) > limit))
+            if chamfer_pos & 8:
+                inside &= ~((local_x > 0.0) & (local_y > 0.0) & ((local_x + local_y) > limit))
+        return inside
+
+    if hasattr(pad, "HitTest") and hasattr(pcbnew, "VECTOR2I"):
+        out = np.zeros(xx.shape, dtype=bool)
+        for r_idx in range(xx.shape[0]):
+            for c_idx in range(xx.shape[1]):
+                pos = pcbnew.VECTOR2I(
+                    int(round(float(xx[r_idx, c_idx]) * 1e6)),
+                    int(round(float(yy[r_idx, c_idx]) * 1e6)),
+                )
+                try:
+                    if layer_id is not None:
+                        try:
+                            out[r_idx, c_idx] = bool(pad.HitTest(pos, 0, int(layer_id)))
+                        except TypeError:
+                            out[r_idx, c_idx] = bool(pad.HitTest(pos))
+                    else:
+                        out[r_idx, c_idx] = bool(pad.HitTest(pos))
+                except Exception:
+                    out[r_idx, c_idx] = False
+        return out
+
+    return (
+        (xx >= x0 - eps)
+        & (xx <= x0 + w_bb + eps)
+        & (yy >= y0 - eps)
+        & (yy <= y0 + h_bb + eps)
+    )
+
+
+def get_pad_grid_mask(
+    pad: Any,
+    rows: int,
+    cols: int,
+    x_min: float,
+    y_min: float,
+    res: float,
+    layer_id: Optional[int] = None,
+    area_mask: Optional[np.ndarray] = None,
+) -> Tuple[int, int, int, int, np.ndarray]:
+    """
+    Rasterize a KiCad pad to a tight local boolean grid slice.
+
+    Returns ``(rs, re, cs, ce, mask_2d)`` where ``mask_2d`` has shape
+    ``(re - rs, ce - cs)`` and matches the exact copper footprint of ``pad``
+    (including rotation, offset, rounded/oval/chamfered/custom shapes, and a
+    sub-pixel cell guarantee so tiny or narrow pads never vanish).
+    """
+    empty = np.zeros((0, 0), dtype=bool)
+    if rows <= 0 or cols <= 0 or res <= 0.0:
+        return 0, 0, 0, 0, empty
+
+    bbox = pad.GetBoundingBox()
+    x0 = float(bbox.GetX()) * 1e-6
+    y0 = float(bbox.GetY()) * 1e-6
+    w_bb = float(bbox.GetWidth()) * 1e-6
+    h_bb = float(bbox.GetHeight()) * 1e-6
+
+    grid_x_max = x_min + cols * res
+    grid_y_max = y_min + rows * res
+    if x0 + w_bb < x_min or x0 > grid_x_max or y0 + h_bb < y_min or y0 > grid_y_max:
+        return 0, 0, 0, 0, empty
+
+    cs = max(0, int(math.floor((x0 - x_min) / res)))
+    rs = max(0, int(math.floor((y0 - y_min) / res)))
+    ce = min(cols, int(math.floor((x0 + w_bb - x_min) / res)) + 1)
+    re = min(rows, int(math.floor((y0 + h_bb - y_min) / res)) + 1)
+    if cs >= ce or rs >= re:
+        return 0, 0, 0, 0, empty
+
+    x = x_min + (np.arange(cs, ce, dtype=np.float64) + 0.5) * res
+    y = y_min + (np.arange(rs, re, dtype=np.float64) + 0.5) * res
+    xx, yy = np.meshgrid(x, y)
+
+    angle = _pad_orientation_radians(pad)
+    cx, cy = _pad_shape_center_mm(pad, layer_id=layer_id, angle_rad=angle)
+
+    try:
+        size = pad.GetSize()
+        width_mm = max(float(size.x) * 1e-6, 0.0)
+        height_mm = max(float(size.y) * 1e-6, 0.0)
+        shape = pad.GetShape()
+        has_shape = True
+    except Exception:
+        has_shape = False
+        width_mm = max(w_bb, 0.0)
+        height_mm = max(h_bb, 0.0)
+        shape = None
+
+    if has_shape:
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        half_w = 0.5 * width_mm
+        half_h = 0.5 * height_mm
+        mask_2d = np.asarray(
+            _evaluate_pad_shape_mask(
+                pad, shape, xx, yy, cx, cy, cos_a, sin_a,
+                half_w, half_h, x0, y0, w_bb, h_bb, layer_id=layer_id,
+            ),
+            dtype=bool,
+        )
+        if area_mask is not None:
+            mask_2d &= area_mask[rs:re, cs:ce]
+
+        if not np.any(mask_2d):
+            eff_half_w = max(half_w, 0.5 * res)
+            eff_half_h = max(half_h, 0.5 * res)
+            if eff_half_w > half_w or eff_half_h > half_h:
+                mask_2d = np.asarray(
+                    _evaluate_pad_shape_mask(
+                        pad, shape, xx, yy, cx, cy, cos_a, sin_a,
+                        eff_half_w, eff_half_h, x0, y0, w_bb, h_bb, layer_id=layer_id,
+                    ),
+                    dtype=bool,
+                )
+                if area_mask is not None:
+                    mask_2d &= area_mask[rs:re, cs:ce]
     else:
-        for layer_idx in layer_indices:
-            _state_fill_box(state, layer_idx, bbox)
+        eps = 1e-9
+        mask_2d = (
+            (xx >= x0 - eps)
+            & (xx <= x0 + w_bb + eps)
+            & (yy >= y0 - eps)
+            & (yy <= y0 + h_bb + eps)
+        )
+        if area_mask is not None:
+            mask_2d &= area_mask[rs:re, cs:ce]
+
+    if not np.any(mask_2d):
+        c_c = min(cols - 1, max(0, int(math.floor((cx - x_min) / res))))
+        r_c = min(rows - 1, max(0, int(math.floor((cy - y_min) / res))))
+        if area_mask is None or bool(area_mask[r_c, c_c]):
+            if r_c < rs or r_c >= re or c_c < cs or c_c >= ce:
+                new_rs = min(rs, r_c)
+                new_re = max(re, r_c + 1)
+                new_cs = min(cs, c_c)
+                new_ce = max(ce, c_c + 1)
+                new_mask = np.zeros((new_re - new_rs, new_ce - new_cs), dtype=bool)
+                new_mask[rs - new_rs:re - new_rs, cs - new_cs:ce - new_cs] = mask_2d
+                rs, re, cs, ce, mask_2d = new_rs, new_re, new_cs, new_ce, new_mask
+            mask_2d[r_c - rs, c_c - cs] = True
+
+    return rs, re, cs, ce, mask_2d
+
+
+def get_pad_power_indices(
+    pad: Any,
+    target_idx: int,
+    rows: int,
+    cols: int,
+    x_min: float,
+    y_min: float,
+    res: float,
+    layer_id: Optional[int] = None,
+    area_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Return flattened 1D int64 node indices matching ``get_pad_grid_mask``."""
+    rs, re, cs, ce, mask_2d = get_pad_grid_mask(
+        pad, rows, cols, x_min, y_min, res, layer_id=layer_id, area_mask=area_mask
+    )
+    if rs >= re or cs >= ce or not np.any(mask_2d):
+        return np.empty(0, dtype=np.int64)
+    local_r, local_c = np.nonzero(mask_2d)
+    base = int(target_idx) * int(rows) * int(cols)
+    return (base + (rs + local_r) * int(cols) + (cs + local_c)).astype(np.int64, copy=False)
+
+
+def _state_fill_pad(state, layer_indices, pad, copper_ids=None):
+    """Rasterize KiCad pad shapes onto ``state.copper_mask`` via ``get_pad_grid_mask``."""
+    if not layer_indices:
+        return
+    if copper_ids is None:
+        rs, re, cs, ce, mask_2d = get_pad_grid_mask(
+            pad,
+            state.rows,
+            state.cols,
+            state.x_min,
+            state.y_min,
+            state.res,
+            layer_id=None,
+            area_mask=state.area_mask,
+        )
+        if rs < re and cs < ce and np.any(mask_2d):
+            for layer_idx in layer_indices:
+                state.copper_mask[layer_idx, rs:re, cs:ce] |= mask_2d
         return
 
     for layer_idx in layer_indices:
-        _state_apply_shape(state, layer_idx, bbox, predicate)
+        lid = copper_ids[layer_idx] if 0 <= layer_idx < len(copper_ids) else None
+        rs, re, cs, ce, mask_2d = get_pad_grid_mask(
+            pad,
+            state.rows,
+            state.cols,
+            state.x_min,
+            state.y_min,
+            state.res,
+            layer_id=lid,
+            area_mask=state.area_mask,
+        )
+        if rs < re and cs < ce and np.any(mask_2d):
+            state.copper_mask[layer_idx, rs:re, cs:ce] |= mask_2d
 
 
 def _state_fill_box_all_layers(state, bbox):
@@ -1241,10 +1618,11 @@ def build_geometry_state(
                 force=(fp_idx == 0),
             )
             for pad in fp.Pads():
-                bbox = pad.GetBoundingBox()
+                pad_layers = get_pad_copper_layer_indices(pad, copper_ids, lid_to_idx)
+                if pad_layers:
+                    _state_fill_pad(state, pad_layers, pad, copper_ids=copper_ids)
                 if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
-                    pad_layers = list(range(num_layers))
-                    _state_fill_pad(state, pad_layers, pad)
+                    bbox = pad.GetBoundingBox()
                     try:
                         size = pad.GetSize()
                         diameter_mm = min(float(size.x), float(size.y)) * 1e-6
@@ -1254,10 +1632,6 @@ def build_geometry_state(
                         )
                     except Exception:
                         _state_fill_via(state, bbox, via_factor)
-                else:
-                    layer_idx = lid_to_idx.get(pad.GetLayer())
-                    if layer_idx is not None:
-                        _state_fill_pad(state, [layer_idx], pad)
         completed += total_fps
 
         for zone_idx, zone in enumerate(zones):
@@ -1431,7 +1805,7 @@ def build_pad_distance_mask(pads_list, rows, cols, x_min, y_min, res, radius_mm)
     return mask
 
 
-def get_pad_pixels(pad, rows, cols, x_min, y_min, res):
+def get_pad_pixels(pad, rows, cols, x_min, y_min, res, layer_id=None):
     """
     Get grid pixel coordinates covered by a pad.
 
@@ -1449,24 +1823,21 @@ def get_pad_pixels(pad, rows, cols, x_min, y_min, res):
         Y coordinate of grid origin in mm.
     res : float
         Grid resolution in mm.
+    layer_id : int, optional
+        Optional KiCad layer ID for ``ShapePos`` / ``HitTest``.
 
     Returns
     -------
     list of tuple
         List of (row, col) tuples for pixels covered by the pad.
     """
-    bb = pad.GetBoundingBox()
-    x0, y0 = bb.GetX() * 1e-6, bb.GetY() * 1e-6
-    w, h = bb.GetWidth() * 1e-6, bb.GetHeight() * 1e-6
-    cs = max(0, int((x0 - x_min) / res))
-    rs = max(0, int((y0 - y_min) / res))
-    ce = min(cols, int((x0 + w - x_min) / res) + 1)
-    re = min(rows, int((y0 + h - y_min) / res) + 1)
-    pixels = []
-    for r in range(rs, re):
-        for c in range(cs, ce):
-            pixels.append((r, c))
-    return pixels
+    rs, re, cs, ce, mask_2d = get_pad_grid_mask(
+        pad, rows, cols, x_min, y_min, res, layer_id=layer_id
+    )
+    if rs >= re or cs >= ce or not np.any(mask_2d):
+        return []
+    local_r, local_c = np.nonzero(mask_2d)
+    return [(int(rs + r), int(cs + c)) for r, c in zip(local_r, local_c)]
 
 
 def create_multilayer_maps(

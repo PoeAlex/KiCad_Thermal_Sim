@@ -47,7 +47,14 @@ from .electrical_solver import (
     net_key_from_values,
     solve_electrical_heating,
 )
-from .geometry_mapper import build_geometry_state, get_pad_pixels
+from .geometry_mapper import (
+    build_geometry_state,
+    get_pad_copper_layer_indices,
+    get_pad_grid_mask,
+    get_pad_pixels,
+    get_pad_power_indices,
+    get_pad_primary_layer_id,
+)
 from .native_core import NATIVE_CORE, clear_native_scratch
 from .pwl_parser import parse_pwl_file, validate_pwl
 from .stackup_parser import parse_stackup_from_board_file
@@ -81,7 +88,7 @@ from .workflow import (
 )
 
 SCHEMA_VERSION = "1.0"
-PLUGIN_VERSION = "0.4.4"
+PLUGIN_VERSION = "0.4.5"
 
 GRID_DETAIL_PRESETS = {
     "fast": (500_000, 425_000),
@@ -414,12 +421,13 @@ def _pad_net_code(pad: Any) -> int:
             return 0
 
 
-def _pad_layer_name(board: Any, pad: Any) -> str:
+def _pad_layer_name(board: Any, pad: Any, copper_ids: Optional[List[int]] = None) -> str:
     """Return the layer name for a KiCad pad."""
+    lid = get_pad_primary_layer_id(pad, copper_ids or None)
     try:
-        return str(board.GetLayerName(pad.GetLayer()))
+        return str(board.GetLayerName(lid))
     except Exception:
-        return str(pad.GetLayer())
+        return str(lid)
 
 
 def _pad_dimensions_mm(pad: Any) -> Tuple[float, float]:
@@ -518,7 +526,12 @@ def _get_capabilities_dict() -> Dict[str, Any]:
     }
 
 
-def _footprint_meta(board: Any, fp: Any, pads: List[Any]) -> Tuple[str, str, str, str, float, float]:
+def _footprint_meta(
+    board: Any,
+    fp: Any,
+    pads: List[Any],
+    copper_ids: Optional[List[int]] = None,
+) -> Tuple[str, str, str, str, float, float]:
     """Extract ``(ref, value, footprint_name, layer_name, x_mm, y_mm)`` safely."""
     try:
         ref = str(fp.GetReference() or "")
@@ -545,7 +558,7 @@ def _footprint_meta(board: Any, fp: Any, pads: List[Any]) -> Tuple[str, str, str
         except Exception:
             layer_name = ""
     if not layer_name and pads:
-        layer_name = _pad_layer_name(board, pads[0])
+        layer_name = _pad_layer_name(board, pads[0], copper_ids=copper_ids)
     if not layer_name:
         layer_name = "F.Cu"
 
@@ -607,7 +620,9 @@ def inspect_board(board_or_path: Any) -> Dict[str, Any]:
 
     for fp in raw_fps:
         raw_pads = list(fp.Pads())
-        ref, value, fp_name, fp_layer, fp_x, fp_y = _footprint_meta(board, fp, raw_pads)
+        ref, value, fp_name, fp_layer, fp_x, fp_y = _footprint_meta(
+            board, fp, raw_pads, copper_ids=copper_ids
+        )
 
         pad_records: List[Dict[str, Any]] = []
         max_area = 0.0
@@ -620,7 +635,7 @@ def inspect_board(board_or_path: Any) -> Dict[str, Any]:
             net = _pad_net_name(pad)
             if net:
                 net_counts[net] = net_counts.get(net, 0) + 1
-            pad_layer = _pad_layer_name(board, pad)
+            pad_layer = _pad_layer_name(board, pad, copper_ids=copper_ids)
             try:
                 pos = pad.GetPosition()
                 px, py = float(pos.x) * 1e-6, float(pos.y) * 1e-6
@@ -981,7 +996,7 @@ def normalize_job_config(
     return _json_clean(normalized)
 
 
-def _build_pad_index(board: Any) -> Dict[str, Any]:
+def _build_pad_index(board: Any, copper_ids: Optional[List[int]] = None) -> Dict[str, Any]:
     """Build exact and case-insensitive lookup maps over all pads on ``board``."""
     exact_ref_pad: Dict[Tuple[str, str], Tuple[Dict[str, Any], Any]] = {}
     ci_ref_pad: Dict[Tuple[str, str], Tuple[Dict[str, Any], Any]] = {}
@@ -1010,7 +1025,7 @@ def _build_pad_index(board: Any) -> Dict[str, Any]:
                 px, py = 0, 0
             net_name = _pad_net_name(pad)
             net_code = _pad_net_code(pad)
-            layer_name = _pad_layer_name(board, pad)
+            layer_name = _pad_layer_name(board, pad, copper_ids=copper_ids)
             pad_key = f"{ref}:{num}:{net_code}:{px}:{py}"
             legacy_base = f"{ref}-{num}"
             legacy_full = f"{legacy_base} [{net_name}]" if net_name else legacy_base
@@ -1453,7 +1468,7 @@ def _validate_with_context(
                 "hint": "Set refill_zones=True (or pass --refill-zones) or refill zones in KiCad.",
             })
 
-    pad_index = _build_pad_index(board)
+    pad_index = _build_pad_index(board, copper_ids=copper_ids)
 
     resolved_power_pads: List[Dict[str, Any]] = []
     resolved_power_objs: List[Any] = []
@@ -1616,7 +1631,7 @@ def _validate_with_context(
         {
             "name": item.name,
             "net": item.net_name,
-            "layer": _pad_layer_name(board, item.pad),
+            "layer": _pad_layer_name(board, item.pad, copper_ids=copper_ids),
             "current_a": float(item.current_a),
         }
         for item in terminals
@@ -1712,6 +1727,25 @@ def _bbox_to_power_indices(
 
 
 def _pad_target_layer_index(board: Any, copper_ids: List[int], pad: Any, lid_to_idx: Dict[int, int]) -> int:
+    copper_indices = get_pad_copper_layer_indices(pad, copper_ids, lid_to_idx=lid_to_idx)
+    if len(copper_indices) == 1:
+        return copper_indices[0]
+    if len(copper_indices) > 1:
+        parent = None
+        if hasattr(pad, "GetParent"):
+            try:
+                parent = pad.GetParent()
+            except Exception:
+                parent = None
+        if parent is not None and hasattr(parent, "GetLayer"):
+            try:
+                parent_idx = lid_to_idx.get(int(parent.GetLayer()))
+                if parent_idx in copper_indices:
+                    return parent_idx
+            except Exception:
+                pass
+        return copper_indices[0]
+
     pad_lid = pad.GetLayer()
     target_idx = lid_to_idx.get(pad_lid)
     if target_idx is not None:
@@ -1732,21 +1766,23 @@ def _build_sparse_pad_contributions(
     x_min: float,
     y_min: float,
     res: float,
+    area_mask: Optional[np.ndarray] = None,
 ) -> List[_SparsePadContribution]:
-    rc = rows * cols
     lid_to_idx = {lid: idx for idx, lid in enumerate(copper_ids)}
     contributions: List[_SparsePadContribution] = []
     for pad in pads_list:
         target_idx = _pad_target_layer_index(board, copper_ids, pad, lid_to_idx)
-        indices = _bbox_to_power_indices(
-            pad.GetBoundingBox(),
+        target_lid = copper_ids[target_idx] if 0 <= target_idx < len(copper_ids) else None
+        indices = get_pad_power_indices(
+            pad,
             target_idx=target_idx,
             rows=rows,
             cols=cols,
             x_min=x_min,
             y_min=y_min,
             res=res,
-            rc=rc,
+            layer_id=target_lid,
+            area_mask=area_mask,
         )
         if indices.size:
             weights = np.full(indices.shape, 1.0 / float(indices.size), dtype=np.float64)
@@ -1919,13 +1955,17 @@ def _extract_components_temperatures(
     layer_count, rows, cols = T.shape
     name_to_idx = {str(name): idx for idx, name in enumerate(layer_names)}
     lid_to_idx: Dict[int, int] = {}
-    for idx, name in enumerate(layer_names):
+    copper_ids: List[int] = []
+    for idx, name in enumerate(layer_names[:layer_count]):
+        lid = -1
         try:
             lid = int(board.GetLayerID(name))
-            if lid >= 0:
-                lid_to_idx[lid] = idx
         except Exception:
-            continue
+            lid = -1
+        if lid >= 0:
+            lid_to_idx[lid] = idx
+        copper_ids.append(lid)
+    valid_copper_ids = [lid for lid in copper_ids if lid >= 0]
 
     def _layer_idx_from_name(lname: str, fallback: int = 0) -> int:
         if lname in name_to_idx:
@@ -1941,7 +1981,9 @@ def _extract_components_temperatures(
 
     for fp in fps:
         raw_pads = list(fp.Pads())
-        ref, value, fp_name, fp_layer, fp_x, fp_y = _footprint_meta(board, fp, raw_pads)
+        ref, value, fp_name, fp_layer, fp_x, fp_y = _footprint_meta(
+            board, fp, raw_pads, copper_ids=valid_copper_ids or None
+        )
         fp_layer_idx = _layer_idx_from_name(fp_layer, 0)
         if hasattr(fp, "GetLayer"):
             try:
@@ -1965,33 +2007,55 @@ def _extract_components_temperatures(
                 px, py = fp_x, fp_y
             pad_points.append((f"{ref}.{pnum}" if ref else pnum, px, py))
 
-            try:
-                p_lid = int(pad.GetLayer())
-                p_idx = lid_to_idx.get(p_lid)
-            except Exception:
-                p_idx = None
-            if p_idx is None:
-                p_idx = _layer_idx_from_name(_pad_layer_name(board, pad), fp_layer_idx)
+            p_indices = (
+                get_pad_copper_layer_indices(pad, copper_ids, lid_to_idx=lid_to_idx)
+                if valid_copper_ids
+                else []
+            )
+            if not p_indices:
+                try:
+                    p_lid = int(pad.GetLayer())
+                    p_idx = lid_to_idx.get(p_lid)
+                except Exception:
+                    p_idx = None
+                if p_idx is None:
+                    p_idx = _layer_idx_from_name(
+                        _pad_layer_name(board, pad, copper_ids=valid_copper_ids or None),
+                        fp_layer_idx,
+                    )
+                p_indices = [p_idx]
 
-            sampled = None
-            try:
-                bb = pad.GetBoundingBox()
-                x0 = float(bb.GetX()) * 1e-6
-                y0 = float(bb.GetY()) * 1e-6
-                w = float(bb.GetWidth()) * 1e-6
-                h = float(bb.GetHeight()) * 1e-6
-                cs = max(0, min(cols - 1, int((x0 - x_min) / res)))
-                rs = max(0, min(rows - 1, int((y0 - y_min) / res)))
-                ce = max(cs + 1, min(cols, int((x0 + w - x_min) / res) + 1))
-                re_ = max(rs + 1, min(rows, int((y0 + h - y_min) / res) + 1))
-                sampled = T[p_idx, rs:re_, cs:ce].ravel()
-            except Exception:
-                sampled = None
+            sampled_parts: List[np.ndarray] = []
+            for p_idx in p_indices:
+                if not (0 <= p_idx < layer_count):
+                    continue
+                target_lid = (
+                    copper_ids[p_idx]
+                    if 0 <= p_idx < len(copper_ids) and copper_ids[p_idx] >= 0
+                    else None
+                )
+                try:
+                    rs, re_, cs, ce, local_mask = get_pad_grid_mask(
+                        pad, rows, cols, x_min, y_min, res, layer_id=target_lid
+                    )
+                    if rs < re_ and cs < ce and np.any(local_mask):
+                        vals = T[p_idx, rs:re_, cs:ce][local_mask]
+                        if vals.size:
+                            sampled_parts.append(vals.ravel())
+                except Exception:
+                    continue
 
-            if sampled is None or sampled.size == 0:
+            if sampled_parts:
+                sampled = np.concatenate(sampled_parts)
+            else:
+                fallback_idx = (
+                    p_indices[0]
+                    if (p_indices and 0 <= p_indices[0] < layer_count)
+                    else fp_layer_idx
+                )
                 ci = max(0, min(cols - 1, int((px - x_min) / res)))
                 ri = max(0, min(rows - 1, int((py - y_min) / res)))
-                sampled = np.asarray([T[p_idx, ri, ci]], dtype=np.float64)
+                sampled = np.asarray([T[fallback_idx, ri, ci]], dtype=np.float64)
 
             pad_vals_list.append(sampled)
             pad_max_vals.append(float(np.max(sampled)))
@@ -2613,6 +2677,7 @@ def run_headless_simulation(
         x_min=x_min,
         y_min=y_min,
         res=res,
+        area_mask=getattr(geometry_state, "area_mask", None),
     )
     has_pwl_sources = any(stype == "pwl" for stype, _ in pad_sources)
     Q = None

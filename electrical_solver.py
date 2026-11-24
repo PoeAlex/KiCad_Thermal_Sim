@@ -20,6 +20,11 @@ from .geometry_mapper import (
     GeometryCancelledError,
     _ProgressEmitter,
     _fill_zone_mask_polygons,
+    _pad_orientation_radians,
+    _pad_shape_center_mm,
+    get_pad_copper_layer_indices,
+    get_pad_grid_mask,
+    get_pad_primary_layer_id,
 )
 
 _ELECTRICAL_ITERATIVE_NODE_THRESHOLD = 150_000
@@ -802,8 +807,54 @@ def _build_relevant_net_masks(
             if key not in net_masks:
                 continue
             bbox = pad.GetBoundingBox()
+            pad_layer_indices = get_pad_copper_layer_indices(pad, config.copper_ids, lid_to_idx)
+            has_pad_shape = hasattr(pad, "GetSize") and hasattr(pad, "GetShape")
             if _is_pth_pad(pad):
-                mapped_cells = fill_for_obj(pad, config.copper_ids, bbox=bbox, as_via=True)
+                target_indices = (
+                    pad_layer_indices
+                    if pad_layer_indices
+                    else list(range(len(config.copper_ids)))
+                )
+                if has_pad_shape:
+                    mapped_cells = 0
+                    first_lid = (
+                        config.copper_ids[target_indices[0]]
+                        if target_indices and 0 <= target_indices[0] < len(config.copper_ids)
+                        else None
+                    )
+                    rs, re, cs, ce, via_pad_mask = get_pad_grid_mask(
+                        pad,
+                        config.rows,
+                        config.cols,
+                        config.x_min,
+                        config.y_min,
+                        config.res,
+                        layer_id=first_lid,
+                    )
+                    if rs < re and cs < ce and np.any(via_pad_mask):
+                        via_slice = via_masks[key][rs:re, cs:ce]
+                        before_via = int(np.count_nonzero(via_slice))
+                        via_slice |= via_pad_mask
+                        mapped_cells += int(np.count_nonzero(via_slice)) - before_via
+                    for layer_idx in target_indices:
+                        lid = config.copper_ids[layer_idx]
+                        rs_l, re_l, cs_l, ce_l, pad_mask = get_pad_grid_mask(
+                            pad,
+                            config.rows,
+                            config.cols,
+                            config.x_min,
+                            config.y_min,
+                            config.res,
+                            layer_id=lid,
+                        )
+                        if rs_l < re_l and cs_l < ce_l and np.any(pad_mask):
+                            layer_slice = net_masks[key][layer_idx, rs_l:re_l, cs_l:ce_l]
+                            before = int(np.count_nonzero(layer_slice))
+                            layer_slice |= pad_mask
+                            mapped_cells += int(np.count_nonzero(layer_slice)) - before
+                else:
+                    target_lids = [config.copper_ids[idx] for idx in target_indices]
+                    mapped_cells = fill_for_obj(pad, target_lids, bbox=bbox, as_via=True)
                 record_primitive(
                     key, "Pad", "All copper", bbox,
                     mapped_cells=max(0, mapped_cells)
@@ -813,10 +864,27 @@ def _build_relevant_net_masks(
                     mapped_cells=max(0, mapped_cells)
                 )
             else:
-                layer_id = pad.GetLayer()
-                layer_idx = lid_to_idx.get(layer_id)
-                if layer_idx is not None:
-                    mapped_cells = fill_for_obj(pad, [layer_id], bbox=bbox)
+                for layer_idx in pad_layer_indices:
+                    layer_id = config.copper_ids[layer_idx]
+                    if has_pad_shape:
+                        rs, re, cs, ce, pad_mask = get_pad_grid_mask(
+                            pad,
+                            config.rows,
+                            config.cols,
+                            config.x_min,
+                            config.y_min,
+                            config.res,
+                            layer_id=layer_id,
+                        )
+                        if rs < re and cs < ce and np.any(pad_mask):
+                            layer_slice = net_masks[key][layer_idx, rs:re, cs:ce]
+                            before = int(np.count_nonzero(layer_slice))
+                            layer_slice |= pad_mask
+                            mapped_cells = int(np.count_nonzero(layer_slice)) - before
+                        else:
+                            mapped_cells = 0
+                    else:
+                        mapped_cells = fill_for_obj(pad, [layer_id], bbox=bbox)
                     record_primitive(
                         key, "Pad", _layer_label(layer_id, config), bbox,
                         mapped_cells=max(0, mapped_cells)
@@ -1004,23 +1072,39 @@ def _build_net_edges(
 
 def _pad_node_indices(pad: Any, node_ids: np.ndarray, config: ElectricalConfig) -> np.ndarray:
     """Return electrical node IDs under a pad."""
-    layers = []
     lid_to_idx = {lid: idx for idx, lid in enumerate(config.copper_ids)}
-    if _is_pth_pad(pad):
-        layers = list(range(len(config.copper_ids)))
-    else:
-        layer_idx = lid_to_idx.get(pad.GetLayer())
-        if layer_idx is not None:
-            layers = [layer_idx]
-    rs, re, cs, ce = _bbox_indices(pad.GetBoundingBox(), config)
-    if rs >= re or cs >= ce or not layers:
+    layers = get_pad_copper_layer_indices(pad, config.copper_ids, lid_to_idx)
+    if not layers:
         return np.empty(0, dtype=np.int64)
+
     nodes = []
-    for layer_idx in layers:
-        sub = node_ids[layer_idx, rs:re, cs:ce]
-        valid = sub[sub >= 0]
-        if valid.size:
-            nodes.append(valid.reshape(-1))
+    if hasattr(pad, "GetSize") and hasattr(pad, "GetShape"):
+        for layer_idx in layers:
+            lid = config.copper_ids[layer_idx]
+            rs, re, cs, ce, mask_2d = get_pad_grid_mask(
+                pad,
+                config.rows,
+                config.cols,
+                config.x_min,
+                config.y_min,
+                config.res,
+                layer_id=lid,
+            )
+            if rs < re and cs < ce and np.any(mask_2d):
+                sub = node_ids[layer_idx, rs:re, cs:ce][mask_2d]
+                valid = sub[sub >= 0]
+                if valid.size:
+                    nodes.append(valid.reshape(-1))
+    else:
+        rs, re, cs, ce = _bbox_indices(pad.GetBoundingBox(), config)
+        if rs >= re or cs >= ce:
+            return np.empty(0, dtype=np.int64)
+        for layer_idx in layers:
+            sub = node_ids[layer_idx, rs:re, cs:ce]
+            valid = sub[sub >= 0]
+            if valid.size:
+                nodes.append(valid.reshape(-1))
+
     if not nodes:
         return np.empty(0, dtype=np.int64)
     return np.unique(np.concatenate(nodes))
@@ -1029,8 +1113,8 @@ def _pad_node_indices(pad: Any, node_ids: np.ndarray, config: ElectricalConfig) 
 def _pad_center_mm(pad: Any) -> Tuple[float, float]:
     """Return the pad center in millimeters."""
     try:
-        pos = pad.GetPosition()
-        return float(pos.x) * 1e-6, float(pos.y) * 1e-6
+        angle = _pad_orientation_radians(pad)
+        return _pad_shape_center_mm(pad, angle_rad=angle)
     except Exception:
         bbox = pad.GetBoundingBox()
         x, y, w, h = _bbox_mm(bbox)
@@ -1100,7 +1184,7 @@ def _pad_layer_label(pad: Any, config: ElectricalConfig) -> str:
     if _is_pth_pad(pad):
         return "All copper (PTH)"
     try:
-        return _layer_label(pad.GetLayer(), config)
+        return _layer_label(get_pad_primary_layer_id(pad, config.copper_ids), config)
     except Exception:
         return "n/a"
 

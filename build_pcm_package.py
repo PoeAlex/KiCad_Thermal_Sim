@@ -17,7 +17,7 @@ import os
 import sys
 import zipfile
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 
 IDENTIFIER = "com.github.poealex.kicad-thermal-sim"
 

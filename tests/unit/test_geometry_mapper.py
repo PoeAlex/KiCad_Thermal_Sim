@@ -4,6 +4,7 @@ Unit tests for geometry_mapper module.
 This module tests the PCB geometry to thermal grid mapping functions.
 """
 
+import math
 import pytest
 import numpy as np
 
@@ -18,14 +19,18 @@ from ThermalSim.geometry_mapper import (
     _fill_zone_mask_polygons,
     _scanline_fill_polygon,
     build_pad_distance_mask,
+    get_pad_copper_layer_indices,
+    get_pad_grid_mask,
     get_pad_pixels,
+    get_pad_power_indices,
+    get_pad_primary_layer_id,
     create_multilayer_maps,
 )
 
 from tests.mocks.pcbnew_mock import (
-    MockBoard, MockPad, MockZone, MockFootprint, MockTrack, MockVia,
+    MockBoard, MockLayerSet, MockPad, MockZone, MockFootprint, MockTrack, MockVia,
     VECTOR2I, EDA_RECT, F_Cu, B_Cu, In1_Cu, In2_Cu,
-    PAD_ATTRIB_PTH, PAD_ATTRIB_SMD, Eco1_User,
+    PAD_ATTRIB_NPTH, PAD_ATTRIB_PTH, PAD_ATTRIB_SMD, Eco1_User,
     MockDrawing,
 )
 
@@ -1014,3 +1019,401 @@ class TestFastZoneRasterizationAndProgress:
                 pads_list=[pad],
                 cancel_check=lambda: True,
             )
+
+
+class _ShapedMockPad(MockPad):
+    """MockPad with KiCad-like shape, orientation, LayerSet, and offset APIs."""
+
+    def __init__(
+        self,
+        *,
+        position,
+        size,
+        shape,
+        layer=F_Cu,
+        layer_set=None,
+        attribute=PAD_ATTRIB_SMD,
+        orientation_deg=0.0,
+        offset=None,
+        shape_pos=None,
+        roundrect_ratio=0.25,
+        chamfer_ratio=0.25,
+        chamfer_positions=0,
+        parent=None,
+        hit_fn=None,
+        bbox=None,
+    ):
+        self._size = size
+        self._shape = shape
+        self._layer_set = layer_set
+        self._orientation_deg = float(orientation_deg)
+        self._offset = offset
+        self._shape_pos = shape_pos
+        self._roundrect_ratio = float(roundrect_ratio)
+        self._chamfer_ratio = float(chamfer_ratio)
+        self._chamfer_positions = int(chamfer_positions)
+        self._parent = parent
+        self._hit_fn = hit_fn
+
+        if bbox is None:
+            cx = position.x * 1e-6
+            cy = position.y * 1e-6
+            if offset is not None:
+                a = math.radians(self._orientation_deg)
+                ox, oy = offset.x * 1e-6, offset.y * 1e-6
+                cx += ox * math.cos(a) + oy * math.sin(a)
+                cy += -ox * math.sin(a) + oy * math.cos(a)
+            elif shape_pos is not None:
+                cx, cy = shape_pos.x * 1e-6, shape_pos.y * 1e-6
+            w = size.x * 1e-6
+            h = size.y * 1e-6
+            a = math.radians(self._orientation_deg)
+            bb_w = abs(w * math.cos(a)) + abs(h * math.sin(a))
+            bb_h = abs(w * math.sin(a)) + abs(h * math.cos(a))
+            bbox = EDA_RECT(
+                int(round((cx - 0.5 * bb_w) * 1e6)),
+                int(round((cy - 0.5 * bb_h) * 1e6)),
+                int(round(bb_w * 1e6)),
+                int(round(bb_h * 1e6)),
+            )
+
+        super().__init__(
+            position=position,
+            layer=layer,
+            attribute=attribute,
+            bbox=bbox,
+        )
+
+    def GetSize(self):
+        return self._size
+
+    def GetShape(self):
+        return self._shape
+
+    def GetOrientationDegrees(self):
+        return self._orientation_deg
+
+    def GetRoundRectRadiusRatio(self):
+        return self._roundrect_ratio
+
+    def GetChamferRectRatio(self):
+        return self._chamfer_ratio
+
+    def GetChamferPositions(self):
+        return self._chamfer_positions
+
+    def GetLayerSet(self):
+        if self._layer_set is None:
+            raise AttributeError("no layer_set")
+        return self._layer_set
+
+    def GetOffset(self):
+        if self._offset is None:
+            return VECTOR2I(0, 0)
+        return self._offset
+
+    def ShapePos(self, layer_id=None):
+        if self._shape_pos is not None:
+            return self._shape_pos
+        raise TypeError("no ShapePos")
+
+    def GetParent(self):
+        return self._parent
+
+    def HitTest(self, pos, accuracy=0, layer_id=None):
+        if self._hit_fn is not None:
+            return self._hit_fn(pos, accuracy, layer_id)
+        raise AttributeError("no hit_fn")
+
+
+class _KiCad10LayerSet(MockLayerSet):
+    """LayerSet supporting both Contains() and CuStack()."""
+
+    def CuStack(self):
+        return sorted(self._layers)
+
+
+class TestPadGeometryAndAlignment:
+    """Tests for v0.4.5 pad geometry, LayerSet, rotation, offset, and alignment."""
+
+    @pytest.fixture(autouse=True)
+    def _ensure_pad_shape_consts(self, monkeypatch):
+        import pcbnew
+        import ThermalSim.geometry_mapper as gm
+
+        for target_mod in (pcbnew, gm.pcbnew):
+            for idx, name in enumerate(
+                [
+                    "PAD_SHAPE_CIRCLE",
+                    "PAD_SHAPE_RECT",
+                    "PAD_SHAPE_OVAL",
+                    "PAD_SHAPE_ROUNDRECT",
+                    "PAD_SHAPE_CHAMFERED_RECT",
+                    "PAD_SHAPE_CUSTOM",
+                ]
+            ):
+                if not hasattr(target_mod, name):
+                    monkeypatch.setattr(target_mod, name, idx, raising=False)
+
+    def test_rotated_pad_orientation_kicad_y_down_ccw(self):
+        """Rotated 30 deg and 45 deg pads must follow KiCad +Y-down CCW convention."""
+        import pcbnew
+
+        # 6mm x 1mm rect centered at (10, 10), rotated +30 deg CCW (+Y down).
+        # At dx=+2.0, dy=-1.15 -> (12.0, 8.85) lies along the rotated +X axis (INSIDE).
+        # At dx=+2.0, dy=+1.15 -> (12.0, 11.15) is on the mirrored side (OUTSIDE).
+        pad_30 = _ShapedMockPad(
+            position=VECTOR2I(10_000_000, 10_000_000),
+            size=VECTOR2I(6_000_000, 1_000_000),
+            shape=pcbnew.PAD_SHAPE_RECT,
+            orientation_deg=30.0,
+            layer=F_Cu,
+        )
+        board = MockBoard(
+            footprints=[MockFootprint("U1", [pad_30])],
+            layer_names={F_Cu: "F.Cu"},
+        )
+        res = 0.25
+        rows = cols = 80
+        state = build_geometry_state(
+            board=board,
+            copper_ids=[F_Cu],
+            rows=rows,
+            cols=cols,
+            x_min=0.0,
+            y_min=0.0,
+            res=res,
+            settings={"ignore_traces": True, "ignore_polygons": True, "use_heatsink": False},
+            via_factor=1300.0,
+            pads_list=[pad_30],
+        )
+
+        r_in = int((8.85 - 0.0) / res)
+        c_in = int((12.0 - 0.0) / res)
+        r_out = int((11.15 - 0.0) / res)
+        c_out = int((12.0 - 0.0) / res)
+        assert state.copper_mask[0, r_in, c_in]
+        assert not state.copper_mask[0, r_out, c_out]
+
+        power_idx = get_pad_power_indices(pad_30, 0, rows, cols, 0.0, 0.0, res)
+        assert power_idx.size > 0
+        np.testing.assert_array_equal(
+            np.sort(power_idx), np.flatnonzero(state.copper_mask[0])
+        )
+
+        # 45 deg rect: (+2, -2) is along the +45 CCW axis (inside), (+2, +2) is outside.
+        pad_45 = _ShapedMockPad(
+            position=VECTOR2I(10_000_000, 10_000_000),
+            size=VECTOR2I(7_000_000, 1_000_000),
+            shape=pcbnew.PAD_SHAPE_RECT,
+            orientation_deg=45.0,
+            layer=F_Cu,
+        )
+        rs, re, cs, ce, mask_45 = get_pad_grid_mask(pad_45, rows, cols, 0.0, 0.0, res)
+        full_45 = np.zeros((rows, cols), dtype=bool)
+        full_45[rs:re, cs:ce] = mask_45
+        assert full_45[int(8.0 / res), int(12.0 / res)]
+        assert not full_45[int(12.0 / res), int(12.0 / res)]
+
+    def test_b_cu_smd_pad_uses_layerset_when_getlayer_returns_zero(self):
+        """KiCad 10 B.Cu SMD pad with GetLayer()==0 must map exclusively to B.Cu."""
+        import pcbnew
+
+        b_cu_pad = _ShapedMockPad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            size=VECTOR2I(2_000_000, 2_000_000),
+            shape=pcbnew.PAD_SHAPE_RECT,
+            layer=F_Cu,  # Simulates KiCad 10 returning 0 (F.Cu) on B.Cu SMD pad
+            layer_set=_KiCad10LayerSet([B_Cu]),
+            attribute=PAD_ATTRIB_SMD,
+        )
+        npth_pad = _ShapedMockPad(
+            position=VECTOR2I(15_000_000, 5_000_000),
+            size=VECTOR2I(2_000_000, 2_000_000),
+            shape=pcbnew.PAD_SHAPE_CIRCLE,
+            layer=F_Cu,
+            layer_set=_KiCad10LayerSet([]),
+            attribute=PAD_ATTRIB_NPTH,
+        )
+        copper_ids = [F_Cu, B_Cu]
+        assert get_pad_copper_layer_indices(b_cu_pad, copper_ids) == [1]
+        assert get_pad_primary_layer_id(b_cu_pad, copper_ids) == B_Cu
+        assert get_pad_copper_layer_indices(npth_pad, copper_ids) == []
+
+        board = MockBoard(
+            footprints=[MockFootprint("U1", [b_cu_pad, npth_pad])],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+        )
+        state = build_geometry_state(
+            board=board,
+            copper_ids=copper_ids,
+            rows=40,
+            cols=40,
+            x_min=0.0,
+            y_min=0.0,
+            res=0.5,
+            settings={"ignore_traces": True, "ignore_polygons": True, "use_heatsink": False},
+            via_factor=1300.0,
+            pads_list=[b_cu_pad],
+        )
+
+        assert not np.any(state.copper_mask[0])
+        assert np.any(state.copper_mask[1])
+        power_idx = get_pad_power_indices(
+            b_cu_pad, 1, 40, 40, 0.0, 0.0, 0.5, layer_id=B_Cu
+        )
+        assert power_idx.size > 0
+        assert np.all(state.copper_mask.reshape(-1)[power_idx])
+
+    def test_offset_pads_use_shapepos_or_rotated_getoffset(self):
+        """Offset pads must center copper and power at ShapePos / rotated GetOffset."""
+        import pcbnew
+
+        # Case A: ShapePos provided (e.g. KiCad 10 ShapePos(layer_id))
+        pad_shapepos = _ShapedMockPad(
+            position=VECTOR2I(10_000_000, 10_000_000),
+            size=VECTOR2I(2_000_000, 2_000_000),
+            shape=pcbnew.PAD_SHAPE_RECT,
+            shape_pos=VECTOR2I(14_000_000, 10_000_000),
+            layer=F_Cu,
+        )
+        # Case B: No ShapePos, uses GetOffset=(+4, 0) rotated 30 deg CCW -> (13.464, 8.0)
+        pad_offset = _ShapedMockPad(
+            position=VECTOR2I(10_000_000, 10_000_000),
+            size=VECTOR2I(2_000_000, 2_000_000),
+            shape=pcbnew.PAD_SHAPE_RECT,
+            orientation_deg=30.0,
+            offset=VECTOR2I(4_000_000, 0),
+            layer=F_Cu,
+        )
+
+        for pad, expected_cx, expected_cy in [
+            (pad_shapepos, 14.0, 10.0),
+            (pad_offset, 10.0 + 4.0 * math.cos(math.radians(30.0)), 10.0 - 4.0 * math.sin(math.radians(30.0))),
+        ]:
+            board = MockBoard(footprints=[MockFootprint("U1", [pad])], layer_names={F_Cu: "F.Cu"})
+            state = build_geometry_state(
+                board=board,
+                copper_ids=[F_Cu],
+                rows=40,
+                cols=40,
+                x_min=0.0,
+                y_min=0.0,
+                res=0.5,
+                settings={"ignore_traces": True, "ignore_polygons": True, "use_heatsink": False},
+                via_factor=1300.0,
+                pads_list=[pad],
+            )
+            r_exp = int(expected_cy / 0.5)
+            c_exp = int(expected_cx / 0.5)
+            assert state.copper_mask[0, r_exp, c_exp]
+            assert not state.copper_mask[0, int(10.0 / 0.5), int(10.0 / 0.5)]
+            power_idx = get_pad_power_indices(pad, 0, 40, 40, 0.0, 0.0, 0.5)
+            assert np.all(state.copper_mask.reshape(-1)[power_idx])
+
+    def test_subpixel_and_narrow_pads_keep_copper_and_power_aligned(self):
+        """Sub-pixel and narrow between-row pads stay >=1 cell and 100% aligned."""
+        import pcbnew
+
+        # 0.12 x 0.12 mm sub-pixel pad off cell center at (10.1, 10.1) on 0.5 mm grid
+        tiny_pad = _ShapedMockPad(
+            position=VECTOR2I(10_100_000, 10_100_000),
+            size=VECTOR2I(120_000, 120_000),
+            shape=pcbnew.PAD_SHAPE_RECT,
+        )
+        # Narrow 1.7 x 0.35 mm horizontal pad midway between row centers (y=10.0 vs 9.75/10.25)
+        narrow_pad = _ShapedMockPad(
+            position=VECTOR2I(20_000_000, 10_000_000),
+            size=VECTOR2I(1_700_000, 350_000),
+            shape=pcbnew.PAD_SHAPE_RECT,
+        )
+
+        board = MockBoard(
+            footprints=[MockFootprint("U1", [tiny_pad, narrow_pad])],
+            layer_names={F_Cu: "F.Cu"},
+        )
+        state = build_geometry_state(
+            board=board,
+            copper_ids=[F_Cu],
+            rows=60,
+            cols=60,
+            x_min=0.0,
+            y_min=0.0,
+            res=0.5,
+            settings={"ignore_traces": True, "ignore_polygons": True, "use_heatsink": False},
+            via_factor=1300.0,
+            pads_list=[tiny_pad, narrow_pad],
+        )
+
+        tiny_power = get_pad_power_indices(tiny_pad, 0, 60, 60, 0.0, 0.0, 0.5)
+        narrow_power = get_pad_power_indices(narrow_pad, 0, 60, 60, 0.0, 0.0, 0.5)
+        assert tiny_power.size >= 1
+        assert narrow_power.size >= 3
+        assert np.all(state.copper_mask.reshape(-1)[tiny_power])
+        assert np.all(state.copper_mask.reshape(-1)[narrow_power])
+
+    def test_circle_oval_roundrect_chamfer_custom_power_subset_of_copper(self):
+        """All pad shapes produce non-empty power indices strictly inside copper_mask."""
+        import pcbnew
+
+        custom_pad = _ShapedMockPad(
+            position=VECTOR2I(35_000_000, 15_000_000),
+            size=VECTOR2I(3_000_000, 3_000_000),
+            shape=pcbnew.PAD_SHAPE_CUSTOM,
+            hit_fn=lambda pos, acc, lid: (
+                (pos.x * 1e-6 - 35.0) ** 2 + (pos.y * 1e-6 - 15.0) ** 2 <= 1.5 ** 2
+            ),
+        )
+        pads = [
+            _ShapedMockPad(
+                position=VECTOR2I(5_000_000, 5_000_000),
+                size=VECTOR2I(4_000_000, 4_000_000),
+                shape=pcbnew.PAD_SHAPE_CIRCLE,
+            ),
+            _ShapedMockPad(
+                position=VECTOR2I(15_000_000, 5_000_000),
+                size=VECTOR2I(5_000_000, 2_000_000),
+                shape=pcbnew.PAD_SHAPE_OVAL,
+                orientation_deg=45.0,
+            ),
+            _ShapedMockPad(
+                position=VECTOR2I(25_000_000, 5_000_000),
+                size=VECTOR2I(4_000_000, 4_000_000),
+                shape=pcbnew.PAD_SHAPE_ROUNDRECT,
+                roundrect_ratio=0.25,
+            ),
+            _ShapedMockPad(
+                position=VECTOR2I(15_000_000, 15_000_000),
+                size=VECTOR2I(4_000_000, 4_000_000),
+                shape=pcbnew.PAD_SHAPE_CHAMFERED_RECT,
+                chamfer_ratio=0.25,
+                chamfer_positions=0b1111,
+            ),
+            custom_pad,
+        ]
+        board = MockBoard(
+            footprints=[MockFootprint("U1", pads)],
+            layer_names={F_Cu: "F.Cu"},
+        )
+        state = build_geometry_state(
+            board=board,
+            copper_ids=[F_Cu],
+            rows=80,
+            cols=80,
+            x_min=0.0,
+            y_min=0.0,
+            res=0.5,
+            settings={"ignore_traces": True, "ignore_polygons": True, "use_heatsink": False},
+            via_factor=1300.0,
+            pads_list=pads,
+        )
+
+        # Circle bbox corner (3.25, 3.25) is outside radius 2.0 from (5.0, 5.0)
+        assert not state.copper_mask[0, int(3.25 / 0.5), int(3.25 / 0.5)]
+        # Roundrect corner (23.25, 3.25) is outside r=1.0 rounded corner
+        assert not state.copper_mask[0, int(3.25 / 0.5), int(23.25 / 0.5)]
+
+        for pad in pads:
+            power_idx = get_pad_power_indices(pad, 0, 80, 80, 0.0, 0.0, 0.5)
+            assert power_idx.size > 0
+            assert np.all(state.copper_mask.reshape(-1)[power_idx])

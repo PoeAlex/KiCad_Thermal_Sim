@@ -2161,3 +2161,269 @@ class TestGuiResponsivenessAndProgress:
         assert out_cancelled is None
         assert message_boxes == []
         assert "Preview cancelled." in status_labels
+
+
+class _PluginShapeLayerSet:
+    """Minimal KiCad LayerSet supporting Contains and CuStack."""
+
+    def __init__(self, layers):
+        self._layers = list(layers)
+
+    def Contains(self, layer_id):
+        return int(layer_id) in self._layers
+
+    def CuStack(self):
+        return list(self._layers)
+
+    def IntSeq(self):
+        return list(self._layers)
+
+
+class _PluginShapePad(MockPad):
+    """MockPad exposing GetLayerSet, GetShape, GetSize, orientation, and parent."""
+
+    def __init__(
+        self,
+        *,
+        layer_set=None,
+        shape=None,
+        size=None,
+        orientation_deg=0.0,
+        corner_radius_nm=0,
+        parent=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self._layer_set = _PluginShapeLayerSet(layer_set) if layer_set is not None else None
+        self._shape = shape
+        self._size = size
+        self._orientation_deg = float(orientation_deg)
+        self._corner_radius_nm = int(corner_radius_nm)
+        self._parent = parent
+
+    def GetLayerSet(self):
+        if self._layer_set is None:
+            return _PluginShapeLayerSet([self._layer])
+        return self._layer_set
+
+    def GetShape(self):
+        return self._shape
+
+    def GetSize(self):
+        if self._size is not None:
+            return self._size
+        return VECTOR2I(self._bbox.GetWidth(), self._bbox.GetHeight())
+
+    def GetOrientationDegrees(self):
+        return self._orientation_deg
+
+    def GetRoundRectCornerRadius(self):
+        return self._corner_radius_nm
+
+    def GetParent(self):
+        return self._parent
+
+
+class TestPadAlignmentAndBottomLayerFixes:
+    """Regression tests for v0.4.5 pad copper/power alignment and B.Cu LayerSet fixes."""
+
+    def test_bcu_smd_pad_with_fcu_getlayer_resolves_bcu_and_injects_onto_bcu_copper(
+        self, monkeypatch
+    ):
+        import ThermalSim.geometry_mapper as geom_mod
+        from ThermalSim.thermal_plugin import ThermalPlugin, _pad_target_layer_index
+
+        monkeypatch.setattr(geom_mod.pcbnew, "PAD_SHAPE_RECT", 1, raising=False)
+        bcu_pad = _PluginShapePad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,  # KiCad 10 reports 0 (F_Cu) on B.Cu SMD pads
+            layer_set=[B_Cu],
+            shape=1,
+            size=VECTOR2I(2_000_000, 2_000_000),
+            bbox=EDA_RECT(4_000_000, 4_000_000, 2_000_000, 2_000_000),
+            net_code=1,
+            net_name="SW",
+            number="1",
+        )
+        board = MockBoard(
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+            footprints=[MockFootprint("Q1", [bcu_pad])],
+        )
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        plugin.copper_ids = [F_Cu, B_Cu]
+
+        # Descriptors and lookup must report B.Cu instead of F.Cu
+        selected_desc = plugin._descriptors_from_selected_pads(board, [("Q1-1", bcu_pad)])
+        assert selected_desc[0]["layer"] == "B.Cu"
+        _, by_name = plugin._build_pad_lookup(board)
+        assert by_name["Q1-1 [SW]"][0]["layer"] == "B.Cu"
+
+        copper_ids = [F_Cu, B_Cu]
+        lid_to_idx = {F_Cu: 0, B_Cu: 1}
+        assert _pad_target_layer_index(board, copper_ids, bcu_pad, lid_to_idx) == 1
+
+        rows = cols = 20
+        res = 0.5
+        state = geom_mod.build_geometry_state(
+            board=board,
+            copper_ids=copper_ids,
+            rows=rows,
+            cols=cols,
+            x_min=0.0,
+            y_min=0.0,
+            res=res,
+            settings={"ignore_traces": True, "ignore_polygons": True, "use_heatsink": False, "area_mode": "full"},
+            via_factor=1300.0,
+            pads_list=[bcu_pad],
+        )
+        contribs = _build_sparse_pad_contributions(
+            board, copper_ids, [bcu_pad], rows, cols, 0.0, 0.0, res, area_mask=state.area_mask
+        )
+        assert contribs[0].indices.size > 0
+        assert np.all(contribs[0].indices >= rows * cols)
+        assert not np.any(state.copper_mask[0])
+        assert np.all(state.copper_mask.ravel()[contribs[0].indices])
+
+    def test_pth_pad_prefers_parent_footprint_layer(self):
+        from ThermalSim.thermal_plugin import _pad_target_layer_index
+
+        fp_bot = MockFootprint("J1", [])
+        fp_bot.GetLayer = lambda: B_Cu
+        pth_pad = _PluginShapePad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            layer_set=[F_Cu, B_Cu],
+            parent=fp_bot,
+            number="1",
+        )
+        board = MockBoard(layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"})
+        copper_ids = [F_Cu, B_Cu]
+        assert _pad_target_layer_index(board, copper_ids, pth_pad, {F_Cu: 0, B_Cu: 1}) == 1
+
+    def test_roundrect_circle_rotated_narrow_pads_have_zero_fr4_power_cells(self, monkeypatch):
+        import ThermalSim.geometry_mapper as geom_mod
+
+        monkeypatch.setattr(geom_mod.pcbnew, "PAD_SHAPE_RECT", 1, raising=False)
+        monkeypatch.setattr(geom_mod.pcbnew, "PAD_SHAPE_CIRCLE", 2, raising=False)
+        monkeypatch.setattr(geom_mod.pcbnew, "PAD_SHAPE_ROUNDRECT", 3, raising=False)
+
+        diag_half = int(round(0.5 * (4.0 + 1.0) / np.sqrt(2.0) * 1e6))
+        rotated_pad = _PluginShapePad(
+            position=VECTOR2I(10_000_000, 10_000_000),
+            layer=F_Cu,
+            layer_set=[F_Cu],
+            shape=1,
+            size=VECTOR2I(4_000_000, 1_000_000),
+            orientation_deg=45.0,
+            bbox=EDA_RECT(10_000_000 - diag_half, 10_000_000 - diag_half, 2 * diag_half, 2 * diag_half),
+            number="1",
+        )
+        circle_pad = _PluginShapePad(
+            position=VECTOR2I(20_000_000, 10_000_000),
+            layer=F_Cu,
+            layer_set=[F_Cu],
+            shape=2,
+            size=VECTOR2I(4_000_000, 4_000_000),
+            bbox=EDA_RECT(18_000_000, 8_000_000, 4_000_000, 4_000_000),
+            number="2",
+        )
+        roundrect_pad = _PluginShapePad(
+            position=VECTOR2I(30_000_000, 10_000_000),
+            layer=F_Cu,
+            layer_set=[F_Cu],
+            shape=3,
+            size=VECTOR2I(4_000_000, 4_000_000),
+            corner_radius_nm=1_000_000,
+            bbox=EDA_RECT(28_000_000, 8_000_000, 4_000_000, 4_000_000),
+            number="3",
+        )
+        narrow_pad = _PluginShapePad(
+            position=VECTOR2I(10_250_000, 20_250_000),
+            layer=F_Cu,
+            layer_set=[F_Cu],
+            shape=1,
+            size=VECTOR2I(120_000, 120_000),
+            bbox=EDA_RECT(10_190_000, 20_190_000, 120_000, 120_000),
+            number="4",
+        )
+        pads = [rotated_pad, circle_pad, roundrect_pad, narrow_pad]
+        board = MockBoard(
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+            footprints=[MockFootprint("U1", pads)],
+        )
+        copper_ids = [F_Cu, B_Cu]
+        rows, cols, res = 60, 80, 0.5
+        state = geom_mod.build_geometry_state(
+            board=board,
+            copper_ids=copper_ids,
+            rows=rows,
+            cols=cols,
+            x_min=0.0,
+            y_min=0.0,
+            res=res,
+            settings={"ignore_traces": True, "ignore_polygons": True, "use_heatsink": False, "area_mode": "full"},
+            via_factor=1300.0,
+            pads_list=pads,
+        )
+        contribs = _build_sparse_pad_contributions(
+            board, copper_ids, pads, rows, cols, 0.0, 0.0, res, area_mask=state.area_mask
+        )
+        flat_copper = state.copper_mask.ravel()
+        for c in contribs:
+            assert c.indices.size > 0
+            assert np.all(flat_copper[c.indices])
+
+    def test_geometry_key_invalidates_stale_v044_and_bcu_layerset_changes(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+        from ThermalSim.workflow import GridEstimate, geometry_cache_key
+
+        pad_fcu = _PluginShapePad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            layer_set=[F_Cu],
+            number="1",
+        )
+        pad_bcu = _PluginShapePad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            layer_set=[B_Cu],
+            number="1",
+        )
+        bbox = EDA_RECT(0, 0, 10_000_000, 10_000_000)
+        board_f = MockBoard(footprints=[MockFootprint("U1", [pad_fcu])])
+        board_b = MockBoard(footprints=[MockFootprint("U1", [pad_bcu])])
+        grid = GridEstimate(
+            rows=20,
+            cols=20,
+            layer_count=2,
+            requested_res_mm=0.5,
+            actual_res_mm=0.5,
+            x_min_mm=0.0,
+            y_min_mm=0.0,
+            width_mm=10.0,
+            height_mm=10.0,
+            auto_coarsened=False,
+            expert_limits=False,
+            max_cells=200_000,
+            target_cells=100_000,
+            detail_level="balanced",
+            node_budget=1_200_000,
+            memory_mb_low=1.0,
+            memory_mb_high=2.0,
+            runtime_class="fast",
+        )
+        settings = {"ignore_traces": False, "ignore_polygons": False}
+        plugin = ThermalPlugin()
+        plugin.defaults()
+
+        key_f = plugin._geometry_key(board_f, [F_Cu, B_Cu], bbox, grid, settings, [pad_fcu])
+        key_b = plugin._geometry_key(board_b, [F_Cu, B_Cu], bbox, grid, settings, [pad_bcu])
+        # Legacy v0.4.4 key without ("pad_raster_v", 2)
+        snap_f = plugin._capture_board_snapshot(board_f, [F_Cu, B_Cu], bbox)
+        legacy_key = geometry_cache_key(
+            snap_f, grid, settings, [(pad_fcu.GetNumber(), pad_fcu.GetLayer(), 5_000_000, 5_000_000)]
+        )
+
+        assert key_f != legacy_key
+        assert key_f != key_b

@@ -58,7 +58,14 @@ try:
     from .adaptive_mesh import build_adaptive_system_compact
 except ImportError:
     build_adaptive_system_compact = None
-from .geometry_mapper import build_geometry_state, create_multilayer_maps, get_pad_pixels
+from .geometry_mapper import (
+    build_geometry_state,
+    create_multilayer_maps,
+    get_pad_copper_layer_indices,
+    get_pad_pixels,
+    get_pad_power_indices,
+    get_pad_primary_layer_id,
+)
 try:
     from .geometry_mapper import GeometryCancelledError
 except ImportError:
@@ -488,6 +495,25 @@ def _pad_target_layer_index(board, copper_ids, pad, lid_to_idx):
     int
         Target copper layer index for the pad.
     """
+    copper_indices = get_pad_copper_layer_indices(pad, copper_ids, lid_to_idx=lid_to_idx)
+    if len(copper_indices) == 1:
+        return copper_indices[0]
+    if len(copper_indices) > 1:
+        parent = None
+        if hasattr(pad, "GetParent"):
+            try:
+                parent = pad.GetParent()
+            except Exception:
+                parent = None
+        if parent is not None and hasattr(parent, "GetLayer"):
+            try:
+                parent_idx = lid_to_idx.get(int(parent.GetLayer()))
+                if parent_idx in copper_indices:
+                    return parent_idx
+            except Exception:
+                pass
+        return copper_indices[0]
+
     pad_lid = pad.GetLayer()
     target_idx = lid_to_idx.get(pad_lid)
     if target_idx is not None:
@@ -500,7 +526,9 @@ def _pad_target_layer_index(board, copper_ids, pad, lid_to_idx):
     return len(copper_ids) - 1 if ("B." in lname or "BOT" in lname) else 0
 
 
-def _build_sparse_pad_contributions(board, copper_ids, pads_list, rows, cols, x_min, y_min, res):
+def _build_sparse_pad_contributions(
+    board, copper_ids, pads_list, rows, cols, x_min, y_min, res, area_mask=None
+):
     """
     Build sparse per-pad unit power distributions.
 
@@ -522,27 +550,30 @@ def _build_sparse_pad_contributions(board, copper_ids, pads_list, rows, cols, x_
         Grid origin y coordinate in millimeters.
     res : float
         Grid resolution in millimeters.
+    area_mask : np.ndarray, optional
+        Optional 2D boolean mask restricting active simulation cells.
 
     Returns
     -------
     list of SparsePadContribution
         Sparse power distributions normalized to 1 W per pad.
     """
-    rc = rows * cols
     lid_to_idx = {lid: idx for idx, lid in enumerate(copper_ids)}
     contributions = []
 
     for pad in pads_list:
         target_idx = _pad_target_layer_index(board, copper_ids, pad, lid_to_idx)
-        indices = _bbox_to_power_indices(
-            pad.GetBoundingBox(),
+        target_lid = copper_ids[target_idx] if 0 <= target_idx < len(copper_ids) else None
+        indices = get_pad_power_indices(
+            pad,
             target_idx=target_idx,
             rows=rows,
             cols=cols,
             x_min=x_min,
             y_min=y_min,
             res=res,
-            rc=rc,
+            layer_id=target_lid,
+            area_mask=area_mask,
         )
         if indices.size:
             weights = np.full(indices.shape, 1.0 / float(indices.size), dtype=np.float64)
@@ -1420,7 +1451,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 primitive_rows.append(tuple(zone_row))
             except Exception:
                 continue
-        pad_getters = ("GetShape", "GetSize", "GetOrientationDegrees")
+        pad_getters = ("GetShape", "GetSize", "GetOrientationDegrees", "GetShapePos", "GetOffset")
         for fp in footprints:
             done_items += 1
             if progress_callback is not None and (done_items & 31) == 0:
@@ -1438,6 +1469,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         pad.GetLayer(), rect.GetX(), rect.GetY(),
                         rect.GetWidth(), rect.GetHeight(),
                     ]
+                    get_layer_set = getattr(pad, "GetLayerSet", None)
+                    if get_layer_set is not None:
+                        try:
+                            lset = get_layer_set()
+                            if hasattr(lset, "CuStack"):
+                                row.extend(("layers", tuple(int(v) for v in lset.CuStack())))
+                            elif hasattr(lset, "IntSeq"):
+                                row.extend(("layers", tuple(int(v) for v in lset.IntSeq())))
+                        except Exception:
+                            pass
                     for getter in pad_getters:
                         fn = getattr(pad, getter, None)
                         if fn is not None:
@@ -1483,11 +1524,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         snapshot = self._capture_board_snapshot(
             board, copper_ids, bbox, progress_callback=progress_callback
         )
-        pad_keys = []
+        # Bump pad_raster_v to invalidate stale v0.4.4 .npz caches on upgrade.
+        pad_keys = [("pad_raster_v", 2)]
         for pad in pads or []:
             try:
                 pos = pad.GetPosition()
-                pad_keys.append((pad.GetNumber(), pad.GetLayer(), pos.x, pos.y))
+                primary_lid = get_pad_primary_layer_id(pad, copper_ids or None)
+                pad_keys.append((pad.GetNumber(), primary_lid, pos.x, pos.y))
             except Exception:
                 pad_keys.append(id(pad))
         return geometry_cache_key(snapshot, grid, settings, pad_keys)
@@ -1827,12 +1870,14 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             except Exception:
                 return 0
 
-    def _pad_layer_name(self, board, pad):
+    def _pad_layer_name(self, board, pad, copper_ids=None):
         """Return the KiCad layer name for a pad."""
+        c_ids = copper_ids if copper_ids else (getattr(self, "copper_ids", None) or None)
+        lid = get_pad_primary_layer_id(pad, c_ids)
         try:
-            return board.GetLayerName(pad.GetLayer())
+            return board.GetLayerName(lid)
         except Exception:
-            return str(pad.GetLayer())
+            return str(lid)
 
     def _pad_descriptor(self, board, fp_ref, pad):
         """Return a serializable pad descriptor for current groups."""
@@ -2690,6 +2735,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 x_min=x_min,
                 y_min=y_min,
                 res=res,
+                area_mask=getattr(geometry_state, "area_mask", None),
             )
             has_pwl_sources = any(source_type == 'pwl' for source_type, _ in pad_sources)
             Q = None

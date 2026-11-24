@@ -24,11 +24,13 @@ from tests.mocks.pcbnew_mock import (
     F_Cu,
     MockBoard,
     MockFootprint,
+    MockLayerSet,
     MockPad,
     MockTrack,
     MockVia,
     MockZone,
     PAD_ATTRIB_PTH,
+    PAD_ATTRIB_SMD,
     VECTOR2I,
 )
 
@@ -669,3 +671,80 @@ def test_solve_electrical_heating_progress_and_cancellation():
             config,
             progress_callback=cancel_on_solve,
         )
+
+
+def test_b_cu_smd_current_terminals_with_kicad10_getlayer_zero():
+    """B.Cu SMD pads with GetLayer()==0 and LayerSet=={B_Cu} solve on B.Cu."""
+    import pcbnew
+
+    class _KiCad10BCuPad(MockPad):
+        def __init__(self, x_mm, y_mm, number):
+            super().__init__(
+                position=VECTOR2I(int(x_mm * 1e6), int(y_mm * 1e6)),
+                layer=F_Cu,  # Simulates KiCad 10 GetLayer() == 0 on B.Cu SMD pad
+                attribute=PAD_ATTRIB_SMD,
+                bbox=EDA_RECT(
+                    int((x_mm - 0.5) * 1e6),
+                    int((y_mm - 0.5) * 1e6),
+                    1_000_000,
+                    1_000_000,
+                ),
+                net_code=1,
+                net_name="PWR",
+                number=number,
+            )
+            self._layer_set = MockLayerSet([B_Cu])
+
+        def GetLayerSet(self):
+            return self._layer_set
+
+        def GetSize(self):
+            return VECTOR2I(1_000_000, 1_000_000)
+
+        def GetShape(self):
+            return getattr(pcbnew, "PAD_SHAPE_RECT", 1)
+
+    pad_a = _KiCad10BCuPad(1.5, 1.5, "1")
+    pad_b = _KiCad10BCuPad(8.5, 1.5, "2")
+    track = MockTrack(
+        layer=B_Cu,
+        bbox=EDA_RECT(1_500_000, 1_000_000, 7_000_000, 1_000_000),
+        start=VECTOR2I(1_500_000, 1_500_000),
+        end=VECTOR2I(8_500_000, 1_500_000),
+        width=1_000_000,
+        net_code=1,
+        net_name="PWR",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_a, pad_b])],
+        tracks=[track],
+        layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+    )
+    config = ElectricalConfig(
+        copper_ids=[F_Cu, B_Cu],
+        rows=4,
+        cols=12,
+        x_min=0.0,
+        y_min=0.0,
+        res=1.0,
+        t_cu=np.array([35e-6, 35e-6], dtype=np.float64),
+        layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+    )
+
+    result = solve_electrical_heating(
+        board,
+        [
+            CurrentTerminal(pad_a, "J1-1", "PWR", 1, 2.0),
+            CurrentTerminal(pad_b, "J2-1", "PWR", 1, -2.0),
+        ],
+        config,
+    )
+
+    assert result.valid, result.errors
+    assert result.total_loss_w > 0.0
+    summary = result.net_summaries[0]
+    assert [t.layer for t in summary.terminal_diagnostics] == ["B.Cu", "B.Cu"]
+    # Joule heat must exist only on B.Cu (layer index 1), zero on F.Cu (layer index 0)
+    q_3d = result.q_joule.reshape(2, 4, 12)
+    assert np.sum(q_3d[0]) == 0.0
+    assert np.sum(q_3d[1]) > 0.0

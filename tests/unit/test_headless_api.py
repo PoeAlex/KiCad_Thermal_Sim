@@ -128,7 +128,7 @@ class TestHeadlessIsolationAndJson:
 
     def test_constants(self):
         assert headless_api.SCHEMA_VERSION == "1.0"
-        assert headless_api.PLUGIN_VERSION == "0.4.4"
+        assert headless_api.PLUGIN_VERSION == "0.4.5"
 
     def test_no_wx_or_gui_imports_in_ast(self):
         path = os.path.abspath(headless_api.__file__)
@@ -722,3 +722,258 @@ class TestRunAndSweepAndCompare:
         )
         assert res["status"] == "validation_error"
         assert res["errors"][0]["code"] == "INVALID_SWEEP_PARAM"
+
+
+class _ShapeMockLayerSet:
+    """Minimal KiCad LayerSet supporting Contains and CuStack."""
+
+    def __init__(self, layers):
+        self._layers = list(layers)
+
+    def Contains(self, layer_id):
+        return int(layer_id) in self._layers
+
+    def CuStack(self):
+        return list(self._layers)
+
+    def IntSeq(self):
+        return list(self._layers)
+
+
+class _ShapeMockPad(MockPad):
+    """MockPad with GetLayerSet, GetShape, GetSize, orientation, and corner radius."""
+
+    def __init__(
+        self,
+        *,
+        layer_set=None,
+        shape=None,
+        size=None,
+        orientation_deg=0.0,
+        corner_radius_nm=0,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self._layer_set = _ShapeMockLayerSet(layer_set) if layer_set is not None else None
+        self._shape = shape
+        self._size = size
+        self._orientation_deg = float(orientation_deg)
+        self._corner_radius_nm = int(corner_radius_nm)
+
+    def GetLayerSet(self):
+        if self._layer_set is None:
+            return _ShapeMockLayerSet([self._layer])
+        return self._layer_set
+
+    def GetShape(self):
+        return self._shape
+
+    def GetSize(self):
+        if self._size is not None:
+            return self._size
+        return VECTOR2I(self._bbox.GetWidth(), self._bbox.GetHeight())
+
+    def GetOrientationDegrees(self):
+        return self._orientation_deg
+
+    def GetRoundRectCornerRadius(self):
+        return self._corner_radius_nm
+
+
+class TestPadAlignmentAndBottomLayerRegression:
+    """Regression tests for v0.4.5 B.Cu LayerSet & pad shape/power alignment."""
+
+    def test_bcu_smd_pad_with_fcu_getlayer_inspect_power_and_temp(
+        self, sample_2layer_board_file, monkeypatch
+    ):
+        # KiCad 10 returns GetLayer() == 0 (F_Cu) even for B.Cu SMD pads;
+        # GetLayerSet() carries the authoritative {B_Cu}.
+        bcu_pad = _ShapeMockPad(
+            position=VECTOR2I(10_000_000, 10_000_000),
+            layer=F_Cu,
+            layer_set=[B_Cu],
+            attribute=PAD_ATTRIB_SMD,
+            bbox=EDA_RECT(8_000_000, 8_000_000, 4_000_000, 4_000_000),
+            size=VECTOR2I(4_000_000, 4_000_000),
+            shape=1,
+            net_code=1,
+            net_name="HOT_BOT",
+            number="1",
+        )
+        fp = MockFootprint(reference="Q1", pads=[bcu_pad])
+        fp.GetLayer = lambda: B_Cu
+        board = MockBoard(
+            filename=sample_2layer_board_file,
+            footprints=[fp],
+            zones=[
+                MockZone(
+                    layers=[F_Cu, B_Cu],
+                    bbox=EDA_RECT(0, 0, 20_000_000, 20_000_000),
+                    filled=True,
+                    net_code=0,
+                    net_name="GND",
+                )
+            ],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu", Eco1_User: "User.Eco1"},
+        )
+        board.GetEnabledLayers = lambda: _ShapeMockLayerSet([F_Cu, B_Cu])
+        monkeypatch.setattr(headless_api.pcbnew, "PAD_SHAPE_RECT", 1, raising=False)
+
+        # 1. inspect_board must report B.Cu, not F.Cu
+        inspected = headless_api.inspect_board(board)
+        q1_pads = [p for fp_d in inspected["footprints"] if fp_d["ref"] == "Q1" for p in fp_d["pads"]]
+        assert len(q1_pads) == 1
+        assert q1_pads[0]["layer"] == "B.Cu"
+
+        # 2. _pad_target_layer_index & _build_sparse_pad_contributions target B.Cu copper only
+        copper_ids = [F_Cu, B_Cu]
+        lid_to_idx = {F_Cu: 0, B_Cu: 1}
+        assert headless_api._pad_target_layer_index(board, copper_ids, bcu_pad, lid_to_idx) == 1
+
+        rows = cols = 40
+        res = 0.5
+        state = headless_api.build_geometry_state(
+            board=board,
+            copper_ids=copper_ids,
+            rows=rows,
+            cols=cols,
+            x_min=0.0,
+            y_min=0.0,
+            res=res,
+            settings={"ignore_traces": True, "ignore_polygons": True, "use_heatsink": False, "area_mode": "full"},
+            via_factor=1300.0,
+            pads_list=[bcu_pad],
+        )
+        assert not np.any(state.copper_mask[0])
+        assert np.any(state.copper_mask[1])
+
+        contribs = headless_api._build_sparse_pad_contributions(
+            board, copper_ids, [bcu_pad], rows, cols, 0.0, 0.0, res, area_mask=state.area_mask
+        )
+        assert len(contribs) == 1
+        assert contribs[0].indices.size > 0
+        assert np.all(contribs[0].indices >= rows * cols)
+        assert np.all(state.copper_mask.ravel()[contribs[0].indices])
+
+        # 3. _extract_components_temperatures must read B.Cu layer, not F.Cu
+        T = np.zeros((2, rows, cols), dtype=np.float64)
+        T[0, :, :] = 25.0
+        T[1, state.copper_mask[1]] = 85.0
+        comps, _ = headless_api._extract_components_temperatures(
+            T, board, ["F.Cu", "B.Cu"], 0.0, 0.0, res
+        )
+        assert comps["Q1"]["max_c"] == pytest.approx(85.0)
+        assert comps["Q1"]["mean_c"] == pytest.approx(85.0)
+
+        # 4. End-to-end headless run heats B.Cu above F.Cu
+        sim = headless_api.run_headless_simulation(
+            board,
+            {"power_pads": {"Q1.1": 2.0}, "res": 1.0, "compute_engine": "legacy"},
+            generate_plots=False,
+            generate_html=False,
+        )
+        assert sim["status"] == "ok"
+        layers_by_name = {item["name"]: item for item in sim["temperatures"]["layers"]}
+        assert layers_by_name["B.Cu"]["max_c"] > layers_by_name["F.Cu"]["max_c"]
+
+    def test_shaped_rotated_and_narrow_pads_align_100_percent_with_copper(
+        self, sample_2layer_board_file, monkeypatch
+    ):
+        monkeypatch.setattr(headless_api.pcbnew, "PAD_SHAPE_RECT", 1, raising=False)
+        monkeypatch.setattr(headless_api.pcbnew, "PAD_SHAPE_CIRCLE", 2, raising=False)
+        monkeypatch.setattr(headless_api.pcbnew, "PAD_SHAPE_ROUNDRECT", 3, raising=False)
+
+        # Rotated 45° bbox is larger than the rotated 4x1 mm rectangle
+        diag_half = int(round(0.5 * (4.0 + 1.0) / np.sqrt(2.0) * 1e6))
+        rotated_pad = _ShapeMockPad(
+            position=VECTOR2I(10_000_000, 10_000_000),
+            layer=F_Cu,
+            layer_set=[F_Cu],
+            shape=1,
+            size=VECTOR2I(4_000_000, 1_000_000),
+            orientation_deg=45.0,
+            bbox=EDA_RECT(
+                10_000_000 - diag_half,
+                10_000_000 - diag_half,
+                2 * diag_half,
+                2 * diag_half,
+            ),
+            number="1",
+        )
+        circle_pad = _ShapeMockPad(
+            position=VECTOR2I(20_000_000, 10_000_000),
+            layer=F_Cu,
+            layer_set=[F_Cu],
+            shape=2,
+            size=VECTOR2I(4_000_000, 4_000_000),
+            bbox=EDA_RECT(18_000_000, 8_000_000, 4_000_000, 4_000_000),
+            number="2",
+        )
+        roundrect_pad = _ShapeMockPad(
+            position=VECTOR2I(30_000_000, 10_000_000),
+            layer=F_Cu,
+            layer_set=[F_Cu],
+            shape=3,
+            size=VECTOR2I(4_000_000, 4_000_000),
+            corner_radius_nm=1_000_000,
+            bbox=EDA_RECT(28_000_000, 8_000_000, 4_000_000, 4_000_000),
+            number="3",
+        )
+        narrow_pad = _ShapeMockPad(
+            position=VECTOR2I(10_250_000, 20_250_000),
+            layer=F_Cu,
+            layer_set=[F_Cu],
+            shape=1,
+            size=VECTOR2I(120_000, 120_000),
+            bbox=EDA_RECT(10_190_000, 20_190_000, 120_000, 120_000),
+            number="4",
+        )
+        pads = [rotated_pad, circle_pad, roundrect_pad, narrow_pad]
+        board = MockBoard(
+            filename=sample_2layer_board_file,
+            footprints=[MockFootprint(reference="U1", pads=pads)],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+        )
+        copper_ids = [F_Cu, B_Cu]
+        rows, cols, res = 60, 80, 0.5
+        state = headless_api.build_geometry_state(
+            board=board,
+            copper_ids=copper_ids,
+            rows=rows,
+            cols=cols,
+            x_min=0.0,
+            y_min=0.0,
+            res=res,
+            settings={"ignore_traces": True, "ignore_polygons": True, "use_heatsink": False, "area_mode": "full"},
+            via_factor=1300.0,
+            pads_list=pads,
+        )
+        contribs = headless_api._build_sparse_pad_contributions(
+            board, copper_ids, pads, rows, cols, 0.0, 0.0, res, area_mask=state.area_mask
+        )
+        flat_copper = state.copper_mask.ravel()
+        for c in contribs:
+            assert c.indices.size > 0
+            assert np.all(flat_copper[c.indices]), "Power injected into non-copper FR4 cell"
+            assert np.sum(c.weights) == pytest.approx(1.0)
+
+        # Ensure corner of circle bbox (FR4) is NOT in circle_pad power indices
+        circle_indices = set(contribs[1].indices.tolist())
+        # Corner cell at (18.25 mm, 8.25 mm) -> col=36, row=16 is outside radius 2.0 from (20,10)
+        corner_flat = 0 * (rows * cols) + 16 * cols + 36
+        assert not flat_copper[corner_flat]
+        assert corner_flat not in circle_indices
+
+        # Ensure _extract_components_temperatures excludes FR4 corner cells
+        T = np.full((2, rows, cols), 25.0, dtype=np.float64)
+        T[0, state.copper_mask[0]] = 60.0
+        T[0, 16, 36] = 150.0  # artificial hot FR4 corner outside circle pad
+        board_circle_only = MockBoard(
+            filename=sample_2layer_board_file,
+            footprints=[MockFootprint(reference="C_CIRC", pads=[circle_pad])],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+        )
+        comps, _ = headless_api._extract_components_temperatures(
+            T, board_circle_only, ["F.Cu", "B.Cu"], 0.0, 0.0, res
+        )
+        assert comps["C_CIRC"]["max_c"] == pytest.approx(60.0)
