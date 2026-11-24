@@ -49,6 +49,16 @@ def _downsample_layer_block_max(layer, stride):
     return pooled
 
 
+def _downsample_for_plot(layer, max_plot_dim=800):
+    """Downsample a 2D array for Matplotlib imshow while preserving full-grid extent."""
+    rows, cols = layer.shape[:2]
+    max_axis = max(rows, cols)
+    if max_axis > max_plot_dim:
+        stride = int(math.ceil(max_axis / max_plot_dim))
+        return _downsample_layer_block_max(layer, stride), [-0.5, cols - 0.5, rows - 0.5, -0.5]
+    return layer, None
+
+
 def _layer_to_json_list(layer):
     """Convert a 2D layer array into a row-major JSON-safe list rounded to 3 decimals."""
     arr = np.asarray(layer, dtype=np.float64)
@@ -242,9 +252,10 @@ def save_stackup_plot(T, H, amb, layer_names, fname, t_elapsed=None):
             ax.set_title(f"{name} - t = {t_elapsed:.1f} s - Max: {max_temp:.1f}C")
         else:
             ax.set_title(f"{name} - Max: {max_temp:.1f}C")
+        plot_layer, extent = _downsample_for_plot(T[i])
         im = ax.imshow(
-            T[i], cmap='inferno', origin='upper',
-            vmin=amb, vmax=vmax, interpolation='bilinear'
+            plot_layer, cmap='inferno', origin='upper',
+            vmin=amb, vmax=vmax, interpolation='bilinear', extent=extent
         )
         plt.colorbar(im, ax=ax)
         ax.axis('off')
@@ -371,13 +382,15 @@ def save_joule_loss_map(
         ax = axes[i]
         name = layer_names[i] if i < len(layer_names) else f"Layer {i}"
         layer = q_layers[i]
+        plot_layer, extent = _downsample_for_plot(layer)
         im = ax.imshow(
-            layer,
+            plot_layer,
             cmap="magma",
             origin="upper",
             vmin=0.0,
             vmax=vmax,
             interpolation="nearest",
+            extent=extent,
         )
         max_mw = float(np.nanmax(layer)) * 1e3 if np.any(np.isfinite(layer)) else 0.0
         ax.set_title(f"{name} Joule Loss - Max: {max_mw:.3f} mW/cell")
@@ -440,15 +453,17 @@ def show_results_top_bot(T, H, amb, open_file=True, t_elapsed=None, out_dir=None
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     time_label = f"t = {t_elapsed:.1f} s - " if t_elapsed is not None else ""
     ax1.set_title(f"TOP Layer ({time_label}Max: {np.max(T[0]):.1f} C)")
+    top_plot, top_extent = _downsample_for_plot(T[0])
     im1 = ax1.imshow(
-        T[0], cmap='inferno', origin='upper',
-        vmin=amb, vmax=vmax, interpolation='bilinear'
+        top_plot, cmap='inferno', origin='upper',
+        vmin=amb, vmax=vmax, interpolation='bilinear', extent=top_extent
     )
     plt.colorbar(im1, ax=ax1)
     ax2.set_title(f"BOTTOM Layer ({time_label}Max: {np.max(T[-1]):.1f} C)")
+    bot_plot, bot_extent = _downsample_for_plot(T[-1])
     im2 = ax2.imshow(
-        T[-1], cmap='inferno', origin='upper',
-        vmin=amb, vmax=vmax, interpolation='bilinear'
+        bot_plot, cmap='inferno', origin='upper',
+        vmin=amb, vmax=vmax, interpolation='bilinear', extent=bot_extent
     )
     plt.colorbar(im2, ax=ax2)
     if np.max(H) > 0:
@@ -526,9 +541,10 @@ def show_results_all_layers(T, H, amb, layer_names, open_file=True, t_elapsed=No
         max_temp = np.max(T[i])
         time_label = f"t = {t_elapsed:.1f} s - " if t_elapsed is not None else ""
         ax.set_title(f"{name} - {time_label}Max: {max_temp:.1f}C")
+        plot_layer, extent = _downsample_for_plot(T[i])
         im = ax.imshow(
-            T[i], cmap='inferno', origin='upper',
-            vmin=amb, vmax=vmax, interpolation='bilinear'
+            plot_layer, cmap='inferno', origin='upper',
+            vmin=amb, vmax=vmax, interpolation='bilinear', extent=extent
         )
         plt.colorbar(im, ax=ax)
         ax.axis('off')
@@ -689,6 +705,10 @@ def save_preview_image(
                         label = pad.GetNumber() if hasattr(pad, "GetNumber") else ""
                         pad_labels.append((target_indices[0], cx, cy, label))
 
+        max_axis = max(rows, cols)
+        stride = int(math.ceil(max_axis / 800)) if max_axis > 800 else 1
+        extent = [-0.5, cols - 0.5, rows - 0.5, -0.5] if stride > 1 else None
+
         for i in range(count):
             ax = axes[i]
             name = layer_names[i] if i < len(layer_names) else f"Layer {i}"
@@ -696,7 +716,8 @@ def save_preview_image(
 
             # Show copper as a mask overlay
             copper_mask = K[i] > k_fr4_rel
-            ax.imshow(copper_mask, cmap='Greens', origin='upper', interpolation='none', alpha=0.35)
+            copper_disp = (_downsample_layer_block_max(copper_mask, stride) > 0) if stride > 1 else copper_mask
+            ax.imshow(copper_disp, cmap='Greens', origin='upper', interpolation='none', alpha=0.35, extent=extent)
 
             if adaptive_mesh is not None:
                 leaf_sizes = np.maximum(
@@ -704,41 +725,50 @@ def save_preview_image(
                     adaptive_mesh.leaves[:, 3] - adaptive_mesh.leaves[:, 2],
                 ).astype(np.uint8)
                 cell_sizes = leaf_sizes[adaptive_mesh.leaf_map]
-                refinement = np.ma.masked_where(
-                    cell_sizes <= 1,
-                    adaptive_mesh.max_cell_ratio - cell_sizes + 1,
-                )
+                if stride > 1:
+                    raw_ref = np.where(cell_sizes <= 1, 0.0, adaptive_mesh.max_cell_ratio - cell_sizes + 1)
+                    ref_disp = _downsample_layer_block_max(raw_ref, stride)
+                    refinement = np.ma.masked_where(ref_disp <= 0, ref_disp)
+                else:
+                    refinement = np.ma.masked_where(
+                        cell_sizes <= 1,
+                        adaptive_mesh.max_cell_ratio - cell_sizes + 1,
+                    )
                 ax.imshow(
                     refinement,
                     cmap='Purples',
                     origin='upper',
                     interpolation='none',
                     alpha=0.16,
+                    extent=extent,
                 )
 
             # Heatsink overlay (board-level)
             if settings.get('use_heatsink'):
                 is_bottom = (i == count - 1) or (name == "B.Cu")
                 if is_bottom:
+                    h_disp = _downsample_layer_block_max(H_map, stride) if stride > 1 else H_map
                     ax.imshow(
-                        np.ma.masked_where(H_map <= 0, H_map),
-                        cmap='Blues', origin='upper', interpolation='none', alpha=0.45
+                        np.ma.masked_where(h_disp <= 0, h_disp),
+                        cmap='Blues', origin='upper', interpolation='none', alpha=0.45, extent=extent
                     )
 
             # Overlay vias in red
             v_mask = V_map > 1.0
             if np.any(v_mask):
+                v_disp = (_downsample_layer_block_max(v_mask, stride) > 0) if stride > 1 else v_mask
                 ax.imshow(
-                    np.ma.masked_where(~v_mask, v_mask),
-                    cmap='Reds', origin='upper', alpha=0.5, interpolation='none'
+                    np.ma.masked_where(~v_disp, v_disp),
+                    cmap='Reds', origin='upper', alpha=0.5, interpolation='none', extent=extent
                 )
 
             # Overlay pads (heat sources)
             pad_mask = pad_masks[i]
             if np.any(pad_mask):
+                pad_disp = (_downsample_layer_block_max(pad_mask, stride) > 0) if stride > 1 else pad_mask
                 ax.imshow(
-                    np.ma.masked_where(~pad_mask, pad_mask),
-                    cmap='autumn', origin='upper', alpha=0.6, interpolation='none'
+                    np.ma.masked_where(~pad_disp, pad_disp),
+                    cmap='autumn', origin='upper', alpha=0.6, interpolation='none', extent=extent
                 )
                 for layer_idx, cx, cy, label in pad_labels:
                     if layer_idx == i:

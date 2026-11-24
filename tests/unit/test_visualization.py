@@ -593,3 +593,71 @@ class TestBuildInteractiveHeatmapPayload:
         assert payload_pool["layers"][0]["rows"] == 2
         assert payload_pool["layers"][0]["cols"] == 2
         assert payload_pool["layers"][0]["data"] == [45.5, None, -15.0, 20.0]
+
+
+class TestFastLargeGridPngExport:
+    """Tests for Quick-Win #5: hotspot-preserving block-max PNG rendering on large grids."""
+
+    def test_large_grid_show_results_and_snapshot_preserve_exact_max_and_downsample(
+        self, temp_dir, monkeypatch
+    ):
+        """1200x1200 PNG exports downsample imshow arrays (<=800) while keeping exact max title & extent."""
+        import matplotlib.axes
+        from ThermalSim.visualization import save_joule_loss_map
+
+        T = np.full((2, 1200, 1200), 25.0, dtype=np.float64)
+        T[0, 345, 789] = 112.4
+        T[1, 900, 100] = 68.7
+        H = np.zeros((1200, 1200), dtype=np.float64)
+        H[400:800, 400:800] = 1.0
+
+        recorded_imshow = []
+        recorded_titles = []
+        orig_imshow = matplotlib.axes.Axes.imshow
+        orig_set_title = matplotlib.axes.Axes.set_title
+
+        def spy_imshow(self, X, *args, **kwargs):
+            recorded_imshow.append((np.asarray(X).shape, kwargs.get("extent")))
+            return orig_imshow(self, X, *args, **kwargs)
+
+        def spy_set_title(self, label, *args, **kwargs):
+            recorded_titles.append(label)
+            return orig_set_title(self, label, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "imshow", spy_imshow)
+        monkeypatch.setattr(matplotlib.axes.Axes, "set_title", spy_set_title)
+
+        out_all = show_results_all_layers(
+            T, H, amb=25.0, layer_names=["F.Cu", "B.Cu"], open_file=False, out_dir=temp_dir
+        )
+        out_snap = save_snapshot(
+            T, H, amb=25.0, layer_names=["F.Cu", "B.Cu"], idx=1, t_elapsed=12.5, out_dir=temp_dir
+        )
+        out_tb = show_results_top_bot(
+            T, H, amb=25.0, open_file=False, out_dir=temp_dir
+        )
+
+        for path in (out_all, out_snap, out_tb):
+            assert os.path.exists(path)
+            with open(path, "rb") as f:
+                assert f.read(4) == b"\x89PNG"
+
+        assert len(recorded_imshow) == 6
+        for shape, extent in recorded_imshow:
+            assert shape == (600, 600)
+            assert extent == [-0.5, 1199.5, 1199.5, -0.5]
+
+        assert any("112.4" in title for title in recorded_titles)
+        assert any("68.7" in title for title in recorded_titles)
+
+        # Also check save_joule_loss_map downsampling and exact mW/cell annotation
+        recorded_imshow.clear()
+        recorded_titles.clear()
+        q = np.zeros((2, 1200, 1200), dtype=np.float64)
+        q[0, 500, 600] = 0.012345  # 12.345 mW/cell
+        out_j = save_joule_loss_map(
+            q, 2, 1200, 1200, ["F.Cu", "B.Cu"], out_dir=temp_dir
+        )
+        assert out_j is not None and os.path.exists(out_j)
+        assert all(shape == (600, 600) and extent == [-0.5, 1199.5, 1199.5, -0.5] for shape, extent in recorded_imshow)
+        assert any("12.345 mW/cell" in title for title in recorded_titles)

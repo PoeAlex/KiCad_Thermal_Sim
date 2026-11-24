@@ -7,6 +7,8 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
+import pytest
+
 import ThermalSim.electrical_solver as electrical_solver
 from ThermalSim.electrical_solver import (
     CurrentTerminal,
@@ -15,17 +17,20 @@ from ThermalSim.electrical_solver import (
     _solve_electrical_system,
     solve_electrical_heating,
 )
+from ThermalSim.geometry_mapper import GeometryCancelledError
 from tests.mocks.pcbnew_mock import (
     B_Cu,
     EDA_RECT,
     F_Cu,
     MockBoard,
     MockFootprint,
+    MockLayerSet,
     MockPad,
     MockTrack,
     MockVia,
     MockZone,
     PAD_ATTRIB_PTH,
+    PAD_ATTRIB_SMD,
     VECTOR2I,
 )
 
@@ -599,3 +604,147 @@ def test_end_to_end_joule_loss_matches_between_direct_and_pcg(monkeypatch):
         rtol=1e-7,
         atol=1e-12,
     )
+
+
+def test_solve_electrical_heating_progress_and_cancellation():
+    """solve_electrical_heating reports progress and aborts on cancellation."""
+    pad_a = _pad(0.25, 1.25, "1")
+    pad_b = _pad(9.25, 1.25, "2")
+    track = MockTrack(
+        layer=F_Cu,
+        bbox=EDA_RECT(250000, 1250000, 9100000, 100000),
+        start=VECTOR2I(500000, 1500000),
+        end=VECTOR2I(9500000, 1500000),
+        width=1000000,
+        net_code=1,
+        net_name="PWR",
+    )
+    zone = MockZone(
+        layers=[F_Cu],
+        bbox=EDA_RECT(0, 1000000, 10000000, 1000000),
+        filled=True,
+        net_code=1,
+        net_name="PWR",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_a, pad_b])],
+        tracks=[track],
+        zones=[zone],
+    )
+    terminals = [
+        CurrentTerminal(pad_a, "J1-1", "PWR", 1, 1.0),
+        CurrentTerminal(pad_b, "J2-1", "PWR", 1, -1.0),
+    ]
+    config = _config()
+
+    events = []
+    res = solve_electrical_heating(
+        board,
+        terminals,
+        config,
+        progress_callback=lambda done, total, msg: events.append((done, total, msg)) or True,
+    )
+    assert res.valid, res.errors
+    msgs = [m.lower() for _, _, m in events]
+    assert any("pads" in m for m in msgs)
+    assert any("tracks" in m for m in msgs)
+    assert any("zone" in m for m in msgs)
+    assert any("solving electrical net" in m for m in msgs)
+
+    with pytest.raises(GeometryCancelledError):
+        solve_electrical_heating(
+            board,
+            terminals,
+            config,
+            cancel_check=lambda: True,
+        )
+
+    def cancel_on_solve(done, total, msg):
+        if "solving electrical net" in msg.lower():
+            return False
+        return True
+
+    with pytest.raises(GeometryCancelledError):
+        solve_electrical_heating(
+            board,
+            terminals,
+            config,
+            progress_callback=cancel_on_solve,
+        )
+
+
+def test_b_cu_smd_current_terminals_with_kicad10_getlayer_zero():
+    """B.Cu SMD pads with GetLayer()==0 and LayerSet=={B_Cu} solve on B.Cu."""
+    import pcbnew
+
+    class _KiCad10BCuPad(MockPad):
+        def __init__(self, x_mm, y_mm, number):
+            super().__init__(
+                position=VECTOR2I(int(x_mm * 1e6), int(y_mm * 1e6)),
+                layer=F_Cu,  # Simulates KiCad 10 GetLayer() == 0 on B.Cu SMD pad
+                attribute=PAD_ATTRIB_SMD,
+                bbox=EDA_RECT(
+                    int((x_mm - 0.5) * 1e6),
+                    int((y_mm - 0.5) * 1e6),
+                    1_000_000,
+                    1_000_000,
+                ),
+                net_code=1,
+                net_name="PWR",
+                number=number,
+            )
+            self._layer_set = MockLayerSet([B_Cu])
+
+        def GetLayerSet(self):
+            return self._layer_set
+
+        def GetSize(self):
+            return VECTOR2I(1_000_000, 1_000_000)
+
+        def GetShape(self):
+            return getattr(pcbnew, "PAD_SHAPE_RECT", 1)
+
+    pad_a = _KiCad10BCuPad(1.5, 1.5, "1")
+    pad_b = _KiCad10BCuPad(8.5, 1.5, "2")
+    track = MockTrack(
+        layer=B_Cu,
+        bbox=EDA_RECT(1_500_000, 1_000_000, 7_000_000, 1_000_000),
+        start=VECTOR2I(1_500_000, 1_500_000),
+        end=VECTOR2I(8_500_000, 1_500_000),
+        width=1_000_000,
+        net_code=1,
+        net_name="PWR",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_a, pad_b])],
+        tracks=[track],
+        layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+    )
+    config = ElectricalConfig(
+        copper_ids=[F_Cu, B_Cu],
+        rows=4,
+        cols=12,
+        x_min=0.0,
+        y_min=0.0,
+        res=1.0,
+        t_cu=np.array([35e-6, 35e-6], dtype=np.float64),
+        layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+    )
+
+    result = solve_electrical_heating(
+        board,
+        [
+            CurrentTerminal(pad_a, "J1-1", "PWR", 1, 2.0),
+            CurrentTerminal(pad_b, "J2-1", "PWR", 1, -2.0),
+        ],
+        config,
+    )
+
+    assert result.valid, result.errors
+    assert result.total_loss_w > 0.0
+    summary = result.net_summaries[0]
+    assert [t.layer for t in summary.terminal_diagnostics] == ["B.Cu", "B.Cu"]
+    # Joule heat must exist only on B.Cu (layer index 1), zero on F.Cu (layer index 0)
+    q_3d = result.q_joule.reshape(2, 4, 12)
+    assert np.sum(q_3d[0]) == 0.0
+    assert np.sum(q_3d[1]) > 0.0

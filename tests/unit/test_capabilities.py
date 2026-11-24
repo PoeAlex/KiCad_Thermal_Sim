@@ -27,6 +27,16 @@ class TestCapabilityFlags:
         from ThermalSim.capabilities import HAS_NATIVE_MG
         assert isinstance(HAS_NATIVE_MG, bool)
 
+    def test_has_native_compact_is_boolean(self):
+        """Test that HAS_NATIVE_COMPACT is a boolean value."""
+        from ThermalSim.capabilities import HAS_NATIVE_COMPACT
+        assert isinstance(HAS_NATIVE_COMPACT, bool)
+
+    def test_has_native_pcg_is_boolean(self):
+        """Test that HAS_NATIVE_PCG is a boolean value."""
+        from ThermalSim.capabilities import HAS_NATIVE_PCG
+        assert isinstance(HAS_NATIVE_PCG, bool)
+
     def test_has_numba_is_boolean(self):
         """Test that HAS_NUMBA is a boolean value."""
         from ThermalSim.capabilities import HAS_NUMBA
@@ -239,6 +249,18 @@ class TestGetCapabilitiesSummary:
         result = get_capabilities_summary()
         assert "Native multigrid V-cycle" in result
 
+    def test_contains_native_compact_status(self):
+        """Test that summary mentions the compact low-RAM multigrid core."""
+        from ThermalSim.capabilities import get_capabilities_summary
+        result = get_capabilities_summary()
+        assert "Compact low-RAM multigrid core" in result
+
+    def test_contains_native_pcg_status(self):
+        """Test that summary mentions the native fused PCG kernels."""
+        from ThermalSim.capabilities import get_capabilities_summary
+        result = get_capabilities_summary()
+        assert "Native fused PCG kernels" in result
+
     def test_contains_numba_status(self):
         """Test that summary mentions Numba."""
         from ThermalSim.capabilities import get_capabilities_summary
@@ -302,6 +324,32 @@ class TestCapabilityFlagsConsistency:
                     assert 'Not available' in line
                 break
 
+    def test_native_compact_flag_matches_summary(self):
+        """Test that HAS_NATIVE_COMPACT flag matches summary text."""
+        from ThermalSim.capabilities import HAS_NATIVE_COMPACT, get_capabilities_summary
+        summary = get_capabilities_summary()
+
+        for line in summary.split('\n'):
+            if 'Compact low-RAM multigrid core' in line:
+                if HAS_NATIVE_COMPACT:
+                    assert 'Available' in line
+                else:
+                    assert 'Not available' in line
+                break
+
+    def test_native_pcg_flag_matches_summary(self):
+        """Test that HAS_NATIVE_PCG flag matches summary text."""
+        from ThermalSim.capabilities import HAS_NATIVE_PCG, get_capabilities_summary
+        summary = get_capabilities_summary()
+
+        for line in summary.split('\n'):
+            if 'Native fused PCG kernels' in line:
+                if HAS_NATIVE_PCG:
+                    assert 'Available' in line
+                else:
+                    assert 'Not available' in line
+                break
+
     def test_numba_flag_matches_summary(self):
         """Test that HAS_NUMBA flag matches summary text."""
         from ThermalSim.capabilities import HAS_NUMBA, get_capabilities_summary
@@ -327,7 +375,7 @@ class TestModuleImportBehavior:
     def test_reimport_stable(self):
         """Test that reimporting gives same flags."""
         from ThermalSim.capabilities import (
-            HAS_LIBS, HAS_NATIVE_CORE, HAS_NATIVE_MG, HAS_NUMBA
+            HAS_LIBS, HAS_NATIVE_CORE, HAS_NATIVE_MG, HAS_NATIVE_COMPACT, HAS_NATIVE_PCG, HAS_NUMBA
         )
 
         # Reimport
@@ -336,10 +384,14 @@ class TestModuleImportBehavior:
 
         from ThermalSim.capabilities import HAS_NATIVE_CORE as HAS_NATIVE_CORE2
         from ThermalSim.capabilities import HAS_NATIVE_MG as HAS_NATIVE_MG2
+        from ThermalSim.capabilities import HAS_NATIVE_COMPACT as HAS_NATIVE_COMPACT2
+        from ThermalSim.capabilities import HAS_NATIVE_PCG as HAS_NATIVE_PCG2
         from ThermalSim.capabilities import HAS_NUMBA as HAS_NUMBA2
 
         assert HAS_NATIVE_CORE == HAS_NATIVE_CORE2
         assert HAS_NATIVE_MG == HAS_NATIVE_MG2
+        assert HAS_NATIVE_COMPACT == HAS_NATIVE_COMPACT2
+        assert HAS_NATIVE_PCG == HAS_NATIVE_PCG2
         assert HAS_NUMBA == HAS_NUMBA2
 
     def test_attributes_exist(self):
@@ -354,6 +406,8 @@ class TestModuleImportBehavior:
         assert hasattr(capabilities, 'HAS_NUMBA')
         assert hasattr(capabilities, 'HAS_NATIVE_CORE')
         assert hasattr(capabilities, 'HAS_NATIVE_MG')
+        assert hasattr(capabilities, 'HAS_NATIVE_COMPACT')
+        assert hasattr(capabilities, 'HAS_NATIVE_PCG')
         assert hasattr(capabilities, 'get_capabilities_summary')
         assert hasattr(capabilities, 'get_missing_packages')
 
@@ -397,3 +451,5 @@ class TestEdgeCases:
         assert capabilities.HAS_NUMBA in [True, False]
         assert capabilities.HAS_NATIVE_CORE in [True, False]
         assert capabilities.HAS_NATIVE_MG in [True, False]
+        assert capabilities.HAS_NATIVE_COMPACT in [True, False]
+        assert capabilities.HAS_NATIVE_PCG in [True, False]

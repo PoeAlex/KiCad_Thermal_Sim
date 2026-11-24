@@ -49,6 +49,14 @@ TOOLTIP_TEXTS = {
     'pad_thick': "Thermal pad thickness in mm.",
     'pad_k': "Thermal pad conductivity in W/(m\u00b7K). Silicone ~3, aluminium ~200.",
     'pad_cap': "Areal heat capacity in J/(m\u00b2\u00b7K). Set 0 for negligible thermal mass.",
+    'pad_contact_factor': "Effective contact factor (0.05 to 1.0) accounting for thermal interface contact quality.",
+    'pad_sink_mode': "Select a fixed boundary temperature or a dynamic 0D heatsink with finite thermal resistance and mass.",
+    'pad_sink_temp_use_ambient': "Use the simulation ambient temperature as the fixed sink temperature.",
+    'pad_sink_temp_c': "Fixed sink temperature in \u00b0C when not using ambient temperature.",
+    'heatsink_rth_kw': "Heatsink-to-ambient thermal resistance R_th in K/W.",
+    'heatsink_material': "Heatsink material preset used to auto-fill specific heat capacity c_p.",
+    'heatsink_mass_g': "Heatsink mass in grams. Set 0 for an instantaneous (zero thermal mass) heatsink.",
+    'heatsink_cp_j_kgk': "Specific heat capacity c_p in J/(kg\u00b7K). Editable only when material is Custom.",
     'h_conv': "Convection coefficient in W/(m\u00b2\u00b7K). Still air ~5-10, light fan ~25, forced ~50-100.",
     'pcb_thick': "PCB thickness override in mm. Usually auto-detected from stackup.",
     'grid_detail': "Compute budget used to preserve the desired cell size on large simulations.",
@@ -91,6 +99,34 @@ GRID_DETAIL_PRESETS = {
 DEFAULT_GRID_DETAIL = "balanced"
 DEFAULT_GRID_NODE_BUDGET = GRID_DETAIL_PRESETS[DEFAULT_GRID_DETAIL][0]
 MAX_CUSTOM_GRID_NODES = 100_000_000
+
+HEATSINK_MATERIAL_OPTIONS = [
+    ("Aluminium (897 J/kg\u00b7K)", "aluminium", 897.0),
+    ("Copper (385 J/kg\u00b7K)", "copper", 385.0),
+    ("Steel (490 J/kg\u00b7K)", "steel", 490.0),
+    ("Magnesium (1020 J/kg\u00b7K)", "magnesium", 1020.0),
+    ("Custom", "custom", None),
+]
+
+
+def resolve_heatsink_cp(material, custom_cp=897.0):
+    """Return specific heat c_p in J/(kg*K) for a heatsink material preset or custom value."""
+    mat_key = str(material or "aluminium").strip().lower()
+    for _, key, preset_cp in HEATSINK_MATERIAL_OPTIONS:
+        if key == mat_key and preset_cp is not None:
+            return float(preset_cp)
+    try:
+        return float(custom_cp)
+    except (TypeError, ValueError):
+        return 897.0
+
+
+def _set_control_enabled(control, enabled):
+    """Enable or disable a wx control safely across real wx and headless mocks."""
+    if hasattr(control, "Enable"):
+        control.Enable(bool(enabled))
+    else:
+        control._enabled = bool(enabled)
 
 
 def _safe_float(value, default=0.0):
@@ -862,9 +898,96 @@ class SettingsDialog(wx.Dialog):
             min_val=0.0, max_val=100000.0, inc=100.0, digits=0,
             tooltip_key='pad_cap'
         )
-        self._thermal_pad_controls = [self.pad_thick, self.pad_k, self.pad_cap]
-        for control in self._thermal_pad_controls:
-            control.Enable(False)
+        self.pad_contact_factor = self._add_spin_field(
+            box_pad, pad_panel, "Contact factor", 0.2,
+            min_val=0.05, max_val=1.0, inc=0.05, digits=2,
+            tooltip_key='pad_contact_factor'
+        )
+
+        choice_event = getattr(wx, "EVT_CHOICE", None)
+        spin_double_event = getattr(wx, "EVT_SPINCTRLDOUBLE", None)
+        focus_event = getattr(wx, "EVT_KILL_FOCUS", None)
+
+        sink_mode_row = wx.BoxSizer(wx.HORIZONTAL)
+        sink_mode_row.Add(
+            wx.StaticText(pad_panel, label="Sink model", size=(160, -1)),
+            0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5,
+        )
+        self.pad_sink_mode_choice = wx.Choice(
+            pad_panel,
+            choices=["Fixed temperature", "Dynamic heatsink (0D)"],
+        )
+        self.pad_sink_mode_choice.SetSelection(0)
+        self.pad_sink_mode_choice.SetToolTip(TOOLTIP_TEXTS['pad_sink_mode'])
+        if choice_event is not None:
+            self.pad_sink_mode_choice.Bind(choice_event, self._on_pad_sink_mode_changed)
+        sink_mode_row.Add(self.pad_sink_mode_choice, 1, wx.EXPAND)
+        box_pad.Add(sink_mode_row, 0, wx.EXPAND | wx.ALL, 2)
+
+        self.chk_pad_sink_ambient = wx.CheckBox(
+            pad_panel, label="Use ambient temperature"
+        )
+        self.chk_pad_sink_ambient.SetValue(True)
+        self.chk_pad_sink_ambient.SetToolTip(TOOLTIP_TEXTS['pad_sink_temp_use_ambient'])
+        self.chk_pad_sink_ambient.Bind(wx.EVT_CHECKBOX, self._on_pad_sink_ambient_toggle)
+        box_pad.Add(self.chk_pad_sink_ambient, 0, wx.ALL, 3)
+
+        self.pad_sink_temp_input = self._add_spin_field(
+            box_pad, pad_panel, "Fixed sink temp (C)", 25.0,
+            min_val=-50.0, max_val=300.0, inc=1.0, digits=1,
+            tooltip_key='pad_sink_temp_c'
+        )
+
+        self.heatsink_rth_input = self._add_spin_field(
+            box_pad, pad_panel, "Heatsink R_th (K/W)", 5.0,
+            min_val=0.05, max_val=500.0, inc=0.5, digits=2,
+            tooltip_key='heatsink_rth_kw'
+        )
+
+        material_row = wx.BoxSizer(wx.HORIZONTAL)
+        material_row.Add(
+            wx.StaticText(pad_panel, label="Heatsink material", size=(160, -1)),
+            0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5,
+        )
+        self.heatsink_material_choice = wx.Choice(
+            pad_panel,
+            choices=[label for label, _, _ in HEATSINK_MATERIAL_OPTIONS],
+        )
+        self.heatsink_material_choice.SetSelection(0)
+        self.heatsink_material_choice.SetToolTip(TOOLTIP_TEXTS['heatsink_material'])
+        if choice_event is not None:
+            self.heatsink_material_choice.Bind(choice_event, self._on_heatsink_material_changed)
+        material_row.Add(self.heatsink_material_choice, 1, wx.EXPAND)
+        box_pad.Add(material_row, 0, wx.EXPAND | wx.ALL, 2)
+
+        self.heatsink_mass_input = self._add_spin_field(
+            box_pad, pad_panel, "Heatsink mass (g)", 50.0,
+            min_val=0.0, max_val=50000.0, inc=5.0, digits=1,
+            tooltip_key='heatsink_mass_g'
+        )
+
+        self.heatsink_cp_input = self._add_spin_field(
+            box_pad, pad_panel, "Specific heat c_p (J/kg\u00b7K)", 897.0,
+            min_val=10.0, max_val=5000.0, inc=10.0, digits=1,
+            tooltip_key='heatsink_cp_j_kgk'
+        )
+
+        for ctrl in (self.heatsink_rth_input, self.heatsink_mass_input, self.heatsink_cp_input):
+            if spin_double_event is not None and hasattr(ctrl, "Bind"):
+                ctrl.Bind(spin_double_event, self._on_heatsink_param_changed)
+            if focus_event is not None and hasattr(ctrl, "Bind"):
+                ctrl.Bind(focus_event, self._on_heatsink_param_changed)
+
+        self.lbl_heatsink_summary = wx.StaticText(pad_panel, label="")
+        box_pad.Add(self.lbl_heatsink_summary, 0, wx.EXPAND | wx.ALL, 3)
+
+        self._thermal_pad_controls = [
+            self.pad_thick,
+            self.pad_k,
+            self.pad_cap,
+            self.pad_contact_factor,
+        ]
+        self._apply_thermal_pad_controls()
 
         pad_panel.SetSizer(box_pad)
         sizer.Add(self.thermal_pad_pane, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
@@ -1302,6 +1425,26 @@ class SettingsDialog(wx.Dialog):
         except Exception:
             pass
 
+    def _flush_ui_updates(self):
+        """Force immediate repaint and pending UI event processing safely."""
+        for method_name in ("Refresh", "Update"):
+            method = getattr(self, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    pass
+        try:
+            get_app = getattr(wx, "GetApp", None)
+            app = get_app() if callable(get_app) else None
+            if app is not None and hasattr(app, "Yield"):
+                try:
+                    app.Yield(True)
+                except TypeError:
+                    app.Yield()
+        except Exception:
+            pass
+
     def _on_preview(self, event):
         """Handle Preview button click."""
         if self.preview_callback:
@@ -1312,13 +1455,14 @@ class SettingsDialog(wx.Dialog):
                     "Extracting and rasterizing board geometry.",
                 )
                 self.btn_preview.Enable(False)
+                self._flush_ui_updates()
                 try:
                     output_path = self.preview_callback(settings, self.layer_names)
                     if output_path:
                         self._set_footer_status(
                             "Preview ready", os.path.basename(output_path)
                         )
-                    else:
+                    elif self.lbl_preflight.GetLabel() != "Preview cancelled.":
                         self._set_footer_status(
                             "Preview failed", "No preview image was created."
                         )
@@ -1330,6 +1474,7 @@ class SettingsDialog(wx.Dialog):
                     wx.MessageBox("Geometry preview failed.", "ThermalSim")
                 finally:
                     self.btn_preview.Enable(True)
+                    self._flush_ui_updates()
 
     def _on_run(self, event):
         """Handle Run button click for modal and modeless workflows."""
@@ -1470,6 +1615,7 @@ class SettingsDialog(wx.Dialog):
         title, default_message = labels.get(self.last_run_status, (self.last_run_status.title(), ""))
         self._set_footer_status(title, message or default_message)
         self.btn_run.Enable(self.last_run_status != "running")
+        self._flush_ui_updates()
 
     def set_artifacts(self, report_path, run_dir, elapsed_s=None, max_temp_c=None):
         """Expose completion summary and actions for a successful run."""
@@ -1550,14 +1696,77 @@ class SettingsDialog(wx.Dialog):
         )
         self._refresh_preflight()
 
-    def _on_heatsink_toggle(self, event):
-        """Enable thermal-interface fields only when their model is active."""
-        enabled = self.chk_heatsink.GetValue()
+    def _selected_heatsink_material(self):
+        """Return (material_key, preset_cp) for the active material selection."""
+        idx = self.heatsink_material_choice.GetSelection()
+        if 0 <= idx < len(HEATSINK_MATERIAL_OPTIONS):
+            _, key, preset_cp = HEATSINK_MATERIAL_OPTIONS[idx]
+            return key, preset_cp
+        return "aluminium", 897.0
+
+    def _apply_thermal_pad_controls(self):
+        """Update enable states, preset c_p, and live heatsink summary."""
+        enabled = bool(self.chk_heatsink.GetValue())
+        is_heatsink_mode = self.pad_sink_mode_choice.GetSelection() == 1
+        use_ambient = bool(self.chk_pad_sink_ambient.GetValue())
+        mat_key, preset_cp = self._selected_heatsink_material()
+
         for control in self._thermal_pad_controls:
             control.Enable(enabled)
-        if enabled:
+        _set_control_enabled(self.pad_sink_mode_choice, enabled)
+
+        self.chk_pad_sink_ambient.Enable(enabled and not is_heatsink_mode)
+        self.pad_sink_temp_input.Enable(enabled and (not is_heatsink_mode) and (not use_ambient))
+
+        if preset_cp is not None:
+            self.heatsink_cp_input.SetValue(float(preset_cp))
+
+        self.heatsink_rth_input.Enable(enabled and is_heatsink_mode)
+        _set_control_enabled(self.heatsink_material_choice, enabled and is_heatsink_mode)
+        self.heatsink_mass_input.Enable(enabled and is_heatsink_mode)
+        self.heatsink_cp_input.Enable(enabled and is_heatsink_mode and mat_key == "custom")
+
+        if not is_heatsink_mode:
+            summary = "Fixed sink temperature (infinite thermal mass)"
+        else:
+            mass_g = max(0.0, float(self.heatsink_mass_input.GetValue()))
+            cp = float(self.heatsink_cp_input.GetValue())
+            rth = float(self.heatsink_rth_input.GetValue())
+            if mass_g <= 0.0:
+                summary = "C_hs = 0.0 J/K (instantaneous heatsink, tau = 0 s)"
+            else:
+                c_hs = (mass_g / 1000.0) * cp
+                tau = rth * c_hs
+                summary = f"C_hs = {c_hs:.1f} J/K  \u00b7  Time constant tau = {tau:.1f} s"
+        if hasattr(self.lbl_heatsink_summary, "SetLabel"):
+            self.lbl_heatsink_summary.SetLabel(summary)
+
+    def _on_heatsink_toggle(self, event):
+        """Enable thermal-interface fields only when their model is active."""
+        self._apply_thermal_pad_controls()
+        if self.chk_heatsink.GetValue():
             self.thermal_pad_pane.Expand()
         self._refresh_preflight()
+
+    def _on_pad_sink_mode_changed(self, event):
+        """Handle sink mode selection change."""
+        self._apply_thermal_pad_controls()
+
+    def _on_pad_sink_ambient_toggle(self, event):
+        """Handle fixed sink ambient checkbox toggle."""
+        self._apply_thermal_pad_controls()
+
+    def _on_heatsink_material_changed(self, event):
+        """Handle heatsink material preset change."""
+        self._apply_thermal_pad_controls()
+
+    def _on_heatsink_param_changed(self, event):
+        """Update live heatsink capacity and time-constant readout."""
+        self._apply_thermal_pad_controls()
+        try:
+            event.Skip()
+        except Exception:
+            pass
 
     def _on_advanced_pane_changed(self, event):
         """Relayout the Advanced tab when a native pane is expanded."""
@@ -2103,6 +2312,14 @@ class SettingsDialog(wx.Dialog):
         - pad_th : float
         - pad_k : float
         - pad_cap_areal : float
+        - pad_sink_mode : str
+        - pad_contact_factor : float
+        - pad_sink_temp_use_ambient : bool
+        - pad_sink_temp_c : float
+        - heatsink_rth_kw : float
+        - heatsink_material : str
+        - heatsink_mass_g : float
+        - heatsink_cp_j_kgk : float
         - h_conv : float
         - grid_expert_limits : bool
         - grid_max_cells : int
@@ -2163,6 +2380,17 @@ class SettingsDialog(wx.Dialog):
                 if 0 <= mesh_idx < len(mesh_modes)
                 else "auto"
             )
+            mat_key, preset_cp = self._selected_heatsink_material()
+            pad_sink_mode = (
+                "heatsink"
+                if self.pad_sink_mode_choice.GetSelection() == 1
+                else "fixed"
+            )
+            heatsink_cp = (
+                float(preset_cp)
+                if preset_cp is not None
+                else float(self.heatsink_cp_input.GetValue())
+            )
             return {
                 'power_str': power_str,
                 'power_pads': power_pads,
@@ -2185,6 +2413,14 @@ class SettingsDialog(wx.Dialog):
                 'pad_th': float(self.pad_thick.GetValue()),
                 'pad_k': float(self.pad_k.GetValue()),
                 'pad_cap_areal': float(self.pad_cap.GetValue()),
+                'pad_sink_mode': pad_sink_mode,
+                'pad_contact_factor': float(self.pad_contact_factor.GetValue()),
+                'pad_sink_temp_use_ambient': bool(self.chk_pad_sink_ambient.GetValue()),
+                'pad_sink_temp_c': float(self.pad_sink_temp_input.GetValue()),
+                'heatsink_rth_kw': float(self.heatsink_rth_input.GetValue()),
+                'heatsink_material': mat_key,
+                'heatsink_mass_g': float(self.heatsink_mass_input.GetValue()),
+                'heatsink_cp_j_kgk': heatsink_cp,
                 'h_conv': float(self.h_conv_input.GetValue()),
                 'grid_expert_limits': grid_expert_limits,
                 'grid_max_cells': grid_max_cells,
@@ -2259,14 +2495,45 @@ class SettingsDialog(wx.Dialog):
             self.chk_heatsink.SetValue(
                 bool(defaults.get('use_heatsink', self.chk_heatsink.GetValue()))
             )
-            for control in self._thermal_pad_controls:
-                control.Enable(self.chk_heatsink.GetValue())
             if 'pad_th' in defaults:
                 self.pad_thick.SetValue(float(defaults['pad_th']))
             if 'pad_k' in defaults:
                 self.pad_k.SetValue(float(defaults['pad_k']))
             if 'pad_cap_areal' in defaults:
                 self.pad_cap.SetValue(float(defaults['pad_cap_areal']))
+
+            contact_factor = defaults.get('pad_contact_factor', 0.2)
+            self.pad_contact_factor.SetValue(
+                0.2 if contact_factor is None else float(contact_factor)
+            )
+            sink_mode = str(defaults.get('pad_sink_mode', 'fixed') or 'fixed').strip().lower()
+            self.pad_sink_mode_choice.SetSelection(1 if sink_mode == 'heatsink' else 0)
+            self.chk_pad_sink_ambient.SetValue(
+                bool(defaults.get('pad_sink_temp_use_ambient', True))
+            )
+            sink_temp = defaults.get('pad_sink_temp_c', 25.0)
+            self.pad_sink_temp_input.SetValue(
+                25.0 if sink_temp is None else float(sink_temp)
+            )
+            rth_kw = defaults.get('heatsink_rth_kw', 5.0)
+            self.heatsink_rth_input.SetValue(
+                5.0 if rth_kw is None else float(rth_kw)
+            )
+            mat_key = str(defaults.get('heatsink_material', 'aluminium') or 'aluminium').strip().lower()
+            mat_idx = next(
+                (i for i, (_, key, _) in enumerate(HEATSINK_MATERIAL_OPTIONS) if key == mat_key),
+                0,
+            )
+            self.heatsink_material_choice.SetSelection(mat_idx)
+            mass_g = defaults.get('heatsink_mass_g', 50.0)
+            self.heatsink_mass_input.SetValue(
+                50.0 if mass_g is None else float(mass_g)
+            )
+            custom_cp = defaults.get('heatsink_cp_j_kgk', 897.0)
+            self.heatsink_cp_input.SetValue(
+                897.0 if custom_cp is None else float(custom_cp)
+            )
+            self._apply_thermal_pad_controls()
 
             if 'h_conv' in defaults:
                 self.h_conv_input.SetValue(float(defaults['h_conv']))

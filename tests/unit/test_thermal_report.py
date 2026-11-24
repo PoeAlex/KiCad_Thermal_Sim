@@ -783,3 +783,245 @@ class TestWriteHtmlReportEdgeCases:
             small_html = f.read()
 
         assert "Interactive preview downsampled" not in small_html
+
+
+class TestWriteHtmlReportDynamicHeatsink:
+    """Tests for dynamic 0D heatsink and thermal pad reporting."""
+
+    @pytest.fixture
+    def base_params(self, temp_dir):
+        """Create base parameters for heatsink report tests."""
+        interactive_heatmap = build_interactive_heatmap_payload(
+            create_uniform_temperature(2, 6, 8, temperature=55.0),
+            amb=25.0,
+            layer_names=['F.Cu', 'B.Cu'],
+            res_mm=0.5,
+            show_all=True,
+        )
+        return {
+            'settings': {
+                'power_str': '5.0',
+                'time': 300.0,
+                'amb': 25.0,
+                'thick': 1.6,
+                'res': 0.5,
+                'show_all': True,
+                'snapshots': False,
+            },
+            'stack_info': {},
+            'stackup_derived': {
+                'total_thick_mm_used': 1.6,
+                'stack_board_thick_mm': 1.6,
+                'copper_thickness_mm_used': [0.035, 0.035],
+                'gap_mm_used': [1.53],
+                'gap_fallback_used': False,
+            },
+            'pad_power': [('U1:EP', 5.0)],
+            'layer_names': ['F.Cu', 'B.Cu'],
+            'preview_path': None,
+            'heatmap_path': None,
+            'out_dir': temp_dir,
+            'interactive_heatmap': interactive_heatmap,
+        }
+
+    def test_dynamic_heatsink_cards_details_diagnostics_and_snapshot_stats(self, base_params):
+        """Dynamic heatsink report renders summary cards, pad details, diagnostics, and snapshot column."""
+        params = base_params.copy()
+        params['settings'] = dict(base_params['settings'], **{
+            'use_heatsink': True,
+            'pad_sink_mode': 'heatsink',
+            'pad_contact_factor': 0.85,
+            'heatsink_rth_kw': 3.0,
+            'heatsink_material': 'aluminium',
+            'heatsink_mass_g': 100.0,
+            'heatsink_cp_j_kgk': 897.0,
+            'snapshots': True,
+            'snap_count': 2,
+        })
+        params['k_norm_info'] = {
+            'backend': 'NativeMG',
+            'steps_total': 50,
+            'pin_w': 5.0,
+            'pout_final_w': 4.95,
+            'heatsink_enabled': True,
+            'heatsink_mode': 'heatsink',
+            'heatsink_temp_c': 37.60,
+            'heatsink_temp_rise_c': 12.60,
+            'heatsink_rth_kw': 3.0,
+            'heatsink_capacity_j_k': 89.7,
+            'heatsink_tau_s': 269.1,
+            'heatsink_power_w': 4.20,
+            'heatsink_pad_flux_w': 4.25,
+            'pcb_convection_power_w': 0.75,
+            'heatsink_power_fraction': 4.20 / 4.95,
+        }
+        params['snapshot_debug'] = {
+            'snapshots_enabled': True,
+            'stats': [
+                {
+                    't': 30.0,
+                    'max_top': 48.12,
+                    'max_bottom': 42.34,
+                    'heatsink_temp_c': 28.45,
+                    'pin': 5.0,
+                    'pout': 2.1,
+                    'energy': 90.0,
+                    'eps_rel': 0.001,
+                },
+                {
+                    't': 300.0,
+                    'max_top': 55.00,
+                    'max_bottom': 50.00,
+                    'heatsink_temp_c': 37.60,
+                    'pin': 5.0,
+                    'pout': 4.95,
+                    'energy': 420.0,
+                    'eps_rel': 0.0002,
+                },
+            ],
+        }
+
+        result = write_html_report(**params)
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Summary metric cards
+        assert "Heatsink Temp" in content
+        assert "37.60 C" in content
+        assert "+12.6 K" in content
+        assert "tau 269.1 s" in content
+        assert "Heat Removal Split" in content
+        assert "4.20 W (84.8%)" in content
+        assert "PCB air: 0.75 W (15.2%)" in content
+
+        # Thermal Pad settings/details
+        assert "Dynamic heatsink (0D)" in content
+        assert "3.00 K/W" in content
+        assert "Aluminium (c_p = 897.0 J/kg·K)" in content
+        assert "100.0 g" in content
+        assert "89.70 J/K" in content
+        assert "269.1 s" in content
+        assert "0.85" in content
+
+        # Solver Summary diagnostics
+        assert "Heatsink Power" in content
+        assert "4.2000 W" in content
+        assert "Pad-to-Heatsink Flux" in content
+        assert "4.2500 W" in content
+        assert "PCB Convection Power" in content
+        assert "0.7500 W" in content
+        assert "Heatsink Time Constant (tau)" in content
+
+        # Snapshot Statistics column
+        assert "Snapshot Statistics" in content
+        assert "28.45 C" in content
+
+    def test_zero_mass_heatsink_renders_instantaneous_tau(self, base_params):
+        """Zero-mass dynamic heatsink displays instantaneous tau label."""
+        params = base_params.copy()
+        params['settings'] = dict(base_params['settings'], **{
+            'use_heatsink': True,
+            'pad_sink_mode': 'heatsink',
+            'pad_contact_factor': 0.5,
+            'heatsink_rth_kw': 4.0,
+            'heatsink_material': 'custom',
+            'heatsink_mass_g': 0.0,
+            'heatsink_cp_j_kgk': 500.0,
+        })
+        params['k_norm_info'] = {
+            'heatsink_enabled': True,
+            'heatsink_mode': 'heatsink',
+            'heatsink_temp_c': 41.0,
+            'heatsink_temp_rise_c': 16.0,
+            'heatsink_rth_kw': 4.0,
+            'heatsink_capacity_j_k': 0.0,
+            'heatsink_tau_s': 0.0,
+            'heatsink_power_w': 4.0,
+            'heatsink_pad_flux_w': 4.0,
+            'pcb_convection_power_w': 1.0,
+            'heatsink_power_fraction': 0.8,
+        }
+
+        result = write_html_report(**params)
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        assert "+16.0 K · instantaneous" in content
+        assert "0.0 s (instantaneous)" in content
+        assert "Custom (c_p = 500.0 J/kg·K)" in content
+
+    def test_fixed_sink_and_no_heatsink_omit_dynamic_cards(self, base_params):
+        """Fixed-sink and no-pad reports must not render dynamic heatsink summary cards."""
+        # No heatsink at all
+        result_none = write_html_report(**base_params)
+        with open(result_none, 'r', encoding='utf-8') as f:
+            content_none = f.read()
+        assert "Heatsink Temp" not in content_none
+        assert "Heat Removal Split" not in content_none
+        assert "Thermal Pad Mode" not in content_none
+
+        # Fixed sink mode with custom sink temperature
+        params_fixed = base_params.copy()
+        params_fixed['settings'] = dict(base_params['settings'], **{
+            'use_heatsink': True,
+            'pad_sink_mode': 'fixed',
+            'pad_sink_temp_use_ambient': False,
+            'pad_sink_temp_c': 40.0,
+            'pad_contact_factor': 0.35,
+        })
+        params_fixed['k_norm_info'] = {
+            'heatsink_mode': 'fixed',
+            'pad_contact_factor': 0.35,
+        }
+        params_fixed['snapshot_debug'] = {
+            'stats': [
+                {
+                    't': 10.0,
+                    'max_top': 45.0,
+                    'max_bottom': 41.0,
+                    'pin': 5.0,
+                    'pout': 4.0,
+                    'energy': 50.0,
+                    'eps_rel': 0.01,
+                }
+            ]
+        }
+
+        result_fixed = write_html_report(**params_fixed)
+        with open(result_fixed, 'r', encoding='utf-8') as f:
+            content_fixed = f.read()
+
+        assert "Heatsink Temp" not in content_fixed
+        assert "Heat Removal Split" not in content_fixed
+        assert "Fixed temperature" in content_fixed
+        assert "40.00 C" in content_fixed
+        assert "0.35" in content_fixed
+        assert "Snapshot Statistics" in content_fixed
+
+    def test_inactive_dynamic_heatsink_shows_reason_cleanly(self, base_params):
+        """Inactive dynamic heatsink (no User.Eco1 shapes) shows reason without crashing."""
+        params = base_params.copy()
+        params['settings'] = dict(base_params['settings'], **{
+            'use_heatsink': True,
+            'pad_sink_mode': 'heatsink',
+            'pad_contact_factor': 0.2,
+            'heatsink_rth_kw': 5.0,
+            'heatsink_material': 'copper',
+            'heatsink_mass_g': 50.0,
+            'heatsink_cp_j_kgk': 385.0,
+        })
+        params['k_norm_info'] = {
+            'heatsink_enabled': False,
+            'heatsink_mode': 'heatsink',
+            'heatsink_inactive_reason': 'No User.Eco1 thermal pad shapes found on board',
+        }
+
+        result = write_html_report(**params)
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        assert "Heatsink Temp" not in content
+        assert "Heat Removal Split" not in content
+        assert "Dynamic heatsink (0D)" in content
+        assert "No User.Eco1 thermal pad shapes found on board" in content
+        assert "Copper (c_p = 385.0 J/kg·K)" in content

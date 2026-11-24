@@ -221,7 +221,50 @@ def _build_summary_metrics(settings, interactive_heatmap, k_norm_info, snapshot_
         ("Snapshots", "enabled" if settings.get("snapshots") else "disabled", f"target: {settings.get('snap_count', 0)}"),
         ("Output Folder", os.path.basename(str((snapshot_debug or {}).get("run_dir", ""))) or "n/a", None),
     ]
-    featured_labels = {"Overall Peak", "Input Power", "Resolution", "Solver", "Mesh"}
+    if (k_norm_info or {}).get("heatsink_enabled") and (k_norm_info or {}).get("heatsink_temp_c") is not None:
+        t_hs = k_norm_info.get("heatsink_temp_c")
+        rise = k_norm_info.get("heatsink_temp_rise_c")
+        if rise is None and "amb" in settings:
+            try:
+                rise = float(t_hs) - float(settings.get("amb"))
+            except Exception:
+                rise = None
+        tau = k_norm_info.get("heatsink_tau_s")
+        detail_parts = []
+        if rise is not None:
+            detail_parts.append(f"+{_fmt_num(rise, 1, ' K')}")
+        if tau is not None:
+            try:
+                tau_val = float(tau)
+                detail_parts.append("instantaneous" if tau_val <= 0.0 else f"tau {_fmt_num(tau_val, 1, ' s')}")
+            except Exception:
+                pass
+        metrics.append((
+            "Heatsink Temp",
+            _fmt_num(t_hs, 2, " C"),
+            " · ".join(detail_parts) if detail_parts else None,
+        ))
+
+        p_hs = k_norm_info.get("heatsink_power_w")
+        p_air = k_norm_info.get("pcb_convection_power_w")
+        frac = k_norm_info.get("heatsink_power_fraction")
+        if frac is None and p_hs is not None and p_air is not None:
+            try:
+                total_p = float(p_hs) + float(p_air)
+                frac = float(p_hs) / total_p if total_p > 1e-12 else 0.0
+            except Exception:
+                frac = None
+        if frac is not None:
+            hs_pct = float(frac) * 100.0
+            air_pct = max(0.0, 100.0 - hs_pct)
+            split_value = f"{_fmt_num(p_hs, 2, ' W')} ({hs_pct:.1f}%)"
+            split_detail = f"PCB air: {_fmt_num(p_air, 2, ' W')} ({air_pct:.1f}%)" if p_air is not None else None
+        else:
+            split_value = _fmt_num(p_hs, 2, " W")
+            split_detail = f"PCB air: {_fmt_num(p_air, 2, ' W')}" if p_air is not None else None
+        metrics.append(("Heat Removal Split", split_value, split_detail))
+
+    featured_labels = {"Overall Peak", "Input Power", "Resolution", "Solver", "Mesh", "Heatsink Temp"}
     cards = []
     for label, value, detail in metrics:
         detail_html = f"<p class='metric-detail'>{_esc(detail)}</p>" if detail else ""
@@ -316,6 +359,127 @@ def _build_interactive_viewer(interactive_heatmap):
         "</div></div>"
         "<div id='heatmap-tooltip' class='viewer-tooltip'></div>"
         f"<script id='interactive-heatmap-data' type='application/json'>{payload_json}</script>"
+    )
+
+
+_HEATSINK_MATERIAL_CP = {
+    "aluminium": 897.0,
+    "copper": 385.0,
+    "steel": 490.0,
+    "magnesium": 1020.0,
+}
+
+
+def _build_thermal_pad_section(settings, k_norm_info):
+    """Render Thermal Pad settings and dynamic heatsink details when relevant."""
+    settings = settings or {}
+    k_norm_info = k_norm_info or {}
+    inactive_reason = k_norm_info.get("heatsink_inactive_reason")
+    heatsink_enabled = bool(k_norm_info.get("heatsink_enabled"))
+    if not settings.get("use_heatsink") and not heatsink_enabled and not inactive_reason:
+        return ""
+
+    raw_mode = k_norm_info.get("heatsink_mode") or settings.get("pad_sink_mode") or "fixed"
+    mode = str(raw_mode).strip().lower()
+    contact_factor = settings.get("pad_contact_factor", k_norm_info.get("pad_contact_factor", 0.2))
+    rows = []
+
+    if mode == "heatsink" or heatsink_enabled:
+        rows.append(("Thermal Pad Mode", "Dynamic heatsink (0D)"))
+        rth = k_norm_info.get("heatsink_rth_kw", settings.get("heatsink_rth_kw"))
+        mat_raw = str(settings.get("heatsink_material", "aluminium") or "aluminium").strip().lower()
+        cp_val = settings.get("heatsink_cp_j_kgk")
+        if cp_val is None and mat_raw in _HEATSINK_MATERIAL_CP:
+            cp_val = _HEATSINK_MATERIAL_CP[mat_raw]
+        mass_g = settings.get("heatsink_mass_g")
+        c_hs = k_norm_info.get("heatsink_capacity_j_k")
+        if c_hs is None and mass_g is not None and cp_val is not None:
+            try:
+                c_hs = max(0.0, float(mass_g)) * 1e-3 * max(0.0, float(cp_val))
+            except Exception:
+                c_hs = None
+        tau_s = k_norm_info.get("heatsink_tau_s")
+        if tau_s is None and c_hs is not None and rth is not None:
+            try:
+                tau_s = max(0.0, float(c_hs)) * max(0.0, float(rth))
+            except Exception:
+                tau_s = None
+
+        mat_label = mat_raw.title()
+        if cp_val is not None:
+            mat_label = f"{mat_label} (c_p = {_fmt_num(cp_val, 1, ' J/kg·K')})"
+        rows.append(("Heatsink R_th", _fmt_num(rth, 2, " K/W")))
+        rows.append(("Heatsink Material", mat_label))
+        rows.append(("Heatsink Mass", _fmt_num(mass_g, 1, " g")))
+        rows.append(("Heatsink Capacity (C_hs)", _fmt_num(c_hs, 2, " J/K")))
+        if tau_s is not None:
+            try:
+                tau_num = float(tau_s)
+                tau_label = f"{_fmt_num(tau_num, 1, ' s')} (instantaneous)" if tau_num <= 0.0 else _fmt_num(tau_num, 1, " s")
+            except Exception:
+                tau_label = _fmt(tau_s, " s")
+        else:
+            tau_label = "n/a"
+        rows.append(("Heatsink Time Constant (tau)", tau_label))
+        rows.append(("Contact Factor", _fmt_num(contact_factor, 2)))
+    else:
+        rows.append(("Thermal Pad Mode", "Fixed temperature"))
+        use_amb = bool(settings.get("pad_sink_temp_use_ambient", True))
+        if use_amb or settings.get("pad_sink_temp_c") is None:
+            sink_label = f"{_fmt_num(settings.get('amb'), 2, ' C')} (ambient)" if "amb" in settings else "Ambient"
+        else:
+            sink_label = _fmt_num(settings.get("pad_sink_temp_c"), 2, " C")
+        rows.append(("Sink Temperature", sink_label))
+        rows.append(("Contact Factor", _fmt_num(contact_factor, 2)))
+
+    if inactive_reason:
+        rows.append(("Thermal Pad Status", str(inactive_reason)))
+
+    return (
+        "<div class='spacer-sm'></div>"
+        "<h3 class='section-title'>Thermal Pad</h3>"
+        f"{_table_html(['Parameter', 'Value'], rows)}"
+    )
+
+
+def _build_snapshot_stats_table(snapshot_debug):
+    """Render Snapshot Statistics table when snapshot stats are recorded."""
+    stats = (snapshot_debug or {}).get("stats") or []
+    if not isinstance(stats, list) or not stats:
+        return ""
+    has_heatsink = any(
+        isinstance(entry, dict) and entry.get("heatsink_temp_c") is not None
+        for entry in stats
+    )
+    headers = ["Time", "Top Max", "Bottom Max"]
+    if has_heatsink:
+        headers.append("Heatsink Temp")
+    headers.extend(["P_in", "P_out", "Energy", "Rel Error"])
+
+    rows = []
+    for entry in stats:
+        if not isinstance(entry, dict):
+            continue
+        row = [
+            _fmt_num(entry.get("t"), 2, " s"),
+            _fmt_num(entry.get("max_top"), 2, " C"),
+            _fmt_num(entry.get("max_bottom"), 2, " C"),
+        ]
+        if has_heatsink:
+            row.append(_fmt_num(entry.get("heatsink_temp_c"), 2, " C"))
+        row.extend([
+            _fmt_num(entry.get("pin"), 3, " W"),
+            _fmt_num(entry.get("pout"), 3, " W"),
+            _fmt_num(entry.get("energy"), 3, " J"),
+            _fmt_compact(entry.get("eps_rel")),
+        ])
+        rows.append(row)
+    if not rows:
+        return ""
+    return (
+        "<div class='spacer-sm'></div>"
+        "<h3 class='section-title'>Snapshot Statistics</h3>"
+        f"{_table_html(headers, rows)}"
     )
 
 
@@ -611,6 +775,16 @@ def write_html_report(
         "pout_final_w": k_norm_info.get("pout_final_w"),
         "steady_rel_diff": k_norm_info.get("steady_rel_diff"),
     }
+    if k_norm_info.get("heatsink_enabled"):
+        solver_summary.update({
+            "Heatsink Temp": _fmt_num(k_norm_info.get("heatsink_temp_c"), 2, " C"),
+            "Heatsink Power": _fmt_num(k_norm_info.get("heatsink_power_w"), 4, " W"),
+            "Pad-to-Heatsink Flux": _fmt_num(k_norm_info.get("heatsink_pad_flux_w"), 4, " W"),
+            "PCB Convection Power": _fmt_num(k_norm_info.get("pcb_convection_power_w"), 4, " W"),
+            "Heatsink Time Constant (tau)": _fmt_num(k_norm_info.get("heatsink_tau_s"), 2, " s"),
+        })
+    if k_norm_info.get("heatsink_inactive_reason"):
+        solver_summary["Heatsink Status"] = k_norm_info.get("heatsink_inactive_reason")
     solver_summary = {key: value for key, value in solver_summary.items() if value is not None}
 
     images_html = "<div class='image-grid'>" \
@@ -646,7 +820,8 @@ def write_html_report(
         f"{_table_html(['Plane', 't_fr4_eff'], fr4_eff_rows)}"
         "</div><div>"
         "<h3 class='section-title'>Simulation Inputs</h3>"
-        f"{_table_html(['Setting', 'Value'], settings_rows, empty_text='No settings recorded.')}<div class='spacer-sm'></div>"
+        f"{_table_html(['Setting', 'Value'], settings_rows, empty_text='No settings recorded.')}"
+        f"{_build_thermal_pad_section(settings, k_norm_info)}<div class='spacer-sm'></div>"
         "<h3 class='section-title'>Power per Pad</h3>"
         f"{_table_html(['Pad', 'Power'], pad_rows, empty_text='No pad power recorded.')}"
         "<div class='spacer-sm'></div><h3 class='section-title'>Current Heating</h3>"
@@ -655,7 +830,7 @@ def write_html_report(
         "<div class='spacer-sm'></div><h3 class='section-title'>Current Path Diagnostics</h3>"
         f"{_build_current_path_diagnostics(electrical_summary, k_norm_info, joule_map_path)}"
         "</div></div>"
-        f"{_details_block('Snapshots', _build_snapshot_gallery(snapshot_items), open_by_default=False)}"
+        f"{_details_block('Snapshots', _build_snapshot_gallery(snapshot_items) + _build_snapshot_stats_table(snapshot_debug), open_by_default=False)}"
         "</section>"
     )
 

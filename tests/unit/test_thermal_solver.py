@@ -18,15 +18,24 @@ import scipy.sparse.linalg as spla
 
 from ThermalSim import thermal_solver
 from ThermalSim.thermal_solver import (
+    HEATSINK_MATERIAL_CP,
+    CompactStructuredThermalOperator,
+    HeatsinkModel,
     SolverConfig,
     SolverResult,
+    SparsePowerVector,
     _assemble_structured_csc,
     _build_phase_plan,
     _coarsen_structured_operator,
     _factor_linear_system,
     _solve_pcg,
+    build_compact_structured_operator,
+    build_heatsink_coupling_vector,
+    build_heatsink_model,
     build_stiffness_matrix,
     build_structured_operator,
+    compute_heatsink_capacity_j_k,
+    resolve_heatsink_cp,
     run_simulation,
     run_simulation_matrix_free,
     run_steady_state,
@@ -187,6 +196,18 @@ class TestSolverConfig:
             snap_times=snap_times
         )
         assert config.snap_times == snap_times
+
+    @pytest.mark.parametrize("mode", ["auto", "geometric", "multi_phase", "two_phase", "uniform"])
+    def test_valid_time_stepping_modes_preserved(self, mode):
+        """SolverConfig accepts all supported time_stepping modes."""
+        config = SolverConfig(
+            sim_time=10.0,
+            amb=25.0,
+            dt_base=0.1,
+            steps_target=100,
+            time_stepping=mode,
+        )
+        assert config.time_stepping == mode
 
 
 class TestBuildStiffnessMatrix:
@@ -1334,7 +1355,7 @@ class TestStructuredMultigridPreconditioner:
         Mx = M_mg.matvec(x)
         My = M_mg.matvec(y)
         assert float(np.dot(x, Mx)) > 0.0
-        np.testing.assert_allclose(np.dot(x, My), np.dot(y, Mx), rtol=1e-10, atol=1e-12)
+        np.testing.assert_allclose(np.dot(x, My), np.dot(y, Mx), rtol=1e-5, atol=1e-6)
 
         # Compare MG PCG vs diagonal Jacobi PCG and direct sparse solve
         rhs = (scale * capacity) * 25.0 + power + fast_b
@@ -1529,7 +1550,7 @@ class TestSteadyStateAndSpeedups:
         Mx = M_mg.matvec(x)
         My = M_mg.matvec(y)
         assert float(np.dot(x, Mx)) > 0.0
-        np.testing.assert_allclose(np.dot(x, My), np.dot(y, Mx), rtol=1e-10, atol=1e-12)
+        np.testing.assert_allclose(np.dot(x, My), np.dot(y, Mx), rtol=1e-5, atol=1e-6)
 
         rhs = power + fast_b
         initial = np.full(op.shape[0], 25.0, dtype=np.float64)
@@ -1542,7 +1563,7 @@ class TestSteadyStateAndSpeedups:
         np.testing.assert_allclose(sol, sol_direct, rtol=1e-4, atol=1e-3)
 
     def test_native_mg_kernels_match_numpy_fallback(self, monkeypatch):
-        """V-cycle with native C++ v2 MG kernels matches pure-NumPy fallback to ~1e-12."""
+        """V-cycle with native float32 MG kernels matches pure-NumPy fallback."""
         args, capacity, power = self._build_problem(layers=2, rows=33, cols=37)
         op, fast_b, _, _ = build_structured_operator(*args)
         _, M_mg = op.implicit_linear_operator(capacity, 0.5)
@@ -1550,12 +1571,12 @@ class TestSteadyStateAndSpeedups:
 
         native_out = M_mg.matvec(rhs)
 
-        monkeypatch.setattr(thermal_solver, "damped_jacobi_native", None)
-        monkeypatch.setattr(thermal_solver, "residual_restrict_2x2_native", None)
-        monkeypatch.setattr(thermal_solver, "prolong_add_2x2_native", None)
+        monkeypatch.setattr(thermal_solver, "damped_jacobi_f32_native", None)
+        monkeypatch.setattr(thermal_solver, "residual_restrict_2x2_f32_native", None)
+        monkeypatch.setattr(thermal_solver, "prolong_add_2x2_f32_native", None)
         numpy_out = M_mg.matvec(rhs)
 
-        np.testing.assert_allclose(native_out, numpy_out, rtol=1e-11, atol=1e-11)
+        np.testing.assert_allclose(native_out, numpy_out, rtol=1e-5, atol=1e-5)
 
     def test_pcg_linear_extrapolation_reduces_iterations(self, monkeypatch):
         """Linear PCG warm-start extrapolation reduces total PCG iterations without losing accuracy."""
@@ -1730,3 +1751,1201 @@ class TestSteadyStateAndSpeedups:
             with thermal_solver._limit_blas_threads(1):
                 raise ValueError("boom")
         assert read_openblas_threads() == before
+
+
+class TestDynamicHeatsinkModel:
+    """Tests for Dynamic 0D Heatsink helpers, boundary modes, and Sherman-Morrison coupling."""
+
+    @staticmethod
+    def _build_heatsink_pcb(
+        layers=2,
+        rows=16,
+        cols=16,
+        res_mm=0.5,
+        h_conv=10.0,
+        settings_extra=None,
+        full_pad=False,
+    ):
+        dx = dy = res_mm * 1e-3
+        copper_mask = np.ones((layers, rows, cols), dtype=bool)
+        t_cu = np.full(layers, 35e-6, dtype=np.float64)
+        t_fr4_eff = np.full(layers, 0.8e-3, dtype=np.float64)
+        V_map = np.ones((rows, cols), dtype=np.float64)
+        V_map[rows // 2 - 2 : rows // 2 + 2, cols // 2 - 2 : cols // 2 + 2] = 20.0
+        gap_m = [1.0e-3] * max(0, layers - 1)
+        H_map = np.zeros((rows, cols), dtype=np.float64)
+        if full_pad:
+            H_map[:, :] = 1.0
+        else:
+            H_map[rows // 4 : (3 * rows) // 4, cols // 4 : (3 * cols) // 4] = 1.0
+
+        settings = {
+            "h_conv": h_conv,
+            "pad_th": 1.0,
+            "pad_k": 3.0,
+            "pad_contact_factor": 0.25,
+            "use_heatsink": True,
+            "pad_sink_mode": "heatsink",
+            "heatsink_rth_kw": 4.0,
+            "heatsink_material": "aluminium",
+            "heatsink_mass_g": 50.0,
+        }
+        if settings_extra:
+            settings.update(settings_extra)
+        amb = 25.0
+
+        pixel_area = dx * dy
+        N = layers * rows * cols
+        c_cell = (
+            8960.0 * 385.0 * pixel_area * t_cu[0]
+            + 1850.0 * 1100.0 * pixel_area * t_fr4_eff[0]
+        )
+        C = np.full(N, c_cell, dtype=np.float64)
+        Q = np.zeros(N, dtype=np.float64)
+        Q[(rows // 2) * cols + (cols // 2)] = 2.0
+
+        args = (
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings, amb,
+        )
+        return args, C, Q, settings, amb
+
+    @staticmethod
+    def _solve_augmented_ground_truth(K, b, Q, heatsink_model: HeatsinkModel, amb: float):
+        """Solve the exact (N+1)x(N+1) coupled sparse system directly."""
+        g = heatsink_model.pad_conductance
+        g_hs_a = heatsink_model.g_hs_amb
+        alpha_0 = g_hs_a + float(np.sum(g))
+        g_col = sp.csc_matrix(-g.reshape(-1, 1))
+        g_row = sp.csc_matrix(-g.reshape(1, -1))
+        corner = sp.csc_matrix([[alpha_0]])
+        A_aug = sp.bmat([[K, g_col], [g_row, corner]], format="csc")
+        rhs_aug = np.concatenate((Q + b, [g_hs_a * amb]))
+        sol_aug = spla.spsolve(A_aug, rhs_aug)
+        return sol_aug[:-1], float(sol_aug[-1])
+
+    def test_material_constants_and_builder_helpers(self):
+        assert HEATSINK_MATERIAL_CP["aluminium"] == pytest.approx(897.0)
+        assert HEATSINK_MATERIAL_CP["copper"] == pytest.approx(385.0)
+        assert HEATSINK_MATERIAL_CP["steel"] == pytest.approx(490.0)
+        assert HEATSINK_MATERIAL_CP["magnesium"] == pytest.approx(1020.0)
+
+        assert resolve_heatsink_cp({"heatsink_material": "Copper"}) == pytest.approx(385.0)
+        assert resolve_heatsink_cp({}) == pytest.approx(897.0)
+        assert resolve_heatsink_cp(
+            {"heatsink_material": "custom", "heatsink_cp_j_kgk": 750.0}
+        ) == pytest.approx(750.0)
+        assert compute_heatsink_capacity_j_k(
+            {"heatsink_mass_g": 100.0, "heatsink_material": "aluminium"}
+        ) == pytest.approx(89.7)
+
+        H_map = np.zeros((4, 4), dtype=np.float64)
+        H_map[1:3, 1:3] = 1.0
+        settings = {
+            "use_heatsink": True,
+            "pad_sink_mode": "heatsink",
+            "pad_th": 1.0,
+            "pad_k": 3.0,
+            "pad_contact_factor": 0.5,
+            "heatsink_rth_kw": 3.0,
+            "heatsink_mass_g": 100.0,
+            "heatsink_material": "aluminium",
+        }
+        hs = build_heatsink_model(2, 4, 4, 1e-3, 1e-3, H_map, settings, amb=30.0)
+        assert hs is not None
+        assert hs.is_active is True
+        assert hs.initial_temp_c == pytest.approx(30.0)
+        assert hs.rth_kw == pytest.approx(3.0)
+        assert hs.g_hs_amb == pytest.approx(1.0 / 3.0)
+        assert hs.capacity_j_k == pytest.approx(89.7)
+        assert hs.tau_s == pytest.approx(269.1)
+        # Only bottom layer has non-zero entries: 4 cells * (3 / 0.001) * 0.5 * 1e-6
+        assert np.sum(hs.pad_conductance[:16]) == 0.0
+        assert np.sum(hs.pad_conductance) == pytest.approx(4 * 1500.0 * 1e-6)
+
+        assert build_heatsink_model(
+            2, 4, 4, 1e-3, 1e-3, H_map, {**settings, "use_heatsink": False}, 30.0
+        ) is None
+        assert build_heatsink_model(
+            2, 4, 4, 1e-3, 1e-3, H_map, {**settings, "pad_sink_mode": "fixed"}, 30.0
+        ) is None
+        assert build_heatsink_model(
+            2, 4, 4, 1e-3, 1e-3, np.zeros((4, 4)), settings, 30.0
+        ) is None
+
+    @pytest.mark.physics
+    def test_steady_state_sherman_morrison_matches_augmented_direct_and_mg_pcg(self):
+        """Coupled direct and MG-PCG steady-state match ground-truth (N+1)x(N+1) solve."""
+        args, C, Q, settings, amb = self._build_heatsink_pcb(layers=2, rows=16, cols=16)
+        layers, rows, cols = args[0], args[1], args[2]
+        dx, dy, H_map = args[8], args[9], args[12]
+
+        K, b, hA, diag_extra = build_stiffness_matrix(*args)
+        op, fast_b, fast_hA, fast_diag = build_structured_operator(*args)
+        np.testing.assert_allclose(fast_b, b, atol=1e-12)
+        np.testing.assert_allclose(fast_hA, hA, atol=1e-12)
+        np.testing.assert_allclose(fast_diag, diag_extra, atol=1e-12)
+
+        hs_model = build_heatsink_model(layers, rows, cols, dx, dy, H_map, settings, amb)
+        assert hs_model is not None
+
+        T_truth, T_hs_truth = self._solve_augmented_ground_truth(K, b, Q, hs_model, amb)
+
+        ss_cfg = SolverConfig(
+            sim_time=100.0, amb=amb, dt_base=1.0, steps_target=100, steady_state=True
+        )
+        res_direct = run_steady_state(
+            ss_cfg, K, Q, b, hA, layers, rows, cols, heatsink_model=hs_model
+        )
+        res_mf = run_steady_state_matrix_free(
+            ss_cfg, op, C, Q, fast_b, fast_hA, heatsink_model=hs_model
+        )
+
+        np.testing.assert_allclose(
+            res_direct.T.reshape(-1), T_truth, rtol=1e-10, atol=1e-10
+        )
+        assert res_direct.k_norm_info["heatsink_temp_c"] == pytest.approx(
+            T_hs_truth, abs=1e-10
+        )
+
+        max_abs_diff = float(np.max(np.abs(res_mf.T.reshape(-1) - T_truth)))
+        assert max_abs_diff < 1e-5
+        assert abs(res_mf.k_norm_info["heatsink_temp_c"] - T_hs_truth) < 1e-5
+
+        for res in (res_direct, res_mf):
+            info = res.k_norm_info
+            assert info["heatsink_enabled"] is True
+            assert info["heatsink_mode"] == "heatsink"
+            p_hs = info["heatsink_power_w"]
+            p_air = info["pcb_convection_power_w"]
+            p_pad = info["heatsink_pad_flux_w"]
+            assert info["heatsink_temp_rise_c"] == pytest.approx(
+                hs_model.rth_kw * p_hs, abs=1e-6
+            )
+            assert p_pad == pytest.approx(p_hs, abs=1e-5)
+            assert info["pin_w"] == pytest.approx(p_air + p_hs, rel=1e-5)
+            assert info["pout_final_w"] == pytest.approx(p_air + p_hs, abs=1e-9)
+
+    @pytest.mark.physics
+    def test_transient_heatsink_mass_dynamics_analytical_and_steady_convergence(self):
+        """Heavier mass heats slower, matches 1-e^(-t/tau) in lumped limit, and converges to SS."""
+        # 1) Well-coupled small board with zero air convection -> pure lumped 0D RC curve
+        args_lumped, C_small, Q_small, settings_lumped, amb = self._build_heatsink_pcb(
+            layers=1,
+            rows=4,
+            cols=4,
+            res_mm=1.0,
+            h_conv=0.0,
+            full_pad=True,
+            settings_extra={
+                "pad_th": 0.2,
+                "pad_k": 10.0,
+                "pad_contact_factor": 1.0,
+                "heatsink_rth_kw": 5.0,
+                "heatsink_mass_g": 20.0,
+                "heatsink_material": "aluminium",
+            },
+        )
+        layers, rows, cols = args_lumped[0], args_lumped[1], args_lumped[2]
+        dx, dy, H_map = args_lumped[8], args_lumped[9], args_lumped[12]
+        C_lumped = C_small * 1e-4  # negligible PCB capacitance compared to heatsink
+        K_l, b_l, hA_l, _ = build_stiffness_matrix(*args_lumped)
+        op_l, fb_l, fhA_l, _ = build_structured_operator(*args_lumped)
+        hs_l = build_heatsink_model(
+            layers, rows, cols, dx, dy, H_map, settings_lumped, amb
+        )
+        tau = hs_l.tau_s
+        p_in = float(np.sum(Q_small))
+        t_eval = 0.5 * tau
+        expected_t_hs = amb + p_in * hs_l.rth_kw * (1.0 - np.exp(-t_eval / tau))
+
+        cfg_l = SolverConfig(
+            sim_time=t_eval,
+            amb=amb,
+            dt_base=t_eval / 80.0,
+            steps_target=80,
+            use_multi_phase=False,
+            time_stepping="uniform",
+            early_stop=False,
+        )
+        res_dir = run_simulation(
+            cfg_l, K_l, C_lumped, Q_small, b_l, hA_l, layers, rows, cols, heatsink_model=hs_l
+        )
+        res_mf = run_simulation_matrix_free(
+            cfg_l, op_l, C_lumped, Q_small, fb_l, fhA_l, heatsink_model=hs_l
+        )
+        assert res_dir.k_norm_info["heatsink_temp_c"] == pytest.approx(expected_t_hs, rel=5e-3)
+        assert res_mf.k_norm_info["heatsink_temp_c"] == pytest.approx(expected_t_hs, rel=5e-3)
+
+        # 2) Heavier mass heats slower than lighter mass & long transient converges to SS
+        args, C, Q, settings, amb = self._build_heatsink_pcb(layers=2, rows=12, cols=12)
+        layers, rows, cols = args[0], args[1], args[2]
+        dx, dy, H_map = args[8], args[9], args[12]
+        K, b, hA, _ = build_stiffness_matrix(*args)
+        op, fb, fhA, _ = build_structured_operator(*args)
+
+        hs_light = build_heatsink_model(
+            layers, rows, cols, dx, dy, H_map, {**settings, "heatsink_mass_g": 10.0}, amb
+        )
+        hs_heavy = build_heatsink_model(
+            layers, rows, cols, dx, dy, H_map, {**settings, "heatsink_mass_g": 200.0}, amb
+        )
+        cfg_short = SolverConfig(
+            sim_time=30.0,
+            amb=amb,
+            dt_base=1.0,
+            steps_target=30,
+            use_multi_phase=True,
+            snapshots_enabled=True,
+            snap_times=[10.0, 25.0],
+            early_stop=False,
+        )
+        res_light = run_simulation_matrix_free(
+            cfg_short, op, C, Q, fb, fhA, heatsink_model=hs_light
+        )
+        res_heavy = run_simulation_matrix_free(
+            cfg_short, op, C, Q, fb, fhA, heatsink_model=hs_heavy
+        )
+        assert res_light.k_norm_info["heatsink_temp_c"] > res_heavy.k_norm_info["heatsink_temp_c"]
+        assert "heatsink_temp_c" in res_light.snapshot_stats[0]
+        assert res_light.snapshot_stats[1]["heatsink_temp_c"] > res_light.snapshot_stats[0]["heatsink_temp_c"]
+
+        # Long transient with early_stop must not stop prematurely and must reach steady state
+        ss_cfg = SolverConfig(sim_time=10.0, amb=amb, dt_base=1.0, steps_target=10, steady_state=True)
+        res_ss = run_steady_state(ss_cfg, K, Q, b, hA, layers, rows, cols, heatsink_model=hs_light)
+        cfg_long = SolverConfig(
+            sim_time=500.0,
+            amb=amb,
+            dt_base=2.0,
+            steps_target=250,
+            use_multi_phase=False,
+            early_stop=True,
+        )
+        res_long_dir = run_simulation(
+            cfg_long, K, C, Q, b, hA, layers, rows, cols, heatsink_model=hs_light
+        )
+        res_long_mf = run_simulation_matrix_free(
+            cfg_long, op, C, Q, fb, fhA, heatsink_model=hs_light
+        )
+        assert abs(res_long_dir.k_norm_info["heatsink_temp_c"] - res_ss.k_norm_info["heatsink_temp_c"]) < 0.05
+        assert abs(res_long_mf.k_norm_info["heatsink_temp_c"] - res_ss.k_norm_info["heatsink_temp_c"]) < 0.05
+        assert np.max(np.abs(res_long_dir.T - res_ss.T)) < 0.05
+
+    def test_zero_thermal_mass_heatsink_steady_and_transient(self):
+        """Zero-mass heatsink (C_hs = 0) works cleanly in steady-state and transient."""
+        args, C, Q, settings, amb = self._build_heatsink_pcb(
+            layers=2, rows=10, cols=10, settings_extra={"heatsink_mass_g": 0.0}
+        )
+        layers, rows, cols = args[0], args[1], args[2]
+        dx, dy, H_map = args[8], args[9], args[12]
+        K, b, hA, _ = build_stiffness_matrix(*args)
+        op, fb, fhA, _ = build_structured_operator(*args)
+        hs_zero = build_heatsink_model(layers, rows, cols, dx, dy, H_map, settings, amb)
+        assert hs_zero.capacity_j_k == 0.0
+        assert hs_zero.tau_s == 0.0
+
+        ss_cfg = SolverConfig(sim_time=10.0, amb=amb, dt_base=1.0, steps_target=10, steady_state=True)
+        tr_cfg = SolverConfig(
+            sim_time=20.0, amb=amb, dt_base=0.5, steps_target=40, use_multi_phase=False, early_stop=False
+        )
+        ss_dir = run_steady_state(ss_cfg, K, Q, b, hA, layers, rows, cols, heatsink_model=hs_zero)
+        tr_dir = run_simulation(tr_cfg, K, C, Q, b, hA, layers, rows, cols, heatsink_model=hs_zero)
+        tr_mf = run_simulation_matrix_free(tr_cfg, op, C, Q, fb, fhA, heatsink_model=hs_zero)
+
+        np.testing.assert_allclose(tr_dir.T, tr_mf.T, rtol=1e-4, atol=1e-3)
+        assert tr_dir.k_norm_info["heatsink_capacity_j_k"] == 0.0
+        assert tr_dir.k_norm_info["heatsink_tau_s"] == 0.0
+        assert tr_dir.k_norm_info["heatsink_temp_c"] == pytest.approx(
+            tr_mf.k_norm_info["heatsink_temp_c"], abs=1e-3
+        )
+        assert ss_dir.k_norm_info["heatsink_temp_c"] > amb
+
+    def test_fixed_mode_custom_sink_temp_and_contact_factor(self):
+        """Fixed mode honors custom pad_sink_temp_c and pad_contact_factor."""
+        args_amb, C, Q, _, amb = self._build_heatsink_pcb(
+            layers=2,
+            rows=8,
+            cols=8,
+            settings_extra={
+                "pad_sink_mode": "fixed",
+                "pad_sink_temp_use_ambient": True,
+                "pad_contact_factor": 0.4,
+            },
+        )
+        args_hot, _, _, _, _ = self._build_heatsink_pcb(
+            layers=2,
+            rows=8,
+            cols=8,
+            settings_extra={
+                "pad_sink_mode": "fixed",
+                "pad_sink_temp_use_ambient": False,
+                "pad_sink_temp_c": 60.0,
+                "pad_contact_factor": 0.4,
+            },
+        )
+        K_amb, b_amb, hA_amb, diag_amb = build_stiffness_matrix(*args_amb)
+        K_hot, b_hot, hA_hot, diag_hot = build_stiffness_matrix(*args_hot)
+        op_hot, fb_hot, fhA_hot, fdiag_hot = build_structured_operator(*args_hot)
+
+        np.testing.assert_allclose((K_hot - K_amb).toarray(), 0.0, atol=1e-12)
+        np.testing.assert_allclose(diag_hot, diag_amb, atol=1e-12)
+        np.testing.assert_allclose(hA_hot, hA_amb, atol=1e-12)
+        assert np.sum(b_hot) > np.sum(b_amb)
+        np.testing.assert_allclose(fb_hot, b_hot, atol=1e-12)
+        np.testing.assert_allclose(fhA_hot, hA_hot, atol=1e-12)
+        np.testing.assert_allclose(fdiag_hot, diag_hot, atol=1e-12)
+
+        ss_cfg = SolverConfig(sim_time=10.0, amb=amb, dt_base=1.0, steps_target=10, steady_state=True)
+        res_zero_q = run_steady_state_matrix_free(
+            ss_cfg, op_hot, C, np.zeros_like(Q), fb_hot, fhA_hot
+        )
+        assert float(np.min(res_zero_q.T)) > amb
+        assert float(np.max(res_zero_q.T)) <= 60.0 + 1e-6
+
+    def test_empty_hmap_with_heatsink_mode_gracefully_degrades(self):
+        """All-zero H_map in heatsink mode disables coupling without error."""
+        args, C, Q, settings, amb = self._build_heatsink_pcb(layers=2, rows=10, cols=10)
+        args_empty = list(args)
+        args_empty[12] = np.zeros_like(args[12])
+        args_empty = tuple(args_empty)
+
+        K, b, hA, _ = build_stiffness_matrix(*args_empty)
+        op, fb, fhA, _ = build_structured_operator(*args_empty)
+        hs_model = build_heatsink_model(
+            args[0], args[1], args[2], args[8], args[9], args_empty[12], settings, amb
+        )
+        assert hs_model is None
+
+        ss_cfg = SolverConfig(sim_time=10.0, amb=amb, dt_base=1.0, steps_target=10, steady_state=True)
+        res = run_steady_state_matrix_free(
+            ss_cfg, op, C, Q, fb, fhA, heatsink_model=hs_model
+        )
+        assert "heatsink_enabled" not in res.k_norm_info
+        assert res.k_norm_info["steady_rel_diff"] < 1e-4
+
+    def test_derivative_start_with_heatsink_matches_non_derivative_start(self):
+        """Derivative-start BDF2 startup with active heatsink matches standard BE+BDF2."""
+        args, C, Q, settings, amb = self._build_heatsink_pcb(layers=2, rows=12, cols=12)
+        layers, rows, cols = args[0], args[1], args[2]
+        dx, dy, H_map = args[8], args[9], args[12]
+        K, b, hA, _ = build_stiffness_matrix(*args)
+        op, fb, fhA, _ = build_structured_operator(*args)
+        hs_model = build_heatsink_model(layers, rows, cols, dx, dy, H_map, settings, amb)
+
+        cfg_std = SolverConfig(
+            sim_time=10.0, amb=amb, dt_base=0.25, steps_target=40,
+            use_multi_phase=False, time_stepping="uniform", early_stop=False,
+        )
+        # Force derivative_start=True via adaptive-like attribute on operator wrapper
+        class _DerivStartOp:
+            prefer_derivative_start = True
+            def __getattr__(self, name):
+                return getattr(op, name)
+
+        res_std = run_simulation_matrix_free(
+            cfg_std, op, C, Q, fb, fhA, heatsink_model=hs_model
+        )
+        res_deriv = run_simulation_matrix_free(
+            cfg_std, _DerivStartOp(), C, Q, fb, fhA, heatsink_model=hs_model
+        )
+        assert res_deriv.phase_metrics[0].get("startup") == "derivative_bdf2"
+        np.testing.assert_allclose(res_deriv.T, res_std.T, rtol=1e-3, atol=0.05)
+        assert res_deriv.k_norm_info["heatsink_temp_c"] == pytest.approx(
+            res_std.k_norm_info["heatsink_temp_c"], abs=0.05
+        )
+
+
+class TestCompactLowRamOperatorAndHeatsink2D:
+    """Tests for CompactStructuredThermalOperator, SparsePowerVector, cache caps, and 2D HeatsinkModel."""
+
+    @staticmethod
+    def _build_compact_problem(
+        layers=4,
+        rows=25,
+        cols=29,
+        res_mm=0.4,
+        heatsink_mode=False,
+        pad_cap_areal=250.0,
+    ):
+        dx = dy = res_mm * 1e-3
+        yy, xx = np.ogrid[:rows, :cols]
+        copper = np.zeros((layers, rows, cols), dtype=bool)
+        for l in range(layers):
+            copper[l] = (
+                ((yy + 3 * l) % 7 < 2)
+                | ((xx + 5 * l) % 11 < 2)
+                | (
+                    (xx >= cols // 4) & (xx < (3 * cols) // 4)
+                    & (yy >= rows // 4) & (yy < (3 * rows) // 4)
+                )
+            )
+        t_cu = np.full(layers, 35e-6, dtype=np.float64)
+        t_fr4_eff = np.full(layers, 1.6e-3 / layers, dtype=np.float64)
+        gap_m = [1.6e-3 / max(layers - 1, 1)] * max(0, layers - 1)
+        V_map = np.ones((rows, cols), dtype=np.float32)
+        V_map[(yy % 8 == 3) & (xx % 8 == 3)] = 15.0
+        H_map = np.zeros((rows, cols), dtype=np.float64)
+        H_map[rows // 3 : (2 * rows) // 3, cols // 3 : (2 * cols) // 3] = 1.0
+        settings = {
+            "h_conv": 12.0,
+            "pad_th": 1.0,
+            "pad_k": 3.0,
+            "pad_contact_factor": 0.3,
+            "use_heatsink": True,
+            "pad_sink_mode": "heatsink" if heatsink_mode else "fixed",
+            "pad_sink_temp_use_ambient": False,
+            "pad_sink_temp_c": 30.0,
+            "heatsink_rth_kw": 3.5,
+            "heatsink_material": "aluminium",
+            "heatsink_mass_g": 45.0,
+        }
+        amb = 25.0
+        k_cu = 390.0
+        k_fr4 = 0.3
+        rho_cu, cp_cu = 8960.0, 385.0
+        rho_fr4, cp_fr4 = 1850.0, 1100.0
+        pixel_area = dx * dy
+
+        C_layers = np.empty((layers, rows, cols), dtype=np.float64)
+        for l in range(layers):
+            v_cu = pixel_area * t_cu[l]
+            v_fr4 = pixel_area * t_fr4_eff[l]
+            mask = copper[l]
+            c_l = np.where(mask, rho_cu * cp_cu * v_cu, rho_fr4 * cp_fr4 * v_fr4)
+            c_l += mask * (rho_fr4 * cp_fr4 * v_fr4)
+            C_layers[l] = c_l
+        if pad_cap_areal > 0.0 and np.any(H_map):
+            C_layers[-1] += pad_cap_areal * pixel_area * H_map
+        C = C_layers.reshape(-1)
+
+        src_indices = np.array(
+            [
+                (rows // 2) * cols + (cols // 2),
+                (rows // 2) * cols + (cols // 2) + 1,
+                (layers - 1) * rows * cols + (rows // 3) * cols + (cols // 3),
+            ],
+            dtype=np.int64,
+        )
+        src_values = np.array([0.08, 0.05, 0.03], dtype=np.float64)
+        Q_sparse = SparsePowerVector(indices=src_indices, values=src_values, size=C.size)
+        Q_dense = Q_sparse.to_dense()
+
+        args = (
+            layers, rows, cols, copper, t_cu, t_fr4_eff,
+            k_cu, k_fr4, dx, dy, V_map.astype(np.float64), gap_m, H_map, settings, amb,
+        )
+        compact_op = build_compact_structured_operator(
+            layers, rows, cols, copper, t_cu, t_fr4_eff,
+            k_cu, k_fr4, dx, dy, V_map, gap_m, H_map, settings, amb,
+            rho_cu=rho_cu, cp_cu=cp_cu, rho_fr4=rho_fr4, cp_fr4=cp_fr4,
+            pad_cap_areal=pad_cap_areal,
+        )
+        return args, compact_op, C, Q_sparse, Q_dense, settings, amb
+
+    def test_sparse_power_vector_operations(self):
+        spv = SparsePowerVector(
+            indices=np.array([2, 5, 2], dtype=np.int64),
+            values=np.array([1.5, 2.0, 0.5], dtype=np.float64),
+            size=8,
+        )
+        assert spv.total_power() == pytest.approx(4.0)
+        dense = spv.to_dense()
+        np.testing.assert_allclose(dense, [0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 0.0, 0.0])
+        out = np.ones(8, dtype=np.float64)
+        spv.add_to(out)
+        np.testing.assert_allclose(out, 1.0 + dense)
+
+    @pytest.mark.parametrize(
+        "shape,heatsink_mode",
+        [
+            ((1, 24, 24), False),
+            ((1, 25, 29), True),
+            ((4, 24, 24), False),
+            ((4, 25, 29), True),
+        ],
+    )
+    def test_compact_operator_matches_structured_and_direct_ss_and_transient(
+        self, shape, heatsink_mode
+    ):
+        layers, rows, cols = shape
+        args, compact_op, C, Q_sparse, Q_dense, settings, amb = self._build_compact_problem(
+            layers=layers, rows=rows, cols=cols, heatsink_mode=heatsink_mode
+        )
+        K, b, hA, _ = build_stiffness_matrix(*args)
+        struct_op, sb, shA, _ = build_structured_operator(*args)
+
+        # Operator matvec agreement
+        vec = np.linspace(20.0, 75.0, compact_op.shape[0], dtype=np.float64)
+        np.testing.assert_allclose(
+            compact_op.dot(vec), struct_op.dot(vec), rtol=1e-6, atol=1e-9
+        )
+
+        hs_3d = (
+            build_heatsink_model(layers, rows, cols, args[8], args[9], args[12], settings, amb)
+            if heatsink_mode
+            else None
+        )
+        hs_2d = compact_op.build_heatsink_model(settings, amb)
+        assert (hs_2d is not None) == heatsink_mode
+        if hs_2d is not None:
+            assert hs_2d.bottom_layer_only is True
+            assert hs_2d.pad_conductance.size == rows * cols
+
+        # Steady-state: compact (C=None, b=None, hA=None, SparsePowerVector) vs direct & structured
+        ss_cfg = SolverConfig(
+            sim_time=50.0, amb=amb, dt_base=1.0, steps_target=50, steady_state=True
+        )
+        res_direct_ss = run_steady_state(
+            ss_cfg, K, Q_dense, b, hA, layers, rows, cols, heatsink_model=hs_3d
+        )
+        res_struct_ss = run_steady_state_matrix_free(
+            ss_cfg, struct_op, C, Q_dense, sb, shA, heatsink_model=hs_3d
+        )
+        res_compact_sparse_ss = run_steady_state_matrix_free(
+            ss_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+        res_compact_dense_ss = run_steady_state_matrix_free(
+            ss_cfg, compact_op, None, Q_dense, None, None, heatsink_model=hs_2d
+        )
+
+        assert float(np.max(np.abs(res_compact_sparse_ss.T - res_direct_ss.T))) < 1e-5
+        assert float(np.max(np.abs(res_compact_dense_ss.T - res_direct_ss.T))) < 1e-5
+        assert float(np.max(np.abs(res_compact_sparse_ss.T - res_struct_ss.T))) < 1e-5
+        if heatsink_mode:
+            assert abs(
+                res_compact_sparse_ss.k_norm_info["heatsink_temp_c"]
+                - res_direct_ss.k_norm_info["heatsink_temp_c"]
+            ) < 1e-5
+
+        # Transient: compact vs direct & structured
+        tr_cfg = SolverConfig(
+            sim_time=4.0,
+            amb=amb,
+            dt_base=0.4,
+            steps_target=10,
+            use_multi_phase=False,
+            time_stepping="uniform",
+            snapshots_enabled=True,
+            snap_times=[1.5, 3.5],
+            early_stop=False,
+        )
+        res_direct_tr = run_simulation(
+            tr_cfg, K, C, Q_dense, b, hA, layers, rows, cols, heatsink_model=hs_3d
+        )
+        res_struct_tr = run_simulation_matrix_free(
+            tr_cfg, struct_op, C, Q_dense, sb, shA, heatsink_model=hs_3d
+        )
+        res_compact_sparse_tr = run_simulation_matrix_free(
+            tr_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+        res_compact_dense_tr = run_simulation_matrix_free(
+            tr_cfg, compact_op, None, Q_dense, None, None, heatsink_model=hs_2d
+        )
+
+        assert float(np.max(np.abs(res_compact_sparse_tr.T - res_struct_tr.T))) < 1e-5
+        assert float(np.max(np.abs(res_compact_dense_tr.T - res_struct_tr.T))) < 1e-5
+        assert float(np.max(np.abs(res_compact_sparse_tr.T - res_direct_tr.T))) < 1e-4
+        assert float(np.max(np.abs(res_compact_dense_tr.T - res_direct_tr.T))) < 1e-4
+        assert len(res_compact_sparse_tr.snapshot_stats) == 2
+        if heatsink_mode:
+            assert abs(
+                res_compact_sparse_tr.k_norm_info["heatsink_temp_c"]
+                - res_direct_tr.k_norm_info["heatsink_temp_c"]
+            ) < 1e-5
+
+    def test_compact_numpy_fallback_matches_native_v3(self, monkeypatch):
+        """Compact operator pure-NumPy fallback matches live native v3 kernels."""
+        args, compact_op, _, Q_sparse, _, settings, amb = self._build_compact_problem(
+            layers=2, rows=25, cols=29, heatsink_mode=True
+        )
+        hs_2d = compact_op.build_heatsink_model(settings, amb)
+        cfg = SolverConfig(
+            sim_time=2.0, amb=amb, dt_base=0.5, steps_target=4,
+            use_multi_phase=False, early_stop=False,
+        )
+        res_native = run_simulation_matrix_free(
+            cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+        compact_op.clear_caches()
+
+        for attr in (
+            "apply_compact_native",
+            "damped_jacobi_compact_f32_native",
+            "residual_restrict_2x2_compact_f32_native",
+            "coarsen_compact_to_f32_native",
+            "damped_jacobi_f32_native",
+            "residual_restrict_2x2_f32_native",
+            "prolong_add_2x2_f32_native",
+        ):
+            monkeypatch.setattr(thermal_solver, attr, None)
+        monkeypatch.setattr(thermal_solver, "HAS_NATIVE_COMPACT", False)
+
+        res_numpy = run_simulation_matrix_free(
+            cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+        np.testing.assert_allclose(res_native.T, res_numpy.T, rtol=1e-5, atol=1e-5)
+
+    def test_preconditioner_cache_caps_at_one_without_capacity_copy_and_clear_caches(self):
+        """_preconditioner_cache holds at most 1 entry, stores no capacity.copy(), and clears."""
+        args, compact_op, capacity, _, _, _, _ = self._build_compact_problem(
+            layers=2, rows=16, cols=16, heatsink_mode=False
+        )
+        struct_op, _, _, _ = build_structured_operator(*args)
+
+        for op in (struct_op, compact_op):
+            cap_arg = capacity if op is struct_op else None
+            op.implicit_linear_operator(cap_arg, 1.0)
+            assert len(op._preconditioner_cache) == 1
+            cached_key, _ = op._preconditioner_cache[1.0]
+            assert not isinstance(cached_key, np.ndarray)
+
+            op.implicit_linear_operator(cap_arg, 2.0)
+            assert len(op._preconditioner_cache) == 1
+            assert 1.0 not in op._preconditioner_cache
+            assert 2.0 in op._preconditioner_cache
+            assert op._coarse_operators is not None
+
+            op.clear_caches()
+            assert op._preconditioner_cache == {}
+            assert op._coarse_operators is None
+
+    def test_bottom_layer_heatsink_model_matches_3d_bit_identical(self):
+        """2D bottom_layer_only HeatsinkModel gives identical results to 3D HeatsinkModel."""
+        args, compact_op, C, _, Q_dense, settings, amb = self._build_compact_problem(
+            layers=3, rows=16, cols=16, heatsink_mode=True
+        )
+        layers, rows, cols = args[0], args[1], args[2]
+        K, b, hA, _ = build_stiffness_matrix(*args)
+        hs_3d = build_heatsink_model(
+            layers, rows, cols, args[8], args[9], args[12], settings, amb
+        )
+        hs_2d = compact_op.build_heatsink_model(settings, amb)
+        assert hs_2d.bottom_layer_only is True
+        np.testing.assert_allclose(
+            hs_2d.pad_conductance,
+            hs_3d.pad_conductance[-rows * cols :],
+            atol=1e-15,
+        )
+
+        ss_cfg = SolverConfig(sim_time=10.0, amb=amb, dt_base=1.0, steps_target=10, steady_state=True)
+        res_ss_3d = run_steady_state(ss_cfg, K, Q_dense, b, hA, layers, rows, cols, heatsink_model=hs_3d)
+        res_ss_2d = run_steady_state(ss_cfg, K, Q_dense, b, hA, layers, rows, cols, heatsink_model=hs_2d)
+        np.testing.assert_array_equal(res_ss_2d.T, res_ss_3d.T)
+        assert res_ss_2d.k_norm_info["heatsink_temp_c"] == res_ss_3d.k_norm_info["heatsink_temp_c"]
+
+        tr_cfg = SolverConfig(
+            sim_time=4.0, amb=amb, dt_base=0.5, steps_target=8,
+            use_multi_phase=False, time_stepping="uniform", early_stop=False,
+        )
+        res_tr_3d = run_simulation(tr_cfg, K, C, Q_dense, b, hA, layers, rows, cols, heatsink_model=hs_3d)
+        res_tr_2d = run_simulation(tr_cfg, K, C, Q_dense, b, hA, layers, rows, cols, heatsink_model=hs_2d)
+        np.testing.assert_array_equal(res_tr_2d.T, res_tr_3d.T)
+        assert res_tr_2d.k_norm_info["heatsink_temp_c"] == res_tr_3d.k_norm_info["heatsink_temp_c"]
+
+    @pytest.mark.parametrize("scale", [0.0, 1.5])
+    def test_fused_matvec_and_mg_solve_into_and_dot_match_reference(self, scale):
+        """_apply_with_scale_and_dot and solve_into_and_dot match separate ops + np.dot to < 1e-11."""
+        args, compact_op, capacity, _, _, _, _ = self._build_compact_problem(
+            layers=3, rows=25, cols=29, heatsink_mode=True
+        )
+        struct_op, _, _, _ = build_structured_operator(*args)
+        rng = np.random.default_rng(1234)
+        vec = rng.standard_normal(compact_op.shape[0])
+
+        # Compact _apply_with_scale_and_dot vs _apply_with_scale + np.dot
+        out_ref = np.empty_like(vec)
+        compact_op._apply_with_scale(scale, vec, out=out_ref)
+        dot_ref = float(np.dot(vec, out_ref))
+
+        out_fused = np.empty_like(vec)
+        dot_fused = compact_op._apply_with_scale_and_dot(scale, vec, out_fused)
+        np.testing.assert_allclose(out_fused, out_ref, rtol=1e-13, atol=1e-13)
+        assert abs(dot_fused - dot_ref) <= 1e-11 * max(1.0, abs(dot_ref))
+
+        # LinearOperator hooks and MG solve_into_and_dot for both Compact and Structured
+        for op, cap_arg in ((compact_op, None), (struct_op, capacity)):
+            A_op, M_op = op.implicit_linear_operator(cap_arg, scale)
+            if op is compact_op:
+                assert hasattr(A_op, "_matvec_into_and_dot")
+                out_hook = np.empty_like(vec)
+                dot_hook = A_op._matvec_into_and_dot(vec, out_hook)
+                np.testing.assert_allclose(out_hook, out_ref, rtol=1e-13, atol=1e-13)
+                assert abs(dot_hook - dot_ref) <= 1e-11 * max(1.0, abs(dot_ref))
+
+            assert hasattr(M_op, "_solve_into_and_dot")
+            mg_ref = np.empty_like(vec)
+            M_op._solve_into(vec, mg_ref)
+            mg_dot_ref = float(np.dot(vec, mg_ref))
+
+            mg_fused = np.empty_like(vec)
+            mg_dot_fused = M_op._solve_into_and_dot(vec, mg_fused)
+            np.testing.assert_allclose(mg_fused, mg_ref, rtol=1e-13, atol=1e-13)
+            assert abs(mg_dot_fused - mg_dot_ref) <= 1e-11 * max(1.0, abs(mg_dot_ref))
+
+    @pytest.mark.parametrize("heatsink_mode", [False, True])
+    def test_fused_v4_pcg_matches_fallback_ss_and_transient(self, monkeypatch, heatsink_mode):
+        """Fused v4 PCG path (HAS_NATIVE_PCG=True) matches fallback (HAS_NATIVE_PCG=False) to < 1e-10 K."""
+        args, compact_op, capacity, Q_sparse, _, settings, amb = self._build_compact_problem(
+            layers=3, rows=25, cols=29, heatsink_mode=heatsink_mode
+        )
+        hs_2d = compact_op.build_heatsink_model(settings, amb)
+
+        ss_cfg = SolverConfig(
+            sim_time=50.0, amb=amb, dt_base=1.0, steps_target=50, steady_state=True
+        )
+        tr_cfg = SolverConfig(
+            sim_time=3.0,
+            amb=amb,
+            dt_base=0.5,
+            steps_target=6,
+            use_multi_phase=False,
+            time_stepping="uniform",
+            early_stop=False,
+        )
+
+        # Native v4 path (when v4 .so is loaded, HAS_NATIVE_PCG is True)
+        res_ss_v4 = run_steady_state_matrix_free(
+            ss_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+        res_tr_v4 = run_simulation_matrix_free(
+            tr_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+
+        # Structured operator with v4 MG + dot path
+        struct_op, sb, shA, _ = build_structured_operator(*args)
+        hs_3d = (
+            build_heatsink_model(
+                args[0], args[1], args[2], args[8], args[9], args[12], settings, amb
+            )
+            if heatsink_mode
+            else None
+        )
+        Q_dense = Q_sparse.to_dense()
+        res_struct_tr_v4 = run_simulation_matrix_free(
+            tr_cfg, struct_op, capacity, Q_dense, sb, shA, heatsink_model=hs_3d
+        )
+
+        # Force fallback path (HAS_NATIVE_PCG=False)
+        monkeypatch.setattr(thermal_solver, "HAS_NATIVE_PCG", False)
+        res_ss_fb = run_steady_state_matrix_free(
+            ss_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+        res_tr_fb = run_simulation_matrix_free(
+            tr_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_2d
+        )
+        res_struct_tr_fb = run_simulation_matrix_free(
+            tr_cfg, struct_op, capacity, Q_dense, sb, shA, heatsink_model=hs_3d
+        )
+
+        assert float(np.max(np.abs(res_ss_v4.T - res_ss_fb.T))) < 1e-10
+        assert float(np.max(np.abs(res_tr_v4.T - res_tr_fb.T))) < 1e-10
+        assert float(np.max(np.abs(res_struct_tr_v4.T - res_struct_tr_fb.T))) < 1e-10
+        if heatsink_mode:
+            assert abs(
+                res_ss_v4.k_norm_info["heatsink_temp_c"]
+                - res_ss_fb.k_norm_info["heatsink_temp_c"]
+            ) < 1e-10
+            assert abs(
+                res_tr_v4.k_norm_info["heatsink_temp_c"]
+                - res_tr_fb.k_norm_info["heatsink_temp_c"]
+            ) < 1e-10
+
+
+class TestSteadyStatePcgProgress:
+    """Tests for live PCG convergence progress reporting in steady-state solves."""
+
+    @staticmethod
+    def _make_problem(heatsink_mode: bool):
+        args, capacity, power, settings, amb = TestDynamicHeatsinkModel._build_heatsink_pcb(
+            layers=2, rows=24, cols=24
+        )
+        if not heatsink_mode:
+            settings = {**settings, "use_heatsink": False}
+        op, fast_b, fast_hA, _ = build_structured_operator(*args)
+        hs_model = (
+            build_heatsink_model(
+                args[0], args[1], args[2], args[8], args[9], args[12], settings, amb
+            )
+            if heatsink_mode
+            else None
+        )
+        cfg = SolverConfig(
+            sim_time=50.0, amb=amb, dt_base=1.0, steps_target=50, steady_state=True
+        )
+        return cfg, op, capacity, power, fast_b, fast_hA, hs_model
+
+    def test_solve_pcg_invokes_iteration_callback(self):
+        """_solve_pcg calls iteration_callback with (iteration, rel_res, tol)."""
+        cfg, op, capacity, power, fast_b, _, _ = self._make_problem(heatsink_mode=False)
+        A_op, M_op = op.implicit_linear_operator(capacity, 0.0)
+        rhs = power + fast_b
+        initial = np.full(op.shape[0], cfg.amb, dtype=np.float64)
+        events = []
+
+        def on_iter(it, rel_res, target):
+            events.append((it, rel_res, target))
+
+        _, iters, _, _ = _solve_pcg(
+            A_op,
+            M_op,
+            rhs,
+            initial,
+            relative_tolerance=1e-7,
+            maxiter=200,
+            iteration_callback=on_iter,
+        )
+        assert iters >= 2
+        assert [e[0] for e in events] == list(range(1, iters + 1))
+        assert all(isinstance(e[1], float) and e[1] >= 0.0 for e in events)
+        assert all(e[2] == pytest.approx(1e-7) for e in events)
+
+    @pytest.mark.parametrize("heatsink_mode", [False, True])
+    @pytest.mark.parametrize("callback_arity", [2, 3])
+    def test_steady_state_pcg_progress_2arg_and_3arg(
+        self, monkeypatch, heatsink_mode, callback_arity
+    ):
+        """run_steady_state_matrix_free emits monotonic live PCG progress for 2-arg and 3-arg callbacks."""
+        clock = {"t": 100.0}
+
+        def fake_monotonic():
+            clock["t"] += 0.05
+            return clock["t"]
+
+        monkeypatch.setattr(thermal_solver.time, "monotonic", fake_monotonic)
+
+        cfg, op, capacity, power, fast_b, fast_hA, hs_model = self._make_problem(
+            heatsink_mode=heatsink_mode
+        )
+        events = []
+
+        if callback_arity == 2:
+            def cb(cur, tot):
+                events.append((cur, tot))
+                return True
+        else:
+            def cb(cur, tot, msg):
+                events.append((cur, tot, msg))
+                return True
+
+        res = run_steady_state_matrix_free(
+            cfg,
+            op,
+            capacity,
+            power,
+            fast_b,
+            fast_hA,
+            progress_callback=cb,
+            heatsink_model=hs_model,
+        )
+
+        assert res.aborted is False
+        assert res.step_counter == 1
+        assert len(events) >= 3
+        assert all(ev[1] == 100 for ev in events)
+        currents = [ev[0] for ev in events]
+        assert currents == sorted(currents)
+        assert all(0 <= c < 100 for c in currents[:-1])
+        assert currents[-1] == 100
+
+        if callback_arity == 3:
+            assert events[-1] == (100, 100, "Steady-state solved.")
+            messages = [ev[2] for ev in events[:-1]]
+            assert all("PCG iter " in m and "residual " in m for m in messages)
+            if heatsink_mode:
+                hs_events = [
+                    ev for ev in events[:-1]
+                    if ev[2].startswith("Solving steady-state heatsink coupling ")
+                ]
+                main_events = [
+                    ev for ev in events[:-1]
+                    if ev[2].startswith("Solving steady-state (")
+                ]
+                assert len(hs_events) >= 1
+                assert len(main_events) >= 1
+                assert all(0 <= ev[0] <= 45 for ev in hs_events)
+                assert all(45 <= ev[0] <= 99 for ev in main_events)
+            else:
+                assert all(
+                    ev[2].startswith("Solving steady-state (") for ev in events[:-1]
+                )
+
+    def test_steady_state_pcg_progress_throttles_fast_iterations(self, monkeypatch):
+        """Throttling suppresses rapid intermediate callbacks (<40ms apart)."""
+        clock = {"t": 100.0}
+
+        def fast_monotonic():
+            clock["t"] += 0.001
+            return clock["t"]
+
+        monkeypatch.setattr(thermal_solver.time, "monotonic", fast_monotonic)
+
+        cfg, op, capacity, power, fast_b, fast_hA, hs_model = self._make_problem(
+            heatsink_mode=True
+        )
+        events = []
+
+        def cb(cur, tot, msg):
+            events.append((cur, tot, msg))
+            return True
+
+        res = run_steady_state_matrix_free(
+            cfg,
+            op,
+            capacity,
+            power,
+            fast_b,
+            fast_hA,
+            progress_callback=cb,
+            heatsink_model=hs_model,
+        )
+
+        assert res.aborted is False
+        # At most one throttled update per phase (heatsink + main) plus final (100, 100)
+        assert len(events) <= 3
+        assert events[-1] == (100, 100, "Steady-state solved.")
+
+    @pytest.mark.parametrize("heatsink_mode", [False, True])
+    @pytest.mark.parametrize("callback_arity", [2, 3])
+    def test_steady_state_pcg_progress_can_abort_mid_pcg(
+        self, monkeypatch, heatsink_mode, callback_arity
+    ):
+        """Returning False from progress_callback during PCG aborts cleanly."""
+        clock = {"t": 100.0}
+
+        def fake_monotonic():
+            clock["t"] += 0.05
+            return clock["t"]
+
+        monkeypatch.setattr(thermal_solver.time, "monotonic", fake_monotonic)
+
+        cfg, op, capacity, power, fast_b, fast_hA, hs_model = self._make_problem(
+            heatsink_mode=heatsink_mode
+        )
+        events = []
+
+        if callback_arity == 2:
+            def cb(cur, tot):
+                events.append((cur, tot))
+                return len(events) < 2
+        else:
+            def cb(cur, tot, msg):
+                events.append((cur, tot, msg))
+                return len(events) < 2
+
+        res = run_steady_state_matrix_free(
+            cfg,
+            op,
+            capacity,
+            power,
+            fast_b,
+            fast_hA,
+            progress_callback=cb,
+            heatsink_model=hs_model,
+        )
+
+        assert res.aborted is True
+        assert res.step_counter == 0
+        assert len(events) == 2
+        assert all(ev[0] < 100 for ev in events)
+
+
+class TestGeometricTransientAndFmgWarmStart:
+    """Tests for Quick-Win #1 (geometric transient stepping) and #3 (FMG steady-state warm start)."""
+
+    def test_build_geometric_phase_plan_structure_and_snapshots(self):
+        """_build_geometric_phase_plan produces 5 growing-dt phases and adapts for close snapshots."""
+        cfg = SolverConfig(
+            sim_time=120.0,
+            amb=25.0,
+            dt_base=0.2,
+            steps_target=600,
+            time_stepping="geometric",
+        )
+        mode, plan = thermal_solver._build_geometric_phase_plan(cfg)
+        assert mode == "geometric"
+        assert len(plan) == 5
+        assert sum(p_time for _, p_time, _, _ in plan) == pytest.approx(120.0)
+        assert sum(steps for _, _, steps, _ in plan) == 78
+        dts = [p_dt for _, _, _, p_dt in plan]
+        assert all(dts[i] < dts[i + 1] for i in range(len(dts) - 1))
+
+        cfg_snaps = SolverConfig(
+            sim_time=120.0,
+            amb=25.0,
+            dt_base=0.2,
+            steps_target=600,
+            time_stepping="geometric",
+            snapshots_enabled=True,
+            snap_times=[1.0, 40.0, 41.0, 120.0],
+        )
+        _, snap_plan = thermal_solver._build_geometric_phase_plan(cfg_snaps)
+        # Phase 5 has snapshots 1s apart so dt in phase 5 must not exceed 1.0s
+        assert snap_plan[-1][3] <= 1.0 + 1e-9
+
+    @pytest.mark.physics
+    @pytest.mark.parametrize("heatsink_mode", [False, True])
+    @pytest.mark.parametrize("time_stepping", ["geometric", "auto"])
+    def test_geometric_transient_matches_uniform_600_and_captures_snapshots(
+        self, heatsink_mode, time_stepping
+    ):
+        """Geometric stepping uses ~78 steps, preserves energy balance, and matches 600-step uniform (<0.5%)."""
+        args, capacity, power, settings, amb = TestDynamicHeatsinkModel._build_heatsink_pcb(
+            layers=2, rows=24, cols=24
+        )
+        if not heatsink_mode:
+            settings = {**settings, "use_heatsink": False}
+        compact_op = thermal_solver.build_compact_structured_operator(
+            args[0], args[1], args[2], args[3], args[4], args[5],
+            args[6], args[7], args[8], args[9], args[10], args[11], args[12],
+            settings, amb,
+        )
+        Q_sparse = thermal_solver.SparsePowerVector(
+            np.flatnonzero(power > 0), power[power > 0], power.size
+        )
+        hs_model = compact_op.build_heatsink_model(settings, amb) if heatsink_mode else None
+
+        snap_times = [1.0, 10.0, 60.0, 120.0]
+        uniform_cfg = SolverConfig(
+            sim_time=120.0,
+            amb=amb,
+            dt_base=0.2,
+            steps_target=600,
+            use_multi_phase=False,
+            time_stepping="uniform",
+            early_stop=False,
+        )
+        geom_cfg = SolverConfig(
+            sim_time=120.0,
+            amb=amb,
+            dt_base=0.2,
+            steps_target=600,
+            use_multi_phase=True,
+            time_stepping=time_stepping,
+            early_stop=False,
+            snapshots_enabled=True,
+            snap_times=snap_times,
+        )
+
+        ref = run_simulation_matrix_free(
+            uniform_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_model
+        )
+        geom = run_simulation_matrix_free(
+            geom_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_model
+        )
+
+        assert geom.k_norm_info["time_stepping"] == "geometric"
+        assert geom.k_norm_info["multi_phase"] is True
+        assert 70 <= geom.step_counter <= 95
+        assert len(geom.snapshot_stats) == len(snap_times)
+        assert all(s["eps_rel"] < 0.01 for s in geom.snapshot_stats)
+
+        temp_rise = float(np.max(ref.T) - amb)
+        max_diff = float(np.max(np.abs(geom.T - ref.T)))
+        assert max_diff / max(temp_rise, 1e-6) < 0.005
+        if heatsink_mode:
+            hs_diff = abs(
+                geom.k_norm_info["heatsink_temp_c"] - ref.k_norm_info["heatsink_temp_c"]
+            )
+            assert hs_diff / max(temp_rise, 1e-6) < 0.005
+
+    def test_geometric_falls_back_to_fine_stepping_for_pwl_q_func(self):
+        """When Q_func is provided, time_stepping='geometric'/'auto' must not coarsen dt aggressively."""
+        args, capacity, base_power = TestSteadyStateAndSpeedups._build_problem(
+            layers=2, rows=16, cols=16
+        )
+        op, fb, fhA, _ = build_structured_operator(*args)
+
+        def pulse_q(t):
+            if 5.0 <= t <= 6.0:
+                return base_power * 3.0
+            return base_power * 0.2
+
+        cfg_geom = SolverConfig(
+            sim_time=10.0,
+            amb=25.0,
+            dt_base=0.1,
+            steps_target=100,
+            use_multi_phase=True,
+            time_stepping="geometric",
+            early_stop=False,
+        )
+        res = run_simulation_matrix_free(
+            cfg_geom, op, capacity, base_power, fb, fhA, Q_func=pulse_q
+        )
+        assert res.k_norm_info["time_stepping"] == "uniform"
+        assert res.step_counter == 100
+
+    @pytest.mark.parametrize("heatsink_mode", [False, True])
+    @pytest.mark.parametrize("use_compact", [False, True])
+    def test_fmg_warm_start_reduces_pcg_iterations_and_matches_direct(
+        self, monkeypatch, heatsink_mode, use_compact
+    ):
+        """FMG initial guess strictly reduces PCG iterations and matches direct SciPy solve (<1e-5 K)."""
+        args, capacity, power, settings, amb = TestDynamicHeatsinkModel._build_heatsink_pcb(
+            layers=2,
+            rows=32,
+            cols=32,
+            settings_extra=None if heatsink_mode else {"use_heatsink": False},
+        )
+        K, b, hA, _ = build_stiffness_matrix(*args)
+        cfg = SolverConfig(
+            sim_time=50.0, amb=amb, dt_base=1.0, steps_target=50, steady_state=True
+        )
+
+        if use_compact:
+            op = thermal_solver.build_compact_structured_operator(
+                args[0], args[1], args[2], args[3], args[4], args[5],
+                args[6], args[7], args[8], args[9], args[10], args[11], args[12],
+                settings, amb,
+            )
+            q_arg = thermal_solver.SparsePowerVector(
+                np.flatnonzero(power > 0), power[power > 0], power.size
+            )
+            c_arg, b_arg, ha_arg = None, None, None
+            hs_mf = op.build_heatsink_model(settings, amb) if heatsink_mode else None
+        else:
+            op, b_arg, ha_arg, _ = build_structured_operator(*args)
+            q_arg = power
+            c_arg = capacity
+            hs_mf = (
+                build_heatsink_model(
+                    args[0], args[1], args[2], args[8], args[9], args[12], settings, amb
+                )
+                if heatsink_mode
+                else None
+            )
+
+        hs_direct = (
+            build_heatsink_model(
+                args[0], args[1], args[2], args[8], args[9], args[12], settings, amb
+            )
+            if heatsink_mode
+            else None
+        )
+        direct = run_steady_state(
+            cfg, K, power, b, hA, 2, 32, 32, heatsink_model=hs_direct
+        )
+
+        res_fmg = run_steady_state_matrix_free(
+            cfg, op, c_arg, q_arg, b_arg, ha_arg, heatsink_model=hs_mf
+        )
+
+        # Compare against cold-start PCG (FMG disabled)
+        op.clear_caches()
+        monkeypatch.setattr(
+            thermal_solver._BaseGeometricMultigrid, "fmg_initial_guess", None
+        )
+        res_cold = run_steady_state_matrix_free(
+            cfg, op, c_arg, q_arg, b_arg, ha_arg, heatsink_model=hs_mf
+        )
+
+        assert res_fmg.k_norm_info["avg_pcg_iterations"] < res_cold.k_norm_info["avg_pcg_iterations"]
+        max_err = float(np.max(np.abs(res_fmg.T - direct.T)))
+        assert max_err < 1e-5, f"FMG steady-state error vs direct SciPy: {max_err:.3e} K"
+        if heatsink_mode:
+            assert abs(
+                res_fmg.k_norm_info["heatsink_temp_c"]
+                - direct.k_norm_info["heatsink_temp_c"]
+            ) < 1e-5
+
+

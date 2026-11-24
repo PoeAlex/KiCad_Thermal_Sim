@@ -1,0 +1,251 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PoeAlex/KiCad_Thermal_Sim/schema/summary.schema.json",
+  "title": "ThermalSim Semantic Summary Output",
+  "description": "Semantic JSON summary produced by run_headless_simulation / thermalsim_cli.py run (written to summary.json and stdout).",
+  "type": "object",
+  "required": ["schema_version", "command", "status"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0",
+      "description": "Semantic output schema version."
+    },
+    "plugin_version": {
+      "type": "string",
+      "description": "ThermalSim plugin version that generated this summary."
+    },
+    "command": {
+      "type": "string",
+      "enum": ["run"],
+      "description": "CLI/API command that produced this summary."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "limit_violation", "validation_error", "error"],
+      "description": "Outcome status. Maps to CLI exit codes: ok=0, validation_error=2, limit_violation=3, error=1."
+    },
+    "valid": {
+      "type": "boolean",
+      "description": "Present on validation_error responses (false)."
+    },
+    "board": {
+      "type": "object",
+      "description": "Board metadata and physical dimensions.",
+      "additionalProperties": true,
+      "properties": {
+        "path": {"type": ["string", "null"]},
+        "name": {"type": ["string", "null"]},
+        "width_mm": {"type": "number"},
+        "height_mm": {"type": "number"},
+        "x_min_mm": {"type": "number"},
+        "y_min_mm": {"type": "number"},
+        "layer_count": {"type": "integer", "minimum": 1},
+        "layers": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    },
+    "temperatures": {
+      "type": "object",
+      "description": "Global and per-layer temperature statistics in degrees Celsius / Kelvin rise.",
+      "required": ["ambient_c", "min_c", "max_c", "mean_c", "max_rise_k", "layers"],
+      "additionalProperties": true,
+      "properties": {
+        "ambient_c": {"type": "number"},
+        "min_c": {"type": "number"},
+        "max_c": {"type": "number"},
+        "mean_c": {"type": "number"},
+        "max_rise_k": {"type": "number"},
+        "layers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["index", "name", "min_c", "max_c", "mean_c"],
+            "additionalProperties": true,
+            "properties": {
+              "index": {"type": "integer", "minimum": 0},
+              "name": {"type": "string"},
+              "min_c": {"type": "number"},
+              "max_c": {"type": "number"},
+              "mean_c": {"type": "number"}
+            }
+          }
+        }
+      }
+    },
+    "heatsink": {
+      "type": "object",
+      "description": "Thermal pad / 0D dynamic heatsink state and heat removal metrics.",
+      "required": ["enabled", "mode"],
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "mode": {"type": "string", "enum": ["none", "fixed", "heatsink"]},
+        "inactive_reason": {"type": ["string", "null"]},
+        "temp_c": {"type": ["number", "null"]},
+        "temp_rise_k": {"type": ["number", "null"]},
+        "rth_kw": {"type": ["number", "null"]},
+        "capacity_j_k": {"type": ["number", "null"]},
+        "tau_s": {"type": ["number", "null"]},
+        "heatsink_power_w": {"type": ["number", "null"]},
+        "pcb_convection_power_w": {"type": ["number", "null"]},
+        "heatsink_power_fraction": {"type": ["number", "null"]},
+        "pad_flux_w": {"type": ["number", "null"]}
+      }
+    },
+    "hotspots": {
+      "type": "array",
+      "description": "Up to 5 spatially separated local temperature maxima with nearest-component attribution.",
+      "items": {
+        "type": "object",
+        "required": ["rank", "temp_c", "rise_k", "layer", "layer_index", "x_mm", "y_mm", "nearest_component"],
+        "additionalProperties": true,
+        "properties": {
+          "rank": {"type": "integer", "minimum": 1},
+          "temp_c": {"type": "number"},
+          "rise_k": {"type": "number"},
+          "layer": {"type": "string"},
+          "layer_index": {"type": "integer", "minimum": 0},
+          "x_mm": {"type": "number"},
+          "y_mm": {"type": "number"},
+          "nearest_component": {
+            "type": ["object", "null"],
+            "properties": {
+              "ref": {"type": "string"},
+              "value": {"type": "string"},
+              "distance_mm": {"type": "number", "minimum": 0},
+              "nearest_pad": {"type": ["string", "null"]}
+            },
+            "required": ["ref", "value", "distance_mm", "nearest_pad"],
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "components": {
+      "type": "object",
+      "description": "Per-component thermal statistics keyed by reference designator (sorted by max_c descending).",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["ref", "value", "footprint", "layer", "x_mm", "y_mm", "max_c", "mean_c", "min_c", "pad_max_c"],
+        "additionalProperties": true,
+        "properties": {
+          "ref": {"type": "string"},
+          "value": {"type": "string"},
+          "footprint": {"type": "string"},
+          "layer": {"type": "string"},
+          "x_mm": {"type": "number"},
+          "y_mm": {"type": "number"},
+          "max_c": {"type": "number"},
+          "mean_c": {"type": "number"},
+          "min_c": {"type": "number"},
+          "pad_max_c": {"type": "number"}
+        }
+      }
+    },
+    "top_components": {
+      "type": "array",
+      "description": "Top 10 hottest components sorted by max_c descending.",
+      "items": {
+        "type": "object",
+        "required": ["ref", "value", "footprint", "layer", "x_mm", "y_mm", "max_c", "mean_c", "min_c", "pad_max_c"],
+        "additionalProperties": true,
+        "properties": {
+          "ref": {"type": "string"},
+          "value": {"type": "string"},
+          "footprint": {"type": "string"},
+          "layer": {"type": "string"},
+          "x_mm": {"type": "number"},
+          "y_mm": {"type": "number"},
+          "max_c": {"type": "number"},
+          "mean_c": {"type": "number"},
+          "min_c": {"type": "number"},
+          "pad_max_c": {"type": "number"}
+        }
+      }
+    },
+    "limits_check": {
+      "type": "object",
+      "description": "Pass/fail evaluation against configured thermal limits.",
+      "required": ["enabled", "passed", "violations"],
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "passed": {"type": "boolean"},
+        "violations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["rule", "target", "limit_c", "actual_c", "margin_c"],
+            "additionalProperties": true,
+            "properties": {
+              "rule": {"type": "string"},
+              "target": {"type": "string"},
+              "limit_c": {"type": "number"},
+              "actual_c": {"type": "number"},
+              "margin_c": {
+                "type": "number",
+                "description": "limit_c - actual_c (negative when violated)."
+              }
+            }
+          }
+        }
+      }
+    },
+    "electrical": {
+      "type": ["object", "null"],
+      "description": "DC current-flow Joule heating summary when current_enabled is true, otherwise null.",
+      "additionalProperties": true
+    },
+    "solver": {
+      "type": "object",
+      "description": "Solver backend, mesh resolution, performance timings, and energy-balance diagnostics.",
+      "additionalProperties": true,
+      "properties": {
+        "backend": {"type": ["string", "null"]},
+        "strategy": {"type": ["string", "null"]},
+        "steady_state": {"type": "boolean"},
+        "mesh_mode": {"type": "string"},
+        "nodes": {"type": "integer", "minimum": 0},
+        "adaptive_nodes": {"type": ["integer", "null"]},
+        "steps_total": {"type": "integer", "minimum": 0},
+        "solve_s": {"type": "number", "minimum": 0},
+        "total_s": {"type": "number", "minimum": 0},
+        "pin_w": {"type": ["number", "null"]},
+        "pout_w": {"type": ["number", "null"]},
+        "steady_rel_diff": {"type": ["number", "null"]},
+        "peak_rss_mb": {"type": ["number", "null"]}
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "description": "Structured or string warnings emitted during validation and simulation.",
+      "items": {
+        "type": ["object", "string"]
+      }
+    },
+    "errors": {
+      "type": "array",
+      "description": "Structured errors (empty array on successful/limit_violation runs; populated on validation_error/error).",
+      "items": {
+        "type": ["object", "string"]
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "description": "Generated output directory and file paths (null when disabled or not written).",
+      "additionalProperties": true,
+      "properties": {
+        "run_dir": {"type": ["string", "null"]},
+        "summary_json": {"type": ["string", "null"]},
+        "report_html": {"type": ["string", "null"]},
+        "heatmap_png": {"type": ["string", "null"]},
+        "preview_png": {"type": ["string", "null"]},
+        "joule_map_png": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

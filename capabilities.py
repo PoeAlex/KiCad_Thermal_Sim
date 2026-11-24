@@ -22,6 +22,10 @@ HAS_NATIVE_CORE : bool
     True if the optional native C++/OpenMP CPU core shared library is available.
 HAS_NATIVE_MG : bool
     True if the native multigrid V-cycle kernels (v2 ABI) are available.
+HAS_NATIVE_COMPACT : bool
+    True if the native compact low-RAM multigrid kernels (v3 ABI) are available.
+HAS_NATIVE_PCG : bool
+    True if the native fused OpenMP PCG/vector kernels (v4 ABI) are available.
 """
 
 import importlib.util
@@ -76,10 +80,17 @@ except ImportError:
     HAS_NUMBA = False
 
 try:
-    from .native_core import HAS_NATIVE_CORE, HAS_NATIVE_MG
+    from .native_core import (
+        HAS_NATIVE_COMPACT,
+        HAS_NATIVE_CORE,
+        HAS_NATIVE_MG,
+        HAS_NATIVE_PCG,
+    )
 except (ImportError, OSError):
     HAS_NATIVE_CORE = False
     HAS_NATIVE_MG = False
+    HAS_NATIVE_COMPACT = False
+    HAS_NATIVE_PCG = False
 
 
 def get_missing_packages():
@@ -129,6 +140,8 @@ def get_capabilities_summary():
       Numba (JIT compilation): Not available
       Native matrix-free CPU core: Available
       Native multigrid V-cycle: Available
+      Compact low-RAM multigrid core: Available
+      Native fused PCG kernels: Available
     """
     _avail = lambda v: "Available" if v else "Not available"
     lines = ["ThermalSim Capabilities:"]
@@ -140,4 +153,6 @@ def get_capabilities_summary():
     lines.append(f"  Numba (JIT compilation): {_avail(HAS_NUMBA)}")
     lines.append(f"  Native matrix-free CPU core: {_avail(HAS_NATIVE_CORE)}")
     lines.append(f"  Native multigrid V-cycle: {_avail(HAS_NATIVE_MG)}")
+    lines.append(f"  Compact low-RAM multigrid core: {_avail(HAS_NATIVE_COMPACT)}")
+    lines.append(f"  Native fused PCG kernels: {_avail(HAS_NATIVE_PCG)}")
     return "\n".join(lines)
