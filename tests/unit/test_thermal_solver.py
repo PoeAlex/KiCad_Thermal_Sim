@@ -2537,3 +2537,202 @@ class TestCompactLowRamOperatorAndHeatsink2D:
                 res_tr_v4.k_norm_info["heatsink_temp_c"]
                 - res_tr_fb.k_norm_info["heatsink_temp_c"]
             ) < 1e-10
+
+
+class TestSteadyStatePcgProgress:
+    """Tests for live PCG convergence progress reporting in steady-state solves."""
+
+    @staticmethod
+    def _make_problem(heatsink_mode: bool):
+        args, capacity, power, settings, amb = TestDynamicHeatsinkModel._build_heatsink_pcb(
+            layers=2, rows=24, cols=24
+        )
+        if not heatsink_mode:
+            settings = {**settings, "use_heatsink": False}
+        op, fast_b, fast_hA, _ = build_structured_operator(*args)
+        hs_model = (
+            build_heatsink_model(
+                args[0], args[1], args[2], args[8], args[9], args[12], settings, amb
+            )
+            if heatsink_mode
+            else None
+        )
+        cfg = SolverConfig(
+            sim_time=50.0, amb=amb, dt_base=1.0, steps_target=50, steady_state=True
+        )
+        return cfg, op, capacity, power, fast_b, fast_hA, hs_model
+
+    def test_solve_pcg_invokes_iteration_callback(self):
+        """_solve_pcg calls iteration_callback with (iteration, rel_res, tol)."""
+        cfg, op, capacity, power, fast_b, _, _ = self._make_problem(heatsink_mode=False)
+        A_op, M_op = op.implicit_linear_operator(capacity, 0.0)
+        rhs = power + fast_b
+        initial = np.full(op.shape[0], cfg.amb, dtype=np.float64)
+        events = []
+
+        def on_iter(it, rel_res, target):
+            events.append((it, rel_res, target))
+
+        _, iters, _, _ = _solve_pcg(
+            A_op,
+            M_op,
+            rhs,
+            initial,
+            relative_tolerance=1e-7,
+            maxiter=200,
+            iteration_callback=on_iter,
+        )
+        assert iters >= 2
+        assert [e[0] for e in events] == list(range(1, iters + 1))
+        assert all(isinstance(e[1], float) and e[1] >= 0.0 for e in events)
+        assert all(e[2] == pytest.approx(1e-7) for e in events)
+
+    @pytest.mark.parametrize("heatsink_mode", [False, True])
+    @pytest.mark.parametrize("callback_arity", [2, 3])
+    def test_steady_state_pcg_progress_2arg_and_3arg(
+        self, monkeypatch, heatsink_mode, callback_arity
+    ):
+        """run_steady_state_matrix_free emits monotonic live PCG progress for 2-arg and 3-arg callbacks."""
+        clock = {"t": 100.0}
+
+        def fake_monotonic():
+            clock["t"] += 0.05
+            return clock["t"]
+
+        monkeypatch.setattr(thermal_solver.time, "monotonic", fake_monotonic)
+
+        cfg, op, capacity, power, fast_b, fast_hA, hs_model = self._make_problem(
+            heatsink_mode=heatsink_mode
+        )
+        events = []
+
+        if callback_arity == 2:
+            def cb(cur, tot):
+                events.append((cur, tot))
+                return True
+        else:
+            def cb(cur, tot, msg):
+                events.append((cur, tot, msg))
+                return True
+
+        res = run_steady_state_matrix_free(
+            cfg,
+            op,
+            capacity,
+            power,
+            fast_b,
+            fast_hA,
+            progress_callback=cb,
+            heatsink_model=hs_model,
+        )
+
+        assert res.aborted is False
+        assert res.step_counter == 1
+        assert len(events) >= 3
+        assert all(ev[1] == 100 for ev in events)
+        currents = [ev[0] for ev in events]
+        assert currents == sorted(currents)
+        assert all(0 <= c < 100 for c in currents[:-1])
+        assert currents[-1] == 100
+
+        if callback_arity == 3:
+            assert events[-1] == (100, 100, "Steady-state solved.")
+            messages = [ev[2] for ev in events[:-1]]
+            assert all("PCG iter " in m and "residual " in m for m in messages)
+            if heatsink_mode:
+                hs_events = [
+                    ev for ev in events[:-1]
+                    if ev[2].startswith("Solving steady-state heatsink coupling ")
+                ]
+                main_events = [
+                    ev for ev in events[:-1]
+                    if ev[2].startswith("Solving steady-state (")
+                ]
+                assert len(hs_events) >= 1
+                assert len(main_events) >= 1
+                assert all(0 <= ev[0] <= 45 for ev in hs_events)
+                assert all(45 <= ev[0] <= 99 for ev in main_events)
+            else:
+                assert all(
+                    ev[2].startswith("Solving steady-state (") for ev in events[:-1]
+                )
+
+    def test_steady_state_pcg_progress_throttles_fast_iterations(self, monkeypatch):
+        """Throttling suppresses rapid intermediate callbacks (<40ms apart)."""
+        clock = {"t": 100.0}
+
+        def fast_monotonic():
+            clock["t"] += 0.001
+            return clock["t"]
+
+        monkeypatch.setattr(thermal_solver.time, "monotonic", fast_monotonic)
+
+        cfg, op, capacity, power, fast_b, fast_hA, hs_model = self._make_problem(
+            heatsink_mode=True
+        )
+        events = []
+
+        def cb(cur, tot, msg):
+            events.append((cur, tot, msg))
+            return True
+
+        res = run_steady_state_matrix_free(
+            cfg,
+            op,
+            capacity,
+            power,
+            fast_b,
+            fast_hA,
+            progress_callback=cb,
+            heatsink_model=hs_model,
+        )
+
+        assert res.aborted is False
+        # At most one throttled update per phase (heatsink + main) plus final (100, 100)
+        assert len(events) <= 3
+        assert events[-1] == (100, 100, "Steady-state solved.")
+
+    @pytest.mark.parametrize("heatsink_mode", [False, True])
+    @pytest.mark.parametrize("callback_arity", [2, 3])
+    def test_steady_state_pcg_progress_can_abort_mid_pcg(
+        self, monkeypatch, heatsink_mode, callback_arity
+    ):
+        """Returning False from progress_callback during PCG aborts cleanly."""
+        clock = {"t": 100.0}
+
+        def fake_monotonic():
+            clock["t"] += 0.05
+            return clock["t"]
+
+        monkeypatch.setattr(thermal_solver.time, "monotonic", fake_monotonic)
+
+        cfg, op, capacity, power, fast_b, fast_hA, hs_model = self._make_problem(
+            heatsink_mode=heatsink_mode
+        )
+        events = []
+
+        if callback_arity == 2:
+            def cb(cur, tot):
+                events.append((cur, tot))
+                return len(events) < 2
+        else:
+            def cb(cur, tot, msg):
+                events.append((cur, tot, msg))
+                return len(events) < 2
+
+        res = run_steady_state_matrix_free(
+            cfg,
+            op,
+            capacity,
+            power,
+            fast_b,
+            fast_hA,
+            progress_callback=cb,
+            heatsink_model=hs_model,
+        )
+
+        assert res.aborted is True
+        assert res.step_counter == 0
+        assert len(events) == 2
+        assert all(ev[0] < 100 for ev in events)
+

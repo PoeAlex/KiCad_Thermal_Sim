@@ -7,6 +7,7 @@ simulation, including sparse matrix assembly and time-stepping.
 
 import contextlib
 import ctypes
+import inspect
 import math
 import sys
 import time
@@ -2637,6 +2638,7 @@ def _solve_pcg(
     retry_maxiter=200,
     out=None,
     workspaces=None,
+    iteration_callback: Optional[Callable[[int, float, float], None]] = None,
 ):
     """Solve one implicit step with preconditioned conjugate gradients."""
     rhs_arr = _as_1d_contiguous_f64(rhs)
@@ -2748,6 +2750,10 @@ def _solve_pcg(
             iterations += 1
             if cancel_check and cancel_check():
                 raise _CancelledIterativeSolve()
+            if iteration_callback is not None:
+                iteration_callback(
+                    iterations, rnorm / max(bnorm, 1e-30), relative_tolerance
+                )
 
             if rnorm <= tol:
                 converged = True
@@ -2860,6 +2866,7 @@ class _HeatsinkPhaseState:
         cancel_check=None,
         rtol: float = 1e-8,
         workspaces=None,
+        iteration_callback: Optional[Callable[[int, float, float], None]] = None,
     ):
         g = heatsink_model.pad_conductance
         node_count = operator.shape[0]
@@ -2880,6 +2887,7 @@ class _HeatsinkPhaseState:
             retry_maxiter=600,
             out=u,
             workspaces=workspaces,
+            iteration_callback=iteration_callback,
         )
         return cls.from_u(heatsink_model, gamma, u), rel_res
 
@@ -3172,6 +3180,24 @@ def run_steady_state(
     )
 
 
+def _progress_callback_accepts_message(progress_callback) -> bool:
+    """Return True if ``progress_callback`` accepts 3 positional arguments."""
+    try:
+        sig = inspect.signature(progress_callback)
+    except (TypeError, ValueError):
+        return False
+    positional = 0
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional += 1
+    return positional >= 3
+
+
 def run_steady_state_matrix_free(
     config: SolverConfig,
     operator: StructuredThermalOperator,
@@ -3179,7 +3205,7 @@ def run_steady_state_matrix_free(
     Q,
     b: Optional[np.ndarray],
     hA: Optional[np.ndarray],
-    progress_callback: Optional[Callable[[int, int], bool]] = None,
+    progress_callback: Optional[Callable[..., bool]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     heatsink_model: Optional[HeatsinkModel] = None,
 ) -> SolverResult:
@@ -3299,6 +3325,53 @@ def run_steady_state_matrix_free(
         _limit_blas_threads(1) if use_blas_limit else contextlib.nullcontext()
     )
 
+    accepts_message = (
+        _progress_callback_accepts_message(progress_callback)
+        if progress_callback is not None
+        else False
+    )
+    last_reported = 0
+
+    def _emit_progress(current: int, total: int, message: str) -> bool:
+        if progress_callback is None:
+            return True
+        if accepts_message:
+            res = progress_callback(current, total, message)
+        else:
+            res = progress_callback(current, total)
+        return not (res is not None and not res)
+
+    def _make_pcg_callback(start_pct: int, end_pct: int, label: str):
+        if progress_callback is None:
+            return None
+        state = {"r0": None, "last_emit": None}
+        span = max(0, end_pct - start_pct)
+
+        def _on_iter(it: int, rel_res: float, target: float) -> None:
+            nonlocal last_reported
+            if state["r0"] is None:
+                state["r0"] = rel_res
+            now = time.monotonic()
+            last_emit = state["last_emit"]
+            if last_emit is not None and (now - last_emit) < 0.04:
+                return
+            state["last_emit"] = now
+            target_safe = max(float(target), 1e-30)
+            r0_ref = max(float(state["r0"]), target_safe * 10.0)
+            res_clamped = max(float(rel_res), target_safe)
+            denom = max(math.log10(r0_ref / target_safe), 1e-6)
+            frac = max(0.0, min(0.98, math.log10(r0_ref / res_clamped) / denom))
+            pct = min(end_pct, start_pct + int(round(span * frac)))
+            if pct < last_reported:
+                pct = last_reported
+            else:
+                last_reported = pct
+            msg = f"{label} (PCG iter {it}, residual {rel_res:.1e} -> {target:.0e})..."
+            if not _emit_progress(pct, 100, msg):
+                raise _CancelledIterativeSolve()
+
+        return _on_iter
+
     with blas_guard:
         steady_operator, steady_preconditioner = operator.implicit_linear_operator(
             capacity, 0.0
@@ -3307,6 +3380,9 @@ def run_steady_state_matrix_free(
         u_rel_res = 0.0
         try:
             if hs_active:
+                hs_iter_cb = _make_pcg_callback(
+                    0, 45, "Solving steady-state heatsink coupling"
+                )
                 phase_hs, u_rel_res = _HeatsinkPhaseState.prepare_pcg(
                     heatsink_model,
                     0.0,
@@ -3315,6 +3391,7 @@ def run_steady_state_matrix_free(
                     cancel_check=cancel_check,
                     rtol=1e-8,
                     workspaces=pcg_workspaces,
+                    iteration_callback=hs_iter_cb,
                 )
             setup_time = time.perf_counter() - setup_start
 
@@ -3327,6 +3404,9 @@ def run_steady_state_matrix_free(
             else:
                 r_hs = 0.0
                 solve_init = initial
+            main_iter_cb = _make_pcg_callback(
+                45 if hs_active else 0, 99, "Solving steady-state"
+            )
             solution, iterations, retried, relative_residual = _solve_pcg(
                 steady_operator,
                 steady_preconditioner,
@@ -3338,6 +3418,7 @@ def run_steady_state_matrix_free(
                 retry_maxiter=500,
                 out=sol_buf,
                 workspaces=pcg_workspaces,
+                iteration_callback=main_iter_cb,
             )
             if phase_hs is not None:
                 temperature, t_hs = phase_hs.recover(
@@ -3352,8 +3433,9 @@ def run_steady_state_matrix_free(
             solve_time = time.perf_counter() - setup_start
             aborted = True
 
-    if not aborted and progress_callback and not progress_callback(1, 1):
-        aborted = True
+    if not aborted and progress_callback is not None:
+        if not _emit_progress(100, 100, "Steady-state solved."):
+            aborted = True
 
     final_view = temperature.reshape(layer_count, rows, cols)
     pout_final, hs_info = _heatsink_diagnostics(

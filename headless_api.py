@@ -88,7 +88,7 @@ from .workflow import (
 )
 
 SCHEMA_VERSION = "1.0"
-PLUGIN_VERSION = "0.4.5"
+PLUGIN_VERSION = "0.4.6"
 
 GRID_DETAIL_PRESETS = {
     "fast": (500_000, 425_000),
@@ -1271,18 +1271,23 @@ def _estimate_solver_cost(nodes: int, settings: Dict[str, Any]) -> Tuple[int, in
         compute_engine == "fast_native"
         or (compute_engine == "auto" and nodes >= _auto_fast_engine_threshold())
     )
+    mesh_mode = _resolve_mesh_mode(settings, fast_engine, nodes)
     if fast_engine:
         if HAS_NATIVE_COMPACT and HAS_NATIVE_MG:
-            memory_low = int(math.ceil(nodes * 0.00005))
-            memory_high = int(math.ceil(nodes * 0.00010))
-            thresholds = (800_000, 3_000_000, 8_000_000)
+            if mesh_mode == "adaptive":
+                memory_low = int(math.ceil(nodes * 0.000065))
+                memory_high = int(math.ceil(nodes * 0.000115))
+            else:
+                memory_low = int(math.ceil(nodes * 0.000095))
+                memory_high = int(math.ceil(nodes * 0.000145))
+            thresholds = (1_200_000, 4_000_000, 10_000_000)
         elif HAS_NATIVE_MG:
-            memory_low = int(math.ceil(nodes * 0.00025))
-            memory_high = int(math.ceil(nodes * 0.00050))
+            memory_low = int(math.ceil(nodes * 0.00013))
+            memory_high = int(math.ceil(nodes * 0.00022))
             thresholds = (800_000, 3_000_000, 8_000_000)
         else:
-            memory_low = int(math.ceil(nodes * 0.00012))
-            memory_high = int(math.ceil(nodes * 0.00045))
+            memory_low = int(math.ceil(nodes * 0.00011))
+            memory_high = int(math.ceil(nodes * 0.00019))
             thresholds = (500_000, 2_000_000, 7_000_000)
     else:
         memory_low = int(math.ceil(nodes * 0.00035))

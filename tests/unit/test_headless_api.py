@@ -128,7 +128,7 @@ class TestHeadlessIsolationAndJson:
 
     def test_constants(self):
         assert headless_api.SCHEMA_VERSION == "1.0"
-        assert headless_api.PLUGIN_VERSION == "0.4.5"
+        assert headless_api.PLUGIN_VERSION == "0.4.6"
 
     def test_no_wx_or_gui_imports_in_ast(self):
         path = os.path.abspath(headless_api.__file__)
@@ -977,3 +977,28 @@ class TestPadAlignmentAndBottomLayerRegression:
             T, board_circle_only, ["F.Cu", "B.Cu"], 0.0, 0.0, res
         )
         assert comps["C_CIRC"]["max_c"] == pytest.approx(60.0)
+
+    def test_estimate_solver_cost_matches_thermal_plugin_across_modes(self, monkeypatch):
+        """Headless and GUI cost estimators share exact calibrated v4 RAM and runtime bounds."""
+        import ThermalSim.thermal_plugin as plugin_mod
+
+        cases = [
+            (True, True, 6_000_000, {"compute_engine": "auto", "mesh_mode": "uniform"}, (570, 870, "Slow")),
+            (True, True, 6_000_000, {"compute_engine": "auto", "mesh_mode": "adaptive"}, (390, 690, "Slow")),
+            (True, True, 6_000_000, {"compute_engine": "auto", "mesh_mode": "auto"}, (390, 690, "Slow")),
+            (True, True, 500_000, {"compute_engine": "auto", "mesh_mode": "auto"}, (48, 73, "Fast")),
+            (True, True, 3_000_000, {"compute_engine": "auto", "mesh_mode": "auto"}, (285, 435, "Moderate")),
+            (True, True, 10_500_000, {"compute_engine": "auto", "mesh_mode": "adaptive"}, (683, 1208, "Very slow")),
+            (True, False, 6_000_000, {"compute_engine": "auto", "mesh_mode": "uniform"}, (780, 1320, "Slow")),
+            (False, False, 6_000_000, {"compute_engine": "fast_native", "mesh_mode": "adaptive"}, (660, 1140, "Slow")),
+            (True, True, 40_000, {"compute_engine": "auto"}, (14, 48, "Fast")),
+        ]
+        for has_mg, has_compact, nodes, settings, expected in cases:
+            monkeypatch.setattr(headless_api, "HAS_NATIVE_MG", has_mg)
+            monkeypatch.setattr(headless_api, "HAS_NATIVE_COMPACT", has_compact)
+            monkeypatch.setattr(plugin_mod, "HAS_NATIVE_MG", has_mg)
+            monkeypatch.setattr(plugin_mod, "HAS_NATIVE_COMPACT", has_compact)
+            h_res = headless_api._estimate_solver_cost(nodes, settings)
+            p_res = plugin_mod._estimate_solver_cost(nodes, settings)
+            assert h_res == expected
+            assert p_res == h_res

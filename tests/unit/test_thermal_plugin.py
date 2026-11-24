@@ -619,24 +619,42 @@ class TestGridCoarsening:
         assert plugin_mod._resolve_mesh_mode({"mesh_mode": "uniform"}, True, 1_000_000) == "uniform"
 
     def test_estimate_solver_cost_reflects_native_mg_and_ignores_legacy_backend(self, monkeypatch):
-        """Native compact/MG cost models use calibrated RAM/runtime thresholds and ignore legacy backend."""
+        """Native compact/MG cost models use calibrated v4 RAM/runtime bounds and ignore legacy backend."""
         import ThermalSim.thermal_plugin as plugin_mod
 
         monkeypatch.setattr(plugin_mod, "HAS_NATIVE_MG", True)
         monkeypatch.setattr(plugin_mod, "HAS_NATIVE_COMPACT", True)
-        c_low, c_high, c_rt = plugin_mod._estimate_solver_cost(
-            3_000_000, {"compute_engine": "auto"}
-        )
-        assert c_low == 150
-        assert c_high == 300
-        assert c_rt == "Slow"
 
+        # v4 Compact uniform vs adaptive at 3M and 6M nodes
+        assert plugin_mod._estimate_solver_cost(
+            3_000_000, {"compute_engine": "auto", "mesh_mode": "auto"}
+        ) == (285, 435, "Moderate")
+        assert plugin_mod._estimate_solver_cost(
+            6_000_000, {"compute_engine": "auto", "mesh_mode": "uniform"}
+        ) == (570, 870, "Slow")
+        assert plugin_mod._estimate_solver_cost(
+            6_000_000, {"compute_engine": "auto", "mesh_mode": "adaptive"}
+        ) == (390, 690, "Slow")
+        # Auto mesh_mode > 5M resolves to adaptive
+        assert plugin_mod._estimate_solver_cost(
+            6_000_000, {"compute_engine": "auto", "mesh_mode": "auto"}
+        ) == (390, 690, "Slow")
+
+        # v4 runtime thresholds (1.2M, 4.0M, 10.0M)
+        assert plugin_mod._estimate_solver_cost(500_000, {"compute_engine": "auto"})[2] == "Fast"
+        assert plugin_mod._estimate_solver_cost(1_199_999, {"compute_engine": "auto"})[2] == "Fast"
+        assert plugin_mod._estimate_solver_cost(1_200_000, {"compute_engine": "auto"})[2] == "Moderate"
+        assert plugin_mod._estimate_solver_cost(3_000_000, {"compute_engine": "auto"})[2] == "Moderate"
+        assert plugin_mod._estimate_solver_cost(6_000_000, {"compute_engine": "auto"})[2] == "Slow"
+        assert plugin_mod._estimate_solver_cost(10_500_000, {"compute_engine": "auto"})[2] == "Very slow"
+
+        # v2-only native MG (HAS_NATIVE_COMPACT=False)
         monkeypatch.setattr(plugin_mod, "HAS_NATIVE_COMPACT", False)
         low, high, runtime = plugin_mod._estimate_solver_cost(
             3_000_000, {"compute_engine": "auto"}
         )
-        assert low == 750
-        assert high == 1500
+        assert low == 390
+        assert high == 660
         assert runtime == "Slow"
 
         _, _, rt_fast = plugin_mod._estimate_solver_cost(500_000, {"compute_engine": "auto"})
@@ -650,14 +668,16 @@ class TestGridCoarsening:
         c_legacy = plugin_mod._estimate_solver_cost(
             40_000, {"compute_engine": "auto", "solver_backend": legacy_val}
         )
+        assert c_plain == (14, 48, "Fast")
         assert c_plain == c_legacy
 
+        # NumPy/SciPy matrix-free without native MG
         monkeypatch.setattr(plugin_mod, "HAS_NATIVE_MG", False)
         low_no_mg, high_no_mg, rt_no_mg = plugin_mod._estimate_solver_cost(
             1_000_000, {"compute_engine": "fast_native"}
         )
-        assert low_no_mg == 120
-        assert high_no_mg == 450
+        assert low_no_mg == 110
+        assert high_no_mg == 190
         assert rt_no_mg == "Moderate"
 
     def test_preflight_ignores_legacy_backend_setting(self, tmp_path):
@@ -2427,3 +2447,249 @@ class TestPadAlignmentAndBottomLayerFixes:
 
         assert key_f != legacy_key
         assert key_f != key_b
+
+
+class TestProgressEtaAndPcgReporting:
+    """Tests for English ETA formatting, PD_REMAINING_TIME removal, and 3-arg PCG progress."""
+
+    def test_progress_dialog_omits_pd_remaining_time_and_keeps_elapsed_time(self, monkeypatch):
+        import ThermalSim.thermal_plugin as plugin_mod
+
+        captured_styles = []
+
+        class RecordingStyleProgressDialog:
+            def __init__(self, title, message, maximum=100, **kwargs):
+                captured_styles.append(kwargs.get("style", 0))
+
+            def Update(self, value, newmsg=""):
+                return (True, False)
+
+            def WasCancelled(self):
+                return False
+
+            def Hide(self):
+                pass
+
+            def Destroy(self):
+                pass
+
+        monkeypatch.setattr(plugin_mod.wx, "PD_CAN_ABORT", 0x01, raising=False)
+        monkeypatch.setattr(plugin_mod.wx, "PD_APP_MODAL", 0x02, raising=False)
+        monkeypatch.setattr(plugin_mod.wx, "PD_REMAINING_TIME", 0x04, raising=False)
+        monkeypatch.setattr(plugin_mod.wx, "PD_ELAPSED_TIME", 0x08, raising=False)
+        monkeypatch.setattr(plugin_mod.wx, "PD_AUTO_HIDE", 0x10, raising=False)
+        monkeypatch.setattr(plugin_mod.wx, "ProgressDialog", RecordingStyleProgressDialog, raising=False)
+        monkeypatch.setattr(plugin_mod.wx, "GetApp", lambda: None, raising=False)
+
+        with plugin_mod._UiProgressReporter(title="ThermalSim", initial_message="Preparing..."):
+            pass
+
+        assert len(captured_styles) == 1
+        style = captured_styles[0]
+        assert (style & plugin_mod.wx.PD_REMAINING_TIME) == 0
+        assert (style & plugin_mod.wx.PD_ELAPSED_TIME) == plugin_mod.wx.PD_ELAPSED_TIME
+        assert (style & plugin_mod.wx.PD_CAN_ABORT) == plugin_mod.wx.PD_CAN_ABORT
+        assert (style & plugin_mod.wx.PD_APP_MODAL) == plugin_mod.wx.PD_APP_MODAL
+        assert (style & plugin_mod.wx.PD_AUTO_HIDE) == plugin_mod.wx.PD_AUTO_HIDE
+
+    def test_format_eta_seconds_english_ranges(self):
+        from ThermalSim.thermal_plugin import _format_eta_seconds
+
+        assert _format_eta_seconds(0.2) == "~1s remaining"
+        assert _format_eta_seconds(12.4) == "~12s remaining"
+        assert _format_eta_seconds(59.6) == "~1m 00s remaining"
+        assert _format_eta_seconds(135.0) == "~2m 15s remaining"
+        assert _format_eta_seconds(3900.0) == "~1h 05m remaining"
+
+    def test_run_in_background_with_progress_state_stays_at_base_when_zero(self, monkeypatch):
+        import threading
+        import time
+        import ThermalSim.thermal_plugin as plugin_mod
+
+        updates = []
+
+        class RecordingProgressDialog:
+            def __init__(self, title, message, maximum=100, **kwargs):
+                updates.append((0, message))
+
+            def Update(self, value, newmsg=""):
+                updates.append((int(value), newmsg))
+                return (True, False)
+
+            def WasCancelled(self):
+                return False
+
+            def Hide(self):
+                pass
+
+            def Destroy(self):
+                pass
+
+        monkeypatch.setattr(plugin_mod.wx, "ProgressDialog", RecordingProgressDialog, raising=False)
+        monkeypatch.setattr(plugin_mod.wx, "GetApp", lambda: None, raising=False)
+
+        state = {"current": 0, "total": 100, "message": ""}
+        release_worker = threading.Event()
+
+        def worker():
+            time.sleep(0.06)
+            state["current"] = 50
+            state["message"] = "Solving steady-state (PCG iter 10, residual 1e-4 -> 1e-7)..."
+            release_worker.wait(timeout=1.0)
+
+        with plugin_mod._UiProgressReporter(
+            title="ThermalSim",
+            initial_message="Preparing...",
+            throttle_s=0.01,
+            poll_interval_s=0.01,
+        ) as reporter:
+            t = threading.Timer(0.12, release_worker.set)
+            t.start()
+            try:
+                reporter.run_in_background(
+                    worker,
+                    54,
+                    88,
+                    "Solving steady-state thermal model...",
+                    progress_state=state,
+                    message_fn=lambda s: s.get("message") or "Solving steady-state thermal model...",
+                )
+            finally:
+                t.cancel()
+                release_worker.set()
+
+        # Before PCG updates arrive, percentage must stay cleanly at base (54), never creep upward
+        pre_pcg_pcts = [
+            pct for pct, msg in updates[1:]
+            if "PCG iter" not in msg and pct < 88
+        ]
+        assert len(pre_pcg_pcts) >= 2
+        assert all(pct == 54 for pct in pre_pcg_pcts)
+        assert any("PCG iter 10" in msg for _, msg in updates)
+        assert updates[-1][0] == 88
+
+    def test_run_simulation_propagates_steady_state_pcg_and_transient_eta(self, tmp_path, monkeypatch):
+        import threading
+        import time
+        import webbrowser
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_solver import SolverResult
+
+        suite = TestGuiResponsivenessAndProgress()
+        plugin, board, pad, desc = suite._make_board_and_plugin()
+        updates = []
+        pcg_seen = threading.Event()
+        eta_seen = threading.Event()
+
+        class RecordingProgressDialog:
+            def __init__(self, title, message, maximum=100, **kwargs):
+                updates.append((0, message))
+
+            def Update(self, value, newmsg=""):
+                updates.append((int(value), newmsg))
+                if "PCG iter 24" in newmsg:
+                    pcg_seen.set()
+                if "step 4/10 (" in newmsg and "remaining)" in newmsg:
+                    eta_seen.set()
+                return (True, False)
+
+            def WasCancelled(self):
+                return False
+
+            def Hide(self):
+                pass
+
+            def Destroy(self):
+                pass
+
+        def steady_pcg_solver(config, K, C, Q, b, hA, layer_count, rows, cols,
+                              progress_cb, snap_cb, **kwargs):
+            progress_cb(
+                45,
+                100,
+                "Solving steady-state (PCG iter 24, residual 4.2e-5 -> 1e-7)...",
+            )
+            pcg_seen.wait(timeout=1.0)
+            progress_cb(
+                100,
+                100,
+                "Solving steady-state (PCG iter 48, residual 8.1e-8 -> 1e-7)...",
+            )
+            return SolverResult(
+                T=np.full((layer_count, rows, cols), 42.0),
+                aborted=False,
+                step_counter=48,
+                total_solve_time=0.08,
+                total_factor_time=0.01,
+                factor_count=1,
+                snapshot_stats=[],
+                snapshot_files=[],
+                phase_metrics=[],
+                balance_history=[],
+                k_norm_info={},
+            )
+
+        monkeypatch.setattr(plugin_mod, "run_simulation", steady_pcg_solver)
+        monkeypatch.setattr(plugin_mod.wx, "ProgressDialog", RecordingProgressDialog, raising=False)
+        monkeypatch.setattr(plugin_mod.wx, "GetApp", lambda: None, raising=False)
+        monkeypatch.setattr(plugin_mod, "show_results_all_layers", lambda *a, **k: str(tmp_path / "hm.png"))
+        monkeypatch.setattr(plugin_mod, "save_preview_image", lambda *a, **k: str(tmp_path / "prev.png"))
+        monkeypatch.setattr(plugin_mod, "build_interactive_heatmap_payload", lambda *a, **k: {})
+        monkeypatch.setattr(plugin_mod, "write_html_report", lambda *a, **k: str(tmp_path / "rep.html"))
+        monkeypatch.setattr(webbrowser, "open", lambda *a, **k: True)
+
+        steady_settings = suite._make_settings(tmp_path, desc)
+        steady_settings["steady_state"] = True
+        plugin._run_simulation(
+            board, [F_Cu, B_Cu], ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad], steady_settings, {}, ["U1-1"],
+        )
+
+        assert pcg_seen.is_set()
+        assert any(
+            "Solving steady-state (PCG iter 24, residual 4.2e-5 -> 1e-7)..." in msg
+            for _, msg in updates
+        )
+
+        # Transient run appends English ETA once cur >= 3, cur < tot, and elapsed >= 1.5s
+        updates.clear()
+        orig_monotonic = time.monotonic
+        fake_clock = {"offset": 0.0}
+        monkeypatch.setattr(plugin_mod.time, "monotonic", lambda: orig_monotonic() + fake_clock["offset"])
+
+        def transient_solver(config, K, C, Q, b, hA, layer_count, rows, cols,
+                             progress_cb, snap_cb, **kwargs):
+            progress_cb(1, 10)
+            fake_clock["offset"] = 2.0
+            progress_cb(4, 10)
+            eta_seen.wait(timeout=1.0)
+            progress_cb(10, 10)
+            return SolverResult(
+                T=np.full((layer_count, rows, cols), 42.0),
+                aborted=False,
+                step_counter=10,
+                total_solve_time=0.08,
+                total_factor_time=0.01,
+                factor_count=1,
+                snapshot_stats=[],
+                snapshot_files=[],
+                phase_metrics=[],
+                balance_history=[],
+                k_norm_info={},
+            )
+
+        monkeypatch.setattr(plugin_mod, "run_simulation", transient_solver)
+        transient_settings = suite._make_settings(tmp_path, desc)
+        transient_settings["steady_state"] = False
+        plugin._run_simulation(
+            board, [F_Cu, B_Cu], ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad], transient_settings, {}, ["U1-1"],
+        )
+
+        assert eta_seen.is_set()
+        assert any(
+            "Solving thermal model - step 4/10 (~3s remaining)" in msg
+            for _, msg in updates
+        )

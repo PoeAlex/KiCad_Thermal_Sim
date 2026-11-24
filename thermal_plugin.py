@@ -124,6 +124,19 @@ def _message_phase(message):
     return text.strip()
 
 
+def _format_eta_seconds(seconds: float) -> str:
+    """Format an estimated remaining duration in concise English."""
+    total_sec = max(1, int(round(max(0.0, float(seconds)))))
+    if total_sec < 60:
+        return f"~{total_sec}s remaining"
+    if total_sec < 3600:
+        mins, secs = divmod(total_sec, 60)
+        return f"~{mins}m {secs:02d}s remaining"
+    hours, rem = divmod(total_sec, 3600)
+    mins = rem // 60
+    return f"~{hours}h {mins:02d}m remaining"
+
+
 class _UiProgressReporter:
     """Cancellable wx.ProgressDialog wrapper with throttled updates and background pumping."""
 
@@ -148,7 +161,6 @@ class _UiProgressReporter:
             getattr(wx, "PD_CAN_ABORT", 0)
             | getattr(wx, "PD_APP_MODAL", 0)
             | getattr(wx, "PD_ELAPSED_TIME", 0)
-            | getattr(wx, "PD_REMAINING_TIME", 0)
             | getattr(wx, "PD_AUTO_HIDE", 0)
         )
         kwargs = {"style": style}
@@ -281,7 +293,7 @@ class _UiProgressReporter:
                 if (progress_state is not None and message_fn is not None)
                 else message
             )
-            self.update(end_pct, final_msg)
+            self.update(end_pct, final_msg, force=True)
         return box.get("value")
 
     def close(self):
@@ -1115,7 +1127,7 @@ def _estimate_simulation_area(board, bbox, settings, power_pads=None, terminals=
 
 
 def _estimate_solver_cost(nodes, settings):
-    """Return conservative memory bounds and a relative runtime class."""
+    """Return calibrated memory bounds (MB) and a relative runtime class."""
     nodes = max(0, int(nodes))
     compute_engine = str(
         settings.get("compute_engine", "auto") or "auto"
@@ -1124,18 +1136,23 @@ def _estimate_solver_cost(nodes, settings):
         compute_engine == "fast_native"
         or (compute_engine == "auto" and nodes >= _auto_fast_engine_threshold())
     )
+    mesh_mode = _resolve_mesh_mode(settings, fast_engine, nodes)
     if fast_engine:
         if HAS_NATIVE_COMPACT and HAS_NATIVE_MG:
-            memory_low = int(math.ceil(nodes * 0.00005))
-            memory_high = int(math.ceil(nodes * 0.00010))
-            thresholds = (800_000, 3_000_000, 8_000_000)
+            if mesh_mode == "adaptive":
+                memory_low = int(math.ceil(nodes * 0.000065))
+                memory_high = int(math.ceil(nodes * 0.000115))
+            else:
+                memory_low = int(math.ceil(nodes * 0.000095))
+                memory_high = int(math.ceil(nodes * 0.000145))
+            thresholds = (1_200_000, 4_000_000, 10_000_000)
         elif HAS_NATIVE_MG:
-            memory_low = int(math.ceil(nodes * 0.00025))
-            memory_high = int(math.ceil(nodes * 0.00050))
+            memory_low = int(math.ceil(nodes * 0.00013))
+            memory_high = int(math.ceil(nodes * 0.00022))
             thresholds = (800_000, 3_000_000, 8_000_000)
         else:
-            memory_low = int(math.ceil(nodes * 0.00012))
-            memory_high = int(math.ceil(nodes * 0.00045))
+            memory_low = int(math.ceil(nodes * 0.00011))
+            memory_high = int(math.ceil(nodes * 0.00019))
             thresholds = (500_000, 2_000_000, 7_000_000)
     else:
         memory_low = int(math.ceil(nodes * 0.00035))
@@ -2998,11 +3015,20 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 snap_times = [sim_time * (k / (snap_count + 1)) for k in range(1, snap_count + 1)]
             snap_times = sorted({t for t in snap_times if 0.0 < t < sim_time})
 
-            progress_state = {"current": 0, "total": 1}
+            progress_state = {
+                "current": 0,
+                "total": 1,
+                "message": "",
+                "started_at": None,
+            }
 
-            def progress_callback(current, total):
+            def progress_callback(current, total, message=None):
+                if progress_state["started_at"] is None:
+                    progress_state["started_at"] = time.monotonic()
                 progress_state["current"] = int(current)
                 progress_state["total"] = max(1, int(total))
+                if message is not None:
+                    progress_state["message"] = str(message)
                 return not cancel_token.cancelled
 
             def snapshot_callback(T_view, t_elapsed, snap_idx):
@@ -3214,9 +3240,21 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         worker_result["traceback"] = fast_traceback
 
             def _solver_progress_message(state):
+                msg = state.get("message")
+                if msg:
+                    return msg
                 if steady_state:
                     return "Solving steady-state thermal model..."
-                return f"Solving thermal model - step {state['current']}/{state['total']}"
+                cur = int(state.get("current", 0))
+                tot = max(1, int(state.get("total", 1)))
+                text = f"Solving thermal model - step {cur}/{tot}"
+                started_at = state.get("started_at")
+                if started_at is not None and 3 <= cur < tot:
+                    elapsed = time.monotonic() - float(started_at)
+                    if elapsed >= 1.5:
+                        eta_s = elapsed * float(tot - cur) / float(cur)
+                        text += f" ({_format_eta_seconds(eta_s)})"
+                return text
 
             try:
                 reporter.run_in_background(
