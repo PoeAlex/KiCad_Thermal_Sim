@@ -2693,3 +2693,94 @@ class TestProgressEtaAndPcgReporting:
             "Solving thermal model - step 4/10 (~3s remaining)" in msg
             for _, msg in updates
         )
+
+
+class TestSimulationCoreDeduplication:
+    """Verify simulation_core single-source-of-truth exports and auto time_stepping wiring."""
+
+    def test_simulation_core_exports_and_dead_helper_removed(self):
+        import ThermalSim.headless_api as headless_mod
+        import ThermalSim.simulation_core as core_mod
+        import ThermalSim.thermal_plugin as plugin_mod
+
+        for name in (
+            "GRID_DETAIL_PRESETS",
+            "DEFAULT_GRID_DETAIL",
+            "DEFAULT_GRID_NODE_BUDGET",
+            "auto_fast_engine_threshold",
+            "resolve_mesh_mode",
+            "resolve_grid_policy",
+            "coarsen_grid_resolution",
+            "estimate_solver_cost",
+            "bbox_bounds_mm",
+            "calculate_suggested_resolution",
+            "estimate_simulation_area",
+            "estimate_solver_grid",
+            "derive_stackup_thicknesses",
+            "effective_fr4_control_volume_thicknesses",
+            "build_dense_capacity",
+            "build_compact_heatsink_model",
+            "SparsePadContribution",
+            "pad_target_layer_index",
+            "build_sparse_pad_contributions",
+            "build_power_vector",
+            "build_sparse_power_vector",
+        ):
+            assert hasattr(core_mod, name), f"Missing {name} in simulation_core"
+
+        assert plugin_mod.GRID_DETAIL_PRESETS is core_mod.GRID_DETAIL_PRESETS
+        assert headless_mod.GRID_DETAIL_PRESETS is core_mod.GRID_DETAIL_PRESETS
+        assert plugin_mod.SparsePadContribution is core_mod.SparsePadContribution
+        assert headless_mod._SparsePadContribution is core_mod.SparsePadContribution
+        assert not hasattr(plugin_mod, "_bbox_to_power_indices")
+        assert not hasattr(headless_mod, "_bbox_to_power_indices")
+
+    def test_fast_engine_preserves_auto_time_stepping(self, tmp_path, monkeypatch):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_solver import SolverResult
+
+        suite = TestCompactLowRamPluginWiring()
+        plugin, board, pad, settings = suite._setup_plugin_env(tmp_path, monkeypatch, with_eco1=False)
+        settings["compute_engine"] = "fast_native"
+        settings["mesh_mode"] = "uniform"
+        settings["steady_state"] = False
+
+        recorded = []
+
+        def spy_mf(config, op, C, Q, b, hA, *args, **kwargs):
+            recorded.append(config.time_stepping)
+            return SolverResult(
+                T=np.full((op.layer_count, op.rows, op.cols), 35.0),
+                k_norm_info={},
+                step_counter=1,
+                total_solve_time=0.01,
+                total_factor_time=0.0,
+                factor_count=0,
+            )
+
+        monkeypatch.setattr(plugin_mod, "run_simulation_matrix_free", spy_mf)
+
+        plugin._run_simulation(
+            board,
+            [F_Cu, B_Cu],
+            ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad],
+            settings,
+            {},
+            ["U1-1"],
+        )
+        assert recorded == ["auto"]
+
+        settings["time_stepping"] = "uniform"
+        plugin._run_simulation(
+            board,
+            [F_Cu, B_Cu],
+            ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad],
+            settings,
+            {},
+            ["U1-1"],
+        )
+        assert recorded == ["auto", "uniform"]

@@ -197,6 +197,18 @@ class TestSolverConfig:
         )
         assert config.snap_times == snap_times
 
+    @pytest.mark.parametrize("mode", ["auto", "geometric", "multi_phase", "two_phase", "uniform"])
+    def test_valid_time_stepping_modes_preserved(self, mode):
+        """SolverConfig accepts all supported time_stepping modes."""
+        config = SolverConfig(
+            sim_time=10.0,
+            amb=25.0,
+            dt_base=0.1,
+            steps_target=100,
+            time_stepping=mode,
+        )
+        assert config.time_stepping == mode
+
 
 class TestBuildStiffnessMatrix:
     """Tests for build_stiffness_matrix function."""
@@ -2735,4 +2747,205 @@ class TestSteadyStatePcgProgress:
         assert res.step_counter == 0
         assert len(events) == 2
         assert all(ev[0] < 100 for ev in events)
+
+
+class TestGeometricTransientAndFmgWarmStart:
+    """Tests for Quick-Win #1 (geometric transient stepping) and #3 (FMG steady-state warm start)."""
+
+    def test_build_geometric_phase_plan_structure_and_snapshots(self):
+        """_build_geometric_phase_plan produces 5 growing-dt phases and adapts for close snapshots."""
+        cfg = SolverConfig(
+            sim_time=120.0,
+            amb=25.0,
+            dt_base=0.2,
+            steps_target=600,
+            time_stepping="geometric",
+        )
+        mode, plan = thermal_solver._build_geometric_phase_plan(cfg)
+        assert mode == "geometric"
+        assert len(plan) == 5
+        assert sum(p_time for _, p_time, _, _ in plan) == pytest.approx(120.0)
+        assert sum(steps for _, _, steps, _ in plan) == 78
+        dts = [p_dt for _, _, _, p_dt in plan]
+        assert all(dts[i] < dts[i + 1] for i in range(len(dts) - 1))
+
+        cfg_snaps = SolverConfig(
+            sim_time=120.0,
+            amb=25.0,
+            dt_base=0.2,
+            steps_target=600,
+            time_stepping="geometric",
+            snapshots_enabled=True,
+            snap_times=[1.0, 40.0, 41.0, 120.0],
+        )
+        _, snap_plan = thermal_solver._build_geometric_phase_plan(cfg_snaps)
+        # Phase 5 has snapshots 1s apart so dt in phase 5 must not exceed 1.0s
+        assert snap_plan[-1][3] <= 1.0 + 1e-9
+
+    @pytest.mark.physics
+    @pytest.mark.parametrize("heatsink_mode", [False, True])
+    @pytest.mark.parametrize("time_stepping", ["geometric", "auto"])
+    def test_geometric_transient_matches_uniform_600_and_captures_snapshots(
+        self, heatsink_mode, time_stepping
+    ):
+        """Geometric stepping uses ~78 steps, preserves energy balance, and matches 600-step uniform (<0.5%)."""
+        args, capacity, power, settings, amb = TestDynamicHeatsinkModel._build_heatsink_pcb(
+            layers=2, rows=24, cols=24
+        )
+        if not heatsink_mode:
+            settings = {**settings, "use_heatsink": False}
+        compact_op = thermal_solver.build_compact_structured_operator(
+            args[0], args[1], args[2], args[3], args[4], args[5],
+            args[6], args[7], args[8], args[9], args[10], args[11], args[12],
+            settings, amb,
+        )
+        Q_sparse = thermal_solver.SparsePowerVector(
+            np.flatnonzero(power > 0), power[power > 0], power.size
+        )
+        hs_model = compact_op.build_heatsink_model(settings, amb) if heatsink_mode else None
+
+        snap_times = [1.0, 10.0, 60.0, 120.0]
+        uniform_cfg = SolverConfig(
+            sim_time=120.0,
+            amb=amb,
+            dt_base=0.2,
+            steps_target=600,
+            use_multi_phase=False,
+            time_stepping="uniform",
+            early_stop=False,
+        )
+        geom_cfg = SolverConfig(
+            sim_time=120.0,
+            amb=amb,
+            dt_base=0.2,
+            steps_target=600,
+            use_multi_phase=True,
+            time_stepping=time_stepping,
+            early_stop=False,
+            snapshots_enabled=True,
+            snap_times=snap_times,
+        )
+
+        ref = run_simulation_matrix_free(
+            uniform_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_model
+        )
+        geom = run_simulation_matrix_free(
+            geom_cfg, compact_op, None, Q_sparse, None, None, heatsink_model=hs_model
+        )
+
+        assert geom.k_norm_info["time_stepping"] == "geometric"
+        assert geom.k_norm_info["multi_phase"] is True
+        assert 70 <= geom.step_counter <= 95
+        assert len(geom.snapshot_stats) == len(snap_times)
+        assert all(s["eps_rel"] < 0.01 for s in geom.snapshot_stats)
+
+        temp_rise = float(np.max(ref.T) - amb)
+        max_diff = float(np.max(np.abs(geom.T - ref.T)))
+        assert max_diff / max(temp_rise, 1e-6) < 0.005
+        if heatsink_mode:
+            hs_diff = abs(
+                geom.k_norm_info["heatsink_temp_c"] - ref.k_norm_info["heatsink_temp_c"]
+            )
+            assert hs_diff / max(temp_rise, 1e-6) < 0.005
+
+    def test_geometric_falls_back_to_fine_stepping_for_pwl_q_func(self):
+        """When Q_func is provided, time_stepping='geometric'/'auto' must not coarsen dt aggressively."""
+        args, capacity, base_power = TestSteadyStateAndSpeedups._build_problem(
+            layers=2, rows=16, cols=16
+        )
+        op, fb, fhA, _ = build_structured_operator(*args)
+
+        def pulse_q(t):
+            if 5.0 <= t <= 6.0:
+                return base_power * 3.0
+            return base_power * 0.2
+
+        cfg_geom = SolverConfig(
+            sim_time=10.0,
+            amb=25.0,
+            dt_base=0.1,
+            steps_target=100,
+            use_multi_phase=True,
+            time_stepping="geometric",
+            early_stop=False,
+        )
+        res = run_simulation_matrix_free(
+            cfg_geom, op, capacity, base_power, fb, fhA, Q_func=pulse_q
+        )
+        assert res.k_norm_info["time_stepping"] == "uniform"
+        assert res.step_counter == 100
+
+    @pytest.mark.parametrize("heatsink_mode", [False, True])
+    @pytest.mark.parametrize("use_compact", [False, True])
+    def test_fmg_warm_start_reduces_pcg_iterations_and_matches_direct(
+        self, monkeypatch, heatsink_mode, use_compact
+    ):
+        """FMG initial guess strictly reduces PCG iterations and matches direct SciPy solve (<1e-5 K)."""
+        args, capacity, power, settings, amb = TestDynamicHeatsinkModel._build_heatsink_pcb(
+            layers=2,
+            rows=32,
+            cols=32,
+            settings_extra=None if heatsink_mode else {"use_heatsink": False},
+        )
+        K, b, hA, _ = build_stiffness_matrix(*args)
+        cfg = SolverConfig(
+            sim_time=50.0, amb=amb, dt_base=1.0, steps_target=50, steady_state=True
+        )
+
+        if use_compact:
+            op = thermal_solver.build_compact_structured_operator(
+                args[0], args[1], args[2], args[3], args[4], args[5],
+                args[6], args[7], args[8], args[9], args[10], args[11], args[12],
+                settings, amb,
+            )
+            q_arg = thermal_solver.SparsePowerVector(
+                np.flatnonzero(power > 0), power[power > 0], power.size
+            )
+            c_arg, b_arg, ha_arg = None, None, None
+            hs_mf = op.build_heatsink_model(settings, amb) if heatsink_mode else None
+        else:
+            op, b_arg, ha_arg, _ = build_structured_operator(*args)
+            q_arg = power
+            c_arg = capacity
+            hs_mf = (
+                build_heatsink_model(
+                    args[0], args[1], args[2], args[8], args[9], args[12], settings, amb
+                )
+                if heatsink_mode
+                else None
+            )
+
+        hs_direct = (
+            build_heatsink_model(
+                args[0], args[1], args[2], args[8], args[9], args[12], settings, amb
+            )
+            if heatsink_mode
+            else None
+        )
+        direct = run_steady_state(
+            cfg, K, power, b, hA, 2, 32, 32, heatsink_model=hs_direct
+        )
+
+        res_fmg = run_steady_state_matrix_free(
+            cfg, op, c_arg, q_arg, b_arg, ha_arg, heatsink_model=hs_mf
+        )
+
+        # Compare against cold-start PCG (FMG disabled)
+        op.clear_caches()
+        monkeypatch.setattr(
+            thermal_solver._BaseGeometricMultigrid, "fmg_initial_guess", None
+        )
+        res_cold = run_steady_state_matrix_free(
+            cfg, op, c_arg, q_arg, b_arg, ha_arg, heatsink_model=hs_mf
+        )
+
+        assert res_fmg.k_norm_info["avg_pcg_iterations"] < res_cold.k_norm_info["avg_pcg_iterations"]
+        max_err = float(np.max(np.abs(res_fmg.T - direct.T)))
+        assert max_err < 1e-5, f"FMG steady-state error vs direct SciPy: {max_err:.3e} K"
+        if heatsink_mode:
+            assert abs(
+                res_fmg.k_norm_info["heatsink_temp_c"]
+                - direct.k_norm_info["heatsink_temp_c"]
+            ) < 1e-5
+
 

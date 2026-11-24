@@ -25,6 +25,7 @@ IDENTIFIER = "com.github.poealex.kicad-thermal-sim"
 PLUGIN_FILES = [
     "__init__.py",
     "__main__.py",
+    "simulation_core.py",
     "thermal_plugin.py",
     "headless_api.py",
     "thermalsim_cli.py",

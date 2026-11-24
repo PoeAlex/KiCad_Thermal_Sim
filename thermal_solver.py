@@ -298,7 +298,7 @@ class SolverConfig:
         if self.snap_times is None:
             self.snap_times = []
         mode = str(self.time_stepping or "multi_phase").strip().lower()
-        if mode not in {"auto", "multi_phase", "two_phase", "uniform"}:
+        if mode not in {"auto", "geometric", "multi_phase", "two_phase", "uniform"}:
             mode = "multi_phase"
         self.time_stepping = mode
 
@@ -308,6 +308,8 @@ def _build_phase_plan(config: SolverConfig, node_count: int):
     mode = config.time_stepping
     auto_large = False
     if not config.use_multi_phase:
+        mode = "uniform"
+    elif mode == "geometric":
         mode = "uniform"
     elif mode == "auto":
         # Large direct-solver systems pay a high price for every distinct
@@ -347,6 +349,54 @@ def _build_phase_plan(config: SolverConfig, node_count: int):
         phase_dt = phase_time / step_count if phase_time > 0 else config.dt_base
         plan.append((pdef, phase_time, step_count, phase_dt))
     return mode, plan
+
+
+def _build_geometric_phase_plan(config: SolverConfig):
+    """Return a 5-phase geometrically growing BDF2 plan for matrix-free transients."""
+    phase_specs = (
+        ("G1", 0.01, 12),
+        ("G2", 0.03, 12),
+        ("G3", 0.08, 14),
+        ("G4", 0.20, 16),
+        ("G5", 0.68, 24),
+    )
+    phase_times = [config.sim_time * frac for _, frac, _ in phase_specs]
+    phase_times[-1] = config.sim_time - sum(phase_times[:-1])
+
+    valid_snaps = []
+    if config.snapshots_enabled and config.snap_times:
+        valid_snaps = sorted(
+            float(t) for t in config.snap_times
+            if 0.0 < float(t) <= config.sim_time + 1e-9
+        )
+
+    plan = []
+    t_cursor = 0.0
+    max_cap = max(24, int(config.steps_target))
+    for (name, frac, base_steps), phase_time in zip(phase_specs, phase_times):
+        t_end = t_cursor + phase_time
+        step_count = base_steps
+        if valid_snaps and phase_time > 0.0:
+            snaps_in_phase = [
+                t for t in valid_snaps if t_cursor - 1e-9 < t <= t_end + 1e-9
+            ]
+            if snaps_in_phase:
+                step_count = max(step_count, len(snaps_in_phase))
+                if len(snaps_in_phase) >= 2:
+                    gaps = [
+                        b - a
+                        for a, b in zip(snaps_in_phase, snaps_in_phase[1:])
+                        if (b - a) > 1e-9
+                    ]
+                    if gaps:
+                        min_gap = min(gaps)
+                        needed = int(math.ceil(phase_time / min_gap))
+                        step_count = min(max_cap, max(step_count, needed))
+        phase_dt = phase_time / step_count if phase_time > 0.0 else config.dt_base
+        pdef = {"name": name, "frac": frac, "dt_scale": phase_dt / max(config.dt_base, 1e-12)}
+        plan.append((pdef, phase_time, step_count, phase_dt))
+        t_cursor = t_end
+    return "geometric", plan
 
 
 @dataclass
@@ -798,6 +848,31 @@ class _BaseGeometricMultigrid:
         out = np.empty(self._rhs_bufs[0].size, dtype=np.float64)
         return self.solve_into(rhs, out)
 
+    def fmg_initial_guess(self, rhs_f64: np.ndarray, out_f64: np.ndarray) -> np.ndarray:
+        """Compute a Full-Multigrid initial guess into preallocated ``out_f64``."""
+        num_levels = len(self._rhs_bufs)
+        self._prepare_rhs(rhs_f64)
+        if num_levels < 2:
+            self._cycle(0)
+            np.copyto(out_f64.reshape(-1), self._x_bufs[0])
+            return out_f64
+        for level in range(num_levels - 1):
+            layers, rows, cols = self._level_shape(level)
+            _restrict_2x2_into(
+                self._rhs_bufs[level].reshape(layers, rows, cols),
+                self._rhs_bufs[level + 1].reshape(layers, (rows + 1) // 2, (cols + 1) // 2),
+            )
+        coarsest = num_levels - 1
+        sol = self.coarse_solver(self._rhs_bufs[coarsest].astype(np.float64, copy=False))
+        np.copyto(self._x_bufs[coarsest], np.asarray(sol, dtype=np.float64).reshape(-1), casting="unsafe")
+        for level in range(coarsest - 1, -1, -1):
+            layers, rows, cols = self._level_shape(level)
+            self._x_bufs[level].fill(0.0)
+            _prolong_add_2x2_f32(layers, rows, cols, self._x_bufs[level + 1], self._x_bufs[level])
+            self._cycle(level, zero_init=False)
+        np.copyto(out_f64.reshape(-1), self._x_bufs[0])
+        return out_f64
+
 
 class _StructuredGeometricMultigrid(_BaseGeometricMultigrid):
     """Mixed-precision float32 V-cycle geometric multigrid preconditioner."""
@@ -888,7 +963,11 @@ class _StructuredGeometricMultigrid(_BaseGeometricMultigrid):
             np.empty(op.shape[0], dtype=np.float32) for op in self.operators[:-1]
         ]
 
-    def _cycle(self, level: int) -> None:
+    def _level_shape(self, level: int):
+        op = self.operators[level]
+        return op.layer_count, op.rows, op.cols
+
+    def _cycle(self, level: int, zero_init: bool = True) -> None:
         if level == len(self.operators) - 1:
             sol = self.coarse_solver(
                 self._rhs_bufs[level].astype(np.float64, copy=False)
@@ -919,7 +998,7 @@ class _StructuredGeometricMultigrid(_BaseGeometricMultigrid):
             x,
             scratch,
             self.smooth_steps,
-            zero_init=True,
+            zero_init=zero_init,
         )
         _residual_restrict_2x2_f32(
             op.layer_count,
@@ -1134,6 +1213,7 @@ class StructuredThermalOperator:
         )
         preconditioner._solve_into = multigrid.solve_into
         preconditioner._solve_into_and_dot = multigrid.solve_into_and_dot
+        preconditioner._fmg_initial_guess = multigrid.fmg_initial_guess
         return operator, preconditioner
 
 
@@ -1538,7 +1618,11 @@ class _CompactGeometricMultigrid(_BaseGeometricMultigrid):
             ),
         )
 
-    def _cycle(self, level: int) -> None:
+    def _level_shape(self, level: int):
+        op = self.compact_op if level == 0 else self.coarse_operators[level - 1]
+        return op.layer_count, op.rows, op.cols
+
+    def _cycle(self, level: int, zero_init: bool = True) -> None:
         num_total_levels = 1 + len(self.coarse_operators)
         if level == num_total_levels - 1:
             sol = self.coarse_solver(
@@ -1553,7 +1637,7 @@ class _CompactGeometricMultigrid(_BaseGeometricMultigrid):
 
         if level == 0:
             op = self.compact_op
-            self._smooth_level0(zero_init=True)
+            self._smooth_level0(zero_init=zero_init)
             self._residual_restrict_level0()
             self._cycle(1)
             _prolong_add_2x2_f32(
@@ -1590,7 +1674,7 @@ class _CompactGeometricMultigrid(_BaseGeometricMultigrid):
             x,
             scratch,
             self.smooth_steps,
-            zero_init=True,
+            zero_init=zero_init,
         )
         _residual_restrict_2x2_f32(
             op.layer_count,
@@ -2045,6 +2129,7 @@ class CompactStructuredThermalOperator:
         )
         preconditioner._solve_into = multigrid.solve_into
         preconditioner._solve_into_and_dot = multigrid.solve_into_and_dot
+        preconditioner._fmg_initial_guess = multigrid.fmg_initial_guess
         return operator, preconditioner
 
 
@@ -2876,6 +2961,9 @@ class _HeatsinkPhaseState:
         else:
             g_rhs = g
         u = np.zeros(node_count, dtype=np.float64)
+        fmg_fn = getattr(preconditioner, "_fmg_initial_guess", None)
+        if fmg_fn is not None:
+            fmg_fn(g_rhs, u)
         _, _, _, rel_res = _solve_pcg(
             operator,
             preconditioner,
@@ -3404,6 +3492,17 @@ def run_steady_state_matrix_free(
             else:
                 r_hs = 0.0
                 solve_init = initial
+            fmg_fn = getattr(steady_preconditioner, "_fmg_initial_guess", None)
+            if fmg_fn is not None:
+                matvec_into = getattr(steady_operator, "_matvec_into", None)
+                if matvec_into is not None:
+                    matvec_into(solve_init, pcg_workspaces[0])
+                else:
+                    np.copyto(pcg_workspaces[0], steady_operator.matvec(solve_init))
+                np.subtract(rhs, pcg_workspaces[0], out=pcg_workspaces[0])
+                fmg_fn(pcg_workspaces[0], pcg_workspaces[1])
+                np.add(solve_init, pcg_workspaces[1], out=sol_buf)
+                solve_init = sol_buf
             main_iter_cb = _make_pcg_callback(
                 45 if hs_active else 0, 99, "Solving steady-state"
             )
@@ -3614,7 +3713,17 @@ def run_simulation_matrix_free(
     else:
         backend_name = "MatrixFree-PCG"
 
-    time_stepping_used, phase_plan = _build_phase_plan(config, node_count)
+    if (
+        config.time_stepping in ("auto", "geometric")
+        and Q_func is None
+        and config.use_multi_phase
+        and config.sim_time > 0
+        and config.steps_target > 60
+    ):
+        time_stepping_used, phase_plan = _build_geometric_phase_plan(config)
+    else:
+        time_stepping_used, phase_plan = _build_phase_plan(config, node_count)
+    snap_tol = 1e-9 * max(1.0, float(config.sim_time))
     total_steps = sum(item[2] for item in phase_plan)
     update_interval = max(1, total_steps // 100)
 
@@ -3881,7 +3990,7 @@ def run_simulation_matrix_free(
                         if config.snapshots_enabled:
                             while (
                                 next_snapshot_idx < len(config.snap_times)
-                                and current_time >= config.snap_times[next_snapshot_idx]
+                                and current_time + snap_tol >= config.snap_times[next_snapshot_idx]
                             ):
                                 record_snapshot(config.snap_times[next_snapshot_idx])
                                 next_snapshot_idx += 1
@@ -3956,7 +4065,7 @@ def run_simulation_matrix_free(
                 if config.snapshots_enabled:
                     while (
                         next_snapshot_idx < len(config.snap_times)
-                        and current_time >= config.snap_times[next_snapshot_idx]
+                        and current_time + snap_tol >= config.snap_times[next_snapshot_idx]
                     ):
                         record_snapshot(config.snap_times[next_snapshot_idx])
                         next_snapshot_idx += 1
@@ -3991,7 +4100,7 @@ def run_simulation_matrix_free(
                     if config.snapshots_enabled:
                         while (
                             next_snapshot_idx < len(config.snap_times)
-                            and current_time >= config.snap_times[next_snapshot_idx]
+                            and current_time + snap_tol >= config.snap_times[next_snapshot_idx]
                         ):
                             record_snapshot(config.snap_times[next_snapshot_idx])
                             next_snapshot_idx += 1

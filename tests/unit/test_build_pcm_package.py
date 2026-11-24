@@ -51,6 +51,7 @@ class TestBuildPcmPackage:
             names = zf.namelist()
             assert "plugins/__init__.py" in names
             assert "plugins/__main__.py" in names
+            assert "plugins/simulation_core.py" in names
             assert "plugins/thermal_plugin.py" in names
             assert "plugins/headless_api.py" in names
             assert "plugins/thermalsim_cli.py" in names

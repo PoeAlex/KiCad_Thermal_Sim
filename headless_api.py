@@ -7,7 +7,7 @@ thermal simulations, run parameter sweeps, and compare simulation runs.
 No GUI or ``wx`` modules are imported here.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 import fnmatch
 import json
 import math
@@ -87,20 +87,36 @@ from .workflow import (
     get_process_memory_mb,
 )
 
+from .simulation_core import (
+    DEFAULT_GRID_DETAIL,
+    DEFAULT_GRID_MAX_CELLS,
+    DEFAULT_GRID_NODE_BUDGET,
+    DEFAULT_GRID_TARGET_CELLS,
+    GRID_DETAIL_PRESETS,
+    MAX_CUSTOM_GRID_NODES,
+    SparsePadContribution,
+    SparsePadContribution as _SparsePadContribution,
+    auto_fast_engine_threshold,
+    bbox_bounds_mm as _bbox_bounds_mm,
+    build_compact_heatsink_model,
+    build_dense_capacity as _build_dense_capacity,
+    build_power_vector as _build_power_vector,
+    build_sparse_pad_contributions as _build_sparse_pad_contributions,
+    build_sparse_power_vector,
+    calculate_suggested_resolution as _calculate_suggested_resolution,
+    coarsen_grid_resolution as _coarsen_grid_resolution,
+    derive_stackup_thicknesses as _derive_stackup_thicknesses,
+    effective_fr4_control_volume_thicknesses as _effective_fr4_control_volume_thicknesses,
+    estimate_simulation_area as _estimate_simulation_area,
+    estimate_solver_cost,
+    estimate_solver_grid,
+    pad_target_layer_index as _pad_target_layer_index,
+    resolve_grid_policy as _resolve_grid_policy,
+    resolve_mesh_mode,
+)
+
 SCHEMA_VERSION = "1.0"
 PLUGIN_VERSION = "0.4.6"
-
-GRID_DETAIL_PRESETS = {
-    "fast": (500_000, 425_000),
-    "balanced": (1_200_000, 1_020_000),
-    "detailed": (3_000_000, 2_550_000),
-    "very_detailed": (6_000_000, 5_100_000),
-}
-DEFAULT_GRID_DETAIL = "balanced"
-DEFAULT_GRID_NODE_BUDGET = GRID_DETAIL_PRESETS[DEFAULT_GRID_DETAIL][0]
-DEFAULT_GRID_MAX_CELLS = 200_000
-DEFAULT_GRID_TARGET_CELLS = 100_000
-MAX_CUSTOM_GRID_NODES = 100_000_000
 
 SUPPORTED_SWEEP_PARAMS = frozenset({
     "heatsink_rth_kw",
@@ -122,12 +138,72 @@ _ORIG_BUILD_STRUCTURED_OPERATOR = build_structured_operator
 _ORIG_BUILD_HEATSINK_MODEL = build_heatsink_model
 
 
-@dataclass
-class _SparsePadContribution:
-    """Sparse per-pad unit power distribution on the simulation grid."""
+def _auto_fast_engine_threshold() -> int:
+    return auto_fast_engine_threshold(HAS_NATIVE_MG)
 
-    indices: np.ndarray
-    weights: np.ndarray
+
+def _resolve_mesh_mode(settings: Dict[str, Any], use_fast_engine: bool, node_count: int) -> str:
+    return resolve_mesh_mode(settings, use_fast_engine, node_count, has_native_mg=HAS_NATIVE_MG)
+
+
+def _estimate_solver_cost(nodes: int, settings: Dict[str, Any]) -> Tuple[int, int, str]:
+    return estimate_solver_cost(
+        nodes,
+        settings,
+        has_native_mg=HAS_NATIVE_MG,
+        has_native_compact=HAS_NATIVE_COMPACT,
+    )
+
+
+def _estimate_solver_grid(
+    bbox: Any,
+    requested_res: float,
+    settings: Dict[str, Any],
+    layer_count: int,
+    focus_pads: Optional[List[Any]] = None,
+    area: Optional[AreaEstimate] = None,
+) -> GridEstimate:
+    return estimate_solver_grid(
+        bbox,
+        requested_res,
+        settings,
+        layer_count,
+        focus_pads=focus_pads,
+        area=area,
+        has_native_mg=HAS_NATIVE_MG,
+        has_native_compact=HAS_NATIVE_COMPACT,
+    )
+
+
+def _build_sparse_power_vector(
+    pad_sources: List[Tuple[str, Any]],
+    pad_contributions: List[SparsePadContribution],
+    total_nodes: int,
+) -> Any:
+    return build_sparse_power_vector(
+        pad_sources,
+        pad_contributions,
+        total_nodes,
+        sparse_power_cls=SparsePowerVector,
+    )
+
+
+def _build_compact_heatsink_model(
+    dx: float,
+    dy: float,
+    heatsink_mask: np.ndarray,
+    settings: Dict[str, Any],
+    amb: float,
+) -> Optional[HeatsinkModel]:
+    return build_compact_heatsink_model(
+        dx,
+        dy,
+        heatsink_mask,
+        settings,
+        amb,
+        heatsink_model_cls=HeatsinkModel,
+        capacity_fn=compute_heatsink_capacity_j_k,
+    )
 
 
 def _json_clean(value: Any) -> Any:
@@ -310,92 +386,6 @@ def _get_board_bbox(board: Any) -> Any:
         y0 = min(ys)
         return pcbnew.EDA_RECT(x0, y0, max(1_000_000, max(x1s) - x0), max(1_000_000, max(y1s) - y0))
     return pcbnew.EDA_RECT(0, 0, 50_000_000, 50_000_000)
-
-
-def _bbox_bounds_mm(bbox: Any) -> Tuple[float, float, float, float]:
-    """Return a KiCad rectangle as ``(x_min, y_min, x_max, y_max)`` in mm."""
-    x_min = float(bbox.GetX()) * 1e-6
-    y_min = float(bbox.GetY()) * 1e-6
-    return (
-        x_min,
-        y_min,
-        x_min + float(bbox.GetWidth()) * 1e-6,
-        y_min + float(bbox.GetHeight()) * 1e-6,
-    )
-
-
-def _calculate_suggested_resolution(w_mm: float, h_mm: float, layer_count: int) -> float:
-    """Calculate suggested grid resolution based on board size."""
-    target_nodes = 25_000 if layer_count <= 2 else 15_000
-    area = max(0.0, float(w_mm)) * max(0.0, float(h_mm))
-    if area > 0.0:
-        suggested_res = round(math.sqrt(area / target_nodes), 2)
-        if suggested_res < 0.2:
-            suggested_res = 0.2
-        return float(suggested_res)
-    return 0.5
-
-
-def _derive_stackup_thicknesses(
-    board: Any,
-    copper_ids: List[int],
-    stack_info: Dict[str, Any],
-    settings: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Derive copper thicknesses and dielectric gaps from stackup or defaults."""
-    stack_copper = stack_info.get("copper", []) if isinstance(stack_info, dict) else []
-    stack_gaps = stack_info.get("dielectric_gaps_mm", []) if isinstance(stack_info, dict) else []
-    stack_board_thick = stack_info.get("board_thickness_mm") if isinstance(stack_info, dict) else None
-
-    copper_thickness_by_id: Dict[int, float] = {}
-    copper_thickness_by_name: Dict[str, float] = {}
-    for c in stack_copper:
-        th = c.get("thickness_mm")
-        if isinstance(th, (int, float)) and th > 0:
-            lid = c.get("layer_id")
-            name = c.get("name")
-            if isinstance(lid, int):
-                copper_thickness_by_id[lid] = float(th)
-            if isinstance(name, str):
-                copper_thickness_by_name[name] = float(th)
-
-    cu_scale = float(settings.get("copper_thickness_scale", 1.0) or 1.0)
-    copper_thickness_mm_used: List[float] = []
-    for lid in copper_ids:
-        th = copper_thickness_by_id.get(lid)
-        if th is None:
-            try:
-                lname = str(board.GetLayerName(lid))
-            except Exception:
-                lname = ""
-            th = copper_thickness_by_name.get(lname)
-        if not isinstance(th, (int, float)) or th <= 0:
-            th = 0.035
-        copper_thickness_mm_used.append(float(th) * cu_scale)
-
-    total_thick_mm_used = float(settings.get("thick", 1.6) or 1.6)
-    if isinstance(stack_board_thick, (int, float)) and stack_board_thick > 0:
-        total_thick_mm_used = float(stack_board_thick)
-
-    fallback_gap_mm = total_thick_mm_used / max(1, len(copper_ids) - 1)
-    use_uniform_gap = len(stack_gaps) != max(0, len(copper_ids) - 1)
-    if not use_uniform_gap:
-        for g in stack_gaps:
-            if not isinstance(g, (int, float)) or g <= 0:
-                use_uniform_gap = True
-                break
-    if use_uniform_gap:
-        gap_mm_used = [fallback_gap_mm] * max(0, len(copper_ids) - 1)
-    else:
-        gap_mm_used = [float(g) for g in stack_gaps]
-
-    return {
-        "total_thick_mm_used": float(total_thick_mm_used),
-        "stack_board_thick_mm": float(stack_board_thick) if isinstance(stack_board_thick, (int, float)) else None,
-        "copper_thickness_mm_used": copper_thickness_mm_used,
-        "gap_mm_used": gap_mm_used,
-        "gap_fallback_used": bool(use_uniform_gap),
-    }
 
 
 def _pad_net_name(pad: Any) -> str:
@@ -1091,273 +1081,6 @@ def _lookup_pad(pad_index: Dict[str, Any], spec: Dict[str, Any]) -> Tuple[Option
     return None, hint
 
 
-def _resolve_grid_policy(settings: Dict[str, Any], layer_count: int) -> Tuple[str, bool, int, int, int]:
-    """Resolve layer-aware grid detail preset to 2D cell limits."""
-    layers = max(1, int(layer_count or 1))
-    detail = str(settings.get("grid_detail_level") or DEFAULT_GRID_DETAIL).strip().lower()
-    detail = detail.replace(" ", "_").replace("-", "_")
-    if detail not in set(GRID_DETAIL_PRESETS) | {"custom"}:
-        detail = DEFAULT_GRID_DETAIL
-
-    if detail == "custom":
-        try:
-            max_nodes = int(settings.get("grid_node_budget", DEFAULT_GRID_NODE_BUDGET))
-        except Exception:
-            max_nodes = DEFAULT_GRID_NODE_BUDGET
-        max_nodes = min(MAX_CUSTOM_GRID_NODES, max(50_000, max_nodes))
-        target_nodes = max(25_000, int(max_nodes * 0.85))
-        expert = True
-    else:
-        max_nodes, target_nodes = GRID_DETAIL_PRESETS[detail]
-        expert = False
-
-    max_cells = max(1000, max_nodes // layers)
-    target_cells = max(1000, min(max_cells, target_nodes // layers))
-    return detail, expert, max_cells, target_cells, max_nodes
-
-
-def _auto_fast_engine_threshold() -> int:
-    return 50_000 if HAS_NATIVE_MG else 250_000
-
-
-def _resolve_mesh_mode(settings: Dict[str, Any], use_fast_engine: bool, node_count: int) -> str:
-    if not use_fast_engine:
-        return "uniform"
-    mesh_mode = str(settings.get("mesh_mode", "auto") or "auto").strip().lower()
-    if mesh_mode not in {"auto", "uniform", "adaptive"}:
-        mesh_mode = "auto"
-    if mesh_mode == "auto":
-        return "uniform" if (HAS_NATIVE_MG and int(node_count) <= 5_000_000) else "adaptive"
-    return mesh_mode
-
-
-def _estimate_simulation_area(
-    board: Any,
-    bbox: Any,
-    settings: Dict[str, Any],
-    power_pads: Optional[List[Any]] = None,
-    terminals: Optional[List[CurrentTerminal]] = None,
-) -> AreaEstimate:
-    """Estimate active simulation rectangle around heat sources and current nets."""
-    board_x0, board_y0, board_x1, board_y1 = _bbox_bounds_mm(bbox)
-    board_w = max(0.0, board_x1 - board_x0)
-    board_h = max(0.0, board_y1 - board_y0)
-    legacy_limited = bool(settings.get("limit_area", False))
-    mode = str(settings.get("area_mode") or ("active" if legacy_limited else "full")).strip().lower()
-    if mode not in ("full", "active"):
-        mode = "active" if legacy_limited else "full"
-    margin = max(0.0, float(settings.get("area_margin_mm", settings.get("pad_dist_mm", 0.0)) or 0.0))
-
-    active_terms = [item for item in (terminals or []) if abs(float(getattr(item, "current_a", 0.0))) > 0.0]
-    active_keys = {net_key_from_values(item.net_code, item.net_name) for item in active_terms}
-    active_names = tuple(sorted({
-        str(item.net_name or net_key_from_values(item.net_code, item.net_name))
-        for item in active_terms
-    }))
-
-    if mode == "full":
-        return AreaEstimate(
-            mode="full",
-            x_min_mm=board_x0,
-            y_min_mm=board_y0,
-            width_mm=board_w,
-            height_mm=board_h,
-            board_width_mm=board_w,
-            board_height_mm=board_h,
-            margin_mm=margin,
-            heat_source_count=len(power_pads or []),
-            active_net_names=active_names,
-        )
-
-    bounds: List[Tuple[float, float, float, float]] = []
-    warnings: List[str] = []
-
-    def add_bbox(item: Any) -> None:
-        try:
-            item_bbox = item.GetBoundingBox() if hasattr(item, "GetBoundingBox") else item
-            x0, y0, x1, y1 = _bbox_bounds_mm(item_bbox)
-            if x1 > x0 and y1 > y0:
-                bounds.append((x0, y0, x1, y1))
-        except Exception:
-            return
-
-    for pad in power_pads or []:
-        add_bbox(pad)
-
-    if active_keys:
-        try:
-            footprints = list(board.Footprints() if hasattr(board, "Footprints") else board.GetFootprints())
-            for footprint in footprints:
-                for pad in footprint.Pads():
-                    if net_key_from_obj(pad)[0] in active_keys:
-                        add_bbox(pad)
-            tracks = list(board.Tracks() if hasattr(board, "Tracks") else board.GetTracks())
-            for track in tracks:
-                if net_key_from_obj(track)[0] in active_keys:
-                    add_bbox(track)
-            zones = list(board.Zones() if hasattr(board, "Zones") else board.GetZones())
-            for zone in zones:
-                if net_key_from_obj(zone)[0] not in active_keys:
-                    continue
-                if hasattr(zone, "IsFilled") and not zone.IsFilled():
-                    continue
-                add_bbox(zone)
-        except Exception:
-            warnings.append("Current-net geometry could not be inspected safely; the full board is used.")
-            return AreaEstimate(
-                mode="full",
-                x_min_mm=board_x0,
-                y_min_mm=board_y0,
-                width_mm=board_w,
-                height_mm=board_h,
-                board_width_mm=board_w,
-                board_height_mm=board_h,
-                margin_mm=margin,
-                heat_source_count=len(power_pads or []),
-                active_net_names=active_names,
-                fallback_to_full=True,
-                warnings=tuple(warnings),
-            )
-
-    if settings.get("use_heatsink"):
-        try:
-            for drawing in list(board.GetDrawings() if hasattr(board, "GetDrawings") else []):
-                if drawing.GetLayer() == pcbnew.Eco1_User:
-                    add_bbox(drawing)
-        except Exception:
-            pass
-
-    if not bounds:
-        warnings.append("No active source geometry was found; the full board is used.")
-        return AreaEstimate(
-            mode="full",
-            x_min_mm=board_x0,
-            y_min_mm=board_y0,
-            width_mm=board_w,
-            height_mm=board_h,
-            board_width_mm=board_w,
-            board_height_mm=board_h,
-            margin_mm=margin,
-            heat_source_count=0,
-            active_net_names=active_names,
-            fallback_to_full=True,
-            warnings=tuple(warnings),
-        )
-
-    safety = max(0.0, float(settings.get("res", 0.0) or 0.0))
-    x0 = max(board_x0, min(item[0] for item in bounds) - margin - safety)
-    y0 = max(board_y0, min(item[1] for item in bounds) - margin - safety)
-    x1 = min(board_x1, max(item[2] for item in bounds) + margin + safety)
-    y1 = min(board_y1, max(item[3] for item in bounds) + margin + safety)
-    return AreaEstimate(
-        mode="active",
-        x_min_mm=x0,
-        y_min_mm=y0,
-        width_mm=max(0.0, x1 - x0),
-        height_mm=max(0.0, y1 - y0),
-        board_width_mm=board_w,
-        board_height_mm=board_h,
-        margin_mm=margin,
-        heat_source_count=len(power_pads or []),
-        active_net_names=active_names,
-        warnings=tuple(warnings),
-    )
-
-
-def _estimate_solver_cost(nodes: int, settings: Dict[str, Any]) -> Tuple[int, int, str]:
-    nodes = max(0, int(nodes))
-    compute_engine = str(settings.get("compute_engine", "auto") or "auto").strip().lower()
-    fast_engine = (
-        compute_engine == "fast_native"
-        or (compute_engine == "auto" and nodes >= _auto_fast_engine_threshold())
-    )
-    mesh_mode = _resolve_mesh_mode(settings, fast_engine, nodes)
-    if fast_engine:
-        if HAS_NATIVE_COMPACT and HAS_NATIVE_MG:
-            if mesh_mode == "adaptive":
-                memory_low = int(math.ceil(nodes * 0.000065))
-                memory_high = int(math.ceil(nodes * 0.000115))
-            else:
-                memory_low = int(math.ceil(nodes * 0.000095))
-                memory_high = int(math.ceil(nodes * 0.000145))
-            thresholds = (1_200_000, 4_000_000, 10_000_000)
-        elif HAS_NATIVE_MG:
-            memory_low = int(math.ceil(nodes * 0.00013))
-            memory_high = int(math.ceil(nodes * 0.00022))
-            thresholds = (800_000, 3_000_000, 8_000_000)
-        else:
-            memory_low = int(math.ceil(nodes * 0.00011))
-            memory_high = int(math.ceil(nodes * 0.00019))
-            thresholds = (500_000, 2_000_000, 7_000_000)
-    else:
-        memory_low = int(math.ceil(nodes * 0.00035))
-        memory_high = int(math.ceil(nodes * 0.00120))
-        thresholds = (150_000, 500_000, 1_000_000)
-
-    if nodes < thresholds[0]:
-        runtime = "Fast"
-    elif nodes < thresholds[1]:
-        runtime = "Moderate"
-    elif nodes < thresholds[2]:
-        runtime = "Slow"
-    else:
-        runtime = "Very slow"
-    return memory_low, memory_high, runtime
-
-
-def _estimate_solver_grid(
-    bbox: Any,
-    requested_res: float,
-    settings: Dict[str, Any],
-    layer_count: int,
-    area: Optional[AreaEstimate] = None,
-) -> GridEstimate:
-    original_x_min, original_y_min, original_x_max, original_y_max = _bbox_bounds_mm(bbox)
-    x_min, y_min = original_x_min, original_y_min
-    x_max, y_max = original_x_max, original_y_max
-    if area is not None:
-        x_min = float(area.x_min_mm)
-        y_min = float(area.y_min_mm)
-        x_max = x_min + float(area.width_mm)
-        y_max = y_min + float(area.height_mm)
-
-    req_res = max(1e-4, float(requested_res))
-    width = max(req_res, x_max - x_min)
-    height = max(req_res, y_max - y_min)
-    detail, expert, max_cells, target_cells, node_budget = _resolve_grid_policy(settings, layer_count)
-    area_mm2 = width * height
-    res = req_res
-    coarsened = False
-    if res > 0.0 and area_mm2 > 0.0 and (width / res) * (height / res) > max_cells:
-        res = math.sqrt(area_mm2 / float(target_cells))
-        coarsened = True
-
-    rows = int(height / res) + 4
-    cols = int(width / res) + 4
-    nodes = rows * cols * int(layer_count)
-    memory_low, memory_high, runtime = _estimate_solver_cost(nodes, settings)
-    return GridEstimate(
-        requested_res_mm=float(req_res),
-        actual_res_mm=float(res),
-        x_min_mm=float(x_min),
-        y_min_mm=float(y_min),
-        width_mm=float(width),
-        height_mm=float(height),
-        rows=rows,
-        cols=cols,
-        layer_count=int(layer_count),
-        auto_coarsened=bool(coarsened),
-        expert_limits=bool(expert),
-        max_cells=int(max_cells),
-        target_cells=int(target_cells),
-        detail_level=detail,
-        node_budget=int(node_budget),
-        memory_mb_low=memory_low,
-        memory_mb_high=memory_high,
-        runtime_class=runtime,
-    )
-
-
 def _resolve_current_groups_entries(
     raw_groups: List[Any],
     pad_index: Dict[str, Any],
@@ -1704,245 +1427,6 @@ def validate_job(board_or_path: Any, job_config: Optional[Dict[str, Any]]) -> Di
         job_config or {},
     )
     return ctx["payload"]
-
-
-def _bbox_to_power_indices(
-    bbox: Any,
-    target_idx: int,
-    rows: int,
-    cols: int,
-    x_min: float,
-    y_min: float,
-    res: float,
-    rc: int,
-) -> np.ndarray:
-    x0 = float(bbox.GetX()) * 1e-6
-    y0 = float(bbox.GetY()) * 1e-6
-    w = float(bbox.GetWidth()) * 1e-6
-    h = float(bbox.GetHeight()) * 1e-6
-    cs = max(0, int((x0 - x_min) / res))
-    rs = max(0, int((y0 - y_min) / res))
-    ce = min(cols, int((x0 + w - x_min) / res) + 1)
-    re_ = min(rows, int((y0 + h - y_min) / res) + 1)
-    if cs >= ce or rs >= re_:
-        return np.empty(0, dtype=np.int64)
-    row_offsets = np.arange(rs, re_, dtype=np.int64) * cols
-    col_offsets = np.arange(cs, ce, dtype=np.int64)
-    return target_idx * rc + (row_offsets[:, None] + col_offsets[None, :]).ravel(order="C")
-
-
-def _pad_target_layer_index(board: Any, copper_ids: List[int], pad: Any, lid_to_idx: Dict[int, int]) -> int:
-    copper_indices = get_pad_copper_layer_indices(pad, copper_ids, lid_to_idx=lid_to_idx)
-    if len(copper_indices) == 1:
-        return copper_indices[0]
-    if len(copper_indices) > 1:
-        parent = None
-        if hasattr(pad, "GetParent"):
-            try:
-                parent = pad.GetParent()
-            except Exception:
-                parent = None
-        if parent is not None and hasattr(parent, "GetLayer"):
-            try:
-                parent_idx = lid_to_idx.get(int(parent.GetLayer()))
-                if parent_idx in copper_indices:
-                    return parent_idx
-            except Exception:
-                pass
-        return copper_indices[0]
-
-    pad_lid = pad.GetLayer()
-    target_idx = lid_to_idx.get(pad_lid)
-    if target_idx is not None:
-        return target_idx
-    try:
-        lname = str(board.GetLayerName(pad_lid)).upper()
-    except Exception:
-        lname = ""
-    return len(copper_ids) - 1 if ("B." in lname or "BOT" in lname) else 0
-
-
-def _build_sparse_pad_contributions(
-    board: Any,
-    copper_ids: List[int],
-    pads_list: List[Any],
-    rows: int,
-    cols: int,
-    x_min: float,
-    y_min: float,
-    res: float,
-    area_mask: Optional[np.ndarray] = None,
-) -> List[_SparsePadContribution]:
-    lid_to_idx = {lid: idx for idx, lid in enumerate(copper_ids)}
-    contributions: List[_SparsePadContribution] = []
-    for pad in pads_list:
-        target_idx = _pad_target_layer_index(board, copper_ids, pad, lid_to_idx)
-        target_lid = copper_ids[target_idx] if 0 <= target_idx < len(copper_ids) else None
-        indices = get_pad_power_indices(
-            pad,
-            target_idx=target_idx,
-            rows=rows,
-            cols=cols,
-            x_min=x_min,
-            y_min=y_min,
-            res=res,
-            layer_id=target_lid,
-            area_mask=area_mask,
-        )
-        if indices.size:
-            weights = np.full(indices.shape, 1.0 / float(indices.size), dtype=np.float64)
-        else:
-            weights = np.empty(0, dtype=np.float64)
-        contributions.append(_SparsePadContribution(indices=indices, weights=weights))
-    return contributions
-
-
-def _build_power_vector(
-    pad_sources: List[Tuple[str, Any]],
-    pad_contributions: List[_SparsePadContribution],
-    total_nodes: int,
-) -> Tuple[np.ndarray, Optional[Any]]:
-    q_const = np.zeros(total_nodes, dtype=np.float64)
-    pwl_terms = []
-    for idx, (source_type, source_value) in enumerate(pad_sources):
-        if idx >= len(pad_contributions):
-            break
-        contribution = pad_contributions[idx]
-        if contribution.indices.size == 0:
-            continue
-        if source_type == "const":
-            q_const[contribution.indices] += float(source_value) * contribution.weights
-        else:
-            times, powers = source_value
-            pwl_terms.append((
-                np.asarray(times, dtype=np.float64),
-                np.asarray(powers, dtype=np.float64),
-                contribution.indices,
-                contribution.weights,
-            ))
-    if not pwl_terms:
-        return q_const, None
-
-    q_initial = q_const.copy()
-    for times, powers, indices, weights in pwl_terms:
-        q_initial[indices] += float(np.interp(0.0, times, powers)) * weights
-
-    q_workspace = np.empty_like(q_const)
-
-    def q_func(t, _q_const=q_const, _pwl_terms=tuple(pwl_terms), _workspace=q_workspace):
-        np.copyto(_workspace, _q_const)
-        for times, powers, indices, weights in _pwl_terms:
-            _workspace[indices] += float(np.interp(t, times, powers)) * weights
-        return _workspace
-
-    return q_initial, q_func
-
-
-def _build_sparse_power_vector(
-    pad_sources: List[Tuple[str, Any]],
-    pad_contributions: List[_SparsePadContribution],
-    total_nodes: int,
-) -> Any:
-    idx_parts = []
-    val_parts = []
-    for idx, (source_type, source_value) in enumerate(pad_sources):
-        if idx >= len(pad_contributions):
-            break
-        contribution = pad_contributions[idx]
-        if contribution.indices.size == 0 or source_type != "const":
-            continue
-        val = float(source_value)
-        if val == 0.0:
-            continue
-        idx_parts.append(contribution.indices)
-        val_parts.append(val * contribution.weights)
-    if idx_parts:
-        indices = np.concatenate(idx_parts)
-        values = np.concatenate(val_parts)
-    else:
-        indices = np.empty(0, dtype=np.int64)
-        values = np.empty(0, dtype=np.float64)
-    return SparsePowerVector(indices=indices, values=values, size=total_nodes)
-
-
-def _build_dense_capacity(
-    layer_count: int,
-    rows: int,
-    cols: int,
-    copper_mask: np.ndarray,
-    t_cu: np.ndarray,
-    t_fr4_eff: np.ndarray,
-    pixel_area: float,
-    rho_cu: float,
-    cp_cu: float,
-    rho_fr4: float,
-    cp_fr4: float,
-    pad_cap_areal: float,
-    heatsink_mask: np.ndarray,
-) -> np.ndarray:
-    C_layers = np.empty((layer_count, rows, cols), dtype=np.float64)
-    for layer_idx in range(layer_count):
-        V_cu = pixel_area * t_cu[layer_idx]
-        V_fr4 = pixel_area * t_fr4_eff[layer_idx]
-        mask = copper_mask[layer_idx]
-        C_layer = np.where(mask, rho_cu * cp_cu * V_cu, rho_fr4 * cp_fr4 * V_fr4)
-        C_layer += mask * (rho_fr4 * cp_fr4 * V_fr4)
-        C_layers[layer_idx] = C_layer
-    if pad_cap_areal > 0.0 and np.any(heatsink_mask):
-        pad_cap_per_cell = pad_cap_areal * pixel_area
-        C_layers[-1] += pad_cap_per_cell * np.asarray(heatsink_mask, dtype=np.float64)
-    return C_layers.reshape(-1)
-
-
-def _build_compact_heatsink_model(
-    dx: float,
-    dy: float,
-    heatsink_mask: np.ndarray,
-    settings: Dict[str, Any],
-    amb: float,
-) -> Optional[HeatsinkModel]:
-    if not bool(settings.get("use_heatsink", True)):
-        return None
-    sink_mode = str(settings.get("pad_sink_mode", "fixed") or "fixed").strip().lower()
-    if sink_mode != "heatsink":
-        return None
-    hs_bool = np.asarray(heatsink_mask, dtype=bool)
-    if not np.any(hs_bool):
-        return None
-    pad_thick_m = max(0.0001, float(settings.get("pad_th", 1.0)) * 1e-3)
-    pad_k = float(settings.get("pad_k", 3.0))
-    contact_factor = max(1e-6, float(settings.get("pad_contact_factor", 0.2)))
-    h_sink = (pad_k / pad_thick_m) * contact_factor
-    pad_conductance = hs_bool.astype(np.float64).reshape(-1) * (h_sink * float(dx) * float(dy))
-    rth_val = settings.get("heatsink_rth_kw", 5.0)
-    rth_kw = max(1e-6, float(5.0 if rth_val is None else rth_val))
-    return HeatsinkModel(
-        pad_conductance=pad_conductance,
-        rth_kw=rth_kw,
-        capacity_j_k=compute_heatsink_capacity_j_k(settings),
-        initial_temp_c=float(amb),
-        bottom_layer_only=True,
-    )
-
-
-def _effective_fr4_control_volume_thicknesses(
-    gap_m: List[float],
-    total_thickness_m: float,
-    layer_count: int,
-) -> np.ndarray:
-    count = max(1, int(layer_count))
-    total = max(float(total_thickness_m), 1e-5)
-    if count == 1:
-        return np.asarray([total], dtype=np.float64)
-    gaps = np.asarray(list(gap_m) if gap_m is not None else [], dtype=np.float64)
-    if gaps.size != count - 1 or not np.all(np.isfinite(gaps)) or np.any(gaps <= 0.0):
-        gaps = np.full(count - 1, total / float(count - 1), dtype=np.float64)
-    thicknesses = np.empty(count, dtype=np.float64)
-    thicknesses[0] = 0.5 * gaps[0]
-    thicknesses[-1] = 0.5 * gaps[-1]
-    if count > 2:
-        thicknesses[1:-1] = 0.5 * (gaps[:-1] + gaps[1:])
-    return np.clip(thicknesses, 1e-6, 5e-3)
 
 
 def _extract_components_temperatures(
@@ -2900,8 +2384,6 @@ def run_headless_simulation(
             solver_snapshot_callback = snapshot_callback
 
         configured_time_stepping = settings.get("time_stepping", "auto")
-        if use_fast_engine and configured_time_stepping == "auto":
-            configured_time_stepping = "uniform"
 
         config = SolverConfig(
             sim_time=sim_time,

@@ -19,15 +19,18 @@ This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineer
 
 - **2D in-plane conduction** on each copper layer.
 - **Vertical coupling** between adjacent copper layers through FR4 and via enhancement.
-- **Direct Steady-State (final temperature)** mode solving $K \cdot T = Q + b$ directly in a single solve for constant heat sources (solves 160k+ node multilayer PCBs in well under a second).
-- **Transient BDF2 time integration** with linear PCG warm-start extrapolation and lossless early steady-state stop.
-- **Native C++/OpenMP v3 Compact Low-RAM CPU core** (`thermalsim_core.dll`, `libthermalsim_core.so`, `libthermalsim_core.dylib`) with on-the-fly Level-0 evaluation, mixed-precision `float32` multigrid V-cycles, and automatic fallback to a pure NumPy/SciPy implementation.
-- **Manual power injection** from explicitly configured **Heat Sources** (constant power or time-varying **PWL power profiles**).
+- **Direct Steady-State (final temperature)** with Full-Multigrid (FMG) warm start and live PCG convergence progress, solving $K \cdot T = Q + b$ directly in a single solve for constant heat sources.
+- **Geometric multi-phase transient time integration** (5-phase geometrically growing BDF2 stepping — 5–8x faster on long transients — with linear PCG warm-start extrapolation and lossless early steady-state stop).
+- **Native C++/OpenMP v4 Compact Low-RAM Multigrid & Fused PCG core** (`thermalsim_core.dll`, `libthermalsim_core.so`, `libthermalsim_core.dylib`) solving **6M-node steady-state boards in ~5 s at ~725 MB Peak RSS**, with on-the-fly Level-0 mask+LUT evaluation, mixed-precision `float32` multigrid V-cycles, fused OpenMP PCG kernels, and automatic fallback to pure NumPy/SciPy.
+- **Manual power injection** from explicitly configured **Heat Sources** (constant power or time-varying **PWL power profiles**) with **exact KiCad 9/10 pad rasterization** (`GetLayerSet()` `B.Cu` SMD pads, rotated & offset pads, and zero FR4 power bleed).
 - Optional **DC current-flow heating** from source/sink pads on KiCad nets.
 - **Convection** to ambient on top and bottom outer surfaces.
-- Optional **Thermal Pad** geometry on `User.Eco1` for stronger bottom-side heat removal.
+- Optional **Thermal Pad (`User.Eco1`)** geometry with **Fixed temperature** or **Dynamic heatsink (0D)** ($R_{\text{th}}$, mass/material presets, live $C_{\text{hs}}$ & $\tau$, plus **Heatsink Temp** and **Heat Removal Split** in reports).
+- **Calibrated RAM & runtime estimates** across Uniform, Adaptive, and Legacy solver modes.
+- **Fast scanline zone polygon rasterization** and **continuous cancellable progress** (with elapsed time and English phase ETA) across both **Preview** and **Run**.
 - Current-path diagnostics: copper loss, effective resistance, equivalent voltage drop, grid quality, and a Joule loss map.
 - Persistent compressed `.npz` disk geometry cache and hotspot-preserving downsampled HTML interactive heatmaps for million-node grids.
+- **Headless CLI & AI Agent JSON API** (`inspect`, `validate`, `run`, `sweep`, `compare`, `summary.json`, `schema/*.json`).
 
 ---
 
@@ -111,8 +114,8 @@ Shows detected copper layers with thicknesses and dielectric gaps parsed from th
 
 #### Main Settings
 
-- **Steady-state (final temperature)** - solves $K \cdot T = Q + b$ directly in a single solve for constant heat sources, skipping transient time stepping and solving 160k+ node multilayer PCBs in well under a second. Disable this option for transient analysis or time-varying PWL profiles.
-- **Duration (sec)** - total simulated time in transient mode. Transient BDF2 uses linear PCG warm-start extrapolation and lossless early steady-state stop when temperatures have converged.
+- **Steady-state (final temperature)** - solves $K \cdot T = Q + b$ directly in a single solve for constant heat sources (with FMG warm start and live PCG convergence progress), skipping transient time stepping and solving million-node multilayer PCBs in ~1–5 seconds. Disable this option for transient analysis or time-varying PWL profiles.
+- **Duration (sec)** - total simulated time in transient mode. Transient BDF2 uses geometric multi-phase time stepping (`Auto`, 5–8x faster on long transients), linear PCG warm-start extrapolation, and lossless early steady-state stop when temperatures have converged.
 - **Ambient Temp (C)** - reference temperature. Results are relative to ambient.
 - **Target Cell Size (mm)** - desired spatial grid size. Smaller values improve hotspot and trace localization but increase runtime.
 - **Compute Budget** - based on total solver nodes across all copper layers, with an **85% auto-coarsening target** when a requested resolution exceeds the budget:
@@ -122,7 +125,7 @@ Shows detected copper layers with thicknesses and dielectric gaps parsed from th
   - **Very detailed** - up to **6M** nodes
   - **Custom** - explicit upper limit up to **100M** equivalent uniform nodes (values above 10M are expert settings and may require tens of GB of RAM before adaptive reduction)
 
-The live estimate shows requested versus actual cell size, grid dimensions, total nodes, approximate resolvable feature size, memory range, and a relative runtime class. For large boards, ThermalSim automatically coarsens the requested cell size toward 85% of the selected budget so you keep most of your chosen detail while staying within limits. The report records the requested and actual resolution, compute budget, and simulated board fraction.
+The live estimate shows requested versus actual cell size, grid dimensions, total nodes, approximate resolvable feature size, calibrated memory range (distinguishing Uniform, Adaptive, and Legacy solver modes), and a relative runtime class. For large boards, ThermalSim automatically coarsens the requested cell size toward 85% of the selected budget so you keep most of your chosen detail while staying within limits. The report records the requested and actual resolution, compute budget, and simulated board fraction.
 
 #### Output
 
@@ -230,17 +233,18 @@ The preflight status shows the effective dimensions and percentage of the board.
 
 - **Convection h (W/m2K)** - convection coefficient for top/bottom surfaces. Default is 10.
 - **PCB Thickness (mm)** - overall board thickness. Stackup thickness is used when available.
-- **Compute Engine** - `Auto` selects the matrix-free CPU engine (with geometric multigrid PCG) for larger jobs (starting at 50k nodes when the Native C++/OpenMP v3 Compact Low-RAM core is active, or 250k nodes without it) and keeps the sparse SciPy direct solver for small jobs. Both engines remain manually selectable.
+- **Compute Engine** - `Auto` selects the matrix-free CPU engine (with FMG-warm-started geometric multigrid PCG) for larger jobs (starting at 50k nodes when the Native C++/OpenMP v4 Compact Low-RAM core is active, or 250k nodes without it) and keeps the sparse SciPy direct solver for small jobs. Both engines remain manually selectable.
 - **Spatial Mesh** - `Auto`, `Uniform`, or `Adaptive`:
-  - **`Auto`** (default) uses `Uniform` with the Native C++/OpenMP v3 Compact Low-RAM multigrid solver up to **5M nodes** for maximum speed and zero coarsening error, and switches to `Adaptive` above 5M nodes or when running without the native multigrid core.
+  - **`Auto`** (default) uses `Uniform` with the Native C++/OpenMP v4 Compact Low-RAM multigrid solver up to **5M nodes** for maximum speed and zero coarsening error, and switches to `Adaptive` above 5M nodes or when running without the native multigrid core.
   - **`Uniform`** keeps the full regular grid.
   - **`Adaptive`** keeps the requested cell size at copper edges, pads, vias, sources, and thermal-pad boundaries while merging homogeneous interiors.
 - **Adaptive Max Cell Ratio** - largest adaptive cell relative to the requested cell size. The default is 8.
-- **Capabilities** - detected solver backend, including the Native C++/OpenMP v3 Compact Low-RAM core (`thermalsim_core.dll`, `libthermalsim_core.so`, or `libthermalsim_core.dylib`).
+- **Time Stepping** - `Auto` selects 5-phase geometric BDF2 stepping on matrix-free transient runs (5–8x faster on long transients with lossless steady-state convergence), alongside `Legacy 3-phase`, `2-phase`, and `Uniform BDF2`.
+- **Capabilities** - detected solver backend, including the Native C++/OpenMP v4 Compact Low-RAM & Fused PCG core (`thermalsim_core.dll`, `libthermalsim_core.so`, or `libthermalsim_core.dylib`).
 
 The **Balanced** compute budget (1.2M nodes) is the default. Presets use total solver nodes, so a four-layer board automatically receives fewer 2D cells than a two-layer board at the same budget. When auto-coarsening is needed, ThermalSim targets 85% of the budget so headroom is preserved without sacrificing unnecessary resolution.
 
-The fast engine applies the finite-volume operator without constructing a large global COO/CSR matrix. Uniform native runs use the **Native C++/OpenMP v3 Compact Low-RAM Core** — evaluating Level-0 stencil conductances and capacities on the fly from compact `bool`/`float32` masks and per-layer lookup tables (LUTs), solving mixed-precision `float32` multigrid V-cycle preconditioners inside a `float64` outer PCG loop, and releasing solver scratch/operator caches automatically after each run (and in-memory caches when the dialog closes). Adaptive runs assemble the reduced graph directly from the compact geometry state without materializing fine 3D conductance/capacity arrays. Reports show the equivalent uniform nodes, actual adaptive nodes, reduction factor, PCG iterations, and residual.
+The fast engine applies the finite-volume operator without constructing a large global COO/CSR matrix. Uniform native runs use the **Native C++/OpenMP v4 Compact Low-RAM & Fused PCG Core** — evaluating Level-0 stencil conductances and capacities on the fly from compact `bool`/`float32` masks and per-layer lookup tables (LUTs), solving mixed-precision `float32` multigrid V-cycle preconditioners inside a fused `float64` outer PCG loop (`6M` nodes steady-state in ~5 s at ~725 MB Peak RSS), and releasing solver scratch/operator caches automatically after each run (and in-memory caches when the dialog closes). Adaptive runs assemble the reduced graph directly from the compact geometry state without materializing fine 3D conductance/capacity arrays. Reports show the equivalent uniform nodes, actual adaptive nodes, reduction factor, PCG iterations, and residual.
 
 ---
 
@@ -262,11 +266,14 @@ Each run creates a timestamped result folder, for example `Thermalsim_20260426_1
 
 Typical files:
 
-- `thermal_report.html` - main report with settings, stackup, diagnostics, images, and interactive heatmap. For million-node grids, the embedded interactive heatmap payload is automatically downsampled using hotspot-preserving pooling so peak temperatures stay accurate while the HTML stays fast and lightweight.
+- `thermal_report.html` - main report with summary cards (including **Heatsink Temp** & **Heat Removal Split**), settings, stackup, diagnostics, images, and an interactive ROI heatmap. For million-node grids, the embedded interactive heatmap payload is automatically downsampled using hotspot-preserving pooling so peak temperatures stay accurate while the HTML stays fast and lightweight.
 - `thermal_preview.png` - mapped geometry preview.
 - `thermal_stackup.png` or `thermal_final.png` - final temperature heatmap.
 - `joule_loss_map.png` - current-induced copper loss map when current heating is active.
 - `snap_*.png` - optional time-series snapshots (transient mode).
+- `summary.json` - semantic machine-readable summary (written by `headless_api` / CLI).
+
+![HTML Thermal Report](docs/images/report.png "Interactive HTML Thermal Report with Heatsink Summary Cards")
 
 ### Current Path Diagnostics
 
@@ -372,23 +379,26 @@ The plugin is split into focused modules:
 
 | Module | Purpose |
 |--------|---------|
-| `capabilities.py` | Runtime detection of `numpy`, `scipy`, `matplotlib`, and the Native C++/OpenMP v3 core |
+| `simulation_core.py` | Zero-`wx` single source of truth for board area/grid estimation, calibrated RAM/runtime cost estimation, stackup thickness derivation, capacity assembly, and sparse pad power distribution |
+| `capabilities.py` | Runtime detection of `numpy`, `scipy`, `matplotlib`, `wx`, and the Native C++/OpenMP v4 core |
 | `dependency_installer.py` | Auto-install dialog for missing packages via pip |
 | `stackup_parser.py` | Parse copper/dielectric layers from `.kicad_pcb` S-expressions |
 | `gui_dialogs.py` | wxPython dialog for simulation parameters |
-| `geometry_mapper.py` | Accurately rasterize tracks, arcs, pads, vias, and filled zones |
-| `adaptive_mesh.py` | Build conservative adaptive meshes and multigrid operators |
+| `geometry_mapper.py` | Accurately rasterize tracks, arcs, rotated/offset SMD & THT pads (`GetLayerSet()`), vias, and fast scanline filled zones |
+| `adaptive_mesh.py` | Build conservative adaptive meshes and geometric multigrid operators |
 | `electrical_solver.py` | Solve DC current flow and convert copper losses to heat sources |
-| `thermal_solver.py` | Direct steady-state, transient BDF2, and matrix-free multigrid PCG thermal solvers |
-| `native_core.py` | Cross-platform loader for the optional C++/OpenMP v3 Compact Low-RAM CPU core |
-| `workflow.py` | Safe compressed `.npz` disk geometry caching, operator caching, and solver phase planning |
+| `thermal_solver.py` | Direct steady-state, FMG-preconditioned PCG, geometric transient BDF2, and Dynamic 0D Heatsink (Sherman-Morrison) solvers |
+| `native_core.py` | Cross-platform loader (`ctypes`) for the optional Native C++/OpenMP v4 Compact Low-RAM & Fused PCG core |
+| `native/thermalsim_core.cpp` | C++/OpenMP v4 stencil, mixed-precision `float32` multigrid, and fused `float64` PCG kernels |
+| `workflow.py` | Safe compressed `.npz` disk geometry caching, operator caching, and preflight state |
 | `pwl_parser.py` | Parse LTspice-style PWL power profiles |
-| `visualization.py` | Generate thermal plots, previews, hotspot-preserving interactive heatmaps, and Joule loss maps |
+| `visualization.py` | Generate fast PNG thermal plots, previews, hotspot-preserving interactive heatmaps, and Joule loss maps |
 | `thermal_report.py` | Generate the HTML report |
-| `thermal_plugin.py` | Orchestrate workflow and KiCad ActionPlugin integration |
+| `thermal_plugin.py` | Orchestrate workflow, background progress/ETA, and KiCad ActionPlugin integration |
 | `headless_api.py` | Zero-GUI headless API (`inspect`, `validate`, `run`, `sweep`, `compare`) and semantic `summary.json` builder |
 | `thermalsim_cli.py` | Agent-friendly JSON CLI entrypoint with strict stdout/stderr separation and semantic exit codes |
 | `__main__.py` | Module entrypoint for `python3 -m KiCad_Thermal_Sim` |
+| `schema/` | JSON Schemas (`job.schema.json`, `summary.schema.json`) for headless automation |
 
 ---
 
@@ -421,12 +431,12 @@ The plugin is split into focused modules:
 
 ---
 
-## Building the Native C++/OpenMP v3 Compact Low-RAM Core
+## Building the Native C++/OpenMP v4 Compact Low-RAM & Fused PCG Core
 
-The optional native C++/OpenMP v3 Compact Low-RAM core accelerates matrix-free stencil evaluation and geometric multigrid V-cycles across all CPU cores while minimizing peak RAM:
+The optional native C++/OpenMP v4 core accelerates matrix-free stencil evaluation, geometric multigrid V-cycles, and fused `float64` PCG vector/dot kernels across all CPU cores while minimizing peak RAM (`6M` nodes steady-state in ~5 s at ~725 MB Peak RSS):
 
 - **On-the-fly Level-0 mask + LUT evaluation** avoids allocating dense 3D `float64` conductance (`gx`/`gy`/`gz`), capacity (`C`), boundary (`b`), and convection (`hA`) arrays.
-- **Mixed-precision multigrid** runs `float32` V-cycle smoothing, restriction, and prolongation inside a `float64` outer PCG loop.
+- **Mixed-precision multigrid with FMG warm start** runs `float32` V-cycle smoothing, restriction, and prolongation inside a fused `float64` outer PCG loop (`apply_compact_dot_native`, `pcg_update_xr_norm2_native`, `pcg_update_p_native`, `f64_to_f32_native`, `f32_to_f64_dot_native`).
 - **Direct adaptive mesh assembly** builds reduced adaptive graphs straight from compact masks and layer lookup tables without building a full fine operator first.
 - **Automatic post-run cache cleanup** frees native scratch buffers and operator caches after each solve, and releases in-memory caches when the plugin dialog closes.
 

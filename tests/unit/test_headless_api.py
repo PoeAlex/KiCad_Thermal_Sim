@@ -9,7 +9,7 @@ import sys
 import numpy as np
 import pytest
 
-from ThermalSim import headless_api
+from ThermalSim import headless_api, simulation_core
 from ThermalSim.thermal_solver import SolverResult
 from tests.mocks.pcbnew_mock import (
     B_Cu,
@@ -131,21 +131,22 @@ class TestHeadlessIsolationAndJson:
         assert headless_api.PLUGIN_VERSION == "0.4.6"
 
     def test_no_wx_or_gui_imports_in_ast(self):
-        path = os.path.abspath(headless_api.__file__)
-        with open(path, "r", encoding="utf-8") as handle:
-            tree = ast.parse(handle.read(), filename=path)
+        for mod in (headless_api, simulation_core):
+            path = os.path.abspath(mod.__file__)
+            with open(path, "r", encoding="utf-8") as handle:
+                tree = ast.parse(handle.read(), filename=path)
 
-        imported = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    imported.add(alias.name.split(".")[0])
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                imported.add(node.module.lstrip(".").split(".")[0])
+            imported = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imported.add(alias.name.split(".")[0])
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imported.add(node.module.lstrip(".").split(".")[0])
 
-        assert "wx" not in imported
-        assert "thermal_plugin" not in imported
-        assert "gui_dialogs" not in imported
+            assert "wx" not in imported
+            assert "thermal_plugin" not in imported
+            assert "gui_dialogs" not in imported
 
     def test_fresh_subprocess_import_without_wx(self):
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -158,6 +159,8 @@ class TestHeadlessIsolationAndJson:
             "from mocks.pcbnew_mock import install_mock\n"
             "install_mock()\n"
             f"sys.path.insert(0, {parent_dir!r})\n"
+            f"core = __import__('{pkg_name}.simulation_core', fromlist=['GRID_DETAIL_PRESETS'])\n"
+            "assert core.DEFAULT_GRID_DETAIL == 'balanced'\n"
             f"mod = __import__('{pkg_name}.headless_api', fromlist=['SCHEMA_VERSION'])\n"
             "assert mod.SCHEMA_VERSION == '1.0'\n"
             "assert 'thermal_plugin' not in str(list(sys.modules.keys()))\n"
@@ -1002,3 +1005,35 @@ class TestPadAlignmentAndBottomLayerRegression:
             p_res = plugin_mod._estimate_solver_cost(nodes, settings)
             assert h_res == expected
             assert p_res == h_res
+
+    def test_fast_engine_preserves_auto_time_stepping(self, sample_2layer_board_file, monkeypatch):
+        """Fast engine passes time_stepping='auto' through without forcing 'uniform'."""
+        board = _make_board(sample_2layer_board_file, with_eco1=False)
+        captured_configs = []
+
+        def spy_mf(config, op, C, Q, b, hA, *args, **kwargs):
+            captured_configs.append(config.time_stepping)
+            return SolverResult(
+                T=np.full((op.layer_count, op.rows, op.cols), 30.0),
+                k_norm_info={},
+                step_counter=1,
+                total_solve_time=0.01,
+                total_factor_time=0.0,
+                factor_count=0,
+            )
+
+        monkeypatch.setattr(headless_api, "run_simulation_matrix_free", spy_mf)
+        res = headless_api.run_headless_simulation(
+            board,
+            {
+                "power_pads": {"U1.EP": 2.0},
+                "time": 10.0,
+                "res": 2.0,
+                "compute_engine": "fast_native",
+                "mesh_mode": "uniform",
+            },
+            generate_plots=False,
+            generate_html=False,
+        )
+        assert res["status"] == "ok"
+        assert captured_configs == ["auto"]
