@@ -1,0 +1,288 @@
+name: Build & Package Universal PCM Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version (leave empty to use build_pcm_package.py default)"
+        required: false
+        default: ""
+      release_tag:
+        description: "Optional existing GitHub Release tag to attach the universal ZIP to (e.g. v0.4.6)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-native:
+    name: Build Native Core (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            os: windows-latest
+            binary: thermalsim_core.dll
+          - platform: linux
+            os: ubuntu-22.04
+            binary: libthermalsim_core.so
+          - platform: macos
+            os: macos-latest
+            binary: libthermalsim_core.dylib
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install NumPy for native core verification
+        shell: bash
+        run: python -m pip install --upgrade pip numpy
+
+      - name: Configure and build native C++ core
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            cmake -S native -B native/build -A x64
+            cmake --build native/build --config Release
+          elif [ "${{ matrix.platform }}" = "macos" ]; then
+            # Build universal2 (Apple Silicon + Intel) without Homebrew libomp
+            # so end-users need zero external runtime libraries.
+            cmake -S native -B native/build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+              -DCMAKE_DISABLE_FIND_PACKAGE_OpenMP=TRUE
+            cmake --build native/build --config Release
+          else
+            cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release
+            cmake --build native/build --config Release
+          fi
+          ls -lh "native/bin/${{ matrix.binary }}"
+
+      - name: Inspect binary dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="native/bin/${{ matrix.binary }}"
+          if [ "${{ matrix.platform }}" = "linux" ]; then
+            ldd "$BIN"
+          elif [ "${{ matrix.platform }}" = "macos" ]; then
+            lipo -info "$BIN"
+            otool -L "$BIN"
+            if otool -L "$BIN" | grep -E "homebrew|usr/local"; then
+              echo "ERROR: Unexpected non-system dependency in macOS dylib" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Verify native core ABI v4 and kernels
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import os
+          from pathlib import Path
+          import numpy as np
+          import native_core
+
+          binary = Path("native/bin") / "${{ matrix.binary }}"
+          assert binary.is_file(), f"Missing native binary: {binary}"
+
+          core = native_core.NativeCore(binary)
+          print(
+              f"Loaded {binary.name}: version={core.version}, "
+              f"has_mg={core.has_mg}, has_compact={core.has_compact}, has_pcg={core.has_pcg}"
+          )
+          assert core.version == 4, f"Expected ABI v4, got {core.version}"
+          assert core.has_mg is True
+          assert core.has_compact is True
+          assert core.has_pcg is True
+
+          # Exercise OpenMP parallel vector kernel (> 65536 elements)
+          rng = np.random.default_rng(42)
+          a = rng.standard_normal(100_000)
+          b = rng.standard_normal(100_000)
+          got = core.dot_f64(a, b)
+          expected = float(np.dot(a, b))
+          assert np.isclose(got, expected, rtol=1e-12, atol=1e-12), (
+              f"dot_f64 mismatch: got={got}, expected={expected}"
+          )
+
+          # Exercise compact stencil + fused dot kernel (ABI v4)
+          layers, rows, cols = 2, 32, 32
+          n = layers * rows * cols
+          copper_mask = np.zeros((layers, rows, cols), dtype=np.uint8)
+          copper_mask[:, 8:24, 8:24] = 1
+          via_enh = np.ones((rows, cols), dtype=np.float32)
+          hs_mask = np.zeros((rows, cols), dtype=np.uint8)
+          gx_lut = np.array([[0.05, 0.1, 1.0], [0.05, 0.1, 1.0]], dtype=np.float64)
+          gy_lut = np.array([[0.05, 0.1, 1.0], [0.05, 0.1, 1.0]], dtype=np.float64)
+          gz_scale = np.array([0.2], dtype=np.float64)
+          cap_lut = np.array([[0.005, 0.01], [0.005, 0.01]], dtype=np.float64)
+          p = rng.standard_normal(n)
+          out, dot_val = core.apply_compact_dot(
+              layers,
+              rows,
+              cols,
+              copper_mask,
+              via_enh,
+              hs_mask,
+              gx_lut,
+              gy_lut,
+              gz_scale,
+              cap_lut,
+              0.0,
+              0.002,
+              0.002,
+              0.01,
+              1.5,
+              p,
+          )
+          assert np.isfinite(dot_val) and dot_val > 0.0
+          assert np.isclose(dot_val, float(np.dot(p, out)), rtol=1e-12, atol=1e-12)
+          print("Native core smoke test passed.")
+          EOF
+
+      - name: Upload native binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.platform }}
+          path: native/bin/${{ matrix.binary }}
+          if-no-files-found: error
+
+  package-release:
+    name: Build Universal PCM ZIP
+    needs: build-native
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download all native binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: native/bin
+          merge-multiple: true
+
+      - name: Verify all platform binaries are present
+        run: |
+          set -euo pipefail
+          ls -lh native/bin/
+          for f in thermalsim_core.dll libthermalsim_core.so libthermalsim_core.dylib; do
+            test -f "native/bin/$f" || { echo "Missing native/bin/$f" >&2; exit 1; }
+          done
+
+      - name: Determine release version and tag
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          python - <<'EOF'
+          import os
+          import re
+          import build_pcm_package
+
+          def clean_version(raw: str) -> str:
+              return re.sub(r"^[vV]\.?", "", raw.strip())
+
+          event_name = os.environ["EVENT_NAME"]
+          release_tag = ""
+          version = ""
+
+          if event_name == "release":
+              release_tag = os.environ.get("EVENT_RELEASE_TAG", "").strip()
+              version = clean_version(release_tag)
+          else:
+              release_tag = os.environ.get("INPUT_RELEASE_TAG", "").strip()
+              raw_ver = os.environ.get("INPUT_VERSION", "").strip()
+              if raw_ver:
+                  version = clean_version(raw_ver)
+              elif release_tag:
+                  version = clean_version(release_tag)
+              else:
+                  version = build_pcm_package.VERSION
+
+          if not version:
+              version = build_pcm_package.VERSION
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"version={version}\n")
+              fh.write(f"release_tag={release_tag}\n")
+
+          print(f"Resolved version={version}, release_tag={release_tag or '(none)'}")
+          EOF
+
+      - name: Build universal PCM ZIP
+        run: |
+          set -euo pipefail
+          python build_pcm_package.py --version "${{ steps.meta.outputs.version }}" --output-dir dist
+          (cd dist && sha256sum "ThermalSim-v${{ steps.meta.outputs.version }}.zip" > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+
+      - name: Validate universal PCM ZIP contents
+        run: |
+          python - <<'EOF'
+          import json
+          import zipfile
+
+          version = "${{ steps.meta.outputs.version }}"
+          zip_path = f"dist/ThermalSim-v{version}.zip"
+          required = {
+              "metadata.json",
+              "plugins/simulation_core.py",
+              "plugins/thermal_plugin.py",
+              "plugins/headless_api.py",
+              "plugins/schema/job.schema.json",
+              "plugins/schema/summary.schema.json",
+              "plugins/thermalsim_core.dll",
+              "plugins/libthermalsim_core.so",
+              "plugins/libthermalsim_core.dylib",
+          }
+          with zipfile.ZipFile(zip_path, "r") as zf:
+              names = set(zf.namelist())
+              missing = sorted(required - names)
+              assert not missing, f"ZIP missing required entries: {missing}"
+              meta = json.loads(zf.read("metadata.json").decode("utf-8"))
+              assert meta["versions"][0]["version"] == version, meta["versions"]
+              print(f"Validated {zip_path}: {len(names)} files, all 3 native binaries bundled.")
+          EOF
+
+      - name: Upload universal PCM ZIP workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ThermalSim-v${{ steps.meta.outputs.version }}-Universal-PCM
+          path: |
+            dist/ThermalSim-v${{ steps.meta.outputs.version }}.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Attach universal PCM ZIP to GitHub Release
+        if: steps.meta.outputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${{ steps.meta.outputs.release_tag }}" \
+            "dist/ThermalSim-v${{ steps.meta.outputs.version }}.zip" \
+            "dist/SHA256SUMS.txt" \
+            --clobber
