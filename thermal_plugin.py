@@ -49,15 +49,6 @@ from .electrical_solver import (
     net_key_from_values,
     solve_electrical_heating,
 )
-from .adaptive_mesh import (
-    build_adaptive_mesh,
-    build_adaptive_system,
-    restrict_heatsink_model,
-)
-try:
-    from .adaptive_mesh import build_adaptive_system_compact
-except ImportError:
-    build_adaptive_system_compact = None
 from .geometry_mapper import (
     build_geometry_state,
     create_multilayer_maps,
@@ -375,7 +366,7 @@ def _auto_fast_engine_threshold():
 
 
 def _resolve_mesh_mode(settings, use_fast_engine, node_count):
-    """Resolve user mesh_mode ('auto', 'uniform', 'adaptive') to 'uniform' or 'adaptive'."""
+    """Return the active spatial mesh mode (always ``'uniform'`` since v0.4.7)."""
     return resolve_mesh_mode(
         settings, use_fast_engine, node_count, has_native_mg=HAS_NATIVE_MG
     )
@@ -1649,59 +1640,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 if reporter.cancelled:
                     raise GeometryCancelledError("Preview cancelled.")
 
-            preview_adaptive_mesh = None
-            preview_engine = str(
-                effective_settings.get("compute_engine", "auto") or "auto"
-            ).strip().lower()
-            if preview_engine not in {"auto", "fast_native", "legacy"}:
-                preview_engine = "auto"
-            preview_use_fast_engine = (
-                preview_engine == "fast_native"
-                or (preview_engine == "auto" and grid.nodes >= _auto_fast_engine_threshold())
-            )
-            preview_mesh_mode = _resolve_mesh_mode(
-                effective_settings, preview_use_fast_engine, grid.nodes
-            )
-            if preview_mesh_mode == "adaptive":
-                preview_status("Building adaptive refinement levels...")
-                source_mask = np.zeros(
-                    (len(self.copper_ids), grid.rows, grid.cols), dtype=bool
-                )
-                for pad in preview_pads:
-                    pixels = get_pad_pixels(
-                        pad, grid.rows, grid.cols,
-                        grid.x_min_mm, grid.y_min_mm, grid.actual_res_mm
-                    )
-                    if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
-                        target_layers = range(len(self.copper_ids))
-                    else:
-                        try:
-                            target_layers = [self.copper_ids.index(pad.GetLayer())]
-                        except ValueError:
-                            target_layers = [0]
-                    for layer_idx in target_layers:
-                        for row, col in pixels:
-                            if 0 <= row < grid.rows and 0 <= col < grid.cols:
-                                source_mask[layer_idx, row, col] = True
-                preview_adaptive_mesh = reporter.run_in_background(
-                    lambda: build_adaptive_mesh(
-                        geometry_state.copper_mask,
-                        geometry_state.via_map,
-                        geometry_state.heatsink_mask,
-                        source_mask=source_mask,
-                        max_cell_ratio=max(
-                            1, min(16, int(
-                                effective_settings.get("adaptive_max_cell_ratio", 8) or 8
-                            ))
-                        ),
-                    ),
-                    75,
-                    85,
-                    "Building adaptive refinement levels...",
-                )
-                if reporter.cancelled:
-                    raise GeometryCancelledError("Preview cancelled.")
-
             preview_status("Rendering preview layers...")
             if not reporter.update(85, "Rendering preview layers...", force=True):
                 raise GeometryCancelledError("Preview cancelled.")
@@ -1715,7 +1653,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 open_file=True,
                 geometry_state=geometry_state,
                 grid_spec=grid,
-                adaptive_mesh=preview_adaptive_mesh,
             )
             reporter.update(100, "Done", force=True)
             reporter.close()
@@ -1945,21 +1882,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 or (engine_setting == "auto" and grid.nodes >= _auto_fast_engine_threshold())
             )
             resolved_engine = "fast_native" if use_fast_engine else "legacy"
-            mesh_mode = _resolve_mesh_mode(settings, use_fast_engine, grid.nodes)
 
             use_compact_uniform = (
                 use_fast_engine
-                and mesh_mode != "adaptive"
                 and build_compact_structured_operator is not None
                 and build_structured_operator is _ORIG_BUILD_STRUCTURED_OPERATOR
             )
-            use_compact_adaptive = (
-                use_fast_engine
-                and mesh_mode == "adaptive"
-                and build_adaptive_system_compact is not None
-                and build_structured_operator is _ORIG_BUILD_STRUCTURED_OPERATOR
-            )
-            use_compact_path = use_compact_uniform or use_compact_adaptive
+            use_compact_path = use_compact_uniform
 
             operator_key = _build_operator_cache_key(
                 cache_key,
@@ -1974,9 +1903,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             operator_cache_lookup_key = (
                 f"{operator_key}:compact_uniform" if use_compact_uniform else operator_key
             )
-            cached_operator = (
-                None if use_compact_adaptive else self.operator_cache.get(operator_cache_lookup_key)
-            )
+            cached_operator = self.operator_cache.get(operator_cache_lookup_key)
             operator_cache_hit = cached_operator is not None
 
             # Heat capacity (deferred/omitted on zero-peak compact paths)
@@ -2212,7 +2139,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 else:
                     pad_power.append((name, None))
 
-            # Build the thermal operator & adaptive mesh (46-54 %)
+            # Build the thermal operator (46-54 %)
             set_dialog_state("running", "Building the thermal operator...")
             stiffness_start = time.perf_counter()
             if use_compact_uniform:
@@ -2225,15 +2152,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             pad_cap_areal=pad_cap_areal,
                         ),
                         46,
-                        50,
+                        54,
                         "Building thermal operator...",
                     )
                     if reporter.cancelled:
                         raise GeometryCancelledError("Simulation cancelled.")
                     self.operator_cache.put(operator_cache_lookup_key, (None, K_matrix, None, None))
                 init_timings["stiffness_matrix_s"] = time.perf_counter() - stiffness_start
-            elif use_compact_adaptive:
-                init_timings["stiffness_matrix_s"] = 0.0
             else:
                 if not operator_cache_hit:
                     H_map_float = H_map.astype(np.float64, copy=False)
@@ -2244,7 +2169,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             k_cu, k_fr4, dx, dy, V_map, gap_m, H_map_float, settings, amb
                         ),
                         46,
-                        50,
+                        54,
                         "Building thermal operator...",
                     )
                     if reporter.cancelled:
@@ -2253,66 +2178,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 init_timings["stiffness_matrix_s"] = time.perf_counter() - stiffness_start
             init_timings["compute_engine"] = resolved_engine
 
-            adaptive_system = None
-            if use_fast_engine and mesh_mode == "adaptive":
-                set_dialog_state("running", "Building the adaptive multilevel mesh...")
-                adaptive_started = time.perf_counter()
-                max_cell_ratio = max(
-                    1, min(16, int(settings.get("adaptive_max_cell_ratio", 8) or 8))
-                )
-
-                def _build_adaptive_pipeline():
-                    source_mask = np.zeros(N, dtype=bool)
-                    for contribution in pad_contributions:
-                        source_mask[contribution.indices] = True
-                    if q_joule is not None:
-                        source_mask |= np.asarray(q_joule) != 0.0
-                    adaptive_grid = build_adaptive_mesh(
-                        copper_mask,
-                        V_map,
-                        geometry_state.heatsink_mask,
-                        source_mask=source_mask.reshape(layer_count, rows, cols),
-                        max_cell_ratio=max_cell_ratio,
-                    )
-                    if use_compact_adaptive:
-                        adaptive_power_input = Q_sparse if Q_sparse is not None else Q
-                        return build_adaptive_system_compact(
-                            layer_count, rows, cols, copper_mask, t_cu, t_fr4_eff,
-                            k_cu, k_fr4, dx, dy, V_map, gap_m, H_map, settings, amb,
-                            adaptive_grid, adaptive_power_input,
-                            rho_cu=rho_cu, cp_cu=cp_cu, rho_fr4=rho_fr4, cp_fr4=cp_fr4,
-                            pad_cap_areal=pad_cap_areal,
-                        )
-                    return build_adaptive_system(
-                        K_matrix, C, Q, b, hA, adaptive_grid
-                    )
-
-                adaptive_system = reporter.run_in_background(
-                    _build_adaptive_pipeline,
-                    50,
-                    54,
-                    "Building adaptive multilevel mesh...",
-                )
-                if reporter.cancelled:
-                    raise GeometryCancelledError("Simulation cancelled.")
-                init_timings["adaptive_mesh_s"] = time.perf_counter() - adaptive_started
-                grid_info.update({
-                    "mesh_mode": "adaptive",
-                    "equivalent_uniform_nodes": int(N),
-                    "adaptive_nodes": int(adaptive_system.operator.shape[0]),
-                    "mesh_reduction_ratio": float(
-                        N / max(adaptive_system.operator.shape[0], 1)
-                    ),
-                    "adaptive_max_cell_ratio": max_cell_ratio,
-                })
-            else:
-                grid_info.update({
-                    "mesh_mode": "uniform",
-                    "equivalent_uniform_nodes": int(N),
-                    "adaptive_nodes": int(N),
-                    "mesh_reduction_ratio": 1.0,
-                    "adaptive_max_cell_ratio": 1,
-                })
+            grid_info.update({
+                "mesh_mode": "uniform",
+                "equivalent_uniform_nodes": int(N),
+            })
             if build_heatsink_model is not _ORIG_BUILD_HEATSINK_MODEL or not use_compact_path:
                 H_map_float = H_map.astype(np.float64, copy=False)
                 heatsink_model = build_heatsink_model(
@@ -2324,12 +2193,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 heatsink_model = _build_compact_heatsink_model(
                     dx, dy, H_map, settings, amb
                 )
-            if adaptive_system is not None and heatsink_model is not None:
-                solver_heatsink_model = restrict_heatsink_model(
-                    heatsink_model, adaptive_system.mesh, layer_count
-                )
-            else:
-                solver_heatsink_model = heatsink_model
+            solver_heatsink_model = heatsink_model
 
             steady_state = bool(settings.get("steady_state", False)) and Q_func is None
             print(f"[ThermalSim] init timings: {_format_timing_summary(init_timings)}")
@@ -2366,15 +2230,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             def snapshot_callback(T_view, t_elapsed, snap_idx):
                 return save_snapshot(T_view, H_map, amb, layer_names, snap_idx, t_elapsed, out_dir=run_dir)
 
-            if adaptive_system is not None:
-                def solver_snapshot_callback(T_view, t_elapsed, snap_idx):
-                    fine_view = adaptive_system.mesh.prolong(
-                        T_view.reshape(-1), layer_count
-                    )
-                    return snapshot_callback(fine_view, t_elapsed, snap_idx)
-            else:
-                solver_snapshot_callback = snapshot_callback
-
             # Run solver (54-88 %)
             configured_time_stepping = settings.get("time_stepping", "auto")
             solver_config_fields = getattr(SolverConfig, "__dataclass_fields__", None)
@@ -2403,51 +2258,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             def solver_worker():
                 try:
                     if use_fast_engine:
-                        solver_operator = (
-                            adaptive_system.operator
-                            if adaptive_system is not None
-                            else K_matrix
-                        )
-                        solver_capacity = (
-                            adaptive_system.capacity
-                            if adaptive_system is not None
-                            else C
-                        )
-                        solver_power = (
-                            adaptive_system.power
-                            if adaptive_system is not None
-                            else (Q_sparse if Q_sparse is not None else Q)
-                        )
-                        solver_boundary = (
-                            adaptive_system.boundary_rhs
-                            if adaptive_system is not None
-                            else b
-                        )
-                        solver_h_area = (
-                            adaptive_system.h_area
-                            if adaptive_system is not None
-                            else hA
-                        )
-                        solver_power_func = (
-                            adaptive_system.wrap_power_function(Q_func, layer_count)
-                            if adaptive_system is not None
-                            else Q_func
-                        )
+                        solver_power = Q_sparse if Q_sparse is not None else Q
                         mf_kwargs = {}
                         if solver_heatsink_model is not None:
                             mf_kwargs["heatsink_model"] = solver_heatsink_model
                         worker_result["result"] = run_simulation_matrix_free(
-                            config, solver_operator, solver_capacity, solver_power,
-                            solver_boundary, solver_h_area,
-                            progress_callback, solver_snapshot_callback,
-                            Q_func=solver_power_func,
+                            config, K_matrix, C, solver_power,
+                            b, hA,
+                            progress_callback, snapshot_callback,
+                            Q_func=Q_func,
                             cancel_check=lambda: cancel_token.cancelled,
                             **mf_kwargs,
                         )
-                        if adaptive_system is not None:
-                            worker_result["result"].T = adaptive_system.mesh.prolong(
-                                worker_result["result"].T.reshape(-1), layer_count
-                            )
                     else:
                         legacy_kwargs = {}
                         if heatsink_model is not None:
@@ -2556,9 +2378,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             })
                             grid_info.update({
                                 "mesh_mode": "uniform",
-                                "adaptive_nodes": int(N),
-                                "mesh_reduction_ratio": 1.0,
-                                "adaptive_max_cell_ratio": 1,
+                                "equivalent_uniform_nodes": int(N),
                             })
                         except Exception:
                             worker_result["traceback"] = (
@@ -2598,8 +2418,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             finally:
                 if K_matrix is not None and hasattr(K_matrix, "clear_caches"):
                     K_matrix.clear_caches()
-                if adaptive_system is not None and hasattr(adaptive_system.operator, "clear_caches"):
-                    adaptive_system.operator.clear_caches()
                 clear_native_scratch()
 
             if "traceback" in worker_result:

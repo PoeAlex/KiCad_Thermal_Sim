@@ -96,8 +96,7 @@ class SimulationSettings:
     grid_detail_level: str = "balanced"
     grid_node_budget: int = 800000
     compute_engine: str = "auto"
-    mesh_mode: str = "adaptive"
-    adaptive_max_cell_ratio: int = 8
+    mesh_mode: str = "uniform"
     backend: str = "auto"
     time_stepping: str = "auto"
 
@@ -120,10 +119,7 @@ class SimulationSettings:
             compute_engine=str(
                 values.get("compute_engine", "auto") or "auto"
             ).lower(),
-            mesh_mode=str(values.get("mesh_mode", "adaptive") or "adaptive").lower(),
-            adaptive_max_cell_ratio=int(
-                values.get("adaptive_max_cell_ratio", 8) or 8
-            ),
+            mesh_mode="uniform",
             backend=str(values.get("solver_backend", "auto") or "auto").lower(),
             time_stepping=str(values.get("time_stepping", "auto") or "auto").lower(),
         )

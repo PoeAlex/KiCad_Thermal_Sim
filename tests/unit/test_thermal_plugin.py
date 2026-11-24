@@ -583,12 +583,12 @@ class TestGridCoarsening:
         assert target_cells == 42_500_000
 
     def test_named_presets_resolve_to_updated_budgets_and_85pct_targets(self):
-        """Fast/Balanced/Detailed/Very detailed presets use 500k/1.2M/3M/6M with 85% target."""
+        """Fast/Balanced/Detailed/Very detailed presets use 1M/3M/8M/16M with 85% target."""
         expected = {
-            "fast": (500_000, 425_000),
-            "balanced": (1_200_000, 1_020_000),
-            "detailed": (3_000_000, 2_550_000),
-            "very_detailed": (6_000_000, 5_100_000),
+            "fast": (1_000_000, 850_000),
+            "balanced": (3_000_000, 2_550_000),
+            "detailed": (8_000_000, 6_800_000),
+            "very_detailed": (16_000_000, 13_600_000),
         }
         for name, (exp_max, exp_target) in expected.items():
             detail, expert, max_cells, target_cells, max_nodes = _resolve_grid_policy(
@@ -601,22 +601,19 @@ class TestGridCoarsening:
             assert target_cells == exp_target // 4
 
     def test_auto_fast_engine_threshold_and_mesh_mode_resolution(self, monkeypatch):
-        """Auto engine threshold and Auto mesh mode follow HAS_NATIVE_MG."""
+        """Auto engine threshold follows HAS_NATIVE_MG and mesh mode is always uniform."""
         import ThermalSim.thermal_plugin as plugin_mod
 
         monkeypatch.setattr(plugin_mod, "HAS_NATIVE_MG", True)
         assert plugin_mod._auto_fast_engine_threshold() == 50_000
         assert plugin_mod._resolve_mesh_mode({"mesh_mode": "auto"}, True, 1_000_000) == "uniform"
-        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "auto"}, True, 5_000_000) == "uniform"
-        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "auto"}, True, 5_000_001) == "adaptive"
-        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "adaptive"}, True, 100_000) == "adaptive"
+        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "auto"}, True, 25_000_000) == "uniform"
+        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "adaptive"}, True, 100_000) == "uniform"
         assert plugin_mod._resolve_mesh_mode({"mesh_mode": "uniform"}, True, 10_000_000) == "uniform"
-        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "adaptive"}, False, 100_000) == "uniform"
 
         monkeypatch.setattr(plugin_mod, "HAS_NATIVE_MG", False)
         assert plugin_mod._auto_fast_engine_threshold() == 250_000
-        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "auto"}, True, 1_000_000) == "adaptive"
-        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "uniform"}, True, 1_000_000) == "uniform"
+        assert plugin_mod._resolve_mesh_mode({"mesh_mode": "auto"}, True, 1_000_000) == "uniform"
 
     def test_estimate_solver_cost_reflects_native_mg_and_ignores_legacy_backend(self, monkeypatch):
         """Native compact/MG cost models use calibrated v4 RAM/runtime bounds and ignore legacy backend."""
@@ -625,28 +622,24 @@ class TestGridCoarsening:
         monkeypatch.setattr(plugin_mod, "HAS_NATIVE_MG", True)
         monkeypatch.setattr(plugin_mod, "HAS_NATIVE_COMPACT", True)
 
-        # v4 Compact uniform vs adaptive at 3M and 6M nodes
+        # v4 Compact uniform calibrated against 6M (~0.5-0.75 GB) & 25.6M (~2.0 GB) measurements
         assert plugin_mod._estimate_solver_cost(
             3_000_000, {"compute_engine": "auto", "mesh_mode": "auto"}
-        ) == (285, 435, "Moderate")
+        ) == (240, 375, "Moderate")
         assert plugin_mod._estimate_solver_cost(
             6_000_000, {"compute_engine": "auto", "mesh_mode": "uniform"}
-        ) == (570, 870, "Slow")
+        ) == (480, 750, "Moderate")
         assert plugin_mod._estimate_solver_cost(
-            6_000_000, {"compute_engine": "auto", "mesh_mode": "adaptive"}
-        ) == (390, 690, "Slow")
-        # Auto mesh_mode > 5M resolves to adaptive
-        assert plugin_mod._estimate_solver_cost(
-            6_000_000, {"compute_engine": "auto", "mesh_mode": "auto"}
-        ) == (390, 690, "Slow")
+            25_600_000, {"compute_engine": "auto", "mesh_mode": "auto"}
+        ) == (2048, 3200, "Very slow")
 
-        # v4 runtime thresholds (1.2M, 4.0M, 10.0M)
-        assert plugin_mod._estimate_solver_cost(500_000, {"compute_engine": "auto"})[2] == "Fast"
-        assert plugin_mod._estimate_solver_cost(1_199_999, {"compute_engine": "auto"})[2] == "Fast"
-        assert plugin_mod._estimate_solver_cost(1_200_000, {"compute_engine": "auto"})[2] == "Moderate"
-        assert plugin_mod._estimate_solver_cost(3_000_000, {"compute_engine": "auto"})[2] == "Moderate"
-        assert plugin_mod._estimate_solver_cost(6_000_000, {"compute_engine": "auto"})[2] == "Slow"
-        assert plugin_mod._estimate_solver_cost(10_500_000, {"compute_engine": "auto"})[2] == "Very slow"
+        # v4 runtime thresholds (2M, 8M, 20M)
+        assert plugin_mod._estimate_solver_cost(1_000_000, {"compute_engine": "auto"})[2] == "Fast"
+        assert plugin_mod._estimate_solver_cost(1_999_999, {"compute_engine": "auto"})[2] == "Fast"
+        assert plugin_mod._estimate_solver_cost(2_000_000, {"compute_engine": "auto"})[2] == "Moderate"
+        assert plugin_mod._estimate_solver_cost(6_000_000, {"compute_engine": "auto"})[2] == "Moderate"
+        assert plugin_mod._estimate_solver_cost(10_000_000, {"compute_engine": "auto"})[2] == "Slow"
+        assert plugin_mod._estimate_solver_cost(20_500_000, {"compute_engine": "auto"})[2] == "Very slow"
 
         # v2-only native MG (HAS_NATIVE_COMPACT=False)
         monkeypatch.setattr(plugin_mod, "HAS_NATIVE_COMPACT", False)
@@ -713,8 +706,8 @@ class TestGridCoarsening:
         assert result.ready is True
         assert result.errors == []
 
-    def test_generate_preview_respects_resolved_auto_mesh_mode(self, tmp_path, monkeypatch):
-        """Preview should only build adaptive overlay when resolved mesh mode is adaptive."""
+    def test_generate_preview_always_renders_uniform_without_adaptive_overlay(self, tmp_path, monkeypatch):
+        """Preview renders the uniform geometry cleanly even when legacy mesh_mode='adaptive' is passed."""
         import ThermalSim.thermal_plugin as plugin_mod
         from ThermalSim.thermal_plugin import ThermalPlugin
 
@@ -738,46 +731,26 @@ class TestGridCoarsening:
         plugin.pads_list = [pad]
         plugin.stack_info = {}
 
-        adaptive_calls = []
         preview_meshes = []
-
-        def fake_build_adaptive_mesh(*args, **kwargs):
-            adaptive_calls.append(True)
-            return "fake-adaptive-mesh"
 
         def fake_save_preview_image(*args, **kwargs):
             preview_meshes.append(kwargs.get("adaptive_mesh"))
             return str(tmp_path / "preview.png")
 
-        monkeypatch.setattr(plugin_mod, "build_adaptive_mesh", fake_build_adaptive_mesh)
         monkeypatch.setattr(plugin_mod, "save_preview_image", fake_save_preview_image)
         monkeypatch.setattr(plugin_mod, "HAS_NATIVE_MG", True)
 
-        # Auto mesh mode with native MG and small grid resolves to uniform -> no adaptive overlay
-        plugin.generate_preview(
-            {
-                "res": 2.0,
-                "compute_engine": "fast_native",
-                "mesh_mode": "auto",
-                "output_dir": str(tmp_path),
-            },
-            ["F.Cu", "B.Cu"],
-        )
-        assert adaptive_calls == []
-        assert preview_meshes == [None]
-
-        # Explicit adaptive mesh mode with fast engine builds adaptive overlay
-        plugin.generate_preview(
-            {
-                "res": 2.0,
-                "compute_engine": "fast_native",
-                "mesh_mode": "adaptive",
-                "output_dir": str(tmp_path),
-            },
-            ["F.Cu", "B.Cu"],
-        )
-        assert len(adaptive_calls) == 1
-        assert preview_meshes == [None, "fake-adaptive-mesh"]
+        for mode in ("auto", "adaptive"):
+            plugin.generate_preview(
+                {
+                    "res": 2.0,
+                    "compute_engine": "fast_native",
+                    "mesh_mode": mode,
+                    "output_dir": str(tmp_path),
+                },
+                ["F.Cu", "B.Cu"],
+            )
+        assert preview_meshes == [None, None]
 
     def test_default_coarsening_matches_legacy_formula(self):
         """Without expert settings, the historic 200k/100k limits apply."""
@@ -1309,7 +1282,6 @@ class TestDynamicHeatsinkPluginWiring:
                 pass
 
         monkeypatch.setattr(plugin_mod, "build_heatsink_model", fake_build_heatsink_model)
-        monkeypatch.setattr(plugin_mod, "restrict_heatsink_model", fake_restrict_heatsink_model)
         monkeypatch.setattr(plugin_mod, "run_simulation_matrix_free", fake_mf_solver)
         monkeypatch.setattr(plugin_mod, "run_simulation", fake_legacy_solver)
         monkeypatch.setattr(plugin_mod.wx, "ProgressDialog", DummyProgressDialog, raising=False)
@@ -1366,22 +1338,20 @@ class TestDynamicHeatsinkPluginWiring:
         )
         return recorded
 
-    def test_heatsink_model_wiring_uniform_adaptive_legacy_and_metadata(self, tmp_path, monkeypatch):
-        # Uniform matrix-free passes full heatsink_model without restricting
+    def test_heatsink_model_wiring_uniform_legacy_and_metadata(self, tmp_path, monkeypatch):
+        # Uniform matrix-free passes full heatsink_model
         rec_uniform = self._run_plugin_with_heatsink(
             tmp_path, monkeypatch, {"compute_engine": "fast_native", "mesh_mode": "uniform"}
         )
         assert len(rec_uniform["build_calls"]) == 1
-        assert rec_uniform["restrict_calls"] == []
         assert rec_uniform["mf_kwargs"][0]["heatsink_model"]["kind"] == "full_heatsink_model"
 
-        # Adaptive matrix-free restricts heatsink_model
-        rec_adaptive = self._run_plugin_with_heatsink(
+        # Legacy mesh_mode='adaptive' also routes through uniform matrix-free with full heatsink_model
+        rec_legacy_mesh = self._run_plugin_with_heatsink(
             tmp_path, monkeypatch, {"compute_engine": "fast_native", "mesh_mode": "adaptive"}
         )
-        assert len(rec_adaptive["build_calls"]) == 1
-        assert len(rec_adaptive["restrict_calls"]) == 1
-        assert rec_adaptive["mf_kwargs"][0]["heatsink_model"]["kind"] == "restricted_heatsink_model"
+        assert len(rec_legacy_mesh["build_calls"]) == 1
+        assert rec_legacy_mesh["mf_kwargs"][0]["heatsink_model"]["kind"] == "full_heatsink_model"
 
         # Legacy sparse path passes full heatsink_model
         rec_legacy = self._run_plugin_with_heatsink(
@@ -1558,73 +1528,6 @@ class TestCompactLowRamPluginWiring:
         assert np.isclose(Q.total_power(), 2.0)
         assert hs_model is not None
         assert hs_model.bottom_layer_only is True
-        assert recorded["op_cache_clears"] == 1
-        assert recorded["scratch_clears"] == 1
-
-    def test_adaptive_fast_native_uses_direct_compact_assembly_and_never_builds_fine_operator(
-        self, tmp_path, monkeypatch
-    ):
-        import ThermalSim.thermal_plugin as plugin_mod
-        from ThermalSim.adaptive_mesh import AdaptiveSparseOperator
-        from ThermalSim.thermal_solver import SolverResult, SparsePowerVector
-
-        plugin, board, pad, settings = self._setup_plugin_env(tmp_path, monkeypatch, with_eco1=True)
-        settings["compute_engine"] = "fast_native"
-        settings["mesh_mode"] = "adaptive"
-
-        recorded = {
-            "compact_adaptive_power": [],
-            "mf_hs": [],
-            "op_cache_clears": 0,
-            "scratch_clears": 0,
-        }
-        orig_compact_adaptive = plugin_mod.build_adaptive_system_compact
-        orig_ad_clear = AdaptiveSparseOperator.clear_caches
-
-        def spy_build_adaptive_compact(*args, **kwargs):
-            recorded["compact_adaptive_power"].append(args[16])
-            return orig_compact_adaptive(*args, **kwargs)
-
-        def spy_ad_clear(self_op):
-            recorded["op_cache_clears"] += 1
-            return orig_ad_clear(self_op)
-
-        def forbid_structured(*args, **kwargs):
-            raise AssertionError("build_structured_operator must not be called in compact adaptive mode")
-
-        def spy_mf_solver(config, op, C, Q, b, hA, *args, **kwargs):
-            recorded["mf_hs"].append(kwargs.get("heatsink_model"))
-            return SolverResult(
-                T=np.full(op.shape[0], 40.0),
-                k_norm_info={},
-                step_counter=1,
-                total_solve_time=0.01,
-                total_factor_time=0.0,
-                factor_count=0,
-            )
-
-        monkeypatch.setattr(plugin_mod, "build_adaptive_system_compact", spy_build_adaptive_compact)
-        monkeypatch.setattr(AdaptiveSparseOperator, "clear_caches", spy_ad_clear)
-        monkeypatch.setattr(plugin_mod, "clear_native_scratch", lambda: recorded.__setitem__("scratch_clears", recorded["scratch_clears"] + 1))
-        monkeypatch.setattr(plugin_mod, "run_simulation_matrix_free", spy_mf_solver)
-        monkeypatch.setattr(plugin_mod, "build_structured_operator", forbid_structured)
-        monkeypatch.setattr(plugin_mod, "_ORIG_BUILD_STRUCTURED_OPERATOR", forbid_structured)
-
-        plugin._run_simulation(
-            board,
-            [F_Cu, B_Cu],
-            ["F.Cu", "B.Cu"],
-            EDA_RECT(0, 0, 10_000_000, 10_000_000),
-            [pad],
-            settings,
-            {},
-            ["U1-1"],
-        )
-
-        assert len(recorded["compact_adaptive_power"]) == 1
-        assert isinstance(recorded["compact_adaptive_power"][0], SparsePowerVector)
-        assert recorded["mf_hs"][0] is not None
-        assert recorded["mf_hs"][0].bottom_layer_only is True
         assert recorded["op_cache_clears"] == 1
         assert recorded["scratch_clears"] == 1
 

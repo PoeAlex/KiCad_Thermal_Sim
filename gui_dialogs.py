@@ -62,21 +62,69 @@ TOOLTIP_TEXTS = {
     'grid_detail': "Compute budget used to preserve the desired cell size on large simulations.",
     'grid_node_budget': (
         "Maximum total solver nodes across all copper layers in Custom mode "
-        "(up to 100 million). Very large values can require tens of GB of RAM."
+        "(up to 100 million). Compact native mode uses ~80-125 MB per 1M nodes."
+    ),
+    'grid_estimate': (
+        "Live estimate of actual grid cell size, total solver nodes across all copper "
+        "layers, expected peak RAM, and relative runtime."
+    ),
+    'area_estimate': (
+        "Active simulation area relative to the full board bounding box. Enable "
+        "'Limit area' to crop around heat sources and current nets."
+    ),
+    'heatsink_summary': (
+        "Derived dynamic 0D heatsink parameters: thermal capacitance C_hs = m * c_p "
+        "and thermal time constant tau = R_th * C_hs."
+    ),
+    'compute_engine': (
+        "Solver engine: Auto uses direct SciPy LU below 50k nodes and Native C++/OpenMP "
+        "Matrix-Free PCG above. 'Fast CPU' forces Matrix-Free; 'Legacy sparse' forces "
+        "direct SciPy LU (high RAM on large grids)."
+    ),
+    'time_stepping': (
+        "Transient BDF2 time-stepping schedule. Auto uses fast 5-phase geometric stepping "
+        "in Matrix-Free mode; Uniform BDF2 uses a constant step size throughout."
     ),
     'grid_expert_limits': "Legacy expert-grid setting; loaded as a Custom compute budget.",
     'grid_max_cells': "Legacy 2D cell threshold retained for settings compatibility.",
     'grid_target_cells': "Legacy coarsening target retained for settings compatibility.",
     'capabilities': "Detected thermal solver engine and math backends.",
     'help': "Open the ThermalSim documentation in your web browser.",
-    'preview': "Generate a geometry preview image without running the simulation.",
+    'more': "Open actions to load/save settings JSON files or view online documentation.",
+    'preview': "Generate a geometry preview image (copper, vias, heatsink, heat sources) without running the solver.",
+    'run': "Start the thermal simulation with the current settings.",
+    'cancel': "Close the ThermalSim dialog without running a simulation.",
+    'open_report': "Open the generated interactive HTML thermal report in your default browser.",
+    'open_folder': "Open the output directory containing heatmaps, snapshots, and report files.",
     'load_settings': "Load simulation settings from a JSON file.",
     'save_settings': "Save the current simulation settings to a JSON file.",
+    'power_add': "Add the pads currently selected in KiCad PCB Editor to the heat-source list.",
+    'power_remove': "Remove the selected rows from the heat-source list.",
+    'power_clear': "Remove all manual heat sources from the list.",
     'current_enable': "Enable DC current-flow simulation for Joule heating in traces and copper pours.",
+    'current_balance': "Per-net current sum check. Every active net must sum to 0 A (Kirchhoff's current law).",
     'current_groups': "Pad groups used as current sources or sinks. Positive current enters the PCB; negative current leaves it.",
+    'current_new_group': "Create a new current group from the pads currently selected in KiCad.",
+    'current_add_pads': "Add the pads currently selected in KiCad to the selected current group.",
+    'current_remove_pads': "Remove the selected pad row from the current group.",
+    'current_duplicate_group': "Duplicate the selected current group and its pads.",
+    'current_delete_group': "Delete the selected current group.",
+    'current_name': "Descriptive label for the selected current group (e.g. VIN_IN, GND_OUT).",
+    'current_apply_name': "Save the edited group name.",
+    'current_mode': (
+        "Choose whether to assign individual currents to each pad ('Per-Pad Currents') "
+        "or split one total current evenly across all pads in the group."
+    ),
     'current_total': "Total current for the selected group. In distribution mode it is split evenly across all pads.",
     'current_per_pad': "Current value applied to selected pad rows in per-pad mode. If no row is selected, it is applied to all pads in the group.",
+    'current_apply_pad': "Apply the 'Selected Pad A' current value to the selected pad row (or all pads if none is selected).",
     'current_pad_list': "Comma-separated per-pad currents in the same order as the pad table, for example: +6, -4, -2.",
+    'current_apply_list': "Apply the comma-separated current values to the pads in this group in table order.",
+    'current_pads_table': "Pads belonging to the selected current group, their nets, layers, and assigned currents.",
+    'board_details': "Expand to inspect the detected PCB layer stackup and initially selected KiCad pads.",
+    'geometry_pane': "Expand to filter traces or crop the simulation area around active heat sources and current nets.",
+    'thermal_pad_pane': "Expand to configure a bottom-layer thermal pad / heatsink boundary (shapes on User.Eco1).",
+    'solver_pane': "Expand to adjust convection, PCB thickness override, compute engine, and transient time stepping.",
 }
 
 
@@ -91,10 +139,10 @@ DEFAULT_GRID_TARGET_CELLS = 100000
 GRID_DETAIL_LABELS = ["Fast", "Balanced", "Detailed", "Very detailed", "Custom"]
 GRID_DETAIL_VALUES = ["fast", "balanced", "detailed", "very_detailed", "custom"]
 GRID_DETAIL_PRESETS = {
-    "fast": (500_000, 425_000),
-    "balanced": (1_200_000, 1_020_000),
-    "detailed": (3_000_000, 2_550_000),
-    "very_detailed": (6_000_000, 5_100_000),
+    "fast": (1_000_000, 850_000),
+    "balanced": (3_000_000, 2_550_000),
+    "detailed": (8_000_000, 6_800_000),
+    "very_detailed": (16_000_000, 13_600_000),
 }
 DEFAULT_GRID_DETAIL = "balanced"
 DEFAULT_GRID_NODE_BUDGET = GRID_DETAIL_PRESETS[DEFAULT_GRID_DETAIL][0]
@@ -541,10 +589,12 @@ class SettingsDialog(wx.Dialog):
         self.lbl_result = wx.StaticText(self.result_panel, label="")
         result_sizer.Add(self.lbl_result, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
         self.btn_open_report = wx.Button(self.result_panel, label="Open Report")
+        self.btn_open_report.SetToolTip(TOOLTIP_TEXTS['open_report'])
         self.btn_open_report.Bind(wx.EVT_BUTTON, self._on_open_report)
         self.btn_open_report.Enable(False)
         result_sizer.Add(self.btn_open_report, 0, wx.RIGHT, 6)
         self.btn_open_folder = wx.Button(self.result_panel, label="Open Folder")
+        self.btn_open_folder.SetToolTip(TOOLTIP_TEXTS['open_folder'])
         self.btn_open_folder.Bind(wx.EVT_BUTTON, self._on_open_folder)
         self.btn_open_folder.Enable(False)
         result_sizer.Add(self.btn_open_folder, 0)
@@ -583,6 +633,7 @@ class SettingsDialog(wx.Dialog):
         footer.AddStretchSpacer()
 
         self.btn_more = wx.Button(self.footer_actions_panel, label="More")
+        self.btn_more.SetToolTip(TOOLTIP_TEXTS['more'])
         self.btn_more.Bind(wx.EVT_BUTTON, self._on_more)
         footer.Add(self.btn_more, 0, wx.ALL, 4)
 
@@ -592,8 +643,10 @@ class SettingsDialog(wx.Dialog):
         footer.Add(self.btn_preview, 0, wx.ALL, 4)
 
         self.btn_run = wx.Button(self.footer_actions_panel, label="Run Simulation")
+        self.btn_run.SetToolTip(TOOLTIP_TEXTS['run'])
         self.btn_run.Bind(wx.EVT_BUTTON, self._on_run)
         self.btn_cancel = wx.Button(self.footer_actions_panel, label="Close")
+        self.btn_cancel.SetToolTip(TOOLTIP_TEXTS['cancel'])
         self.btn_cancel.Bind(wx.EVT_BUTTON, self._on_cancel)
         footer.Add(self.btn_run, 0, wx.ALL, 4)
         footer.Add(self.btn_cancel, 0, wx.ALL, 4)
@@ -649,6 +702,7 @@ class SettingsDialog(wx.Dialog):
 
         # Board detail stays available without dominating the page.
         self.board_details = wx.CollapsiblePane(panel, label="Board details")
+        self.board_details.SetToolTip(TOOLTIP_TEXTS['board_details'])
         details_panel = self.board_details.GetPane()
         details_sizer = wx.BoxSizer(wx.VERTICAL)
         self.txt_stackup = wx.TextCtrl(
@@ -724,6 +778,7 @@ class SettingsDialog(wx.Dialog):
             params_parent,
             label="Estimate will update from the active board and sources.",
         )
+        self.lbl_grid_estimate.SetToolTip(TOOLTIP_TEXTS['grid_estimate'])
         box_params.Add(self.lbl_grid_estimate, 0, wx.EXPAND | wx.ALL, 3)
 
         sizer.Add(box_params, 0, wx.EXPAND | wx.ALL, 5)
@@ -803,12 +858,15 @@ class SettingsDialog(wx.Dialog):
 
         edit_buttons = wx.BoxSizer(wx.HORIZONTAL)
         btn_add = wx.Button(edit_parent, label="Add Selected")
+        btn_add.SetToolTip(TOOLTIP_TEXTS['power_add'])
         btn_add.Bind(wx.EVT_BUTTON, self._on_power_add_selection)
         edit_buttons.Add(btn_add, 0, wx.ALL, 2)
         btn_remove = wx.Button(edit_parent, label="Remove")
+        btn_remove.SetToolTip(TOOLTIP_TEXTS['power_remove'])
         btn_remove.Bind(wx.EVT_BUTTON, self._on_power_remove_pads)
         edit_buttons.Add(btn_remove, 0, wx.ALL, 2)
         btn_clear = wx.Button(edit_parent, label="Clear")
+        btn_clear.SetToolTip(TOOLTIP_TEXTS['power_clear'])
         btn_clear.Bind(wx.EVT_BUTTON, self._on_power_clear_pads)
         edit_buttons.Add(btn_clear, 0, wx.ALL, 2)
         edit_box.Add(edit_buttons, 0, wx.EXPAND | wx.ALL, 3)
@@ -839,6 +897,7 @@ class SettingsDialog(wx.Dialog):
 
         # --- Geometry Filters ---
         self.geometry_pane = wx.CollapsiblePane(panel, label="Geometry")
+        self.geometry_pane.SetToolTip(TOOLTIP_TEXTS['geometry_pane'])
         self.geometry_pane.Expand()
         filter_panel = self.geometry_pane.GetPane()
         box_filter = wx.BoxSizer(wx.VERTICAL)
@@ -865,6 +924,7 @@ class SettingsDialog(wx.Dialog):
         self.lbl_area_estimate = wx.StaticText(
             filter_panel, label="Area: full board"
         )
+        self.lbl_area_estimate.SetToolTip(TOOLTIP_TEXTS['area_estimate'])
         box_filter.Add(self.lbl_area_estimate, 0, wx.EXPAND | wx.ALL, 3)
 
         filter_panel.SetSizer(box_filter)
@@ -872,6 +932,7 @@ class SettingsDialog(wx.Dialog):
 
         # --- Thermal Pad ---
         self.thermal_pad_pane = wx.CollapsiblePane(panel, label="Thermal Pad (User.Eco1)")
+        self.thermal_pad_pane.SetToolTip(TOOLTIP_TEXTS['thermal_pad_pane'])
         pad_panel = self.thermal_pad_pane.GetPane()
         box_pad = wx.BoxSizer(wx.VERTICAL)
 
@@ -979,6 +1040,7 @@ class SettingsDialog(wx.Dialog):
                 ctrl.Bind(focus_event, self._on_heatsink_param_changed)
 
         self.lbl_heatsink_summary = wx.StaticText(pad_panel, label="")
+        self.lbl_heatsink_summary.SetToolTip(TOOLTIP_TEXTS['heatsink_summary'])
         box_pad.Add(self.lbl_heatsink_summary, 0, wx.EXPAND | wx.ALL, 3)
 
         self._thermal_pad_controls = [
@@ -994,6 +1056,7 @@ class SettingsDialog(wx.Dialog):
 
         # --- Solver ---
         self.solver_pane = wx.CollapsiblePane(panel, label="Solver")
+        self.solver_pane.SetToolTip(TOOLTIP_TEXTS['solver_pane'])
         solver_panel = self.solver_pane.GetPane()
         box_solver = wx.BoxSizer(wx.VERTICAL)
 
@@ -1019,26 +1082,9 @@ class SettingsDialog(wx.Dialog):
             choices=["Auto", "Fast CPU (matrix-free)", "Legacy sparse"],
         )
         self.compute_engine_choice.SetSelection(0)
+        self.compute_engine_choice.SetToolTip(TOOLTIP_TEXTS['compute_engine'])
         engine_row.Add(self.compute_engine_choice, 1, wx.EXPAND)
         box_solver.Add(engine_row, 0, wx.EXPAND | wx.ALL, 3)
-
-        mesh_row = wx.BoxSizer(wx.HORIZONTAL)
-        mesh_row.Add(
-            wx.StaticText(solver_panel, label="Spatial mesh", size=(165, -1)),
-            0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5
-        )
-        self.mesh_mode_choice = wx.Choice(
-            solver_panel,
-            choices=["Auto", "Uniform", "Adaptive"],
-        )
-        self.mesh_mode_choice.SetSelection(0)
-        mesh_row.Add(self.mesh_mode_choice, 1, wx.EXPAND)
-        box_solver.Add(mesh_row, 0, wx.EXPAND | wx.ALL, 3)
-
-        self.adaptive_ratio_input = self._add_spin_field(
-            box_solver, solver_panel, "Adaptive max cell ratio", 8,
-            min_val=2, max_val=16, inc=1, digits=0,
-        )
 
         stepping_row = wx.BoxSizer(wx.HORIZONTAL)
         stepping_row.Add(wx.StaticText(solver_panel, label="Time stepping", size=(165, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
@@ -1047,6 +1093,7 @@ class SettingsDialog(wx.Dialog):
             choices=["Auto", "Legacy 3-phase", "2-phase", "Uniform BDF2"],
         )
         self.time_stepping_choice.SetSelection(0)
+        self.time_stepping_choice.SetToolTip(TOOLTIP_TEXTS['time_stepping'])
         stepping_row.Add(self.time_stepping_choice, 1, wx.EXPAND)
         box_solver.Add(stepping_row, 0, wx.EXPAND | wx.ALL, 3)
 
@@ -1093,6 +1140,7 @@ class SettingsDialog(wx.Dialog):
             balance_parent, value="", style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP
         )
         self.current_balance_text.SetMinSize((-1, 48))
+        self.current_balance_text.SetToolTip(TOOLTIP_TEXTS['current_balance'])
         balance_box.Add(self.current_balance_text, 0, wx.EXPAND | wx.ALL, 3)
         sizer.Add(balance_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
@@ -1115,21 +1163,26 @@ class SettingsDialog(wx.Dialog):
 
         group_buttons = wx.BoxSizer(wx.HORIZONTAL)
         btn_new = wx.Button(group_parent, label="New")
+        btn_new.SetToolTip(TOOLTIP_TEXTS['current_new_group'])
         btn_new.Bind(wx.EVT_BUTTON, self._on_current_new_group)
         group_buttons.Add(btn_new, 0, wx.ALL, 2)
         btn_add = wx.Button(group_parent, label="Add")
+        btn_add.SetToolTip(TOOLTIP_TEXTS['current_add_pads'])
         btn_add.Bind(wx.EVT_BUTTON, self._on_current_add_selection)
         group_buttons.Add(btn_add, 0, wx.ALL, 2)
         btn_remove = wx.Button(group_parent, label="Remove")
+        btn_remove.SetToolTip(TOOLTIP_TEXTS['current_remove_pads'])
         btn_remove.Bind(wx.EVT_BUTTON, self._on_current_remove_pads)
         group_buttons.Add(btn_remove, 0, wx.ALL, 2)
         group_box.Add(group_buttons, 0, wx.EXPAND | wx.ALL, 3)
 
         group_more_buttons = wx.BoxSizer(wx.HORIZONTAL)
         btn_duplicate = wx.Button(group_parent, label="Duplicate")
+        btn_duplicate.SetToolTip(TOOLTIP_TEXTS['current_duplicate_group'])
         btn_duplicate.Bind(wx.EVT_BUTTON, self._on_current_duplicate_group)
         group_more_buttons.Add(btn_duplicate, 0, wx.ALL, 2)
         btn_delete = wx.Button(group_parent, label="Delete")
+        btn_delete.SetToolTip(TOOLTIP_TEXTS['current_delete_group'])
         btn_delete.Bind(wx.EVT_BUTTON, self._on_current_delete_group)
         group_more_buttons.Add(btn_delete, 0, wx.ALL, 2)
         group_box.Add(group_more_buttons, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 3)
@@ -1140,8 +1193,10 @@ class SettingsDialog(wx.Dialog):
         row_name = wx.BoxSizer(wx.HORIZONTAL)
         row_name.Add(wx.StaticText(selected_parent, label="Name:", size=(105, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         self.current_name_input = wx.TextCtrl(selected_parent, value="")
+        self.current_name_input.SetToolTip(TOOLTIP_TEXTS['current_name'])
         row_name.Add(self.current_name_input, 1, wx.EXPAND | wx.RIGHT, 5)
         btn_apply_name = wx.Button(selected_parent, label="Apply")
+        btn_apply_name.SetToolTip(TOOLTIP_TEXTS['current_apply_name'])
         btn_apply_name.Bind(wx.EVT_BUTTON, self._on_current_apply_group_fields)
         row_name.Add(btn_apply_name, 0)
         edit_box.Add(row_name, 0, wx.EXPAND | wx.ALL, 2)
@@ -1153,6 +1208,7 @@ class SettingsDialog(wx.Dialog):
             choices=["Per-Pad Currents", "Distribute Total Current"]
         )
         self.current_mode_choice.SetSelection(0)
+        self.current_mode_choice.SetToolTip(TOOLTIP_TEXTS['current_mode'])
         self.current_mode_choice.Bind(wx.EVT_CHOICE, self._on_current_mode_changed)
         row_mode.Add(self.current_mode_choice, 1, wx.EXPAND)
         edit_box.Add(row_mode, 0, wx.EXPAND | wx.ALL, 2)
@@ -1173,6 +1229,7 @@ class SettingsDialog(wx.Dialog):
         self.current_pad_value_input.SetToolTip(TOOLTIP_TEXTS['current_per_pad'])
         row_pad_current.Add(self.current_pad_value_input, 1, wx.EXPAND | wx.RIGHT, 5)
         btn_set_pad_current = wx.Button(selected_parent, label="Apply to Selected")
+        btn_set_pad_current.SetToolTip(TOOLTIP_TEXTS['current_apply_pad'])
         btn_set_pad_current.Bind(wx.EVT_BUTTON, self._on_current_apply_pad_current)
         row_pad_current.Add(btn_set_pad_current, 0)
         edit_box.Add(row_pad_current, 0, wx.EXPAND | wx.ALL, 2)
@@ -1184,6 +1241,7 @@ class SettingsDialog(wx.Dialog):
         self.current_pad_list_input.SetToolTip(TOOLTIP_TEXTS['current_pad_list'])
         row_pad_list.Add(self.current_pad_list_input, 1, wx.EXPAND | wx.RIGHT, 5)
         btn_apply_list = wx.Button(selected_parent, label="Apply List")
+        btn_apply_list.SetToolTip(TOOLTIP_TEXTS['current_apply_list'])
         btn_apply_list.Bind(wx.EVT_BUTTON, self._on_current_apply_pad_current_list)
         row_pad_list.Add(btn_apply_list, 0)
         edit_box.Add(row_pad_list, 0, wx.EXPAND | wx.ALL, 2)
@@ -1198,6 +1256,7 @@ class SettingsDialog(wx.Dialog):
         ]):
             self.current_pad_list.InsertColumn(idx, title, width=width)
         self.current_pad_list.SetMinSize((-1, 130))
+        self.current_pad_list.SetToolTip(TOOLTIP_TEXTS['current_pads_table'])
         edit_box.Add(self.current_pad_list, 1, wx.EXPAND | wx.ALL, 3)
         current_content.Add(edit_box, 1, wx.EXPAND)
         sizer.Add(current_content, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
@@ -2327,8 +2386,6 @@ class SettingsDialog(wx.Dialog):
         - grid_detail_level : str
         - grid_node_budget : int
         - compute_engine : str
-        - mesh_mode : str
-        - adaptive_max_cell_ratio : int
         """
         try:
             self._sync_current_group_from_fields()
@@ -2371,13 +2428,6 @@ class SettingsDialog(wx.Dialog):
             compute_engine = (
                 engine_modes[engine_idx]
                 if 0 <= engine_idx < len(engine_modes)
-                else "auto"
-            )
-            mesh_modes = ["auto", "uniform", "adaptive"]
-            mesh_idx = self.mesh_mode_choice.GetSelection()
-            mesh_mode = (
-                mesh_modes[mesh_idx]
-                if 0 <= mesh_idx < len(mesh_modes)
                 else "auto"
             )
             mat_key, preset_cp = self._selected_heatsink_material()
@@ -2428,8 +2478,7 @@ class SettingsDialog(wx.Dialog):
                 'grid_detail_level': grid_detail_level,
                 'grid_node_budget': grid_node_budget,
                 'compute_engine': compute_engine,
-                'mesh_mode': mesh_mode,
-                'adaptive_max_cell_ratio': int(self.adaptive_ratio_input.GetValue()),
+                'mesh_mode': 'uniform',
                 'time_stepping': time_stepping,
                 'current_enabled': self.chk_current_enabled.GetValue(),
                 'current_groups': current_groups,
@@ -2546,14 +2595,6 @@ class SettingsDialog(wx.Dialog):
             }.get(compute_engine, 0)
             self.compute_engine_choice.SetSelection(compute_engine_idx)
 
-            mesh_mode = str(defaults.get('mesh_mode', 'auto') or 'auto').lower()
-            mesh_mode_idx = {'auto': 0, 'uniform': 1, 'adaptive': 2}.get(mesh_mode, 0)
-            self.mesh_mode_choice.SetSelection(mesh_mode_idx)
-            if 'adaptive_max_cell_ratio' in defaults:
-                self.adaptive_ratio_input.SetValue(
-                    min(16, max(2, int(defaults['adaptive_max_cell_ratio'])))
-                )
-
             stepping = str(defaults.get('time_stepping', 'auto')).lower()
             stepping_idx = {'auto': 0, 'multi_phase': 1, 'two_phase': 2, 'uniform': 3}.get(stepping, 0)
             self.time_stepping_choice.SetSelection(stepping_idx)
@@ -2596,7 +2637,6 @@ class SettingsDialog(wx.Dialog):
                 self.thermal_pad_pane.Expand()
             if (
                 str(defaults.get('compute_engine', 'auto') or 'auto').lower() != 'auto'
-                or str(defaults.get('mesh_mode', 'auto') or 'auto').lower() != 'auto'
                 or str(defaults.get('time_stepping', 'auto') or 'auto').lower() != 'auto'
                 or float(defaults.get('h_conv', 10.0)) != 10.0
                 or float(defaults.get('thick', 1.6)) != 1.6

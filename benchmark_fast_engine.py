@@ -29,9 +29,9 @@ except ImportError:
 
 import numpy as np
 
-from KiCad_Thermal_Sim.adaptive_mesh import build_adaptive_mesh, build_adaptive_system
 from KiCad_Thermal_Sim.thermal_solver import (
     SolverConfig,
+    build_compact_structured_operator,
     build_stiffness_matrix,
     build_structured_operator,
     run_simulation,
@@ -165,43 +165,41 @@ def benchmark(args):
     source_indices = np.flatnonzero(source_mask.reshape(-1))
     power[source_indices] = 10.0 / max(source_indices.size, 1)
 
-    mesh, mesh_s = _timed(
-        build_adaptive_mesh,
+    compact_op, compact_s = _timed(
+        build_compact_structured_operator,
+        layers,
+        rows,
+        cols,
         copper,
+        t_cu,
+        t_fr4,
+        400.0,
+        0.3,
+        dx,
+        dy,
         via_map,
+        gap_m,
         heatsink,
-        source_mask,
-        args.max_cell_ratio,
+        settings,
+        25.0,
     )
-    adaptive, reduction_s = _timed(
-        build_adaptive_system,
-        structured,
-        capacity,
-        power,
-        boundary,
-        h_area,
-        mesh,
-    )
-    memory_adaptive = _working_set_bytes()
+    memory_compact = _working_set_bytes()
 
     result = {
         "grid": {
             "rows": rows,
             "cols": cols,
             "layers": layers,
-            "equivalent_uniform_nodes": node_count,
-            "adaptive_nodes": adaptive.operator.shape[0],
-            "reduction_ratio": node_count / adaptive.operator.shape[0],
+            "nodes": node_count,
         },
         "timings": {
             "structured_operator_s": structured_s,
-            "adaptive_mesh_s": mesh_s,
-            "adaptive_operator_s": reduction_s,
+            "compact_operator_s": compact_s,
         },
         "memory_mb": {
             "start": memory_start / 1024 ** 2 if memory_start else None,
             "structured": memory_structured / 1024 ** 2 if memory_structured else None,
-            "adaptive": memory_adaptive / 1024 ** 2 if memory_adaptive else None,
+            "compact": memory_compact / 1024 ** 2 if memory_compact else None,
         },
     }
 
@@ -217,13 +215,13 @@ def benchmark(args):
         solved, solve_s = _timed(
             run_simulation_matrix_free,
             config,
-            adaptive.operator,
-            adaptive.capacity,
-            adaptive.power,
-            adaptive.boundary_rhs,
-            adaptive.h_area,
+            compact_op,
+            None,
+            power,
+            None,
+            None,
         )
-        result["timings"]["adaptive_solver_s"] = solve_s
+        result["timings"]["compact_solver_s"] = solve_s
         result["solver"] = {
             "steps": solved.step_counter,
             "avg_pcg_iterations": solved.k_norm_info["avg_pcg_iterations"],

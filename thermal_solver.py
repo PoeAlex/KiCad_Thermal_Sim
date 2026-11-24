@@ -3297,7 +3297,7 @@ def run_steady_state_matrix_free(
     cancel_check: Optional[Callable[[], bool]] = None,
     heatsink_model: Optional[HeatsinkModel] = None,
 ) -> SolverResult:
-    """Solve ``K * T = Q + b`` directly using a matrix-free or adaptive operator."""
+    """Solve ``K * T = Q + b`` directly using a matrix-free operator."""
     layer_count = operator.layer_count
     rows = operator.rows
     cols = operator.cols
@@ -3313,12 +3313,7 @@ def run_steady_state_matrix_free(
         if hs_active
         else float(amb)
     )
-    if bool(getattr(operator, "prefer_derivative_start", False)):
-        backend_name = "Adaptive-Multigrid-PCG"
-    elif HAS_NATIVE_CORE:
-        backend_name = "Native-MatrixFree-PCG"
-    else:
-        backend_name = "MatrixFree-PCG"
+    backend_name = "Native-MatrixFree-PCG" if HAS_NATIVE_CORE else "MatrixFree-PCG"
 
     if cancel_check and cancel_check():
         T_abort = np.full((layer_count, rows, cols), amb, dtype=np.float64)
@@ -3706,12 +3701,7 @@ def run_simulation_matrix_free(
     pin = _power_sum(source)
     next_snapshot_idx = 0
     snapshot_number = 1
-    if bool(getattr(operator, "prefer_derivative_start", False)):
-        backend_name = "Adaptive-Multigrid-PCG"
-    elif HAS_NATIVE_CORE:
-        backend_name = "Native-MatrixFree-PCG"
-    else:
-        backend_name = "MatrixFree-PCG"
+    backend_name = "Native-MatrixFree-PCG" if HAS_NATIVE_CORE else "MatrixFree-PCG"
 
     if (
         config.time_stepping in ("auto", "geometric")

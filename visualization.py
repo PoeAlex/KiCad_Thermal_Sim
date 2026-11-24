@@ -719,30 +719,6 @@ def save_preview_image(
             copper_disp = (_downsample_layer_block_max(copper_mask, stride) > 0) if stride > 1 else copper_mask
             ax.imshow(copper_disp, cmap='Greens', origin='upper', interpolation='none', alpha=0.35, extent=extent)
 
-            if adaptive_mesh is not None:
-                leaf_sizes = np.maximum(
-                    adaptive_mesh.leaves[:, 1] - adaptive_mesh.leaves[:, 0],
-                    adaptive_mesh.leaves[:, 3] - adaptive_mesh.leaves[:, 2],
-                ).astype(np.uint8)
-                cell_sizes = leaf_sizes[adaptive_mesh.leaf_map]
-                if stride > 1:
-                    raw_ref = np.where(cell_sizes <= 1, 0.0, adaptive_mesh.max_cell_ratio - cell_sizes + 1)
-                    ref_disp = _downsample_layer_block_max(raw_ref, stride)
-                    refinement = np.ma.masked_where(ref_disp <= 0, ref_disp)
-                else:
-                    refinement = np.ma.masked_where(
-                        cell_sizes <= 1,
-                        adaptive_mesh.max_cell_ratio - cell_sizes + 1,
-                    )
-                ax.imshow(
-                    refinement,
-                    cmap='Purples',
-                    origin='upper',
-                    interpolation='none',
-                    alpha=0.16,
-                    extent=extent,
-                )
-
             # Heatsink overlay (board-level)
             if settings.get('use_heatsink'):
                 is_bottom = (i == count - 1) or (name == "B.Cu")

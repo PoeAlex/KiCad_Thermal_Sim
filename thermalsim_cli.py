@@ -328,7 +328,7 @@ def _add_common_job_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--mesh",
         choices=["auto", "uniform", "adaptive"],
-        help="Spatial mesh mode.",
+        help="Deprecated compatibility flag (ThermalSim v0.4.7+ always uses uniform meshing).",
     )
     parser.add_argument(
         "--engine",

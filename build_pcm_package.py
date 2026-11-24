@@ -17,7 +17,7 @@ import os
 import sys
 import zipfile
 
-VERSION = "0.4.6"
+VERSION = "0.4.7"
 
 IDENTIFIER = "com.github.poealex.kicad-thermal-sim"
 
@@ -34,7 +34,6 @@ PLUGIN_FILES = [
     "stackup_parser.py",
     "gui_dialogs.py",
     "geometry_mapper.py",
-    "adaptive_mesh.py",
     "electrical_solver.py",
     "thermal_solver.py",
     "visualization.py",
@@ -88,7 +87,7 @@ def build_metadata(version):
             "- Automatic stackup detection from board file\n"
             "- Multi-layer heat spreading with via coupling\n"
             "- DC current-flow Joule heating in traces, vias, and zones\n"
-            "- Auto, Uniform, and Adaptive spatial meshing up to 100M nodes\n"
+            "- High-resolution uniform meshing up to 100M nodes\n"
             "- Piecewise-linear (PWL) time-varying power profiles\n"
             "- Heatsink/thermal-pad support (User.Eco1 layer) with fixed sink "
             "or dynamic 0D heatsink (R_th + thermal mass)\n"

@@ -121,7 +121,7 @@ def test_current_zone_covering_board_reports_little_area_saving():
 
 
 def test_balanced_detail_budget_is_layer_aware():
-    """Four layers should map the Balanced node budget (1.2M / 1.02M) across layers."""
+    """Four layers should map the Balanced node budget (3.0M / 2.55M) across layers."""
     _, _, expert, max_cells, target_cells = _coarsen_grid_resolution(
         300.0,
         75.0,
@@ -131,8 +131,8 @@ def test_balanced_detail_budget_is_layer_aware():
     )
 
     assert expert is False
-    assert max_cells == 300_000
-    assert target_cells == 255_000
+    assert max_cells == 750_000
+    assert target_cells == 637_500
 
 
 def test_geometry_cache_key_ignores_non_geometry_settings():

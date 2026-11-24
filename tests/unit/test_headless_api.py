@@ -128,7 +128,7 @@ class TestHeadlessIsolationAndJson:
 
     def test_constants(self):
         assert headless_api.SCHEMA_VERSION == "1.0"
-        assert headless_api.PLUGIN_VERSION == "0.4.6"
+        assert headless_api.PLUGIN_VERSION == "0.4.7"
 
     def test_no_wx_or_gui_imports_in_ast(self):
         for mod in (headless_api, simulation_core):
@@ -575,7 +575,7 @@ class TestRunAndSweepAndCompare:
         assert res["heatsink"]["temp_c"] > 25.0
         assert res["heatsink"]["tau_s"] > 0.0
 
-    def test_run_adaptive_mesh_fast_engine(self, sample_2layer_board_file):
+    def test_run_legacy_adaptive_mesh_option_resolves_to_uniform(self, sample_2layer_board_file):
         board = _make_board(sample_2layer_board_file, with_eco1=True)
         res = headless_api.run_headless_simulation(
             board,
@@ -590,8 +590,7 @@ class TestRunAndSweepAndCompare:
             generate_html=False,
         )
         assert res["status"] == "ok"
-        assert res["solver"]["mesh_mode"] == "adaptive"
-        assert res["solver"]["adaptive_nodes"] <= res["solver"]["nodes"]
+        assert res["solver"]["mesh_mode"] == "uniform"
         assert res["temperatures"]["max_c"] > 25.0
 
     def test_run_refills_zones_when_requested(self, sample_2layer_board_file, monkeypatch):
@@ -986,14 +985,15 @@ class TestPadAlignmentAndBottomLayerRegression:
         import ThermalSim.thermal_plugin as plugin_mod
 
         cases = [
-            (True, True, 6_000_000, {"compute_engine": "auto", "mesh_mode": "uniform"}, (570, 870, "Slow")),
-            (True, True, 6_000_000, {"compute_engine": "auto", "mesh_mode": "adaptive"}, (390, 690, "Slow")),
-            (True, True, 6_000_000, {"compute_engine": "auto", "mesh_mode": "auto"}, (390, 690, "Slow")),
-            (True, True, 500_000, {"compute_engine": "auto", "mesh_mode": "auto"}, (48, 73, "Fast")),
-            (True, True, 3_000_000, {"compute_engine": "auto", "mesh_mode": "auto"}, (285, 435, "Moderate")),
-            (True, True, 10_500_000, {"compute_engine": "auto", "mesh_mode": "adaptive"}, (683, 1208, "Very slow")),
+            (True, True, 6_000_000, {"compute_engine": "auto", "mesh_mode": "uniform"}, (480, 750, "Moderate")),
+            (True, True, 6_000_000, {"compute_engine": "auto", "mesh_mode": "adaptive"}, (480, 750, "Moderate")),
+            (True, True, 6_000_000, {"compute_engine": "auto", "mesh_mode": "auto"}, (480, 750, "Moderate")),
+            (True, True, 1_000_000, {"compute_engine": "auto", "mesh_mode": "auto"}, (80, 125, "Fast")),
+            (True, True, 3_000_000, {"compute_engine": "auto", "mesh_mode": "auto"}, (240, 375, "Moderate")),
+            (True, True, 10_500_000, {"compute_engine": "auto", "mesh_mode": "uniform"}, (840, 1313, "Slow")),
+            (True, True, 25_600_000, {"compute_engine": "auto", "mesh_mode": "uniform"}, (2048, 3200, "Very slow")),
             (True, False, 6_000_000, {"compute_engine": "auto", "mesh_mode": "uniform"}, (780, 1320, "Slow")),
-            (False, False, 6_000_000, {"compute_engine": "fast_native", "mesh_mode": "adaptive"}, (660, 1140, "Slow")),
+            (False, False, 6_000_000, {"compute_engine": "fast_native", "mesh_mode": "uniform"}, (660, 1140, "Slow")),
             (True, True, 40_000, {"compute_engine": "auto"}, (14, 48, "Fast")),
         ]
         for has_mg, has_compact, nodes, settings, expected in cases:

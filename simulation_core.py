@@ -33,10 +33,10 @@ from .thermal_solver import (
 from .workflow import AreaEstimate, GridEstimate
 
 GRID_DETAIL_PRESETS: Dict[str, Tuple[int, int]] = {
-    "fast": (500_000, 425_000),
-    "balanced": (1_200_000, 1_020_000),
-    "detailed": (3_000_000, 2_550_000),
-    "very_detailed": (6_000_000, 5_100_000),
+    "fast": (1_000_000, 850_000),
+    "balanced": (3_000_000, 2_550_000),
+    "detailed": (8_000_000, 6_800_000),
+    "very_detailed": (16_000_000, 13_600_000),
 }
 DEFAULT_GRID_DETAIL = "balanced"
 DEFAULT_GRID_NODE_BUDGET = GRID_DETAIL_PRESETS[DEFAULT_GRID_DETAIL][0]
@@ -65,16 +65,9 @@ def resolve_mesh_mode(
     *,
     has_native_mg: Optional[bool] = None,
 ) -> str:
-    """Resolve user mesh_mode ('auto', 'uniform', 'adaptive') to 'uniform' or 'adaptive'."""
-    if not use_fast_engine:
-        return "uniform"
-    mg_enabled = HAS_NATIVE_MG if has_native_mg is None else bool(has_native_mg)
-    mesh_mode = str(settings.get("mesh_mode", "auto") or "auto").strip().lower()
-    if mesh_mode not in {"auto", "uniform", "adaptive"}:
-        mesh_mode = "auto"
-    if mesh_mode == "auto":
-        return "uniform" if (mg_enabled and int(node_count) <= 5_000_000) else "adaptive"
-    return mesh_mode
+    """Return the active spatial mesh mode (always ``'uniform'`` since v0.4.7)."""
+    _ = (settings, use_fast_engine, node_count, has_native_mg)
+    return "uniform"
 
 
 def resolve_grid_limits(settings: Dict[str, Any]) -> Tuple[bool, int, int]:
@@ -167,29 +160,27 @@ def estimate_solver_cost(
         compute_engine == "fast_native"
         or (compute_engine == "auto" and nodes >= auto_fast_engine_threshold(mg_enabled))
     )
-    mesh_mode = resolve_mesh_mode(
-        settings, fast_engine, nodes, has_native_mg=mg_enabled
-    )
+    def _ceil_mb(mb_per_million: int) -> int:
+        return (nodes * mb_per_million + 999_999) // 1_000_000
+
     if fast_engine:
         if compact_enabled and mg_enabled:
-            if mesh_mode == "adaptive":
-                memory_low = int(math.ceil(nodes * 0.000065))
-                memory_high = int(math.ceil(nodes * 0.000115))
-            else:
-                memory_low = int(math.ceil(nodes * 0.000095))
-                memory_high = int(math.ceil(nodes * 0.000145))
-            thresholds = (1_200_000, 4_000_000, 10_000_000)
+            # Calibrated against real-world measurements (6M -> ~0.5-0.75 GB,
+            # 25.6M -> ~2.0 GB solver RSS on Windows/Linux).
+            memory_low = _ceil_mb(80)
+            memory_high = _ceil_mb(125)
+            thresholds = (2_000_000, 8_000_000, 20_000_000)
         elif mg_enabled:
-            memory_low = int(math.ceil(nodes * 0.00013))
-            memory_high = int(math.ceil(nodes * 0.00022))
+            memory_low = _ceil_mb(130)
+            memory_high = _ceil_mb(220)
             thresholds = (800_000, 3_000_000, 8_000_000)
         else:
-            memory_low = int(math.ceil(nodes * 0.00011))
-            memory_high = int(math.ceil(nodes * 0.00019))
+            memory_low = _ceil_mb(110)
+            memory_high = _ceil_mb(190)
             thresholds = (500_000, 2_000_000, 7_000_000)
     else:
-        memory_low = int(math.ceil(nodes * 0.00035))
-        memory_high = int(math.ceil(nodes * 0.00120))
+        memory_low = _ceil_mb(350)
+        memory_high = _ceil_mb(1200)
         thresholds = (150_000, 500_000, 1_000_000)
 
     if nodes < thresholds[0]:

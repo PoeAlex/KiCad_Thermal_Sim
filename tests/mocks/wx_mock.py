@@ -15,9 +15,13 @@ class _WxAdvMock:
         def __init__(self, parent, id=-1, label="", url="", **kwargs):
             self.label = label
             self.url = url
+            self._tooltip = ""
 
         def SetToolTip(self, tip):
-            pass
+            self._tooltip = str(tip or "")
+
+        def GetToolTipText(self):
+            return self._tooltip
 
 
 class _WxMock:
@@ -44,6 +48,7 @@ class _WxMock:
         def __init__(self, *args, **kwargs):
             self._size = (-1, -1)
             self._min_size = (-1, -1)
+            self._tooltip = ""
 
         def ShowModal(self):
             return _WxMock.ID_OK
@@ -91,17 +96,24 @@ class _WxMock:
             pass
 
         def SetToolTip(self, tip):
-            pass
+            self._tooltip = str(tip or "")
+
+        def GetToolTipText(self):
+            return self._tooltip
 
     class Panel:
         def __init__(self, parent, **kwargs):
             self._shown = True
+            self._tooltip = ""
 
         def SetSizer(self, sizer):
             pass
 
         def SetToolTip(self, tip):
-            pass
+            self._tooltip = str(tip or "")
+
+        def GetToolTipText(self):
+            return self._tooltip
 
         def Show(self, show=True):
             self._shown = bool(show)
@@ -115,12 +127,16 @@ class _WxMock:
     class Notebook:
         def __init__(self, parent, **kwargs):
             self._pages = []
+            self._tooltip = ""
 
         def AddPage(self, page, caption):
             self._pages.append((page, caption))
 
         def SetToolTip(self, tip):
-            pass
+            self._tooltip = str(tip or "")
+
+        def GetToolTipText(self):
+            return self._tooltip
 
     class BoxSizer:
         VERTICAL = 1
@@ -154,7 +170,10 @@ class _WxMock:
             self._tooltip = ""
 
         def SetToolTip(self, tip):
-            self._tooltip = str(tip)
+            self._tooltip = str(tip or "")
+
+        def GetToolTipText(self):
+            return self._tooltip
 
         def SetLabel(self, label):
             self.label = label
@@ -173,14 +192,18 @@ class _WxMock:
 
     class StaticLine:
         def __init__(self, parent, **kwargs):
-            pass
+            self._tooltip = ""
 
         def SetToolTip(self, tip):
-            pass
+            self._tooltip = str(tip or "")
+
+        def GetToolTipText(self):
+            return self._tooltip
 
     class TextCtrl:
         def __init__(self, parent, value="", style=0, **kwargs):
             self._value = value
+            self._tooltip = ""
 
         def GetValue(self):
             return self._value
@@ -198,10 +221,10 @@ class _WxMock:
             pass
 
         def SetToolTip(self, tip):
-            pass
+            self._tooltip = str(tip or "")
 
-        def SetMinSize(self, size):
-            pass
+        def GetToolTipText(self):
+            return self._tooltip
 
         def Bind(self, event, handler):
             pass
@@ -210,6 +233,7 @@ class _WxMock:
         def __init__(self, parent, choices=None, **kwargs):
             self._choices = list(choices or [])
             self._selection = 0 if self._choices else -1
+            self._tooltip = ""
 
         def SetSelection(self, selection):
             self._selection = int(selection)
@@ -223,7 +247,10 @@ class _WxMock:
             return ""
 
         def SetToolTip(self, tip):
-            pass
+            self._tooltip = str(tip or "")
+
+        def GetToolTipText(self):
+            return self._tooltip
 
         def Bind(self, event, handler):
             pass
@@ -233,6 +260,7 @@ class _WxMock:
             self._columns = []
             self._items = []
             self._selected = []
+            self._tooltip = ""
 
         def InsertColumn(self, idx, heading, width=-1):
             if idx >= len(self._columns):
@@ -276,7 +304,10 @@ class _WxMock:
             pass
 
         def SetToolTip(self, tip):
-            pass
+            self._tooltip = str(tip or "")
+
+        def GetToolTipText(self):
+            return self._tooltip
 
         def SetMinSize(self, size):
             pass
@@ -288,6 +319,7 @@ class _WxMock:
             self._min = min
             self._max = max
             self._enabled = True
+            self._tooltip = ""
 
         def GetValue(self):
             return self._value
@@ -305,7 +337,10 @@ class _WxMock:
             return self._enabled
 
         def SetToolTip(self, tip):
-            pass
+            self._tooltip = str(tip or "")
+
+        def GetToolTipText(self):
+            return self._tooltip
 
         def SetMinSize(self, size):
             pass
@@ -320,6 +355,7 @@ class _WxMock:
             self._min = min
             self._max = max
             self._enabled = True
+            self._tooltip = ""
 
         def GetValue(self):
             return self._value
@@ -334,7 +370,10 @@ class _WxMock:
             return self._enabled
 
         def SetToolTip(self, tip):
-            pass
+            self._tooltip = str(tip or "")
+
+        def GetToolTipText(self):
+            return self._tooltip
 
         def SetMinSize(self, size):
             pass
@@ -347,6 +386,7 @@ class _WxMock:
             self._value = False
             self._enabled = True
             self.label = label
+            self._tooltip = ""
 
         def GetValue(self):
             return self._value
@@ -364,7 +404,10 @@ class _WxMock:
             pass
 
         def SetToolTip(self, tip):
-            pass
+            self._tooltip = str(tip or "")
+
+        def GetToolTipText(self):
+            return self._tooltip
 
     class Button:
         def __init__(self, parent, id=None, label=""):
@@ -372,12 +415,16 @@ class _WxMock:
             self.label = label
             self._enabled = True
             self._is_default = False
+            self._tooltip = ""
 
         def Bind(self, event, handler):
             pass
 
         def SetToolTip(self, tip):
-            pass
+            self._tooltip = str(tip or "")
+
+        def GetToolTipText(self):
+            return self._tooltip
 
         def Enable(self, enable=True):
             self._enabled = enable
@@ -396,6 +443,13 @@ class _WxMock:
             self.label = label
             self._expanded = False
             self._pane = _WxMock.Panel(parent)
+            self._tooltip = ""
+
+        def SetToolTip(self, tip):
+            self._tooltip = str(tip or "")
+
+        def GetToolTipText(self):
+            return self._tooltip
 
         def GetPane(self):
             return self._pane

@@ -196,16 +196,9 @@ def _build_summary_metrics(settings, interactive_heatmap, k_norm_info, snapshot_
             res_detail += f"; simulation area: {float(area_fraction) * 100.0:.0f}% of board"
         except Exception:
             pass
-    mesh_mode = str((k_norm_info or {}).get("mesh_mode", "uniform") or "uniform")
-    adaptive_nodes = (k_norm_info or {}).get("adaptive_nodes")
-    uniform_nodes = (k_norm_info or {}).get("equivalent_uniform_nodes")
-    reduction = (k_norm_info or {}).get("mesh_reduction_ratio")
-    mesh_value = mesh_mode.title()
-    mesh_detail = None
-    if adaptive_nodes is not None and uniform_nodes is not None:
-        mesh_detail = f"{int(adaptive_nodes):,} / {int(uniform_nodes):,} nodes"
-        if reduction is not None:
-            mesh_detail += f"; {float(reduction):.1f}x reduction"
+    uniform_nodes = (k_norm_info or {}).get("equivalent_uniform_nodes") or (k_norm_info or {}).get("N")
+    mesh_value = "Uniform"
+    mesh_detail = f"{int(uniform_nodes):,} nodes" if uniform_nodes is not None else None
     metrics = [
         ("Duration", f"{float(settings.get('time', 0.0)):.2f} s" if "time" in settings else "n/a", None),
         ("Ambient", f"{float(settings.get('amb', 0.0)):.2f} C" if "amb" in settings else "n/a", None),

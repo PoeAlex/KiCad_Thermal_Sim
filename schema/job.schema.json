@@ -96,7 +96,7 @@
       "type": "string",
       "enum": ["fast", "balanced", "detailed", "very_detailed", "custom"],
       "default": "balanced",
-      "description": "Total solver node budget preset: fast (500k), balanced (1.2M), detailed (3M), very_detailed (6M), or custom."
+      "description": "Total solver node budget preset: fast (1M), balanced (3M), detailed (8M), very_detailed (16M), or custom."
     },
     "grid_node_budget": {
       "type": "integer",
@@ -107,8 +107,8 @@
     "mesh_mode": {
       "type": "string",
       "enum": ["auto", "uniform", "adaptive"],
-      "default": "auto",
-      "description": "Spatial mesh mode. 'auto' uses uniform native multigrid up to 5M nodes and adaptive above 5M or without native MG."
+      "default": "uniform",
+      "description": "Deprecated compatibility field; ThermalSim v0.4.7+ always uses compact uniform meshing."
     },
     "compute_engine": {
       "type": "string",
@@ -121,7 +121,7 @@
       "minimum": 1,
       "maximum": 16,
       "default": 8,
-      "description": "Maximum coarse-to-fine cell ratio in adaptive mesh mode."
+      "description": "Deprecated compatibility field ignored since v0.4.7."
     },
     "time_stepping": {
       "type": "string",

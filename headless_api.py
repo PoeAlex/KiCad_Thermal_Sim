@@ -22,16 +22,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pcbnew
 
-from .adaptive_mesh import (
-    build_adaptive_mesh,
-    build_adaptive_system,
-    restrict_heatsink_model,
-)
-try:
-    from .adaptive_mesh import build_adaptive_system_compact
-except ImportError:  # pragma: no cover - optional in older builds
-    build_adaptive_system_compact = None
-
 from .capabilities import (
     HAS_MATPLOTLIB,
     HAS_NATIVE_COMPACT,
@@ -116,7 +106,7 @@ from .simulation_core import (
 )
 
 SCHEMA_VERSION = "1.0"
-PLUGIN_VERSION = "0.4.6"
+PLUGIN_VERSION = "0.4.7"
 
 SUPPORTED_SWEEP_PARAMS = frozenset({
     "heatsink_rth_kw",
@@ -855,15 +845,13 @@ def normalize_job_config(
     else:
         grid_node_budget = DEFAULT_GRID_NODE_BUDGET
 
-    mesh_mode = str(raw.get("mesh_mode") or "auto").strip().lower()
-    if mesh_mode not in {"auto", "uniform", "adaptive"}:
-        mesh_mode = "auto"
+    # Spatial mesh is always uniform since v0.4.7; accept legacy keys silently.
+    mesh_mode = "uniform"
 
     compute_engine = str(raw.get("compute_engine") or "auto").strip().lower()
     if compute_engine not in {"auto", "fast_native", "legacy"}:
         compute_engine = "auto"
 
-    adaptive_max_cell_ratio = max(1, min(16, int(raw.get("adaptive_max_cell_ratio") or 8)))
     time_stepping = str(raw.get("time_stepping") or "auto").strip().lower()
     if time_stepping not in {"auto", "multi_phase", "two_phase", "uniform"}:
         time_stepping = "auto"
@@ -953,7 +941,6 @@ def normalize_job_config(
         "grid_node_budget": grid_node_budget,
         "mesh_mode": mesh_mode,
         "compute_engine": compute_engine,
-        "adaptive_max_cell_ratio": adaptive_max_cell_ratio,
         "time_stepping": time_stepping,
         "limit_area": bool(limit_area),
         "pad_dist_mm": pad_dist_mm,
@@ -2120,21 +2107,13 @@ def run_headless_simulation(
         or (engine_setting == "auto" and grid.nodes >= _auto_fast_engine_threshold())
     )
     resolved_engine = "fast_native" if use_fast_engine else "legacy"
-    mesh_mode = _resolve_mesh_mode(settings, use_fast_engine, grid.nodes)
 
     use_compact_uniform = (
         use_fast_engine
-        and mesh_mode != "adaptive"
         and build_compact_structured_operator is not None
         and build_structured_operator is _ORIG_BUILD_STRUCTURED_OPERATOR
     )
-    use_compact_adaptive = (
-        use_fast_engine
-        and mesh_mode == "adaptive"
-        and build_adaptive_system_compact is not None
-        and build_structured_operator is _ORIG_BUILD_STRUCTURED_OPERATOR
-    )
-    use_compact_path = use_compact_uniform or use_compact_adaptive
+    use_compact_path = use_compact_uniform
 
     pad_cap_areal = float(settings.get("pad_cap_areal", 0.0) or 0.0)
     C = None
@@ -2235,7 +2214,6 @@ def run_headless_simulation(
     K_matrix = None
     b = None
     hA = None
-    adaptive_system = None
     try:
         if use_compact_uniform:
             K_matrix = build_compact_structured_operator(
@@ -2260,7 +2238,7 @@ def run_headless_simulation(
                 cp_fr4=cp_fr4,
                 pad_cap_areal=pad_cap_areal,
             )
-        elif not use_compact_adaptive:
+        else:
             H_map_float = H_map.astype(np.float64, copy=False)
             builder = build_structured_operator if use_fast_engine else build_stiffness_matrix
             K_matrix, b, hA, _ = builder(
@@ -2281,63 +2259,10 @@ def run_headless_simulation(
                 amb,
             )
 
-        if use_fast_engine and mesh_mode == "adaptive":
-            source_mask = np.zeros(N, dtype=bool)
-            for contribution in pad_contributions:
-                source_mask[contribution.indices] = True
-            if q_joule is not None:
-                source_mask |= np.asarray(q_joule) != 0.0
-            max_cell_ratio = max(1, min(16, int(settings.get("adaptive_max_cell_ratio", 8) or 8)))
-            adaptive_grid = build_adaptive_mesh(
-                copper_mask,
-                V_map,
-                geometry_state.heatsink_mask,
-                source_mask=source_mask.reshape(layer_count, rows, cols),
-                max_cell_ratio=max_cell_ratio,
-            )
-            if use_compact_adaptive:
-                adaptive_power_input = Q_sparse if Q_sparse is not None else Q
-                adaptive_system = build_adaptive_system_compact(
-                    layer_count,
-                    rows,
-                    cols,
-                    copper_mask,
-                    t_cu,
-                    t_fr4_eff,
-                    k_cu,
-                    k_fr4,
-                    dx,
-                    dy,
-                    V_map,
-                    gap_m,
-                    H_map,
-                    settings,
-                    amb,
-                    adaptive_grid,
-                    adaptive_power_input,
-                    rho_cu=rho_cu,
-                    cp_cu=cp_cu,
-                    rho_fr4=rho_fr4,
-                    cp_fr4=cp_fr4,
-                    pad_cap_areal=pad_cap_areal,
-                )
-            else:
-                adaptive_system = build_adaptive_system(K_matrix, C, Q, b, hA, adaptive_grid)
-            grid_info.update({
-                "mesh_mode": "adaptive",
-                "equivalent_uniform_nodes": int(N),
-                "adaptive_nodes": int(adaptive_system.operator.shape[0]),
-                "mesh_reduction_ratio": float(N / max(adaptive_system.operator.shape[0], 1)),
-                "adaptive_max_cell_ratio": max_cell_ratio,
-            })
-        else:
-            grid_info.update({
-                "mesh_mode": "uniform",
-                "equivalent_uniform_nodes": int(N),
-                "adaptive_nodes": int(N),
-                "mesh_reduction_ratio": 1.0,
-                "adaptive_max_cell_ratio": 1,
-            })
+        grid_info.update({
+            "mesh_mode": "uniform",
+            "equivalent_uniform_nodes": int(N),
+        })
 
         if build_heatsink_model is not _ORIG_BUILD_HEATSINK_MODEL or not use_compact_path:
             H_map_float = H_map.astype(np.float64, copy=False)
@@ -2349,12 +2274,7 @@ def run_headless_simulation(
         else:
             heatsink_model = _build_compact_heatsink_model(dx, dy, H_map, settings, amb)
 
-        if adaptive_system is not None and heatsink_model is not None:
-            solver_heatsink_model = restrict_heatsink_model(
-                heatsink_model, adaptive_system.mesh, layer_count
-            )
-        else:
-            solver_heatsink_model = heatsink_model
+        solver_heatsink_model = heatsink_model
 
         steady_state = bool(settings.get("steady_state", False)) and Q_func is None
         snap_times: List[float] = []
@@ -2376,13 +2296,6 @@ def run_headless_simulation(
             from .visualization import save_snapshot
             return save_snapshot(T_view, H_map, amb, layer_names, snap_idx, t_elapsed, out_dir=run_dir_str)
 
-        if adaptive_system is not None:
-            def solver_snapshot_callback(T_view, t_elapsed, snap_idx):
-                fine_view = adaptive_system.mesh.prolong(T_view.reshape(-1), layer_count)
-                return snapshot_callback(fine_view, t_elapsed, snap_idx)
-        else:
-            solver_snapshot_callback = snapshot_callback
-
         configured_time_stepping = settings.get("time_stepping", "auto")
 
         config = SolverConfig(
@@ -2399,37 +2312,22 @@ def run_headless_simulation(
 
         try:
             if use_fast_engine:
-                solver_operator = adaptive_system.operator if adaptive_system is not None else K_matrix
-                solver_capacity = adaptive_system.capacity if adaptive_system is not None else C
-                solver_power = (
-                    adaptive_system.power
-                    if adaptive_system is not None
-                    else (Q_sparse if Q_sparse is not None else Q)
-                )
-                solver_boundary = adaptive_system.boundary_rhs if adaptive_system is not None else b
-                solver_h_area = adaptive_system.h_area if adaptive_system is not None else hA
-                solver_power_func = (
-                    adaptive_system.wrap_power_function(Q_func, layer_count)
-                    if adaptive_system is not None
-                    else Q_func
-                )
+                solver_power = Q_sparse if Q_sparse is not None else Q
                 mf_kwargs = {}
                 if solver_heatsink_model is not None:
                     mf_kwargs["heatsink_model"] = solver_heatsink_model
                 result = run_simulation_matrix_free(
                     config,
-                    solver_operator,
-                    solver_capacity,
+                    K_matrix,
+                    C,
                     solver_power,
-                    solver_boundary,
-                    solver_h_area,
+                    b,
+                    hA,
                     None,
-                    solver_snapshot_callback,
-                    Q_func=solver_power_func,
+                    snapshot_callback,
+                    Q_func=Q_func,
                     **mf_kwargs,
                 )
-                if adaptive_system is not None:
-                    result.T = adaptive_system.mesh.prolong(result.T.reshape(-1), layer_count)
             else:
                 legacy_kwargs = {}
                 if heatsink_model is not None:
@@ -2445,7 +2343,7 @@ def run_headless_simulation(
                     rows,
                     cols,
                     None,
-                    solver_snapshot_callback,
+                    snapshot_callback,
                     Q_func=Q_func,
                     **legacy_kwargs,
                 )
@@ -2534,15 +2432,11 @@ def run_headless_simulation(
             })
             grid_info.update({
                 "mesh_mode": "uniform",
-                "adaptive_nodes": int(N),
-                "mesh_reduction_ratio": 1.0,
-                "adaptive_max_cell_ratio": 1,
+                "equivalent_uniform_nodes": int(N),
             })
     finally:
         if K_matrix is not None and hasattr(K_matrix, "clear_caches"):
             K_matrix.clear_caches()
-        if adaptive_system is not None and hasattr(adaptive_system.operator, "clear_caches"):
-            adaptive_system.operator.clear_caches()
         clear_native_scratch()
 
     result.k_norm_info.update({

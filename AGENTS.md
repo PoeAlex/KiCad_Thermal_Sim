@@ -4,7 +4,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## Project Overview
 
-ThermalSim (**v0.4.6**) is a KiCad 9.0 & 10.0 PCB Editor plugin and headless automation tool for fast 2.5D steady-state and transient thermal simulation. It simulates heat spreading across multilayer PCBs using finite volume methods, a Native C++/OpenMP **v4** Compact Low-RAM Multigrid & Fused PCG core (with pure NumPy/SciPy fallback), and BDF2 time integration.
+ThermalSim (**v0.4.7**) is a KiCad 9.0 & 10.0 PCB Editor plugin and headless automation tool for fast 2.5D steady-state and transient thermal simulation. It simulates heat spreading across multilayer PCBs using finite volume methods, a Native C++/OpenMP **v4** Compact Low-RAM Multigrid & Fused PCG core (with pure NumPy/SciPy fallback), and BDF2 time integration.
 
 ## Dependencies
 
@@ -34,7 +34,6 @@ KiCad_Thermal_Sim/
 ├── stackup_parser.py         # S-expression parser for .kicad_pcb stackups
 ├── gui_dialogs.py            # wxPython tabbed SettingsDialog with live preflight & 0D heatsink UI
 ├── geometry_mapper.py        # Exact KiCad 9/10 pad/trace/via/zone/Eco1 rasterization & GeometryState
-├── adaptive_mesh.py          # Conservative 2:1 balanced adaptive mesh & geometric multigrid
 ├── electrical_solver.py      # DC current-flow solver and copper Joule heating maps
 ├── thermal_solver.py         # Direct steady-state, FMG-PCG, BDF2, and 0D Sherman-Morrison solvers
 ├── workflow.py               # Compressed .npz geometry caching, operator caches, preflight dataclasses
@@ -59,7 +58,6 @@ KiCad_Thermal_Sim/
 | `stackup_parser.py` | Parse copper/dielectric layers and thicknesses from `.kicad_pcb` S-expressions |
 | `gui_dialogs.py` | Resizable wxPython `SettingsDialog` (Overview, Heat Sources, Current Heating, Advanced) |
 | `geometry_mapper.py` | Rasterize tracks, arcs, rotated/offset SMD/THT pads (`GetLayerSet()`), vias, fast scanline zone polygons, and `User.Eco1` thermal pads into `GeometryState` / `FillContext` |
-| `adaptive_mesh.py` | Build conservative 2:1 balanced quadtree adaptive meshes (`AdaptiveThermalSystem`, `build_adaptive_system_compact`) and geometric multigrid (`_GeometricMultigrid`) |
 | `electrical_solver.py` | Solve DC current flow per net and compute copper Joule losses & path diagnostics |
 | `thermal_solver.py` | Direct steady-state, FMG-preconditioned PCG, mixed-precision multigrid, geometric matrix-free transient BDF2, and Dynamic 0D Heatsink (`_HeatsinkPhaseState` via Sherman-Morrison) |
 | `workflow.py` | Safe compressed `.npz` disk `GeometryCache`, `ThermalOperatorCache`, `ThermalFactorizationCache`, `PreflightResult`, `CancellationToken` |
@@ -78,7 +76,6 @@ KiCad_Thermal_Sim/
 - `CompactStructuredThermalOperator` / `StructuredThermalOperator` (`thermal_solver.py`): Matrix-free finite-volume operators evaluating Level-0 stencils on the fly from compact masks and per-layer LUTs
 - `SolverConfig` / `SolverResult` (`thermal_solver.py`): Simulation configuration (steady-state/transient, heatsink, time stepping) and results/diagnostics
 - `HeatsinkModel` (`thermal_solver.py`): Dynamic 0D heatsink parameters (`R_th`, `C_hs`, contact factor, sink mode)
-- `AdaptiveThermalSystem` (`adaptive_mesh.py`): Reduced adaptive finite-volume graph and multigrid hierarchy
 
 ## Physical Constants
 
@@ -145,7 +142,6 @@ tests/
 │   ├── stackup_configs.py
 │   └── temperature_arrays.py
 └── unit/
-    ├── test_adaptive_mesh.py
     ├── test_build_pcm_package.py
     ├── test_capabilities.py
     ├── test_cli.py

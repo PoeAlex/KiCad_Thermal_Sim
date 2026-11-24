@@ -892,9 +892,9 @@ class TestSimulationDetailSettings:
 
         assert values['grid_expert_limits'] is False
         assert values['grid_detail_level'] == 'balanced'
-        assert values['grid_node_budget'] == 1_200_000
-        assert values['grid_max_cells'] == 600_000
-        assert values['grid_target_cells'] == 510_000
+        assert values['grid_node_budget'] == 3_000_000
+        assert values['grid_max_cells'] == 1_500_000
+        assert values['grid_target_cells'] == 1_275_000
         assert not dlg.grid_node_budget_input.IsEnabled()
 
     def test_switching_from_custom_to_balanced_restores_preset(self):
@@ -913,7 +913,7 @@ class TestSimulationDetailSettings:
 
         assert values['grid_expert_limits'] is False
         assert values['grid_detail_level'] == 'balanced'
-        assert values['grid_node_budget'] == 1_200_000
+        assert values['grid_node_budget'] == 3_000_000
         assert not dlg.grid_node_budget_input.IsEnabled()
 
     def test_custom_mode_accepts_one_hundred_million_nodes(self):
@@ -959,7 +959,7 @@ class TestSimulationDetailSettings:
         assert values['time'] == 30.0
         assert values['grid_expert_limits'] is False
         assert values['grid_detail_level'] == 'balanced'
-        assert values['grid_node_budget'] == 1_200_000
+        assert values['grid_node_budget'] == 3_000_000
 
     def test_apply_defaults_with_grid_expert_limits(self):
         """Saved expert grid limits should migrate to a Custom node budget."""
@@ -995,15 +995,15 @@ class TestSimulationDetailSettings:
         )
 
         expected = {
-            "fast": (500_000, 425_000),
-            "balanced": (1_200_000, 1_020_000),
-            "detailed": (3_000_000, 2_550_000),
-            "very_detailed": (6_000_000, 5_100_000),
+            "fast": (1_000_000, 850_000),
+            "balanced": (3_000_000, 2_550_000),
+            "detailed": (8_000_000, 6_800_000),
+            "very_detailed": (16_000_000, 13_600_000),
         }
         assert GRID_DETAIL_PRESETS == expected
         assert PLUGIN_GRID_DETAIL_PRESETS == expected
         assert DEFAULT_GRID_DETAIL == "balanced"
-        assert DEFAULT_GRID_NODE_BUDGET == 1_200_000
+        assert DEFAULT_GRID_NODE_BUDGET == 3_000_000
 
         dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
         for idx, name in enumerate(("fast", "balanced", "detailed", "very_detailed")):
@@ -1016,34 +1016,27 @@ class TestSimulationDetailSettings:
             assert values['grid_max_cells'] == max_nodes // 4
             assert values['grid_target_cells'] == target_nodes // 4
 
-    def test_mesh_mode_auto_uniform_adaptive_serialization_and_defaults(self):
-        """Spatial mesh dropdown should default to Auto and round-trip all 3 modes."""
+    def test_legacy_adaptive_mesh_defaults_are_tolerated_and_uniform_serialized(self):
+        """Legacy saved settings with mesh_mode='adaptive' load cleanly and serialize uniform."""
         from ThermalSim.gui_dialogs import SettingsDialog
 
-        dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
-        assert dlg.mesh_mode_choice.GetSelection() == 0
-        assert dlg.mesh_mode_choice.GetStringSelection() == "Auto"
-        assert dlg.get_values()['mesh_mode'] == "auto"
-
-        for idx, mode in ((0, "auto"), (1, "uniform"), (2, "adaptive")):
-            dlg.mesh_mode_choice.SetSelection(idx)
-            assert dlg.get_values()['mesh_mode'] == mode
-
-        dlg_uniform = SettingsDialog(
-            None, 1, 0.5, ["F.Cu", "B.Cu"], defaults={'mesh_mode': 'uniform'}
+        dlg = SettingsDialog(
+            None,
+            1,
+            0.5,
+            ["F.Cu", "B.Cu"],
+            defaults={'mesh_mode': 'adaptive', 'adaptive_max_cell_ratio': 4},
         )
-        assert dlg_uniform.get_values()['mesh_mode'] == "uniform"
-        assert dlg_uniform.solver_pane.IsExpanded()
-
-        dlg_adaptive = SettingsDialog(
-            None, 1, 0.5, ["F.Cu", "B.Cu"], defaults={'mesh_mode': 'adaptive'}
-        )
-        assert dlg_adaptive.get_values()['mesh_mode'] == "adaptive"
-        assert dlg_adaptive.solver_pane.IsExpanded()
-
-        # Restoring defaults without mesh_mode returns to 'auto'
-        dlg_adaptive._apply_defaults({'time': 25.0})
-        assert dlg_adaptive.get_values()['mesh_mode'] == "auto"
+        assert not hasattr(dlg, 'mesh_mode_choice')
+        assert not hasattr(dlg, 'adaptive_ratio_input')
+        assert dlg.get_values()['mesh_mode'] == "uniform"
+        # Verify key controls carry English tooltips
+        assert dlg.compute_engine_choice._tooltip
+        assert dlg.time_stepping_choice._tooltip
+        assert dlg.btn_run._tooltip
+        assert dlg.btn_more._tooltip
+        assert dlg.current_mode_choice._tooltip
+        assert dlg.current_balance_text._tooltip
 
     def test_legacy_solver_backend_setting_is_ignored_and_engine_label_updates(self, monkeypatch):
         """Old JSON settings with legacy solver_backend load safely; capabilities label reflects native flags."""
