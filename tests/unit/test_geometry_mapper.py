@@ -1697,3 +1697,158 @@ class TestViaBarrelPhysicsV048:
 
         # 2D via_map equals max across gaps
         np.testing.assert_array_equal(state.via_map, np.max(state.via_map_3d, axis=0))
+
+
+class TestV049GeometryFixes:
+    """Tests for v0.4.9 narrow-trace continuity, NPTH exclusion, and rule/keepout skipping."""
+
+    def test_narrow_015mm_traces_and_arcs_stay_continuous_on_05mm_grid(self):
+        """Sub-grid 0.15 mm horizontal, diagonal, and arc traces never fragment on a 0.5 mm grid."""
+        from scipy.ndimage import label
+
+        class _MockArc(MockTrack):
+            def __init__(self, *, layer, start, middle, end, width, bbox):
+                super().__init__(layer=layer, bbox=bbox, start=start, end=end, width=width)
+                self._mid = middle
+
+            def GetMid(self):
+                return self._mid
+
+        res = 0.5
+        # 1) Horizontal 0.15 mm trace on cell boundary y = 2.50 mm (cell centers at 2.25 & 2.75 mm)
+        horiz = MockTrack(
+            layer=F_Cu,
+            bbox=EDA_RECT(1_000_000, 2_425_000, 8_000_000, 150_000),
+            start=VECTOR2I(1_000_000, 2_500_000),
+            end=VECTOR2I(9_000_000, 2_500_000),
+            width=150_000,
+        )
+        # 2) Diagonal 45-degree 0.15 mm trace from (1, 5) to (6, 10)
+        diag = MockTrack(
+            layer=F_Cu,
+            bbox=EDA_RECT(925_000, 4_925_000, 5_150_000, 5_150_000),
+            start=VECTOR2I(1_000_000, 5_000_000),
+            end=VECTOR2I(6_000_000, 10_000_000),
+            width=150_000,
+        )
+        # 3) 180-degree circular arc 0.15 mm wide: center (14.25, 6.25), R = 3 mm
+        arc = _MockArc(
+            layer=F_Cu,
+            start=VECTOR2I(11_250_000, 6_250_000),
+            middle=VECTOR2I(14_250_000, 3_250_000),
+            end=VECTOR2I(17_250_000, 6_250_000),
+            width=150_000,
+            bbox=EDA_RECT(11_175_000, 3_175_000, 6_150_000, 3_150_000),
+        )
+
+        for trace in (horiz, diag, arc):
+            board = MockBoard(tracks=[trace], layer_names={F_Cu: "F.Cu"})
+            state = build_geometry_state(
+                board=board,
+                copper_ids=[F_Cu],
+                rows=24,
+                cols=40,
+                x_min=0.0,
+                y_min=0.0,
+                res=res,
+                settings={"ignore_traces": False, "ignore_polygons": True, "use_heatsink": False},
+            )
+            num_components = label(state.copper_mask[0])[1]
+            assert num_components == 1, f"Expected 1 connected component, got {num_components}"
+            s = trace.GetStart()
+            e = trace.GetEnd()
+            sr, sc = int(s.y * 1e-6 / res), int(s.x * 1e-6 / res)
+            er, ec = int(e.y * 1e-6 / res), int(e.x * 1e-6 / res)
+            assert state.copper_mask[0, sr, sc]
+            assert state.copper_mask[0, er, ec]
+
+        # Wide trace (width >= res) preserves exact 0.5 * width_mm footprint
+        wide = MockTrack(
+            layer=F_Cu,
+            bbox=EDA_RECT(1_000_000, 1_500_000, 4_000_000, 1_000_000),
+            start=VECTOR2I(1_000_000, 2_000_000),
+            end=VECTOR2I(5_000_000, 2_000_000),
+            width=1_000_000,
+        )
+        wide_state = build_geometry_state(
+            board=MockBoard(tracks=[wide], layer_names={F_Cu: "F.Cu"}),
+            copper_ids=[F_Cu],
+            rows=10,
+            cols=12,
+            x_min=0.0,
+            y_min=0.0,
+            res=res,
+            settings={"ignore_traces": False, "ignore_polygons": True, "use_heatsink": False},
+        )
+        # y=2.0 mm +/- 0.5 mm covers row centers y=1.75 (r=3) and y=2.25 (r=4), not r=2 (1.25) or r=5 (2.75)
+        assert not np.any(wide_state.copper_mask[0, 2, :])
+        assert np.any(wide_state.copper_mask[0, 3, :])
+        assert np.any(wide_state.copper_mask[0, 4, :])
+        assert not np.any(wide_state.copper_mask[0, 5, :])
+
+    def test_npth_pad_excluded_even_when_layerset_nonempty(self):
+        """NPTH mechanical hole with non-empty GetLayerSet() must return [] copper layers."""
+        npth_with_layerset = _ShapedMockPad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            size=VECTOR2I(3_000_000, 3_000_000),
+            shape=0,
+            layer=F_Cu,
+            layer_set=_KiCad10LayerSet([F_Cu, B_Cu]),
+            attribute=PAD_ATTRIB_NPTH,
+        )
+        assert get_pad_copper_layer_indices(npth_with_layerset, [F_Cu, B_Cu]) == []
+
+        board = MockBoard(
+            footprints=[MockFootprint("H1", [npth_with_layerset])],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+        )
+        state = build_geometry_state(
+            board=board,
+            copper_ids=[F_Cu, B_Cu],
+            rows=20,
+            cols=20,
+            x_min=0.0,
+            y_min=0.0,
+            res=0.5,
+            settings={"ignore_traces": True, "ignore_polygons": True, "use_heatsink": False},
+        )
+        assert not np.any(state.copper_mask)
+
+    def test_rule_area_and_keepout_zones_are_skipped(self):
+        """Rule/keepout zones must not be rasterized as copper."""
+        class _RuleZone(MockZone):
+            def __init__(self, *, is_rule=False, is_keepout=False, **kwargs):
+                super().__init__(**kwargs)
+                self._is_rule = is_rule
+                self._is_keepout = is_keepout
+
+            def GetIsRuleArea(self):
+                return self._is_rule
+
+            def GetIsKeepout(self):
+                return self._is_keepout
+
+        z_rule = _RuleZone(
+            is_rule=True,
+            layers=[F_Cu],
+            bbox=EDA_RECT(1_000_000, 1_000_000, 3_000_000, 3_000_000),
+            filled=True,
+        )
+        z_keep = _RuleZone(
+            is_keepout=True,
+            layers=[B_Cu],
+            bbox=EDA_RECT(5_000_000, 1_000_000, 3_000_000, 3_000_000),
+            filled=True,
+        )
+        board = MockBoard(zones=[z_rule, z_keep], layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"})
+        state = build_geometry_state(
+            board=board,
+            copper_ids=[F_Cu, B_Cu],
+            rows=20,
+            cols=20,
+            x_min=0.0,
+            y_min=0.0,
+            res=0.5,
+            settings={"ignore_traces": True, "ignore_polygons": False, "use_heatsink": False},
+        )
+        assert not np.any(state.copper_mask)

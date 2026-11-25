@@ -343,62 +343,6 @@ def _fill_heatsink(ctx, bbox):
                 H_slice[region_mask] = 1.0
 
 
-def _fill_zone(ctx, l_idx, lid, zone, val):
-    """
-    Fill a copper zone using hit-testing for accurate fill detection.
-
-    This function uses KiCad's HitTestFilledArea to respect zone clearances,
-    keepouts, and unfilled areas.
-
-    Parameters
-    ----------
-    ctx : FillContext
-        Grid context.
-    l_idx : int
-        Layer index in the conductivity array.
-    lid : int
-        KiCad layer ID for hit testing.
-    zone : pcbnew.ZONE
-        The zone to fill.
-    val : float
-        Conductivity value to set.
-    """
-    bbox = zone.GetBoundingBox()
-    rs, re, cs, ce = _bbox_to_grid_indices(bbox, ctx)
-    if cs >= ce or rs >= re:
-        return
-
-    has_filled_hit = hasattr(zone, "HitTestFilledArea")
-
-    def to_iu(value_mm):
-        try:
-            return pcbnew.FromMM(value_mm)
-        except Exception:
-            return int(value_mm * 1e6)
-
-    # Tiny margin to avoid edge quantization misses
-    margin_iu = 1
-
-    for r in range(rs, re):
-        y = ctx.y_min + (r + 0.5) * ctx.res
-        y_iu = to_iu(y)
-        for c in range(cs, ce):
-            x = ctx.x_min + (c + 0.5) * ctx.res
-            pos = pcbnew.VECTOR2I(to_iu(x), y_iu)
-            try:
-                if ctx.area_mask is not None and not ctx.area_mask[r, c]:
-                    continue
-                hit = False
-                if has_filled_hit:
-                    hit = zone.HitTestFilledArea(lid, pos, margin_iu)
-                elif hasattr(zone, "HitTest"):
-                    hit = zone.HitTest(pos)
-                if hit:
-                    ctx.K[l_idx, r, c] = max(ctx.K[l_idx, r, c], val)
-            except Exception:
-                continue
-
-
 def _state_fill_box(state, l_idx, bbox):
     """Mark copper occupancy in a rectangular region."""
     rs, re, cs, ce = _bbox_to_grid_indices(bbox, state)
@@ -447,6 +391,59 @@ def _state_apply_shape(
                 state.copper_mask[l_idx, r0:r1, c0:c1] |= inside
 
 
+def _mark_centerline_points(
+    mask_2d: np.ndarray,
+    rows: int,
+    cols: int,
+    x_min: float,
+    y_min: float,
+    res: float,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    area_mask: Optional[np.ndarray] = None,
+) -> None:
+    """Mark nearest in-bounds grid cells along sampled centerline points with 4-connected diagonal bridging."""
+    if rows <= 0 or cols <= 0 or res <= 0.0 or xs.size == 0:
+        return
+    grid_x_max = x_min + cols * res
+    grid_y_max = y_min + rows * res
+    prev_r: Optional[int] = None
+    prev_c: Optional[int] = None
+    for x_val, y_val in zip(xs, ys):
+        x_f = float(x_val)
+        y_f = float(y_val)
+        if x_f < x_min or x_f > grid_x_max or y_f < y_min or y_f > grid_y_max:
+            prev_r = None
+            prev_c = None
+            continue
+        c = min(cols - 1, max(0, int(math.floor((x_f - x_min) / res))))
+        r = min(rows - 1, max(0, int(math.floor((y_f - y_min) / res))))
+        if area_mask is not None and not bool(area_mask[r, c]):
+            prev_r = None
+            prev_c = None
+            continue
+        if prev_r is not None and prev_c is not None and abs(r - prev_r) == 1 and abs(c - prev_c) == 1:
+            # Bridge diagonal step along the closer orthogonal neighbor so narrow traces
+            # remain 4-connected in thermal/electrical finite-volume stencils.
+            if not (bool(mask_2d[prev_r, c]) or bool(mask_2d[r, prev_c])):
+                cx1 = x_min + (c + 0.5) * res
+                cy1 = y_min + (prev_r + 0.5) * res
+                cx2 = x_min + (prev_c + 0.5) * res
+                cy2 = y_min + (r + 0.5) * res
+                d1 = (x_f - cx1) ** 2 + (y_f - cy1) ** 2
+                d2 = (x_f - cx2) ** 2 + (y_f - cy2) ** 2
+                br, bc = (prev_r, c) if d1 <= d2 else (r, prev_c)
+                if area_mask is None or bool(area_mask[br, bc]):
+                    mask_2d[br, bc] = True
+                elif area_mask is None or bool(area_mask[r, prev_c] if (br, bc) == (prev_r, c) else area_mask[prev_r, c]):
+                    alt_r, alt_c = (r, prev_c) if (br, bc) == (prev_r, c) else (prev_r, c)
+                    if bool(area_mask[alt_r, alt_c]):
+                        mask_2d[alt_r, alt_c] = True
+        mask_2d[r, c] = True
+        prev_r = r
+        prev_c = c
+
+
 def _segment_parameters(start, end):
     """Return a line-segment representation in millimetres."""
     sx = float(start.x) * 1e-6
@@ -483,6 +480,24 @@ def _state_fill_segment(state, l_idx, track):
 
     _state_apply_shape(state, l_idx, bbox, predicate)
 
+    if state.res > 0.0 and width_mm < state.res:
+        seg_len = math.sqrt(seg_len_sq)
+        n_steps = max(1, int(math.ceil(seg_len / (0.4 * state.res))))
+        t = np.linspace(0.0, 1.0, n_steps + 1)
+        xs = sx + t * vx
+        ys = sy + t * vy
+        _mark_centerline_points(
+            state.copper_mask[l_idx],
+            state.rows,
+            state.cols,
+            state.x_min,
+            state.y_min,
+            state.res,
+            xs,
+            ys,
+            area_mask=state.area_mask,
+        )
+
 
 def _circle_from_three_points(start, middle, end):
     """Return circle centre and radius for three KiCad points, if defined."""
@@ -500,22 +515,39 @@ def _circle_from_three_points(start, middle, end):
     return cx, cy, math.hypot(x1 - cx, y1 - cy)
 
 
+def _arc_parameters(start, middle, end):
+    """Return ``(cx, cy, radius, start_angle, signed_span)`` in mm/rad, or ``None``."""
+    circle = _circle_from_three_points(start, middle, end)
+    if circle is None:
+        return None
+    cx, cy, radius = circle
+    start_angle = math.atan2(float(start.y) * 1e-6 - cy, float(start.x) * 1e-6 - cx)
+    middle_angle = math.atan2(float(middle.y) * 1e-6 - cy, float(middle.x) * 1e-6 - cx)
+    end_angle = math.atan2(float(end.y) * 1e-6 - cy, float(end.x) * 1e-6 - cx)
+    tau = 2.0 * math.pi
+    ccw_span = (end_angle - start_angle) % tau
+    ccw_middle = (middle_angle - start_angle) % tau
+    if ccw_middle <= ccw_span:
+        signed_span = ccw_span
+    else:
+        signed_span = -((start_angle - end_angle) % tau)
+    return cx, cy, radius, start_angle, signed_span
+
+
 def _state_fill_arc(state, l_idx, track):
     """Rasterize a circular PCB arc when start/mid/end are available."""
     try:
         start = track.GetStart()
         middle = track.GetMid()
         end = track.GetEnd()
-        circle = _circle_from_three_points(start, middle, end)
-        if circle is None:
+        arc = _arc_parameters(start, middle, end)
+        if arc is None:
             _state_fill_segment(state, l_idx, track)
             return
-        cx, cy, radius = circle
-        half_width = 0.5 * float(track.GetWidth()) * 1e-6
+        cx, cy, radius, start_angle, signed_span = arc
+        width_mm = max(float(track.GetWidth()) * 1e-6, 0.0)
+        half_width = 0.5 * width_mm
         bbox = track.GetBoundingBox()
-        start_angle = math.atan2(float(start.y) * 1e-6 - cy, float(start.x) * 1e-6 - cx)
-        middle_angle = math.atan2(float(middle.y) * 1e-6 - cy, float(middle.x) * 1e-6 - cx)
-        end_angle = math.atan2(float(end.y) * 1e-6 - cy, float(end.x) * 1e-6 - cx)
     except Exception:
         _state_fill_segment(state, l_idx, track)
         return
@@ -526,16 +558,31 @@ def _state_fill_arc(state, l_idx, track):
         radial = np.abs(np.hypot(dx, dy) - radius) <= half_width
         angles = np.arctan2(dy, dx)
         tau = 2.0 * np.pi
-        ccw_span = (end_angle - start_angle) % tau
-        ccw_middle = (middle_angle - start_angle) % tau
-        if ccw_middle <= ccw_span:
-            angular = np.mod(angles - start_angle, tau) <= ccw_span
+        if signed_span >= 0.0:
+            angular = np.mod(angles - start_angle, tau) <= signed_span
         else:
-            clockwise_span = (start_angle - end_angle) % tau
-            angular = np.mod(start_angle - angles, tau) <= clockwise_span
+            angular = np.mod(start_angle - angles, tau) <= (-signed_span)
         return radial & angular
 
     _state_apply_shape(state, l_idx, bbox, predicate)
+
+    if state.res > 0.0 and width_mm < state.res:
+        arc_len = radius * abs(signed_span)
+        n_steps = max(1, int(math.ceil(arc_len / (0.4 * state.res))))
+        angles = start_angle + np.linspace(0.0, signed_span, n_steps + 1)
+        xs = cx + radius * np.cos(angles)
+        ys = cy + radius * np.sin(angles)
+        _mark_centerline_points(
+            state.copper_mask[l_idx],
+            state.rows,
+            state.cols,
+            state.x_min,
+            state.y_min,
+            state.res,
+            xs,
+            ys,
+            area_mask=state.area_mask,
+        )
 
 
 def _state_fill_circle(state, layer_indices, bbox, center, diameter_mm):
@@ -613,6 +660,9 @@ def get_pad_copper_layer_indices(
     npth_attrib = getattr(pcbnew, "PAD_ATTRIB_NPTH", None)
     pth_attrib = getattr(pcbnew, "PAD_ATTRIB_PTH", None)
 
+    if npth_attrib is not None and pad_attrib == npth_attrib:
+        return []
+
     if hasattr(pad, "GetLayerSet"):
         try:
             layer_set = pad.GetLayerSet()
@@ -639,14 +689,9 @@ def get_pad_copper_layer_indices(
                     matched = []
             if matched:
                 return matched
-            if npth_attrib is not None and pad_attrib == npth_attrib:
-                return []
 
     if pth_attrib is not None and pad_attrib == pth_attrib:
         return list(range(len(copper_ids)))
-
-    if npth_attrib is not None and pad_attrib == npth_attrib:
-        return []
 
     try:
         layer_idx = lid_to_idx.get(pad.GetLayer())
@@ -1050,38 +1095,6 @@ def _state_fill_pad(state, layer_indices, pad, copper_ids=None):
             state.copper_mask[layer_idx, rs:re, cs:ce] |= mask_2d
 
 
-def _state_fill_box_all_layers(state, bbox):
-    """Mark copper occupancy for all layers in a rectangular region."""
-    rs, re, cs, ce = _bbox_to_grid_indices(bbox, state)
-    if cs >= ce or rs >= re or rs >= state.rows or cs >= state.cols:
-        return
-
-    target = state.copper_mask[:, rs:re, cs:ce]
-    if state.area_mask is None:
-        target[...] = True
-        return
-
-    region_mask = state.area_mask[rs:re, cs:ce]
-    if np.any(region_mask):
-        target |= region_mask[None, :, :]
-
-
-def _state_fill_via(state, bbox, val):
-    """Apply via enhancement in a rectangular region."""
-    rs, re, cs, ce = _bbox_to_grid_indices(bbox, state)
-    if cs >= ce or rs >= re or rs >= state.rows or cs >= state.cols:
-        return
-
-    target = state.via_map[rs:re, cs:ce]
-    if state.area_mask is None:
-        np.maximum(target, val, out=target)
-        return
-
-    region_mask = state.area_mask[rs:re, cs:ce]
-    if np.any(region_mask):
-        np.maximum(target, val, out=target, where=region_mask)
-
-
 def _extract_via_drill_mm(via: Any, outer_diameter_mm: float) -> float:
     """Extract finished drill diameter (mm) for a via across KiCad 9/10 and mocks."""
     for method_name in ("GetDrillValue", "GetDrill"):
@@ -1220,29 +1233,6 @@ def _accumulate_via_conductance(
         if 0 <= g < state.via_map_3d.shape[0]:
             target_g = state.via_map_3d[g, rs:re, cs:ce]
             target_g[inside] += dv
-
-
-def _state_fill_via_circle(state, bbox, center, diameter_mm, val, tile_size=512):
-    """Apply via enhancement using the actual circular outer diameter."""
-    rs, re, cs, ce = _bbox_to_grid_indices(bbox, state)
-    if cs >= ce or rs >= re:
-        return
-    cx = float(center.x) * 1e-6
-    cy = float(center.y) * 1e-6
-    radius = 0.5 * max(float(diameter_mm), 0.0)
-    radius_sq = radius * radius
-    for r0 in range(rs, re, tile_size):
-        r1 = min(re, r0 + tile_size)
-        y = state.y_min + (np.arange(r0, r1, dtype=np.float64) + 0.5) * state.res
-        for c0 in range(cs, ce, tile_size):
-            c1 = min(ce, c0 + tile_size)
-            x = state.x_min + (np.arange(c0, c1, dtype=np.float64) + 0.5) * state.res
-            inside = (x[None, :] - cx) ** 2 + (y[:, None] - cy) ** 2 <= radius_sq
-            if state.area_mask is not None:
-                inside &= state.area_mask[r0:r1, c0:c1]
-            if np.any(inside):
-                target = state.via_map[r0:r1, c0:c1]
-                np.maximum(target, val, out=target, where=inside)
 
 
 def _state_fill_heatsink(state, bbox):
@@ -1611,6 +1601,19 @@ def _fill_zone_mask_polygons(
         return False
 
 
+def _is_rule_or_keepout_zone(zone: Any) -> bool:
+    """Return True if a KiCad zone is a rule/keepout area rather than copper."""
+    for attr in ("GetIsRuleArea", "GetIsKeepout"):
+        fn = getattr(zone, attr, None)
+        if callable(fn):
+            try:
+                if fn():
+                    return True
+            except Exception:
+                pass
+    return False
+
+
 def _state_fill_zone(
     state,
     l_idx,
@@ -1955,6 +1958,8 @@ def build_geometry_state(
                 f"Rasterizing copper zone {zone_idx + 1} / {total_zones}...",
                 force=(zone_idx == 0),
             )
+            if _is_rule_or_keepout_zone(zone):
+                continue
             if hasattr(zone, "IsFilled") and not zone.IsFilled():
                 continue
 

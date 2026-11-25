@@ -107,6 +107,43 @@ def interpolate_pwl(times: np.ndarray, powers: np.ndarray, t: float) -> float:
     return float(np.interp(t, times, powers))
 
 
+def integrate_pwl(times: np.ndarray, powers: np.ndarray, t0: float, t1: float) -> float:
+    """
+    Compute the exact analytical integral of a PWL curve over ``[t0, t1]``.
+
+    Splits ``[t0, t1]`` at all interior breakpoints in ``times`` and integrates
+    each linear sub-segment analytically. Values outside ``[times[0], times[-1]]``
+    are clamped identically to ``np.interp``.
+    """
+    t_start = float(t0)
+    t_end = float(t1)
+    if t_end <= t_start:
+        return 0.0
+    t_arr = np.asarray(times, dtype=np.float64)
+    p_arr = np.asarray(powers, dtype=np.float64)
+    if t_arr.size == 0:
+        return 0.0
+    if t_arr.size == 1:
+        return float(p_arr[0]) * (t_end - t_start)
+
+    interior = t_arr[(t_arr > t_start) & (t_arr < t_end)]
+    if interior.size:
+        pts = np.concatenate(([t_start], interior, [t_end]))
+    else:
+        pts = np.array([t_start, t_end], dtype=np.float64)
+    vals = np.interp(pts, t_arr, p_arr)
+    return float(np.sum(0.5 * (vals[:-1] + vals[1:]) * np.diff(pts)))
+
+
+def average_pwl(times: np.ndarray, powers: np.ndarray, t0: float, t1: float) -> float:
+    """Return the exact time-averaged power of a PWL curve over ``[t0, t1]``."""
+    t_start = float(t0)
+    t_end = float(t1)
+    if t_end <= t_start:
+        return interpolate_pwl(times, powers, t_end)
+    return integrate_pwl(times, powers, t_start, t_end) / (t_end - t_start)
+
+
 def validate_pwl(times: np.ndarray, powers: np.ndarray) -> List[str]:
     """
     Validate a parsed PWL profile and return warnings.

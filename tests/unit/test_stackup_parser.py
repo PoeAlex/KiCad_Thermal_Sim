@@ -124,6 +124,13 @@ class TestSexprFindAllBlocks:
         # Should find the outer layer block first
         assert len(blocks) >= 1
 
+    def test_token_boundary_does_not_match_prefix(self):
+        """Token matching must require a delimiter so '(layers' does not match 'layer'."""
+        s = '(kicad_pcb (layers (0 "F.Cu")) (layer "F.Cu") (layer))'
+        assert _sexpr_extract_block(s, "layer") == '(layer "F.Cu")'
+        assert _sexpr_find_all_blocks(s, "layer") == ['(layer "F.Cu")', "(layer)"]
+        assert _sexpr_extract_block("(kicad_pcb (layers))", "layer") is None
+
 
 class TestParseStackupFromBoardFile:
     """Tests for parse_stackup_from_board_file function."""

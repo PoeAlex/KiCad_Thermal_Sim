@@ -2956,3 +2956,153 @@ class TestV048PluginWiringAndSnapshot:
         )
         assert out2 is not None
         assert captured_extra == {"via_plating_um": 40.0, "via_fill": "copper"}
+
+
+class TestV049PluginElectricalGapAndCleanup:
+    """Tests for v0.4.9 ElectricalConfig gap_m wiring, cache key invalidation, and cleanups."""
+
+    def test_run_simulation_passes_gap_m_and_invalidates_electrical_cache(self, tmp_path, monkeypatch):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.electrical_solver import ElectricalResult
+        from ThermalSim.thermal_solver import SolverResult
+        from ThermalSim.workflow import GeometryCache
+
+        suite = TestCompactLowRamPluginWiring()
+        plugin, board, pad, settings = suite._setup_plugin_env(tmp_path, monkeypatch, with_eco1=False)
+        plugin.geometry_cache = GeometryCache(cache_dir=str(tmp_path / "geom_cache"))
+
+        # Add a second pad on the same net so current path is balanced
+        pad2 = MockPad(
+            position=VECTOR2I(7_000_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(6_500_000, 4_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="VIN",
+            number="2",
+        )
+        board.Footprints()[0].Pads().append(pad2)
+        desc1 = plugin._pad_descriptor(board, "U1", pad)
+        desc2 = plugin._pad_descriptor(board, "U1", pad2)
+
+        settings["compute_engine"] = "legacy"
+        settings["steady_state"] = True
+        settings["current_enabled"] = True
+        settings["current_groups"] = [
+            {
+                "name": "VIN",
+                "mode": "per_pad",
+                "pads": [
+                    {**desc1, "current_a": 2.0},
+                    {**desc2, "current_a": -2.0},
+                ],
+            }
+        ]
+
+        captured_configs = []
+        captured_report = {}
+
+        def spy_solve_electrical(b, terminals, config, **kwargs):
+            captured_configs.append(config)
+            n = len(config.copper_ids) * config.rows * config.cols
+            return ElectricalResult(
+                q_joule=np.zeros(n, dtype=np.float64),
+                net_summaries=[],
+                warnings=[],
+                errors=[],
+            )
+
+        monkeypatch.setattr(plugin_mod, "solve_electrical_heating", spy_solve_electrical)
+        monkeypatch.setattr(
+            plugin_mod,
+            "run_simulation",
+            lambda config, K, C, Q, b, hA, lc, r, c, *a, **k: SolverResult(
+                T=np.full((lc, r, c), 25.0),
+                aborted=False,
+                step_counter=1,
+                total_solve_time=0.01,
+                total_factor_time=0.0,
+                factor_count=1,
+                snapshot_stats=[],
+                snapshot_files=[],
+                phase_metrics=[],
+                balance_history=[],
+                k_norm_info={},
+            ),
+        )
+        monkeypatch.setattr(
+            plugin_mod,
+            "write_html_report",
+            lambda *a, **k: captured_report.update(k) or str(tmp_path / "rep.html"),
+        )
+
+        # First run with thick=0.8 mm
+        settings_a = dict(settings, thick=0.8)
+        plugin._run_simulation(
+            board, [F_Cu, B_Cu], ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad, pad2], settings_a, {}, ["U1-1", "U1-2"],
+        )
+        assert len(captured_configs) == 1
+        assert captured_configs[0].gap_m is not None
+        assert captured_configs[0].gap_m[0] == pytest.approx(0.8e-3, rel=1e-4)
+        first_key = plugin.electrical_cache.key
+        assert "init_adaptive_mesh_s" not in captured_report["k_norm_info"]
+
+        # Second run with thick=1.6 mm must miss electrical_cache and pass updated gap_m
+        settings_b = dict(settings, thick=1.6)
+        plugin._run_simulation(
+            board, [F_Cu, B_Cu], ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad, pad2], settings_b, {}, ["U1-1", "U1-2"],
+        )
+        assert len(captured_configs) == 2
+        assert captured_configs[1].gap_m[0] == pytest.approx(1.6e-3, rel=1e-4)
+        assert plugin.electrical_cache.key != first_key
+        assert captured_report["k_norm_info"]["init_electrical_cache_hit"] is False
+
+    def test_preflight_10m_node_warning_has_no_stale_adaptive_text(self, tmp_path, monkeypatch):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_plugin import ThermalPlugin
+        from ThermalSim.workflow import GridEstimate
+
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        pad = MockPad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(4_500_000, 4_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        board = MockBoard(footprints=[MockFootprint("U1", [pad])])
+        desc = plugin._pad_descriptor(board, "U1", pad)
+        huge_grid = GridEstimate(
+            requested_res_mm=0.1,
+            actual_res_mm=0.1,
+            x_min_mm=0.0,
+            y_min_mm=0.0,
+            width_mm=200.0,
+            height_mm=250.0,
+            rows=2000,
+            cols=2500,
+            layer_count=4,
+            auto_coarsened=False,
+            expert_limits=False,
+            max_cells=20_000_000,
+            target_cells=17_000_000,
+        )
+        monkeypatch.setattr(plugin_mod, "_estimate_solver_grid", lambda *a, **k: huge_grid)
+
+        res = plugin._preflight(
+            board,
+            [F_Cu, B_Cu],
+            EDA_RECT(0, 0, 200_000_000, 250_000_000),
+            {
+                "res": 0.1,
+                "output_dir": str(tmp_path),
+                "power_pads": [{**desc, "power": "1.0"}],
+            },
+        )
+        assert any("uniform nodes" in w for w in res.warnings)
+        assert all("Adaptive reduction depends" not in w for w in res.warnings)

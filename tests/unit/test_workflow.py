@@ -450,3 +450,116 @@ def test_small_auto_plan_keeps_legacy_phases():
     mode, plan = _build_phase_plan(config, 10000)
     assert mode == "multi_phase"
     assert [item[0]["name"] for item in plan] == ["A", "B", "C"]
+
+
+def test_simulation_settings_default_budget_and_cache_key_area_mode():
+    from ThermalSim.workflow import SimulationSettings
+
+    cfg = SimulationSettings.from_mapping({})
+    assert cfg.grid_node_budget == 3_000_000
+
+    snapshot = BoardSnapshot("board", "abc", (0, 0, 10, 10), (0, 2), 1, 1, 1)
+    grid = GridEstimate(0.5, 0.5, 0, 0, 10, 10, 24, 24, 2, False, False, 200000, 100000)
+    k_full = geometry_cache_key(snapshot, grid, {"area_mode": "full"}, ["U1:1"])
+    k_active = geometry_cache_key(snapshot, grid, {"area_mode": "active"}, ["U1:1"])
+    k_legacy = geometry_cache_key(snapshot, grid, {}, ["U1:1"])
+    assert k_full != k_active
+    assert k_full != k_legacy
+
+
+def test_pth_pad_splits_heat_evenly_across_spanned_layers():
+    import pytest
+    from ThermalSim.simulation_core import build_sparse_pad_contributions
+    from tests.mocks.pcbnew_mock import In1_Cu, In2_Cu, PAD_ATTRIB_PTH, PAD_ATTRIB_SMD
+
+    copper_ids = [F_Cu, In1_Cu, In2_Cu, B_Cu]
+    pth_pad = MockPad(
+        position=VECTOR2I(2_500_000, 2_500_000),
+        layer=F_Cu,
+        attribute=PAD_ATTRIB_PTH,
+        bbox=EDA_RECT(2_000_000, 2_000_000, 1_000_000, 1_000_000),
+    )
+    smd_pad = MockPad(
+        position=VECTOR2I(5_500_000, 2_500_000),
+        layer=B_Cu,
+        attribute=PAD_ATTRIB_SMD,
+        bbox=EDA_RECT(5_000_000, 2_000_000, 1_000_000, 1_000_000),
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pth_pad, smd_pad])],
+        layer_names={F_Cu: "F.Cu", In1_Cu: "In1.Cu", In2_Cu: "In2.Cu", B_Cu: "B.Cu"},
+    )
+    rows, cols, res = 8, 8, 1.0
+    contribs = build_sparse_pad_contributions(
+        board, copper_ids, [pth_pad, smd_pad], rows, cols, 0.0, 0.0, res
+    )
+
+    pth_c, smd_c = contribs
+    assert np.sum(pth_c.weights) == pytest.approx(1.0)
+    layer_size = rows * cols
+    for layer_idx in range(4):
+        in_layer = (pth_c.indices >= layer_idx * layer_size) & (
+            pth_c.indices < (layer_idx + 1) * layer_size
+        )
+        assert np.any(in_layer)
+        assert np.sum(pth_c.weights[in_layer]) == pytest.approx(0.25)
+
+    # SMD pad remains strictly on B.Cu (layer_idx == 3)
+    assert np.all(smd_c.indices >= 3 * layer_size)
+    assert np.sum(smd_c.weights) == pytest.approx(1.0)
+
+
+def test_build_power_vector_non_aliasing_breakpoints_and_step_average():
+    import pytest
+    from ThermalSim.simulation_core import SparsePadContribution, build_power_vector
+
+    c_const = SparsePadContribution(indices=np.array([0], dtype=np.int64), weights=np.array([1.0]))
+    c_pwl_a = SparsePadContribution(indices=np.array([1], dtype=np.int64), weights=np.array([1.0]))
+    c_pwl_b = SparsePadContribution(indices=np.array([2], dtype=np.int64), weights=np.array([1.0]))
+
+    # Narrow 20 W pulse from 50.00 to 50.15 s (total energy = 0.15 * 20 = 3.0 J)
+    t_a = np.array([0.0, 50.0, 50.001, 50.149, 50.15, 100.0])
+    p_a = np.array([0.0, 0.0, 20.0, 20.0, 0.0, 0.0])
+    t_b = np.array([0.0, 10.0, 20.0])
+    p_b = np.array([0.0, 4.0, 4.0])
+
+    q0, q_func = build_power_vector(
+        [("const", 1.5), ("pwl", (t_a, p_a)), ("pwl", (t_b, p_b))],
+        [c_const, c_pwl_a, c_pwl_b],
+        total_nodes=4,
+    )
+    assert q0[0] == pytest.approx(1.5)
+    assert q_func is not None
+
+    # Non-aliasing: stored evaluations must remain independent
+    q_t5 = q_func(5.0)
+    q_t50 = q_func(50.05)
+    assert q_t5[1] == pytest.approx(0.0)
+    assert q_t5[2] == pytest.approx(2.0)
+    assert q_t50[1] == pytest.approx(20.0)
+    assert q_t50[2] == pytest.approx(4.0)
+
+    # Breakpoints sorted unique finite tuple
+    assert q_func.breakpoints == (0.0, 10.0, 20.0, 50.0, 50.001, 50.149, 50.15, 100.0)
+
+    # Analytical step_average preserves exact pulse energy across coarse step [50.0, 50.3333]
+    dt_step = 50.3333 - 50.0
+    expected_energy_a = float(np.trapezoid(p_a, t_a)) if hasattr(np, "trapezoid") else float(np.trapz(p_a, t_a))
+    q_avg = q_func.step_average(50.0, 50.3333)
+    assert q_avg[0] == pytest.approx(1.5)
+    assert q_avg[1] * dt_step == pytest.approx(expected_energy_a, rel=1e-12)
+    assert q_avg[2] == pytest.approx(4.0)
+
+    # Degenerate t1 <= t0 matches Q_func(t1)
+    np.testing.assert_allclose(q_func.step_average(5.0, 5.0), q_func(5.0))
+    np.testing.assert_allclose(q_func.step_average(10.0, 5.0), q_func(5.0))
+
+
+def test_effective_fr4_thickness_allows_thick_boards_up_to_50mm():
+    import pytest
+    from ThermalSim.simulation_core import effective_fr4_control_volume_thicknesses
+
+    # 20 mm 2-layer board -> gap = 20 mm -> CV thickness = 10 mm each (not clipped at 5 mm)
+    th = effective_fr4_control_volume_thicknesses([20e-3], 20e-3, 2)
+    assert th[0] == pytest.approx(10e-3)
+    assert th[1] == pytest.approx(10e-3)

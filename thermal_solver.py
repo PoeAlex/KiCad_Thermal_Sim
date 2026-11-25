@@ -11,6 +11,7 @@ import inspect
 import math
 import sys
 import time
+import weakref
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Callable
 
@@ -21,17 +22,9 @@ import scipy.sparse.linalg as spla
 from .native_core import HAS_NATIVE_CORE, apply_structured_native
 
 try:
-    from .native_core import (
-        HAS_NATIVE_MG,
-        damped_jacobi_native,
-        residual_restrict_2x2_native,
-        prolong_add_2x2_native,
-    )
+    from .native_core import HAS_NATIVE_MG
 except ImportError:
     HAS_NATIVE_MG = False
-    damped_jacobi_native = None
-    residual_restrict_2x2_native = None
-    prolong_add_2x2_native = None
 
 try:
     from .native_core import (
@@ -1039,14 +1032,23 @@ class _StructuredGeometricMultigrid(_BaseGeometricMultigrid):
 
 
 def _capacity_cache_key(capacity: Optional[np.ndarray]):
-    """Build a lightweight identity+shape+endpoint key without copying capacity."""
+    """Build a weakref-backed identity+shape+sample key without copying capacity."""
     if capacity is None:
         return None
+    size = capacity.size
+    if size == 0:
+        samples = ()
+    elif size <= 8:
+        samples = tuple(float(capacity[i]) for i in range(size))
+    else:
+        step = (size - 1) // 7
+        indices = tuple(range(0, size - 1, step))[:7] + (size - 1,)
+        samples = tuple(float(capacity[i]) for i in indices)
     return (
-        id(capacity),
-        capacity.size,
-        float(capacity[0]) if capacity.size else 0.0,
-        float(capacity[-1]) if capacity.size else 0.0,
+        weakref.ref(capacity),
+        capacity.shape,
+        str(capacity.dtype),
+        samples,
     )
 
 
@@ -1217,6 +1219,25 @@ class StructuredThermalOperator:
         return operator, preconditioner
 
 
+def _harmonic_sheet_conductance(s_a, s_b):
+    """Exact finite-volume harmonic mean of neighboring cell sheet conductances."""
+    s_sum = s_a + s_b
+    return np.divide(2.0 * s_a * s_b, s_sum, out=np.zeros_like(s_sum), where=s_sum > 0.0)
+
+
+def _layer_sheet_conductance(
+    mask: np.ndarray,
+    k_cu: float,
+    k_fr4: float,
+    t_cu_l: float,
+    t_fr4_l: float,
+) -> np.ndarray:
+    """Compute per-cell sheet conductance ``s = k * t`` (Cu cells include parallel FR4)."""
+    s_fr4 = float(k_fr4) * float(t_fr4_l)
+    s_cu = float(k_cu) * float(t_cu_l) + s_fr4
+    return np.where(mask, s_cu, s_fr4)
+
+
 def _compute_layer_luts(
     layer_count: int,
     t_cu: np.ndarray,
@@ -1233,7 +1254,6 @@ def _compute_layer_luts(
     pad_cap_areal: float = 0.0,
 ):
     """Precompute compact 3-value edge conductance and 2-value capacity LUTs."""
-    eps = 1e-12
     pixel_area = float(dx) * float(dy)
     k0 = float(k_fr4)
     k1 = float(k_cu)
@@ -1241,19 +1261,16 @@ def _compute_layer_luts(
     gy_lut = np.empty((layer_count, 3), dtype=np.float64)
     cap_lut = np.empty((layer_count, 2), dtype=np.float64)
 
-    k_pair = (
-        2.0 * k0 * k0 / (k0 + k0 + eps),
-        2.0 * k0 * k1 / (k0 + k1 + eps),
-        2.0 * k1 * k1 / (k1 + k1 + eps),
-    )
-
     for layer_idx in range(layer_count):
         t0 = float(t_fr4_eff[layer_idx])
         t1 = float(t_cu[layer_idx])
-        t_pair = (t0, 0.5 * (t0 + t1), t1)
+        s_fr4 = k0 * t0
+        s_cu = k1 * t1 + s_fr4
+        s_01 = (2.0 * s_fr4 * s_cu) / (s_fr4 + s_cu) if (s_fr4 + s_cu) > 0.0 else 0.0
+        s_pair = (s_fr4, s_01, s_cu)
         for m in range(3):
-            gx_lut[layer_idx, m] = k_pair[m] * (t_pair[m] * dy) / dx
-            gy_lut[layer_idx, m] = k_pair[m] * (t_pair[m] * dx) / dy
+            gx_lut[layer_idx, m] = s_pair[m] * dy / dx
+            gy_lut[layer_idx, m] = s_pair[m] * dx / dy
         cap_fr4 = float(rho_fr4) * float(cp_fr4) * pixel_area * t0
         cap_cu = float(rho_cu) * float(cp_cu) * pixel_area * t1
         cap_lut[layer_idx, 0] = cap_fr4
@@ -1968,15 +1985,21 @@ class CompactStructuredThermalOperator:
         return total
 
     def convection_power(self, T: np.ndarray, amb: float) -> float:
-        """Compute ``sum(hA * (T - amb))`` touching only top and bottom layers."""
+        """Compute true boundary heat output ``sum(hA * T - b)`` on top and bottom layers."""
         plane_size = self.rows * self.cols
         t_flat = np.asarray(T, dtype=np.float64).reshape(-1)
         amb_f = float(amb)
-        total = self.top_ha * float(np.sum(t_flat[:plane_size] - amb_f))
+        total = 0.0
+        if self.top_ha != 0.0:
+            t_ref_top = self.top_rhs / self.top_ha
+            total += self.top_ha * float(np.sum(t_flat[:plane_size] - t_ref_top))
         if self.bot_air_ha != 0.0 or self.bot_pad_ha != 0.0:
             hs_bool = self.heatsink_mask.reshape(-1).astype(bool, copy=False)
             ha_bot = np.where(hs_bool, self.bot_pad_ha, self.bot_air_ha)
-            total += float(np.dot(ha_bot, t_flat[-plane_size:] - amb_f))
+            t_ref_air = (self.bot_air_rhs / self.bot_air_ha) if self.bot_air_ha != 0.0 else amb_f
+            t_ref_pad = (self.bot_pad_rhs / self.bot_pad_ha) if self.bot_pad_ha != 0.0 else amb_f
+            t_ref_bot = np.where(hs_bool, t_ref_pad, t_ref_air)
+            total += float(np.dot(ha_bot, t_flat[-plane_size:] - t_ref_bot))
         return total
 
     def build_heatsink_model(
@@ -2185,7 +2208,12 @@ def build_compact_structured_operator(
         pad_cap_areal=pad_cap_areal,
     )
 
-    hs_mask_u8 = np.ascontiguousarray(np.asarray(H_map, dtype=bool), dtype=np.uint8)
+    use_heatsink = bool(settings.get("use_heatsink", True))
+    if not use_heatsink:
+        hs_mask_u8 = np.zeros((rows, cols), dtype=np.uint8)
+        pad_cap_cell = 0.0
+    else:
+        hs_mask_u8 = np.ascontiguousarray(np.asarray(H_map, dtype=bool), dtype=np.uint8)
     v_arr = np.asarray(V_map, dtype=np.float32)
     if layer_count > 1 and v_arr.ndim != 2:
         raise ValueError(
@@ -2210,14 +2238,18 @@ def build_compact_structured_operator(
     contact_factor = max(1e-6, float(settings.get("pad_contact_factor", 0.2)))
     h_sink = (pad_k / pad_thick_m) * contact_factor
     bot_air_diag = h_air_bot * pixel_area
-    bot_pad_diag = h_sink * pixel_area
+    bot_pad_diag = (h_sink * pixel_area) if use_heatsink else 0.0
 
     sink_mode = str(settings.get("pad_sink_mode", "fixed") or "fixed").strip().lower()
-    use_heatsink = bool(settings.get("use_heatsink", True))
     heatsink_mode_active = bool(
         use_heatsink and sink_mode == "heatsink" and np.any(hs_mask_u8)
     )
-    if heatsink_mode_active:
+    if not use_heatsink:
+        bot_air_rhs = bot_air_diag * float(amb)
+        bot_pad_rhs = 0.0
+        bot_air_ha = bot_air_diag
+        bot_pad_ha = 0.0
+    elif heatsink_mode_active:
         bot_air_rhs = bot_air_diag * float(amb)
         bot_pad_rhs = 0.0
         bot_air_ha = bot_air_diag
@@ -2273,13 +2305,15 @@ def _compute_bottom_boundary_terms(
     contact_factor = max(1e-6, float(settings.get("pad_contact_factor", 0.2)))
     h_sink = (pad_k / pad_thick_m) * contact_factor
 
+    use_heatsink = bool(settings.get("use_heatsink", True))
     h_map_arr = np.asarray(H_map, dtype=np.float64)
+    if not use_heatsink:
+        h_map_arr = np.zeros_like(h_map_arr)
     g_air_bot = ((1.0 - h_map_arr) * h_air_bot * pixel_area).ravel()
     g_pad_bot = (h_map_arr * h_sink * pixel_area).ravel()
     diag_add_bot = g_air_bot + g_pad_bot
 
     sink_mode = str(settings.get("pad_sink_mode", "fixed") or "fixed").strip().lower()
-    use_heatsink = bool(settings.get("use_heatsink", True))
     if use_heatsink and sink_mode == "heatsink" and np.any(h_map_arr):
         b_add_bot = g_air_bot * float(amb)
         hA_add_bot = g_air_bot
@@ -2315,34 +2349,19 @@ def build_structured_operator(
     amb: float,
 ):
     """Build the matrix-free equivalent of :func:`build_stiffness_matrix`."""
-    eps = 1e-12
     pixel_area = dx * dy
     node_count = layer_count * rows * cols
     gx = np.empty((layer_count, rows, max(cols - 1, 0)), dtype=np.float64)
     gy = np.empty((layer_count, max(rows - 1, 0), cols), dtype=np.float64)
 
     for layer_idx in range(layer_count):
-        mask = copper_mask[layer_idx]
-        conductivity = np.where(mask, k_cu, k_fr4)
-        thickness = np.where(mask, t_cu[layer_idx], t_fr4_eff[layer_idx])
+        s_layer = _layer_sheet_conductance(
+            copper_mask[layer_idx], k_cu, k_fr4, t_cu[layer_idx], t_fr4_eff[layer_idx]
+        )
         if cols > 1:
-            harmonic_k = (
-                2.0
-                * conductivity[:, :-1]
-                * conductivity[:, 1:]
-                / (conductivity[:, :-1] + conductivity[:, 1:] + eps)
-            )
-            edge_thickness = 0.5 * (thickness[:, :-1] + thickness[:, 1:])
-            gx[layer_idx] = harmonic_k * (edge_thickness * dy) / dx
+            gx[layer_idx] = _harmonic_sheet_conductance(s_layer[:, :-1], s_layer[:, 1:]) * (dy / dx)
         if rows > 1:
-            harmonic_k = (
-                2.0
-                * conductivity[:-1, :]
-                * conductivity[1:, :]
-                / (conductivity[:-1, :] + conductivity[1:, :] + eps)
-            )
-            edge_thickness = 0.5 * (thickness[:-1, :] + thickness[1:, :])
-            gy[layer_idx] = harmonic_k * (edge_thickness * dx) / dy
+            gy[layer_idx] = _harmonic_sheet_conductance(s_layer[:-1, :], s_layer[1:, :]) * (dx / dy)
 
     if layer_count > 1 and gap_m:
         gz = np.empty((layer_count - 1, rows, cols), dtype=np.float64)
@@ -2503,14 +2522,12 @@ def build_stiffness_matrix(
     # Build in-plane conduction terms
     for l in range(layer_count):
         base = l * RC
-        mask = copper_mask[l]
-        k_layer = np.where(mask, k_cu, k_fr4)
-        t_layer = np.where(mask, t_cu[l], t_fr4_eff[l])
+        s_layer = _layer_sheet_conductance(
+            copper_mask[l], k_cu, k_fr4, t_cu[l], t_fr4_eff[l]
+        )
 
         # X-direction coupling
-        k_h = 2.0 * k_layer[:, :-1] * k_layer[:, 1:] / (k_layer[:, :-1] + k_layer[:, 1:] + eps)
-        t_edge = 0.5 * (t_layer[:, :-1] + t_layer[:, 1:])
-        Gx = k_h * (t_edge * dy) / dx
+        Gx = _harmonic_sheet_conductance(s_layer[:, :-1], s_layer[:, 1:]) * (dy / dx)
 
         idx_left = base + row_all * cols + col_right
         idx_right = idx_left + 1
@@ -2537,9 +2554,7 @@ def build_stiffness_matrix(
         offset += n
 
         # Y-direction coupling
-        k_h = 2.0 * k_layer[:-1, :] * k_layer[1:, :] / (k_layer[:-1, :] + k_layer[1:, :] + eps)
-        t_edge = 0.5 * (t_layer[:-1, :] + t_layer[1:, :])
-        Gy = k_h * (t_edge * dx) / dy
+        Gy = _harmonic_sheet_conductance(s_layer[:-1, :], s_layer[1:, :]) * (dx / dy)
 
         idx_up = base + row_down * cols + col_all
         idx_down = idx_up + cols
@@ -3120,10 +3135,13 @@ def _heatsink_diagnostics(
     hA: Optional[np.ndarray],
     amb: float,
     operator: Optional[Any] = None,
+    b: Optional[np.ndarray] = None,
 ):
     """Compute total heat output (W) and heatsink metadata for k_norm_info."""
     if hA is None and operator is not None and hasattr(operator, "convection_power"):
         p_pcb_air = float(operator.convection_power(T_flat, amb))
+    elif b is not None:
+        p_pcb_air = float(np.dot(hA, T_flat - amb) - np.sum(b - hA * amb))
     else:
         p_pcb_air = float(np.dot(hA, T_flat - amb))
     if heatsink_model is None or not heatsink_model.is_active:
@@ -3162,6 +3180,79 @@ def _power_sum(source) -> float:
     return float(np.sum(source))
 
 
+def _add_source_to(dst: np.ndarray, q_src) -> None:
+    """Accumulate ``q_src`` (SparsePowerVector or dense array) into ``dst``."""
+    if isinstance(q_src, SparsePowerVector):
+        q_src.add_to(dst)
+    elif q_src is not None:
+        dst += q_src
+
+
+def _evaluate_step_power(Q_func, static_Q, t0: float, t1: float):
+    """Evaluate step-averaged power over ``[t0, t1]`` for ``Q_func`` or constant ``static_Q``."""
+    if Q_func is None:
+        return static_Q
+    step_avg = getattr(Q_func, "step_average", None)
+    if callable(step_avg):
+        return step_avg(t0, t1)
+    if t1 <= t0:
+        return Q_func(t1)
+    q0 = Q_func(t0)
+    q1 = Q_func(t1)
+    if isinstance(q0, SparsePowerVector) or isinstance(q1, SparsePowerVector):
+        arr0 = q0.to_dense() if isinstance(q0, SparsePowerVector) else np.asarray(q0, dtype=np.float64)
+        arr1 = q1.to_dense() if isinstance(q1, SparsePowerVector) else np.asarray(q1, dtype=np.float64)
+        return 0.5 * (arr0 + arr1)
+    return 0.5 * (np.asarray(q0, dtype=np.float64) + np.asarray(q1, dtype=np.float64))
+
+
+def _build_pwl_phase_plan(config: SolverConfig, node_count: int, Q_func):
+    """Build a breakpoint-aligned phase plan when ``Q_func`` exposes ``.breakpoints``."""
+    raw_bps = getattr(Q_func, "breakpoints", None) if Q_func is not None else None
+    sim_time = float(config.sim_time)
+    if not raw_bps or sim_time <= 0.0:
+        return _build_phase_plan(config, node_count)
+
+    tol = 1e-9 * max(1.0, sim_time)
+    interior = sorted(
+        float(t) for t in raw_bps
+        if tol < float(t) < sim_time - tol
+    )
+    merged_bps = []
+    for bp in interior:
+        if not merged_bps or (bp - merged_bps[-1]) > tol:
+            merged_bps.append(bp)
+
+    if not merged_bps:
+        return _build_phase_plan(config, node_count)
+
+    dt_base = max(float(config.dt_base), 1e-12)
+    if len(merged_bps) > 64:
+        step_count = max(int(config.steps_target), int(math.ceil(sim_time / dt_base)))
+        phase_dt = sim_time / step_count
+        pdef = {"name": "pwl_uniform", "frac": 1.0, "dt_scale": phase_dt / dt_base}
+        return "uniform", [(pdef, sim_time, step_count, phase_dt)]
+
+    edges = [0.0] + merged_bps + [sim_time]
+    plan = []
+    for idx, (t_start, t_end) in enumerate(zip(edges[:-1], edges[1:])):
+        dur = t_end - t_start
+        if dur <= 0.02 * dt_base:
+            step_count = 1
+        elif dur <= dt_base:
+            step_count = max(4, min(10, int(math.ceil(dur / (0.125 * dt_base)))))
+        else:
+            step_count = max(1, int(math.ceil(dur / dt_base)))
+        phase_dt = dur / step_count
+        pdef = {
+            "name": f"PWL_{idx + 1}",
+            "frac": dur / sim_time,
+            "dt_scale": phase_dt / dt_base,
+        }
+        plan.append((pdef, dur, step_count, phase_dt))
+    return "pwl_breakpoints", plan
+
+
 def run_steady_state(
     config: SolverConfig,
     K: sp.csr_matrix,
@@ -3194,6 +3285,7 @@ def run_steady_state(
             t_hs,
             hA,
             amb,
+            b=b,
         )
         k_norm_info = {
             "strategy": "direct_steady_state",
@@ -3256,7 +3348,7 @@ def run_steady_state(
 
     T = Tn.reshape((layer_count, rows, cols))
     pout_final, hs_info = _heatsink_diagnostics(
-        heatsink_model if hs_active else None, Tn, t_hs, hA, amb
+        heatsink_model if hs_active else None, Tn, t_hs, hA, amb, b=b
     )
     steady_rel_diff = abs(pin - pout_final) / max(abs(pin), 1e-9)
 
@@ -3361,6 +3453,7 @@ def run_steady_state_matrix_free(
             hA,
             amb,
             operator=operator,
+            b=b,
         )
         k_norm_info = {
             "strategy": "direct_steady_state",
@@ -3576,6 +3669,7 @@ def run_steady_state_matrix_free(
         hA,
         amb,
         operator=operator,
+        b=b,
     )
     steady_rel_diff = (
         abs(pin - pout_final) / max(abs(pin), 1e-9) if step_counter > 0 else None
@@ -3687,6 +3781,12 @@ def run_simulation_matrix_free(
         np.empty(node_count, dtype=np.float64),
     )
 
+    b_offset = (
+        float(np.sum(b - hA * ambient))
+        if (b is not None and hA is not None)
+        else 0.0
+    )
+
     def compute_energy(temp_vec: np.ndarray) -> float:
         if C is None and is_compact:
             pcb_energy = operator.thermal_energy(temp_vec, ambient)
@@ -3700,7 +3800,7 @@ def run_simulation_matrix_free(
             pcb_pout = operator.convection_power(temp_vec, ambient)
         else:
             np.subtract(temp_vec, ambient, out=pcg_workspaces[0])
-            pcb_pout = float(np.dot(hA, pcg_workspaces[0]))
+            pcb_pout = float(np.dot(hA, pcg_workspaces[0])) - b_offset
         return pcb_pout + (
             heatsink_model.g_hs_amb * (t_hs - ambient) if hs_active else 0.0
         )
@@ -3712,10 +3812,7 @@ def run_simulation_matrix_free(
             operator.add_boundary_rhs(dst)
 
     def add_q(dst: np.ndarray, q_src) -> None:
-        if isinstance(q_src, SparsePowerVector):
-            q_src.add_to(dst)
-        elif q_src is not None:
-            dst += q_src
+        _add_source_to(dst, q_src)
 
     initial_energy = compute_energy(temperature)
     current_time = 0.0
@@ -3732,6 +3829,8 @@ def run_simulation_matrix_free(
     balance_history = []
     previous_snapshot_time = 0.0
     previous_snapshot_energy = initial_energy
+    energy_in_j = 0.0
+    energy_out_j = 0.0
     balance_integral = 0.0
     pout_step = compute_pout(temperature)
     source = Q_func(0.0) if Q_func is not None else Q
@@ -3748,6 +3847,10 @@ def run_simulation_matrix_free(
         and config.steps_target > 60
     ):
         time_stepping_used, phase_plan = _build_geometric_phase_plan(config)
+    elif Q_func is not None and hasattr(Q_func, "breakpoints"):
+        time_stepping_used, phase_plan = _build_pwl_phase_plan(
+            config, node_count, Q_func
+        )
     else:
         time_stepping_used, phase_plan = _build_phase_plan(config, node_count)
     snap_tol = 1e-9 * max(1.0, float(config.sim_time))
@@ -3779,7 +3882,8 @@ def run_simulation_matrix_free(
         energy = compute_energy(temperature)
         energy_delta = energy - initial_energy
         absolute_error = abs(energy_delta - balance_integral)
-        relative_error = absolute_error / max(abs(t_elapsed * pin), 1e-9)
+        energy_scale = max(energy_in_j, abs(energy_out_j), abs(energy_delta), 1e-12)
+        relative_error = absolute_error / energy_scale
         interval = t_elapsed - previous_snapshot_time
         if interval > 0.0:
             balance_history.append({
@@ -3795,6 +3899,8 @@ def run_simulation_matrix_free(
             "energy": energy,
             "pin": pin,
             "pout": pout_step,
+            "energy_in_j": energy_in_j,
+            "energy_out_j": energy_out_j,
             "eps_abs": absolute_error,
             "eps_rel": relative_error,
             "energy_warn": relative_error > 0.01 or absolute_error > 0.01,
@@ -3821,6 +3927,7 @@ def run_simulation_matrix_free(
         nonlocal current_time, step_counter
         nonlocal total_solve_time, total_iterations, retry_count
         nonlocal max_relative_residual, pout_step, balance_integral
+        nonlocal energy_in_j, energy_out_j
         if extrapolate:
             np.multiply(2.0, temperature, out=guess_workspace)
             np.subtract(guess_workspace, previous_temperature, out=guess_workspace)
@@ -3865,13 +3972,12 @@ def run_simulation_matrix_free(
         retry_count += int(retried)
         max_relative_residual = max(max_relative_residual, relative_residual)
         pout_step = compute_pout(temperature)
-        balance_integral += dt_value * (pin - pout_step)
+        energy_in_j += dt_value * pin
+        energy_out_j += dt_value * pout_step
+        balance_integral = energy_in_j - energy_out_j
         return elapsed, iterations
 
-    use_blas_limit = (
-        HAS_NATIVE_CORE
-        and not bool(getattr(operator, "prefer_derivative_start", False))
-    )
+    use_blas_limit = HAS_NATIVE_CORE
     blas_guard = (
         _limit_blas_threads(1) if use_blas_limit else contextlib.nullcontext()
     )
@@ -3885,16 +3991,6 @@ def run_simulation_matrix_free(
             phase_solve_time = 0.0
             phase_iterations = 0
             phase_steps_done = 0
-            derivative_start = (
-                bool(phase_definition.get("derivative_start"))
-                or (
-                    time_stepping_used == "uniform"
-                    and (
-                        node_count >= 250_000
-                        or bool(getattr(operator, "prefer_derivative_start", False))
-                    )
-                )
-            )
 
             def build_be_rhs(q_src):
                 if C is None and is_compact:
@@ -3924,119 +4020,6 @@ def run_simulation_matrix_free(
                 return rhs_workspace
 
             try:
-                if derivative_start:
-                    bdf_operator, bdf_preconditioner = operator.implicit_linear_operator(
-                        C, 1.5 / phase_dt
-                    )
-                    phase_hs_bdf = None
-                    if hs_active:
-                        phase_hs_bdf, u_rel = _HeatsinkPhaseState.prepare_pcg(
-                            heatsink_model,
-                            1.5 / phase_dt,
-                            bdf_operator,
-                            bdf_preconditioner,
-                            cancel_check=cancel_check,
-                            rtol=1e-8,
-                            workspaces=pcg_workspaces,
-                        )
-                        max_relative_residual = max(max_relative_residual, u_rel)
-                    if Q_func is not None:
-                        source = Q_func(current_time)
-                        pin = _power_sum(source)
-                    if is_compact:
-                        operator._apply_with_scale(0.0, temperature, out=rhs_workspace)
-                    else:
-                        np.copyto(rhs_workspace, operator.dot(temperature))
-                    rhs_workspace *= -1.0
-                    add_q(rhs_workspace, source)
-                    add_b(rhs_workspace)
-                    if hs_active:
-                        g = heatsink_model.pad_conductance
-                        bottom_only = bool(getattr(heatsink_model, "bottom_layer_only", False))
-                        t_dot_g = (
-                            float(np.dot(g, temperature[-g.size :]))
-                            if bottom_only
-                            else float(np.dot(g, temperature))
-                        )
-                        t_hs_0 = (
-                            t_hs
-                            if c_hs > 0.0
-                            else (heatsink_model.g_hs_amb * ambient + t_dot_g)
-                            / (heatsink_model.g_hs_amb + float(np.sum(g)))
-                        )
-                        if bottom_only:
-                            rhs_workspace[-g.size :] += g * t_hs_0
-                        else:
-                            rhs_workspace += g * t_hs_0
-                        if c_hs > 0.0:
-                            t_diff_g = (
-                                float(np.dot(g, temperature[-g.size :] - t_hs))
-                                if bottom_only
-                                else float(np.dot(g, temperature - t_hs))
-                            )
-                            d_t_hs = (
-                                heatsink_model.g_hs_amb * (ambient - t_hs) + t_diff_g
-                            ) / c_hs
-                            t_hs_prev = t_hs - phase_dt * d_t_hs
-                    if C is None and is_compact:
-                        operator.divide_by_capacity(rhs_workspace, out=rhs_workspace)
-                    else:
-                        rhs_workspace /= C
-                    np.multiply(rhs_workspace, phase_dt, out=rhs_workspace)
-                    np.subtract(temperature, rhs_workspace, out=previous_temperature)
-
-                    while phase_steps_done < phase_steps and not aborted and not early_stopped:
-                        if cancel_check and cancel_check():
-                            aborted = True
-                            break
-                        if Q_func is not None:
-                            source = Q_func(current_time + phase_dt)
-                            pin = _power_sum(source)
-                        rhs = build_bdf2_rhs(source)
-                        elapsed, iterations = advance(
-                            rhs,
-                            bdf_operator,
-                            bdf_preconditioner,
-                            phase_dt,
-                            extrapolate=(phase_steps_done >= 1),
-                            phase_hs=phase_hs_bdf,
-                            bdf2_hs=True,
-                        )
-                        phase_solve_time += elapsed
-                        phase_iterations += iterations
-                        phase_steps_done += 1
-                        if (
-                            step_counter % update_interval == 0
-                            or step_counter == total_steps
-                        ):
-                            if progress_callback and not progress_callback(
-                                step_counter, total_steps
-                            ):
-                                aborted = True
-                                break
-                        if config.snapshots_enabled:
-                            while (
-                                next_snapshot_idx < len(config.snap_times)
-                                and current_time + snap_tol >= config.snap_times[next_snapshot_idx]
-                            ):
-                                record_snapshot(config.snap_times[next_snapshot_idx])
-                                next_snapshot_idx += 1
-                        if should_early_stop():
-                            early_stopped = True
-                            break
-                    phase_metrics.append({
-                        "phase": phase_definition["name"],
-                        "dt": phase_dt,
-                        "steps": phase_steps_done,
-                        "assembly_s": time.perf_counter() - phase_started - phase_solve_time,
-                        "factorization_s": 0.0,
-                        "avg_solve_s": phase_solve_time / max(phase_steps_done, 1),
-                        "avg_pcg_iterations": phase_iterations / max(phase_steps_done, 1),
-                        "startup": "derivative_bdf2",
-                        "backend": backend_name,
-                    })
-                    continue
-
                 be_operator, be_preconditioner = operator.implicit_linear_operator(
                     C, 1.0 / phase_dt
                 )
@@ -4071,7 +4054,9 @@ def run_simulation_matrix_free(
                         )
                         max_relative_residual = max(max_relative_residual, u_rel)
                 if Q_func is not None:
-                    source = Q_func(current_time + phase_dt)
+                    source = _evaluate_step_power(
+                        Q_func, Q, current_time, current_time + phase_dt
+                    )
                     pin = _power_sum(source)
                 rhs = build_be_rhs(source)
                 elapsed, iterations = advance(
@@ -4104,7 +4089,9 @@ def run_simulation_matrix_free(
                         aborted = True
                         break
                     if Q_func is not None:
-                        source = Q_func(current_time + phase_dt)
+                        source = _evaluate_step_power(
+                            Q_func, Q, current_time, current_time + phase_dt
+                        )
                         pin = _power_sum(source)
                     rhs = build_bdf2_rhs(source)
                     elapsed, iterations = advance(
@@ -4145,6 +4132,7 @@ def run_simulation_matrix_free(
                 "factorization_s": 0.0,
                 "avg_solve_s": phase_solve_time / max(phase_steps_done, 1),
                 "avg_pcg_iterations": phase_iterations / max(phase_steps_done, 1),
+                "startup": "backward_euler",
                 "backend": backend_name,
             })
 
@@ -4156,8 +4144,14 @@ def run_simulation_matrix_free(
         hA,
         ambient,
         operator=operator,
+        b=b,
     )
     average_solve = total_solve_time / max(step_counter, 1)
+    pin_report_w = (
+        (energy_in_j / current_time)
+        if (Q_func is not None and current_time > 0.0)
+        else pin
+    )
     steady_rel_diff = (
         abs(pin - pout_final) / max(abs(pin), 1e-9) if early_stopped else None
     )
@@ -4178,8 +4172,10 @@ def run_simulation_matrix_free(
         "avg_pcg_iterations": total_iterations / max(step_counter, 1),
         "pcg_retry_count": retry_count,
         "pcg_relative_residual_max": max_relative_residual,
-        "pin_w": pin,
+        "pin_w": pin_report_w,
         "pout_final_w": pout_final,
+        "energy_in_j": energy_in_j,
+        "energy_out_j": energy_out_j,
         "steady_rel_diff": steady_rel_diff,
         "early_steady_state_stop": early_stopped,
     }
@@ -4298,8 +4294,11 @@ def run_simulation(
     Tn = np.ones(N, dtype=np.float64) * amb
     Tnm1 = Tn.copy()
     e0 = float(np.sum(C * (Tn - amb))) + (c_hs * (t_hs - amb) if hs_active else 0.0)
+    b_offset = float(np.sum(b - hA * amb))
+    energy_in_j = 0.0
+    energy_out_j = 0.0
     balance_integral = 0.0
-    pout_step = float(np.sum(hA * (Tn - amb))) + (
+    pout_step = float(np.sum(hA * (Tn - amb))) - b_offset + (
         heatsink_model.g_hs_amb * (t_hs - amb) if hs_active else 0.0
     )
     prev_snap_time = 0.0
@@ -4323,7 +4322,11 @@ def run_simulation(
     phase_metrics = []
     balance_history = []
 
-    time_stepping_used, phase_plan = _build_phase_plan(config, N)
+    if Q_func is not None and hasattr(Q_func, "breakpoints"):
+        time_stepping_used, phase_plan = _build_pwl_phase_plan(config, N, Q_func)
+    else:
+        time_stepping_used, phase_plan = _build_phase_plan(config, N)
+    snap_tol = 1e-9 * max(1.0, float(sim_time))
     total_steps = sum(item[2] for item in phase_plan)
 
     update_interval = max(1, total_steps // 100)
@@ -4356,7 +4359,8 @@ def run_simulation(
         )
         dE = energy - e0
         eps_abs = abs(dE - balance_integral)
-        eps_rel = eps_abs / max(abs(t_elapsed * pin), 1e-9)
+        energy_scale = max(energy_in_j, abs(energy_out_j), abs(dE), 1e-12)
+        eps_rel = eps_abs / energy_scale
         balance_warn = eps_rel > 0.01 or eps_abs > 0.01
 
         print(
@@ -4386,6 +4390,8 @@ def run_simulation(
             "energy": energy,
             "pin": pin,
             "pout": pout_step,
+            "energy_in_j": energy_in_j,
+            "energy_out_j": energy_out_j,
             "eps_abs": eps_abs,
             "eps_rel": eps_rel,
             "energy_warn": balance_warn
@@ -4409,6 +4415,7 @@ def run_simulation(
     ):
         nonlocal Tnm1, Tn, t_hs, t_hs_prev, current_time, step_counter
         nonlocal pout_step, balance_integral, total_solve_time
+        nonlocal energy_in_j, energy_out_j
         if phase_hs is not None:
             r_hs = phase_hs.scalar_rhs(amb, t_hs, t_hs_prev, dt_k, bdf2=bdf2_hs)
             solve_rhs = phase_hs.modified_rhs(rhs, r_hs)
@@ -4426,10 +4433,12 @@ def run_simulation(
         current_time += dt_k
         step_counter += 1
         delta_t = Tn - amb
-        pout_step = float(np.sum(hA * delta_t)) + (
+        pout_step = float(np.sum(hA * delta_t)) - b_offset + (
             heatsink_model.g_hs_amb * (t_hs - amb) if hs_active else 0.0
         )
-        balance_integral += dt_k * (pin - pout_step)
+        energy_in_j += dt_k * pin
+        energy_out_j += dt_k * pout_step
+        balance_integral = energy_in_j - energy_out_j
         return solve_elapsed
 
     # Main time-stepping loop
@@ -4442,60 +4451,25 @@ def run_simulation(
         D = C / phase_dt
         two_D = 2.0 * D
         half_D = 0.5 * D
+        one_half_D = 1.5 * D
         rhs_workspace = np.empty(N, dtype=np.float64)
-        A_bdf2 = K + sp.diags(1.5 * D, format="csr")
-        A_be = None if pdef.get("derivative_start") else (K + sp.diags(D, format="csr"))
+        use_single_factor_be_startup = bool(pdef.get("derivative_start")) and phase_step_count >= 2
+        A_bdf2 = K + sp.diags(one_half_D, format="csr")
+        A_be = None if use_single_factor_be_startup else (K + sp.diags(D, format="csr"))
         assembly_time = time.perf_counter() - assembly_start
 
         def build_bdf2_rhs(q_value):
             """Populate the reusable BDF2 right-hand-side buffer."""
             np.multiply(two_D, Tn, out=rhs_workspace)
             rhs_workspace[...] -= half_D * Tnm1
-            rhs_workspace[...] += q_value
+            _add_source_to(rhs_workspace, q_value)
             rhs_workspace[...] += b
             return rhs_workspace
 
-        if pdef.get("derivative_start"):
-            # A derivative-consistent fictitious T(-dt) gives BDF2 its
-            # second-order startup without a separate one-shot BE matrix.
-            # This is used by Auto on large uniform direct-solver systems.
-            Q_current = Q_func(current_time) if Q_func is not None else Q
-            pin = _power_sum(Q_current)
-            if hs_active:
-                g = heatsink_model.pad_conductance
-                bottom_only = bool(getattr(heatsink_model, "bottom_layer_only", False))
-                t_dot_g = (
-                    float(np.dot(g, Tn[-g.size :]))
-                    if bottom_only
-                    else float(np.dot(g, Tn))
-                )
-                t_hs_0 = (
-                    t_hs
-                    if c_hs > 0.0
-                    else (heatsink_model.g_hs_amb * amb + t_dot_g)
-                    / (heatsink_model.g_hs_amb + float(np.sum(g)))
-                )
-                rhs0 = Q_current + b - K.dot(Tn)
-                if bottom_only:
-                    rhs0[-g.size :] += g * t_hs_0
-                else:
-                    rhs0 += g * t_hs_0
-                derivative0 = rhs0 / C
-                Tnm1 = Tn - phase_dt * derivative0
-                if c_hs > 0.0:
-                    t_diff_g = (
-                        float(np.dot(g, Tn[-g.size :] - t_hs))
-                        if bottom_only
-                        else float(np.dot(g, Tn - t_hs))
-                    )
-                    d_t_hs = (
-                        heatsink_model.g_hs_amb * (amb - t_hs) + t_diff_g
-                    ) / c_hs
-                    t_hs_prev = t_hs - phase_dt * d_t_hs
-            else:
-                derivative0 = (Q_current + b - K.dot(Tn)) / C
-                Tnm1 = Tn - phase_dt * derivative0
-
+        if use_single_factor_be_startup:
+            # L-stable 3-substep Backward Euler startup with dt_be = (2/3) * phase_dt
+            # shares the exact matrix K + (1.5 / phase_dt) * C = A_bdf2, eliminating
+            # step-1 overshoot while keeping a single LU factorization.
             factor_cache_hit = False
             factor_cached = False
             cached_factor = (
@@ -4534,12 +4508,56 @@ def run_simulation(
             phase_solve_time = 0.0
             phase_steps_done = 0
 
+            dt_be = (2.0 / 3.0) * phase_dt
+            be_sub_temps = []
+            be_sub_hs = []
+            for _sub in range(3):
+                if cancel_check and cancel_check():
+                    aborted = True
+                    break
+                if Q_func is not None:
+                    Q_current = _evaluate_step_power(
+                        Q_func, Q, current_time, current_time + dt_be
+                    )
+                    pin = _power_sum(Q_current)
+                np.multiply(one_half_D, Tn, out=rhs_workspace)
+                _add_source_to(rhs_workspace, Q_current)
+                rhs_workspace[...] += b
+                phase_solve_time += advance_step(
+                    rhs_workspace,
+                    solve_bdf2,
+                    dt_be,
+                    phase_hs=phase_hs_bdf,
+                    bdf2_hs=False,
+                )
+                be_sub_temps.append(Tn)
+                be_sub_hs.append(t_hs)
+                if config.snapshots_enabled:
+                    while (
+                        next_snap_idx < len(config.snap_times)
+                        and current_time + snap_tol >= config.snap_times[next_snap_idx]
+                    ):
+                        record_snapshot(config.snap_times[next_snap_idx])
+                        next_snap_idx += 1
+            if not aborted:
+                Tnm1 = 0.5 * (be_sub_temps[0] + be_sub_temps[1])
+                if hs_active:
+                    t_hs_prev = 0.5 * (be_sub_hs[0] + be_sub_hs[1])
+                phase_steps_done = 2
+                if progress_callback and not progress_callback(
+                    min(step_counter, total_steps), total_steps
+                ):
+                    aborted = True
+                    print("[ThermalSim] Simulation cancelled by user.")
+
             while not aborted and not early_stopped and phase_steps_done < phase_step_count:
                 if cancel_check and cancel_check():
                     aborted = True
                     break
                 if Q_func is not None:
-                    Q_current = Q_func(current_time + phase_dt)
+                    Q_current = _evaluate_step_power(
+                        Q_func, Q, current_time, current_time + phase_dt
+                    )
                     pin = _power_sum(Q_current)
                 rhs = build_bdf2_rhs(Q_current)
                 phase_solve_time += advance_step(
@@ -4551,13 +4569,18 @@ def run_simulation(
                 )
                 phase_steps_done += 1
 
-                if step_counter % update_interval == 0 or step_counter == total_steps:
-                    if progress_callback and not progress_callback(step_counter, total_steps):
+                if step_counter % update_interval == 0 or step_counter >= total_steps:
+                    if progress_callback and not progress_callback(
+                        min(step_counter, total_steps), total_steps
+                    ):
                         aborted = True
                         print("[ThermalSim] Simulation cancelled by user.")
                         break
                 if config.snapshots_enabled:
-                    while next_snap_idx < len(config.snap_times) and current_time >= config.snap_times[next_snap_idx]:
+                    while (
+                        next_snap_idx < len(config.snap_times)
+                        and current_time + snap_tol >= config.snap_times[next_snap_idx]
+                    ):
                         record_snapshot(config.snap_times[next_snap_idx])
                         next_snap_idx += 1
                 if should_early_stop():
@@ -4606,10 +4629,12 @@ def run_simulation(
         )
 
         if Q_func is not None:
-            Q_current = Q_func(current_time + phase_dt)
+            Q_current = _evaluate_step_power(
+                Q_func, Q, current_time, current_time + phase_dt
+            )
             pin = _power_sum(Q_current)
         np.multiply(D, Tn, out=rhs_workspace)
-        rhs_workspace += Q_current
+        _add_source_to(rhs_workspace, Q_current)
         rhs_workspace += b
         rhs1 = rhs_workspace
         solve_elapsed = advance_step(
@@ -4635,7 +4660,10 @@ def run_simulation(
                 break
 
         if config.snapshots_enabled:
-            while next_snap_idx < len(config.snap_times) and current_time >= config.snap_times[next_snap_idx]:
+            while (
+                next_snap_idx < len(config.snap_times)
+                and current_time + snap_tol >= config.snap_times[next_snap_idx]
+            ):
                 record_snapshot(config.snap_times[next_snap_idx])
                 next_snap_idx += 1
 
@@ -4665,8 +4693,10 @@ def run_simulation(
                 aborted = True
                 break
             if Q_func is not None:
-                Q_current = Q_func(current_time + phase_dt)
-                pin = float(np.sum(Q_current))
+                Q_current = _evaluate_step_power(
+                    Q_func, Q, current_time, current_time + phase_dt
+                )
+                pin = _power_sum(Q_current)
             rhs = build_bdf2_rhs(Q_current)
             solve_elapsed = advance_step(
                 rhs,
@@ -4685,7 +4715,10 @@ def run_simulation(
                     break
 
             if config.snapshots_enabled:
-                while next_snap_idx < len(config.snap_times) and current_time >= config.snap_times[next_snap_idx]:
+                while (
+                    next_snap_idx < len(config.snap_times)
+                    and current_time + snap_tol >= config.snap_times[next_snap_idx]
+                ):
                     record_snapshot(config.snap_times[next_snap_idx])
                     next_snap_idx += 1
 
@@ -4721,12 +4754,12 @@ def run_simulation(
     avg_solve_time = total_solve_time / max(step_counter, 1)
     T = Tn.reshape((layer_count, rows, cols))
     pout_final, hs_info = _heatsink_diagnostics(
-        heatsink_model if hs_active else None, Tn, t_hs, hA, amb
+        heatsink_model if hs_active else None, Tn, t_hs, hA, amb, b=b
     )
 
     steady_ok = early_stopped
     rel_diff = None
-    if not steady_ok and balance_history:
+    if not steady_ok and Q_func is None and balance_history:
         recent = balance_history[-min(3, len(balance_history)):]
         steady_ok = all(
             abs(item["dE"]) / max(abs(item["delta_t"] * pin), 1e-9) < 0.01
@@ -4742,6 +4775,12 @@ def run_simulation(
     if backend_modes:
         backend = backend_modes[-1] if len(set(backend_modes)) == 1 else " -> ".join(dict.fromkeys(backend_modes))
 
+    pin_report_w = (
+        (energy_in_j / current_time)
+        if (Q_func is not None and current_time > 0.0)
+        else pin
+    )
+
     k_norm_info = {
         "strategy": "implicit_fvm_bdf2",
         "backend": backend,
@@ -4756,8 +4795,10 @@ def run_simulation(
         "factorizations": factor_count,
         "factorization_cache_hit": factorization_cache_used,
         "avg_solve_s": avg_solve_time,
-        "pin_w": pin,
+        "pin_w": pin_report_w,
         "pout_final_w": pout_final,
+        "energy_in_j": energy_in_j,
+        "energy_out_j": energy_out_j,
         "steady_rel_diff": rel_diff,
         "early_steady_state_stop": early_stopped,
     }

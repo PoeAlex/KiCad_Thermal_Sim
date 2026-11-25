@@ -46,6 +46,24 @@ def _sexpr_extract_from_index(s, i):
     return None, None
 
 
+_SEXPR_DELIMS = (" ", "\t", "\n", "\r", ")")
+
+
+def _find_sexpr_token(s, token, start=0):
+    """Find the first '(' + token followed by an S-expression delimiter."""
+    key = "(" + token
+    key_len = len(key)
+    pos = start
+    while True:
+        i = s.find(key, pos)
+        if i < 0:
+            return -1
+        end = i + key_len
+        if end < len(s) and s[end] in _SEXPR_DELIMS:
+            return i
+        pos = i + 1
+
+
 def _sexpr_extract_block(s, token, start=0):
     """
     Find and extract the first S-expression block starting with a token.
@@ -64,8 +82,7 @@ def _sexpr_extract_block(s, token, start=0):
     str or None
         The complete '(token ...)' block if found, otherwise None.
     """
-    key = "(" + token
-    i = s.find(key, start)
+    i = _find_sexpr_token(s, token, start)
     if i < 0:
         return None
     blk, _ = _sexpr_extract_from_index(s, i)
@@ -88,11 +105,10 @@ def _sexpr_find_all_blocks(s, token):
     list of str
         List of all '(token ...)' blocks found in the string.
     """
-    key = "(" + token
     blocks = []
     i = 0
     while True:
-        i = s.find(key, i)
+        i = _find_sexpr_token(s, token, i)
         if i < 0:
             break
         blk, end = _sexpr_extract_from_index(s, i)

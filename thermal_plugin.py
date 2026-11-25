@@ -1567,9 +1567,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             )
         if result.grid.nodes > 10_000_000:
             result.warnings.append(
-                f"The requested grid contains {result.grid.nodes:,} equivalent "
-                "uniform nodes. Adaptive reduction depends on the actual PCB "
-                "geometry; verify the displayed RAM estimate before running."
+                f"The requested grid contains {result.grid.nodes:,} "
+                "uniform nodes; verify the displayed RAM estimate before running."
             )
         return result
 
@@ -1818,7 +1817,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
             # Physical parameters
             k_fr4_rel = 1.0
-            via_factor = 390.0 / 0.3
             k_cu = 390.0
             k_fr4 = 0.3
             rho_cu, cp_cu = 8960.0, 385.0
@@ -1868,7 +1866,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         y_min=y_min,
                         res=res,
                         settings=settings,
-                        via_factor=via_factor,
+                        via_factor=k_cu / k_fr4,
                         pads_list=focus_pads,
                         progress_callback=reporter.make_stage_callback(
                             5, 32, "Mapping exact PCB geometry..."
@@ -2111,11 +2109,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             "via_plating_um": via_plating_um,
                             "via_fill": via_fill,
                             "ambient_c": float(amb),
+                            "gap_m": gap_m,
                         },
                     )
                     electrical_key = stable_fingerprint({
                         "geometry": cache_key,
                         "copper_thickness_m": [float(value) for value in t_cu],
+                        "gap_m": [float(value) for value in gap_m],
                         "via_plating_um": float(via_plating_um),
                         "via_fill": via_fill,
                         "ambient_c": float(amb),
@@ -2516,7 +2516,6 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 "init_electrical_solve_s": init_timings.get("electrical_solve_s"),
                 "init_electrical_cache_hit": init_timings.get("electrical_cache_hit"),
                 "init_stiffness_matrix_s": init_timings.get("stiffness_matrix_s"),
-                "init_adaptive_mesh_s": init_timings.get("adaptive_mesh_s"),
                 "init_operator_cache_hit": init_timings.get("operator_cache_hit"),
                 "compute_engine": result.k_norm_info.get(
                     "compute_engine", resolved_engine

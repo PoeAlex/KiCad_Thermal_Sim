@@ -611,7 +611,7 @@ def effective_fr4_control_volume_thicknesses(
     thicknesses[-1] = 0.5 * gaps[-1]
     if count > 2:
         thicknesses[1:-1] = 0.5 * (gaps[:-1] + gaps[1:])
-    return np.clip(thicknesses, 1e-6, 5e-3)
+    return np.clip(thicknesses, 1e-6, 50e-3)
 
 
 def build_dense_capacity(
@@ -735,26 +735,103 @@ def build_sparse_pad_contributions(
     contributions: List[SparsePadContribution] = []
 
     for pad in pads_list:
-        target_idx = pad_target_layer_index(board, copper_ids, pad, lid_to_idx)
-        target_lid = copper_ids[target_idx] if 0 <= target_idx < len(copper_ids) else None
-        indices = get_pad_power_indices(
-            pad,
-            target_idx=target_idx,
-            rows=rows,
-            cols=cols,
-            x_min=x_min,
-            y_min=y_min,
-            res=res,
-            layer_id=target_lid,
-            area_mask=area_mask,
-        )
-        if indices.size:
-            weights = np.full(indices.shape, 1.0 / float(indices.size), dtype=np.float64)
+        copper_indices = get_pad_copper_layer_indices(pad, copper_ids, lid_to_idx=lid_to_idx)
+        if len(copper_indices) > 1:
+            layer_indices_list: List[np.ndarray] = []
+            for layer_idx in copper_indices:
+                if not (0 <= layer_idx < len(copper_ids)):
+                    continue
+                layer_lid = copper_ids[layer_idx]
+                layer_cells = get_pad_power_indices(
+                    pad,
+                    target_idx=layer_idx,
+                    rows=rows,
+                    cols=cols,
+                    x_min=x_min,
+                    y_min=y_min,
+                    res=res,
+                    layer_id=layer_lid,
+                    area_mask=area_mask,
+                )
+                if layer_cells.size:
+                    layer_indices_list.append(layer_cells)
+            if layer_indices_list:
+                layer_share = 1.0 / float(len(layer_indices_list))
+                layer_weights_list = [
+                    np.full(arr.shape, layer_share / float(arr.size), dtype=np.float64)
+                    for arr in layer_indices_list
+                ]
+                indices = np.concatenate(layer_indices_list)
+                weights = np.concatenate(layer_weights_list)
+            else:
+                indices = np.empty(0, dtype=np.int64)
+                weights = np.empty(0, dtype=np.float64)
         else:
-            weights = np.empty(0, dtype=np.float64)
+            target_idx = pad_target_layer_index(board, copper_ids, pad, lid_to_idx)
+            target_lid = copper_ids[target_idx] if 0 <= target_idx < len(copper_ids) else None
+            indices = get_pad_power_indices(
+                pad,
+                target_idx=target_idx,
+                rows=rows,
+                cols=cols,
+                x_min=x_min,
+                y_min=y_min,
+                res=res,
+                layer_id=target_lid,
+                area_mask=area_mask,
+            )
+            if indices.size:
+                weights = np.full(indices.shape, 1.0 / float(indices.size), dtype=np.float64)
+            else:
+                weights = np.empty(0, dtype=np.float64)
         contributions.append(SparsePadContribution(indices=indices, weights=weights))
 
     return contributions
+
+
+def _pwl_interval_average(
+    times: np.ndarray,
+    powers: np.ndarray,
+    t0: float,
+    t1: float,
+) -> float:
+    """Return the exact analytical time-average of a clamped PWL curve over ``[t0, t1]``."""
+    n = times.size
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return float(powers[0])
+    t0_f = float(t0)
+    t1_f = float(t1)
+    dt_total = t1_f - t0_f
+    if dt_total <= 0.0:
+        return float(np.interp(t1_f, times, powers))
+
+    integral = 0.0
+    t_first = float(times[0])
+    t_last = float(times[-1])
+    if t0_f < t_first:
+        integral += float(powers[0]) * (min(t1_f, t_first) - t0_f)
+    if t1_f > t_last:
+        integral += float(powers[-1]) * (t1_f - max(t0_f, t_last))
+
+    t_left = times[:-1]
+    t_right = times[1:]
+    a = np.maximum(t_left, t0_f)
+    b = np.minimum(t_right, t1_f)
+    active = b > a
+    if np.any(active):
+        a_act = a[active]
+        b_act = b[active]
+        tl_act = t_left[active]
+        dt_seg = t_right[active] - tl_act
+        p0_act = powers[:-1][active]
+        dp_act = powers[1:][active] - p0_act
+        pa = p0_act + dp_act * ((a_act - tl_act) / dt_seg)
+        pb = p0_act + dp_act * ((b_act - tl_act) / dt_seg)
+        integral += float(np.sum(0.5 * (pa + pb) * (b_act - a_act)))
+
+    return integral / dt_total
 
 
 def build_power_vector(
@@ -790,13 +867,31 @@ def build_power_vector(
     for times, powers, indices, weights in pwl_terms:
         q_initial[indices] += float(np.interp(0.0, times, powers)) * weights
 
-    q_workspace = np.empty_like(q_const)
+    bp_chunks = [times[np.isfinite(times)] for times, _, _, _ in pwl_terms]
+    breakpoints = (
+        tuple(float(val) for val in np.unique(np.concatenate(bp_chunks)))
+        if bp_chunks else ()
+    )
+    pwl_tuple = tuple(pwl_terms)
 
-    def q_func(t, _q_const=q_const, _pwl_terms=tuple(pwl_terms), _workspace=q_workspace):
-        np.copyto(_workspace, _q_const)
+    def q_func(t, _q_const=q_const, _pwl_terms=pwl_tuple):
+        q_out = _q_const.copy()
         for times, powers, indices, weights in _pwl_terms:
-            _workspace[indices] += float(np.interp(t, times, powers)) * weights
-        return _workspace
+            q_out[indices] += float(np.interp(t, times, powers)) * weights
+        return q_out
+
+    def step_average(t0, t1, _q_const=q_const, _pwl_terms=pwl_tuple):
+        t0_f = float(t0)
+        t1_f = float(t1)
+        if t1_f <= t0_f:
+            return q_func(t1_f)
+        q_avg = _q_const.copy()
+        for times, powers, indices, weights in _pwl_terms:
+            q_avg[indices] += _pwl_interval_average(times, powers, t0_f, t1_f) * weights
+        return q_avg
+
+    q_func.breakpoints = breakpoints
+    q_func.step_average = step_average
 
     return q_initial, q_func
 

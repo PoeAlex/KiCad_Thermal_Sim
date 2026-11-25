@@ -579,7 +579,6 @@ def save_preview_image(
     out_dir=None,
     geometry_state=None,
     grid_spec=None,
-    adaptive_mesh=None,
 ):
     """
     Save a geometry preview image showing copper, vias, and heat sources.
@@ -637,7 +636,6 @@ def save_preview_image(
     # Physics constants for mapping
     k_fr4_rel = 1.0
     k_cu_rel = 400.0
-    via_factor = 390.0 / 0.3
     ref_cu_thick_m = 35e-6
     layer_count = len(copper_ids)
 
@@ -667,7 +665,7 @@ def save_preview_image(
                 pass
             K, V_map, H_map = create_maps_func(
                 board, copper_ids, rows, cols, x_min, y_min, res,
-                settings, k_fr4_rel, k_cu_layers, via_factor, pads_list,
+                settings, k_fr4_rel, k_cu_layers, 1300.0, pads_list,
                 **extra_kwargs
             )
         else:
@@ -694,37 +692,66 @@ def save_preview_image(
             fig.suptitle(f"{prefix}: {area_summary}", fontsize=11)
 
         # Build pad masks per layer
+        from .geometry_mapper import get_pad_copper_layer_indices
+
         pad_masks = [np.zeros((rows, cols), dtype=bool) for _ in range(count)]
         pad_labels = []
         label_limit = 10
+        lid_to_idx = {lid: idx for idx, lid in enumerate(copper_ids)}
+        npth_attrib = getattr(pcbnew, "PAD_ATTRIB_NPTH", None)
+        try:
+            px_params = inspect.signature(get_pad_pixels_func).parameters
+            px_accepts_layer_id = (
+                "layer_id" in px_params
+                or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in px_params.values())
+            )
+        except (TypeError, ValueError):
+            px_accepts_layer_id = False
 
         for pad in pads_list or []:
-            pad_lid = pad.GetLayer()
-            target_indices = []
-            if pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
-                target_indices = list(range(count))
-            elif pad_lid in copper_ids:
-                target_indices = [copper_ids.index(pad_lid)]
-            else:
-                lname = board.GetLayerName(pad_lid).upper()
-                target_indices = [count - 1 if ("B." in lname or "BOT" in lname) else 0]
-
-            pixels = get_pad_pixels_func(pad, rows, cols, x_min, y_min, res)
-            if pixels:
-                for idx in target_indices:
-                    for r, c in pixels:
-                        if r < rows and c < cols:
-                            pad_masks[idx][r, c] = True
-                if len(pad_labels) < label_limit:
+            try:
+                if npth_attrib is not None and pad.GetAttribute() == npth_attrib:
+                    continue
+            except Exception:
+                pass
+            target_indices = [
+                idx for idx in get_pad_copper_layer_indices(pad, copper_ids, lid_to_idx)
+                if 0 <= idx < count
+            ]
+            if not target_indices and count > 0:
+                pad_lid = pad.GetLayer()
+                if pad_lid in lid_to_idx and 0 <= lid_to_idx[pad_lid] < count:
+                    target_indices = [lid_to_idx[pad_lid]]
+                else:
                     try:
-                        pos = pad.GetPosition()
-                        cx = int((pos.x * 1e-6 - x_min) / res)
-                        cy = int((pos.y * 1e-6 - y_min) / res)
+                        lname = str(board.GetLayerName(pad_lid)).upper()
                     except Exception:
-                        cx, cy = None, None
-                    if cx is not None and cy is not None:
-                        label = pad.GetNumber() if hasattr(pad, "GetNumber") else ""
-                        pad_labels.append((target_indices[0], cx, cy, label))
+                        lname = ""
+                    target_indices = [count - 1 if ("B." in lname or "BOT" in lname) else 0]
+
+            any_pixels = False
+            for idx in target_indices:
+                if px_accepts_layer_id and idx < len(copper_ids):
+                    pixels = get_pad_pixels_func(
+                        pad, rows, cols, x_min, y_min, res, layer_id=copper_ids[idx]
+                    )
+                else:
+                    pixels = get_pad_pixels_func(pad, rows, cols, x_min, y_min, res)
+                if pixels:
+                    any_pixels = True
+                    for r, c in pixels:
+                        if 0 <= r < rows and 0 <= c < cols:
+                            pad_masks[idx][r, c] = True
+            if any_pixels and target_indices and len(pad_labels) < label_limit:
+                try:
+                    pos = pad.GetPosition()
+                    cx = int((pos.x * 1e-6 - x_min) / res)
+                    cy = int((pos.y * 1e-6 - y_min) / res)
+                except Exception:
+                    cx, cy = None, None
+                if cx is not None and cy is not None:
+                    label = pad.GetNumber() if hasattr(pad, "GetNumber") else ""
+                    pad_labels.append((target_indices[0], cx, cy, label))
 
         max_axis = max(rows, cols)
         stride = int(math.ceil(max_axis / 800)) if max_axis > 800 else 1

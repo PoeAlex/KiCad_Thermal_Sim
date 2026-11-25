@@ -7,6 +7,7 @@ losses into a thermal heat-source vector.
 """
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -19,9 +20,12 @@ import pcbnew
 from .geometry_mapper import (
     GeometryCancelledError,
     _ProgressEmitter,
+    _arc_parameters,
     _extract_pth_drill_mm,
     _extract_via_drill_mm,
     _fill_zone_mask_polygons,
+    _is_rule_or_keepout_zone,
+    _mark_centerline_points,
     _pad_orientation_radians,
     _pad_shape_center_mm,
     compute_via_copper_area_m2,
@@ -1176,6 +1180,8 @@ def _build_relevant_net_data(
             f"Rasterizing electrical zone {z_idx + 1} / {total_zones}...",
             force=(z_idx == 0),
         )
+        if _is_rule_or_keepout_zone(zone):
+            continue
         key, _, _ = net_key_from_obj(zone)
         if key not in net_masks:
             continue
@@ -1398,10 +1404,20 @@ def _bbox_area_mm2(bbox: Optional[Any]) -> float:
 
 
 def _track_length_mm(track: Any) -> float:
-    """Return track centerline length in millimeters."""
+    """Return track centerline length in millimeters (true arc length for PCB_ARC)."""
     try:
         start = track.GetStart()
         end = track.GetEnd()
+        if hasattr(track, "GetMid"):
+            try:
+                middle = track.GetMid()
+                if middle is not None:
+                    arc = _arc_parameters(start, middle, end)
+                    if arc is not None:
+                        _, _, radius, _, signed_span = arc
+                        return float(radius * abs(signed_span))
+            except Exception:
+                pass
         return float(np.hypot(end.x - start.x, end.y - start.y)) * 1e-6
     except Exception:
         bbox = track.GetBoundingBox()
@@ -1475,7 +1491,7 @@ def _fill_bbox_2d(mask: np.ndarray, bbox: Any, config: ElectricalConfig):
 
 
 def _fill_track(mask: np.ndarray, layer_idx: int, track: Any, config: ElectricalConfig):
-    """Rasterize a track segment, falling back to its bounding box."""
+    """Rasterize a straight track or circular PCB_ARC, falling back to its bounding box."""
     if not all(hasattr(track, attr) for attr in ("GetStart", "GetEnd", "GetWidth")):
         _fill_bbox_3d(mask, layer_idx, track.GetBoundingBox(), config)
         return
@@ -1492,15 +1508,52 @@ def _fill_track(mask: np.ndarray, layer_idx: int, track: Any, config: Electrical
     if rs >= re or cs >= ce:
         return
 
-    sx, sy = start.x * 1e-6, start.y * 1e-6
-    ex, ey = end.x * 1e-6, end.y * 1e-6
-    vx, vy = ex - sx, ey - sy
-    seg_len_sq = vx * vx + vy * vy
-    radius = 0.5 * width_mm
-
     y = config.y_min + (np.arange(rs, re, dtype=np.float64) + 0.5) * config.res
     x = config.x_min + (np.arange(cs, ce, dtype=np.float64) + 0.5) * config.res
     xx, yy = np.meshgrid(x, y)
+    radius = 0.5 * width_mm
+
+    arc = None
+    if hasattr(track, "GetMid"):
+        try:
+            middle = track.GetMid()
+            if middle is not None:
+                arc = _arc_parameters(start, middle, end)
+        except Exception:
+            arc = None
+
+    if arc is not None:
+        cx, cy, arc_radius, start_angle, signed_span = arc
+        dx = xx - cx
+        dy = yy - cy
+        radial = np.abs(np.hypot(dx, dy) - arc_radius) <= radius
+        angles = np.arctan2(dy, dx)
+        tau = 2.0 * np.pi
+        if signed_span >= 0.0:
+            angular = np.mod(angles - start_angle, tau) <= signed_span
+        else:
+            angular = np.mod(start_angle - angles, tau) <= (-signed_span)
+        sx, sy = float(start.x) * 1e-6, float(start.y) * 1e-6
+        ex, ey = float(end.x) * 1e-6, float(end.y) * 1e-6
+        endcaps = (np.hypot(xx - sx, yy - sy) <= radius) | (np.hypot(xx - ex, yy - ey) <= radius)
+        mask[layer_idx, rs:re, cs:ce] |= (radial & angular) | endcaps
+        if config.res > 0.0:
+            arc_len = arc_radius * abs(signed_span)
+            n_steps = max(1, int(math.ceil(arc_len / (0.4 * config.res))))
+            theta = start_angle + np.linspace(0.0, signed_span, n_steps + 1)
+            xs = cx + arc_radius * np.cos(theta)
+            ys = cy + arc_radius * np.sin(theta)
+            _mark_centerline_points(
+                mask[layer_idx], config.rows, config.cols,
+                config.x_min, config.y_min, config.res, xs, ys,
+            )
+        return
+
+    sx, sy = float(start.x) * 1e-6, float(start.y) * 1e-6
+    ex, ey = float(end.x) * 1e-6, float(end.y) * 1e-6
+    vx, vy = ex - sx, ey - sy
+    seg_len_sq = vx * vx + vy * vy
+
     if seg_len_sq <= 1e-24:
         dist = np.hypot(xx - sx, yy - sy)
     else:
@@ -1510,6 +1563,15 @@ def _fill_track(mask: np.ndarray, layer_idx: int, track: Any, config: Electrical
         py = sy + t * vy
         dist = np.hypot(xx - px, yy - py)
     mask[layer_idx, rs:re, cs:ce] |= dist <= radius
+    if config.res > 0.0:
+        seg_len = math.sqrt(seg_len_sq)
+        n_steps = max(1, int(math.ceil(seg_len / (0.4 * config.res))))
+        t_vals = np.linspace(0.0, 1.0, n_steps + 1)
+        _mark_centerline_points(
+            mask[layer_idx], config.rows, config.cols,
+            config.x_min, config.y_min, config.res,
+            sx + t_vals * vx, sy + t_vals * vy,
+        )
 
 
 def _fill_zone(

@@ -924,3 +924,103 @@ def test_copper_tcr_scales_resistance_and_loss_at_85c():
         res_85.net_summaries[0].effective_resistance_ohm
         / res_20.net_summaries[0].effective_resistance_ohm
     ) == pytest.approx(expected_ratio, rel=1e-12)
+
+
+def test_pcb_arc_true_rasterization_and_arc_length():
+    """PCB_ARC must rasterize along the circular arc and report R * |delta_theta| length."""
+    class _MockArcTrack(MockTrack):
+        def __init__(self, *, layer, start, middle, end, width, bbox, net_code=1, net_name="PWR"):
+            super().__init__(
+                layer=layer, bbox=bbox, start=start, end=end, width=width,
+                net_code=net_code, net_name=net_name,
+            )
+            self._mid = middle
+
+        def GetMid(self):
+            return self._mid
+
+    # 180-degree semicircle of radius R = 4.0 mm centered at (6.0, 6.0):
+    # start=(2.0, 6.0), mid=(6.0, 2.0), end=(10.0, 6.0)
+    radius_mm = 4.0
+    pad_a = _pad(2.0, 6.0, "1")
+    pad_b = _pad(10.0, 6.0, "2")
+    arc = _MockArcTrack(
+        layer=F_Cu,
+        start=VECTOR2I(2_000_000, 6_000_000),
+        middle=VECTOR2I(6_000_000, 2_000_000),
+        end=VECTOR2I(10_000_000, 6_000_000),
+        width=1_000_000,
+        bbox=EDA_RECT(1_500_000, 1_500_000, 9_000_000, 5_000_000),
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_a, pad_b])],
+        tracks=[arc],
+        layer_names={F_Cu: "F.Cu"},
+    )
+    res_mm = 0.25
+    config = ElectricalConfig(
+        copper_ids=[F_Cu],
+        rows=40,
+        cols=48,
+        x_min=0.0,
+        y_min=0.0,
+        res=res_mm,
+        t_cu=np.array([35e-6], dtype=np.float64),
+        layer_names={F_Cu: "F.Cu"},
+    )
+    net_masks, _, _, summaries, _ = electrical_solver._build_relevant_net_data(
+        board, config, {"C:1"}, compute_via_conductance=False,
+    )
+    # Center of chord (6.0, 6.0) -> row 24, col 24 must NOT be copper!
+    assert not net_masks["C:1"][0, int(6.0 / res_mm), int(6.0 / res_mm)]
+    # Peak of arc (6.0, 2.0) -> row 8, col 24 MUST be copper!
+    assert net_masks["C:1"][0, int(2.0 / res_mm), int(6.0 / res_mm)]
+
+    track_diag = [p for p in summaries["C:1"] if p.primitive_type == "Track"][0]
+    assert track_diag.track_length_mm == pytest.approx(np.pi * radius_mm, rel=1e-6)
+
+    result = solve_electrical_heating(
+        board,
+        [
+            CurrentTerminal(pad_a, "J1-1", "PWR", 1, 2.0),
+            CurrentTerminal(pad_b, "J2-1", "PWR", 1, -2.0),
+        ],
+        config,
+    )
+    assert result.valid, result.errors
+    expected_arc_r = 1.724e-8 * (np.pi * radius_mm * 1e-3) / (1.0e-3 * 35e-6)
+    assert result.net_summaries[0].effective_resistance_ohm == pytest.approx(expected_arc_r, rel=0.25)
+    # Must be clearly higher than a straight chord resistance (ratio pi/2 ~= 1.57x)
+    chord_r = 1.724e-8 * (2.0 * radius_mm * 1e-3) / (1.0e-3 * 35e-6)
+    assert result.net_summaries[0].effective_resistance_ohm > chord_r * 1.25
+
+
+def test_electrical_solver_skips_rule_and_keepout_zones():
+    """Rule/keepout zones with matching net must be ignored by electrical rasterization."""
+    class _KeepoutZone(MockZone):
+        def GetIsRuleArea(self):
+            return True
+
+    pad_a = _pad(1.5, 1.5, "1")
+    pad_b = _pad(8.5, 1.5, "2")
+    keepout = _KeepoutZone(
+        layers=[F_Cu],
+        bbox=EDA_RECT(1_000_000, 1_000_000, 8_000_000, 1_000_000),
+        filled=True,
+        net_code=1,
+        net_name="PWR",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_a, pad_b])],
+        zones=[keepout],
+    )
+    res = solve_electrical_heating(
+        board,
+        [
+            CurrentTerminal(pad_a, "J1-1", "PWR", 1, 1.0),
+            CurrentTerminal(pad_b, "J2-1", "PWR", 1, -1.0),
+        ],
+        _config(),
+    )
+    assert not res.valid
+    assert any("not electrically connected" in err for err in res.errors)

@@ -9,7 +9,13 @@ import os
 import pytest
 import numpy as np
 
-from ThermalSim.pwl_parser import parse_pwl_file, interpolate_pwl, validate_pwl
+from ThermalSim.pwl_parser import (
+    average_pwl,
+    integrate_pwl,
+    interpolate_pwl,
+    parse_pwl_file,
+    validate_pwl,
+)
 
 
 class TestParsePWLFile:
@@ -216,3 +222,19 @@ class TestValidatePWL:
 
         warnings = validate_pwl(times, powers)
         assert any("high" in w.lower() for w in warnings)
+
+
+class TestIntegrateAndAveragePWL:
+    """Tests for analytical PWL integration and step-averaging helpers."""
+
+    def test_narrow_pulse_exact_integral_across_breakpoints(self):
+        """Coarse [t0, t1] spanning a narrow pulse yields exact analytical energy."""
+        times = np.array([0.0, 50.0, 50.001, 50.150, 50.151, 100.0])
+        powers = np.array([0.0, 0.0, 20.0, 20.0, 0.0, 0.0])
+
+        # Exact area: trapezoid with bases 0.151 and 0.149 at height 20 => 3.0 J
+        assert integrate_pwl(times, powers, 0.0, 100.0) == pytest.approx(3.0, rel=1e-12)
+        assert integrate_pwl(times, powers, 49.0, 51.0) == pytest.approx(3.0, rel=1e-12)
+        assert average_pwl(times, powers, 49.0, 51.0) == pytest.approx(1.5, rel=1e-12)
+        assert average_pwl(times, powers, 50.0, 50.0) == pytest.approx(0.0, abs=1e-12)
+        assert integrate_pwl(times, powers, 10.0, 10.0) == 0.0

@@ -110,7 +110,7 @@ from .simulation_core import (
 )
 
 SCHEMA_VERSION = "1.0"
-PLUGIN_VERSION = "0.4.8"
+PLUGIN_VERSION = "0.4.9"
 
 SUPPORTED_SWEEP_PARAMS = frozenset({
     "heatsink_rth_kw",
@@ -1193,6 +1193,62 @@ def _validate_with_context(
             "target": "heatsink_rth_kw",
             "message": f"heatsink_rth_kw must be > 0 (got {norm['heatsink_rth_kw']}).",
         })
+    if norm["thick"] is None or not math.isfinite(norm["thick"]) or norm["thick"] <= 0.0:
+        errors.append({
+            "code": "INVALID_PARAMETER",
+            "target": "thick",
+            "message": f"thick must be > 0 (got {norm['thick']}).",
+        })
+    if norm["pad_dist_mm"] is None or not math.isfinite(norm["pad_dist_mm"]) or norm["pad_dist_mm"] < 0.0:
+        errors.append({
+            "code": "INVALID_PARAMETER",
+            "target": "pad_dist_mm",
+            "message": f"pad_dist_mm must be >= 0 (got {norm['pad_dist_mm']}).",
+        })
+    if norm["pad_th"] is None or not math.isfinite(norm["pad_th"]) or norm["pad_th"] <= 0.0:
+        errors.append({
+            "code": "INVALID_PARAMETER",
+            "target": "pad_th",
+            "message": f"pad_th must be > 0 (got {norm['pad_th']}).",
+        })
+    if norm["pad_k"] is None or not math.isfinite(norm["pad_k"]) or norm["pad_k"] <= 0.0:
+        errors.append({
+            "code": "INVALID_PARAMETER",
+            "target": "pad_k",
+            "message": f"pad_k must be > 0 (got {norm['pad_k']}).",
+        })
+    if (
+        norm["pad_contact_factor"] is None
+        or not math.isfinite(norm["pad_contact_factor"])
+        or not (0.05 <= norm["pad_contact_factor"] <= 1.0)
+    ):
+        errors.append({
+            "code": "INVALID_PARAMETER",
+            "target": "pad_contact_factor",
+            "message": f"pad_contact_factor must be between 0.05 and 1.0 (got {norm['pad_contact_factor']}).",
+        })
+    if norm["heatsink_mass_g"] is None or not math.isfinite(norm["heatsink_mass_g"]) or norm["heatsink_mass_g"] < 0.0:
+        errors.append({
+            "code": "INVALID_PARAMETER",
+            "target": "heatsink_mass_g",
+            "message": f"heatsink_mass_g must be >= 0 (got {norm['heatsink_mass_g']}).",
+        })
+    if (
+        norm["heatsink_cp_j_kgk"] is None
+        or not math.isfinite(norm["heatsink_cp_j_kgk"])
+        or norm["heatsink_cp_j_kgk"] <= 0.0
+    ):
+        errors.append({
+            "code": "INVALID_PARAMETER",
+            "target": "heatsink_cp_j_kgk",
+            "message": f"heatsink_cp_j_kgk must be > 0 (got {norm['heatsink_cp_j_kgk']}).",
+        })
+    if norm["power_scale"] is None or not math.isfinite(norm["power_scale"]) or norm["power_scale"] < 0.0:
+        errors.append({
+            "code": "INVALID_PARAMETER",
+            "target": "power_scale",
+            "message": f"power_scale must be >= 0 (got {norm['power_scale']}).",
+        })
 
     _, unfilled_zones = _count_zones(board)
     if unfilled_zones > 0:
@@ -2081,7 +2137,6 @@ def run_headless_simulation(
 
     k_cu = 390.0
     k_fr4 = 0.3
-    via_factor = k_cu / k_fr4
     rho_cu, cp_cu = 8960.0, 385.0
     rho_fr4, cp_fr4 = 1850.0, 1100.0
     via_plating_um, via_fill = resolve_via_settings(settings)
@@ -2110,7 +2165,7 @@ def run_headless_simulation(
             y_min=y_min,
             res=res,
             settings=settings,
-            via_factor=via_factor,
+            via_factor=k_cu / k_fr4,
             pads_list=focus_pads,
             optional_kwargs={
                 "via_plating_um": via_plating_um,
@@ -2212,6 +2267,7 @@ def run_headless_simulation(
                     "via_plating_um": via_plating_um,
                     "via_fill": via_fill,
                     "ambient_c": amb,
+                    "gap_m": gap_m,
                 },
             )
             electrical_result = solve_electrical_heating(board, terminals, electrical_config)

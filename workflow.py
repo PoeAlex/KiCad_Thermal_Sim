@@ -94,7 +94,7 @@ class SimulationSettings:
     limit_distance_mm: float = 0.0
     area_mode: str = "full"
     grid_detail_level: str = "balanced"
-    grid_node_budget: int = 800000
+    grid_node_budget: int = 3_000_000
     compute_engine: str = "auto"
     mesh_mode: str = "uniform"
     backend: str = "auto"
@@ -115,7 +115,7 @@ class SimulationSettings:
             grid_detail_level=str(
                 values.get("grid_detail_level", "balanced") or "balanced"
             ),
-            grid_node_budget=int(values.get("grid_node_budget", 800000) or 800000),
+            grid_node_budget=int(values.get("grid_node_budget", 3_000_000) or 3_000_000),
             compute_engine=str(
                 values.get("compute_engine", "auto") or "auto"
             ).lower(),
@@ -641,6 +641,11 @@ def geometry_cache_key(snapshot: BoardSnapshot, grid: GridEstimate, settings, pa
     raw_plating = settings.get("via_plating_um", 25.0)
     via_plating_um = 25.0 if raw_plating is None else float(raw_plating)
     via_fill = normalize_via_fill(settings.get("via_fill", "plated"))
+    raw_area_mode = settings.get("area_mode")
+    area_mode = (
+        str(raw_area_mode).strip().lower()
+        if raw_area_mode is not None else None
+    )
     payload = {
         "geometry_cache_version": 4,
         "board": snapshot.fingerprint,
@@ -654,6 +659,7 @@ def geometry_cache_key(snapshot: BoardSnapshot, grid: GridEstimate, settings, pa
         "layers": snapshot.copper_layers,
         "ignore_traces": bool(settings.get("ignore_traces", False)),
         "ignore_polygons": bool(settings.get("ignore_polygons", False)),
+        "area_mode": area_mode,
         "limit_area": bool(settings.get("limit_area", False)),
         "pad_dist_mm": float(settings.get("pad_dist_mm", 0.0) or 0.0),
         "use_heatsink": bool(settings.get("use_heatsink", False)),

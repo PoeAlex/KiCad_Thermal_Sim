@@ -661,3 +661,100 @@ class TestFastLargeGridPngExport:
         assert out_j is not None and os.path.exists(out_j)
         assert all(shape == (600, 600) and extent == [-0.5, 1199.5, 1199.5, -0.5] for shape, extent in recorded_imshow)
         assert any("12.345 mW/cell" in title for title in recorded_titles)
+
+
+class TestSavePreviewImageV049:
+    """Regression tests for KiCad 10 B.Cu SMD pad preview layer placement."""
+
+    def test_kicad10_bcu_smd_pad_renders_on_bcu_not_fcu(self, temp_dir, monkeypatch):
+        """A B.Cu SMD pad with GetLayer()==F_Cu and LayerSet=={B_Cu} must render on B.Cu."""
+        import matplotlib.axes
+        import pcbnew
+        from ThermalSim.geometry_mapper import GeometryState, get_pad_pixels
+        from ThermalSim.visualization import save_preview_image
+        from tests.mocks.pcbnew_mock import (
+            B_Cu,
+            EDA_RECT,
+            F_Cu,
+            MockBoard,
+            MockFootprint,
+            MockLayerSet,
+            MockPad,
+            PAD_ATTRIB_SMD,
+            VECTOR2I,
+        )
+
+        class _KiCad10BCuPad(MockPad):
+            def __init__(self):
+                super().__init__(
+                    position=VECTOR2I(4_000_000, 4_000_000),
+                    layer=F_Cu,  # KiCad 10 reports F_Cu even for B.Cu SMD pads
+                    attribute=PAD_ATTRIB_SMD,
+                    bbox=EDA_RECT(3_000_000, 3_000_000, 2_000_000, 2_000_000),
+                    number="1",
+                )
+                self._ls = MockLayerSet([B_Cu])
+
+            def GetLayerSet(self):
+                return self._ls
+
+            def GetSize(self):
+                return VECTOR2I(2_000_000, 2_000_000)
+
+            def GetShape(self):
+                return getattr(pcbnew, "PAD_SHAPE_RECT", 1)
+
+        bcu_pad = _KiCad10BCuPad()
+        board = MockBoard(
+            footprints=[MockFootprint("Q1", [bcu_pad])],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+        )
+        rows, cols = 10, 10
+        state = GeometryState(
+            copper_mask=np.zeros((2, rows, cols), dtype=bool),
+            via_map=np.ones((rows, cols), dtype=np.float32),
+            heatsink_mask=np.zeros((rows, cols), dtype=bool),
+            area_mask=None,
+            x_min=0.0,
+            y_min=0.0,
+            res=1.0,
+            rows=rows,
+            cols=cols,
+            x_centers_iu=np.zeros(cols, dtype=np.int64),
+            y_centers_iu=np.zeros(rows, dtype=np.int64),
+        )
+
+        recorded_layer_ids = []
+
+        def spy_get_pad_pixels(pad, r, c, x_min, y_min, res, layer_id=None):
+            recorded_layer_ids.append(layer_id)
+            return get_pad_pixels(pad, r, c, x_min, y_min, res, layer_id=layer_id)
+
+        autumn_axes = []
+        orig_imshow = matplotlib.axes.Axes.imshow
+
+        def spy_imshow(self, X, *args, **kwargs):
+            if kwargs.get("cmap") == "autumn":
+                autumn_axes.append(self.get_title())
+            return orig_imshow(self, X, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "imshow", spy_imshow)
+
+        out = save_preview_image(
+            board,
+            [F_Cu, B_Cu],
+            EDA_RECT(0, 0, 6_000_000, 6_000_000),
+            [bcu_pad],
+            {"res": 1.0, "use_heatsink": False},
+            ["F.Cu", "B.Cu"],
+            {},
+            spy_get_pad_pixels,
+            None,
+            lambda *a, **k: {"copper_thickness_mm_used": [0.035, 0.035]},
+            open_file=False,
+            out_dir=temp_dir,
+            geometry_state=state,
+        )
+        assert out is not None and os.path.exists(out)
+        assert recorded_layer_ids == [B_Cu]
+        assert autumn_axes == ["Preview: B.Cu"]

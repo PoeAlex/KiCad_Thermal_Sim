@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ThermalSim (**v0.4.8**) is a KiCad 9.0 & 10.0 PCB Editor plugin and headless automation tool for fast 2.5D steady-state and transient thermal simulation. It simulates heat spreading across multilayer PCBs using finite volume methods, a Native C++/OpenMP **v4** Compact Low-RAM Multigrid & Fused PCG core (with pure NumPy/SciPy fallback), and BDF2 time integration.
+ThermalSim (**v0.4.9**) is a KiCad 9.0 & 10.0 PCB Editor plugin and headless automation tool for fast 2.5D steady-state and transient thermal simulation. It simulates heat spreading across multilayer PCBs using finite volume methods, a Native C++/OpenMP **v4** Compact Low-RAM Multigrid & Fused PCG core (with pure NumPy/SciPy fallback), and BDF2 time integration.
 
 ## Dependencies
 
@@ -51,15 +51,15 @@ KiCad_Thermal_Sim/
 
 | Module | Purpose |
 |--------|---------|
-| `simulation_core.py` | Zero-`wx` single source of truth for board area/grid estimation, calibrated RAM/runtime cost estimation, stackup thickness derivation, capacity assembly, and sparse pad power distribution |
+| `simulation_core.py` | Zero-`wx` single source of truth for board area/grid estimation, calibrated RAM/runtime cost estimation, stackup thickness derivation, capacity assembly, and multi-layer PTH/SMD sparse pad power distribution |
 | `capabilities.py` | Runtime detection of `numpy`, `scipy`, `matplotlib`, `wx`, and native core ABI levels (`HAS_NATIVE_CORE`, `HAS_NATIVE_MG`, `HAS_NATIVE_COMPACT`, `HAS_NATIVE_PCG`) |
 | `native_core.py` | Cross-platform loader (`ctypes`) and wrappers for the Native C++/OpenMP v4 kernels (`apply_compact_dot_native`, `pcg_update_xr_norm2_native`, `pcg_update_p_native`, `f64_to_f32_native`, `f32_to_f64_dot_native`, `dot_f64_native`) |
-| `native/thermalsim_core.cpp` | C++/OpenMP v4 compact mask+LUT stencil operators, `float32` multigrid smooth/restrict/prolong/coarsen kernels, and fused `float64` PCG vector/dot kernels |
+| `native/thermalsim_core.cpp` | C++/OpenMP v4 compact mask+LUT stencil operators (with exact harmonic series Cu/FR4 interface conductance and parallel FR4 on copper cells), `float32` multigrid smooth/restrict/prolong/coarsen kernels, and fused `float64` PCG vector/dot kernels |
 | `stackup_parser.py` | Parse copper/dielectric layers and thicknesses from `.kicad_pcb` S-expressions |
 | `gui_dialogs.py` | Resizable wxPython `SettingsDialog` (Overview, Heat Sources, Current Heating, Advanced) |
-| `geometry_mapper.py` | Rasterize tracks, arcs, rotated/offset SMD/THT pads (`GetLayerSet()`), vias, fast scanline zone polygons, and `User.Eco1` thermal pads into `GeometryState` / `FillContext` |
-| `electrical_solver.py` | Solve DC current flow per net and compute copper Joule losses & path diagnostics |
-| `thermal_solver.py` | Direct steady-state, FMG-preconditioned PCG, mixed-precision multigrid, geometric matrix-free transient BDF2, and Dynamic 0D Heatsink (`_HeatsinkPhaseState` via Sherman-Morrison) |
+| `geometry_mapper.py` | Rasterize continuous sub-grid tracks, arcs, rotated/offset SMD/THT pads (`GetLayerSet()`), vias, fast scanline zone polygons, and `User.Eco1` thermal pads into `GeometryState` / `FillContext` |
+| `electrical_solver.py` | Solve DC current flow per net (including arc-accurate `PCB_ARC` discretization and stackup `gap_m` coupling) and compute copper Joule losses & path diagnostics |
+| `thermal_solver.py` | Direct steady-state, FMG-preconditioned PCG, mixed-precision multigrid, geometric matrix-free transient BDF2 (with PWL breakpoint/step-average integration and exact fixed-sink energy balance), and Dynamic 0D Heatsink (`_HeatsinkPhaseState` via Sherman-Morrison) |
 | `workflow.py` | Safe compressed `.npz` disk `GeometryCache`, `ThermalOperatorCache`, `ThermalFactorizationCache`, `PreflightResult`, `CancellationToken` |
 | `pwl_parser.py` | Parse LTspice-style time-varying PWL power profiles |
 | `visualization.py` | Generate layer heatmaps, geometry previews, Joule loss maps, and hotspot-preserving downsampled interactive heatmap payloads |
@@ -184,7 +184,8 @@ THERMALSIM_HEADLESS=1 python3 benchmark_real_board.py /path/to/board.kicad_pcb -
 - **Direct Steady-State (`run_steady_state` / `run_steady_state_matrix_free`)**: Solves $K \cdot T = Q + b$ directly in a single solve for constant heat sources (using `scipy.sparse.linalg.splu` for small grids or matrix-free PCG for large grids).
 - **FMG-Preconditioned PCG**: Full-Multigrid (FMG) initial guess (`_fmg_initial_guess`) feeds a `float64` outer PCG solver (`_solve_pcg`) using Native C++/OpenMP v4 fused kernels (`apply_compact_dot_native`, `pcg_update_xr_norm2_native`, `pcg_update_p_native`, `f64_to_f32_native`, `f32_to_f64_dot_native`).
 - **Mixed-Precision Multigrid**: Runs symmetric `float32` V-cycle smoothing (damped Jacobi), 2x2 restriction, and prolongation (`_CompactGeometricMultigrid` / `_StructuredGeometricMultigrid` / `_GeometricMultigrid`) inside the `float64` outer PCG loop, with coarse direct solve via `scipy.sparse.linalg.factorized`.
-- **Geometric Matrix-Free Transient (`_build_geometric_phase_plan`)**: 5-phase geometrically growing BDF2 time stepping for `time_stepping="auto"` / `"geometric"` in matrix-free transient runs (reusing the cached MG hierarchy per phase and stopping losslessly when steady state is reached). Legacy direct solver supports `auto`, `multi_phase`, `two_phase`, and `uniform` BDF2.
+- **Geometric Matrix-Free Transient (`_build_geometric_phase_plan`)**: 5-phase geometrically growing BDF2 time stepping for `time_stepping="auto"` / `"geometric"` in matrix-free transient runs (reusing the cached MG hierarchy per phase and stopping losslessly when steady state is reached). For PWL profiles, solver steps align with PWL breakpoints and use exact step-averaged power quadrature with integrated energy balance diagnostics. Legacy direct solver supports `auto`, `multi_phase`, `two_phase`, and `uniform` BDF2.
+- **Exact In-Plane Sheet Conductance & Energy Balance**: Copper/FR4 interface conductances use exact series harmonic mean of effective cell sheet conductances (including parallel FR4 on copper cells), and fixed-temperature thermal-pad energy balance evaluates heat flow against `pad_sink_temp_c`.
 - **Dynamic 0D Heatsink via Sherman-Morrison (`_HeatsinkPhaseState`)**: Couples the lumped 0D heatsink node ($R_{\text{th}}$, $C_{\text{hs}}$) to the PCB `User.Eco1` thermal pad via an exact rank-1 Sherman-Morrison update $(A + \alpha u v^T)^{-1}$ using one precomputed solve per phase/steady solve.
 
 ## Output Files

@@ -17,15 +17,15 @@ This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineer
 
 ## What It Simulates
 
-- **2D in-plane conduction** on each copper layer.
+- **2D in-plane conduction** on each copper layer using exact harmonic series Cu/FR4 sheet conductances (including parallel FR4 on copper cells) and continuous sub-grid trace mapping.
 - **Vertical coupling** between adjacent copper layers through FR4 and via enhancement.
 - **Direct Steady-State (final temperature)** with Full-Multigrid (FMG) warm start and live PCG convergence progress, solving $K \cdot T = Q + b$ directly in a single solve for constant heat sources.
-- **Geometric multi-phase transient time integration** (5-phase geometrically growing BDF2 stepping — 5–8x faster on long transients — with linear PCG warm-start extrapolation and lossless early steady-state stop).
+- **Geometric multi-phase transient time integration** (5-phase geometrically growing BDF2 stepping — 5–8x faster on long transients — with linear PCG warm-start extrapolation, PWL breakpoint alignment and step-averaged power integration, and lossless early steady-state stop).
 - **Native C++/OpenMP v4 Compact Low-RAM Multigrid & Fused PCG core** (`thermalsim_core.dll`, `libthermalsim_core.so`, `libthermalsim_core.dylib`) solving **6M-node steady-state boards in ~5 s at ~725 MB Peak RSS**, with on-the-fly Level-0 mask+LUT evaluation, mixed-precision `float32` multigrid V-cycles, fused OpenMP PCG kernels, and automatic fallback to pure NumPy/SciPy.
-- **Manual power injection** from explicitly configured **Heat Sources** (constant power or time-varying **PWL power profiles**) with **exact KiCad 9/10 pad rasterization** (`GetLayerSet()` `B.Cu` SMD pads, rotated & offset pads, and zero FR4 power bleed).
-- Optional **DC current-flow heating** from source/sink pads on KiCad nets.
+- **Manual power injection** from explicitly configured **Heat Sources** (constant power or time-varying **PWL power profiles**) with **exact KiCad 9/10 pad rasterization** (`GetLayerSet()` `B.Cu` SMD pads, multi-layer PTH power injection across spanned copper layers, rotated & offset pads, and zero FR4 power bleed).
+- Optional **DC current-flow heating** from source/sink pads on KiCad nets (with arc-accurate `PCB_ARC` trace discretization and stackup dielectric `gap_m` via coupling).
 - **Convection** to ambient on top and bottom outer surfaces.
-- Optional **Thermal Pad (`User.Eco1`)** geometry with **Fixed temperature** or **Dynamic heatsink (0D)** ($R_{\text{th}}$, mass/material presets, live $C_{\text{hs}}$ & $\tau$, plus **Heatsink Temp** and **Heat Removal Split** in reports).
+- Optional **Thermal Pad (`User.Eco1`)** geometry with **Fixed temperature** (exact energy balance against `pad_sink_temp_c`) or **Dynamic heatsink (0D)** ($R_{\text{th}}$, mass/material presets, live $C_{\text{hs}}$ & $\tau$, plus **Heatsink Temp** and **Heat Removal Split** in reports).
 - **Calibrated RAM & runtime estimates** across Compact Native C++ and Legacy solver modes (~80–125 MB per 1M nodes; 25M+ nodes in ~2 GB RAM).
 - **Fast scanline zone polygon rasterization** and **continuous cancellable progress** (with elapsed time and English phase ETA) across both **Preview** and **Run**.
 - Current-path diagnostics: copper loss, effective resistance, equivalent voltage drop, grid quality, and a Joule loss map.
@@ -377,14 +377,14 @@ The plugin is split into focused modules:
 
 | Module | Purpose |
 |--------|---------|
-| `simulation_core.py` | Zero-`wx` single source of truth for board area/grid estimation, calibrated RAM/runtime cost estimation, stackup thickness derivation, capacity assembly, and sparse pad power distribution |
+| `simulation_core.py` | Zero-`wx` single source of truth for board area/grid estimation, calibrated RAM/runtime cost estimation, stackup thickness derivation, capacity assembly, and multi-layer PTH/SMD sparse pad power distribution |
 | `capabilities.py` | Runtime detection of `numpy`, `scipy`, `matplotlib`, `wx`, and the Native C++/OpenMP v4 core |
 | `dependency_installer.py` | Auto-install dialog for missing packages via pip |
 | `stackup_parser.py` | Parse copper/dielectric layers from `.kicad_pcb` S-expressions |
 | `gui_dialogs.py` | wxPython dialog for simulation parameters |
-| `geometry_mapper.py` | Accurately rasterize tracks, arcs, rotated/offset SMD & THT pads (`GetLayerSet()`), vias, and fast scanline filled zones |
-| `electrical_solver.py` | Solve DC current flow and convert copper losses to heat sources |
-| `thermal_solver.py` | Direct steady-state, FMG-preconditioned PCG, geometric transient BDF2, and Dynamic 0D Heatsink (Sherman-Morrison) solvers |
+| `geometry_mapper.py` | Accurately rasterize continuous sub-grid tracks, arcs, rotated/offset SMD & THT pads (`GetLayerSet()`), vias, and fast scanline filled zones |
+| `electrical_solver.py` | Solve DC current flow (including arc-accurate `PCB_ARC` discretization and stackup `gap_m` via coupling) and convert copper losses to heat sources |
+| `thermal_solver.py` | Direct steady-state, FMG-preconditioned PCG, geometric transient BDF2 (with exact harmonic Cu/FR4 sheet conductance, PWL breakpoint/step-average integration, and exact fixed-sink energy balance), and Dynamic 0D Heatsink (Sherman-Morrison) solvers |
 | `native_core.py` | Cross-platform loader (`ctypes`) for the optional Native C++/OpenMP v4 Compact Low-RAM & Fused PCG core |
 | `native/thermalsim_core.cpp` | C++/OpenMP v4 stencil, mixed-precision `float32` multigrid, and fused `float64` PCG kernels |
 | `workflow.py` | Safe compressed `.npz` disk geometry caching, operator caching, and preflight state |

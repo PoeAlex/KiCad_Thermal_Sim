@@ -1070,3 +1070,40 @@ class TestWriteHtmlReportDynamicHeatsink:
 
         assert "Copper-filled" in content_cu
         assert "unused; copper-filled" in content_cu
+
+    def test_heatsink_material_preset_overrides_stale_cp_and_subsecond_snapshots(self, base_params, temp_dir):
+        """Non-custom heatsink material ignores stale heatsink_cp_j_kgk; sub-second snapshots don't collide."""
+        snap_a = os.path.join(temp_dir, "snap_01_t0.02.png")
+        snap_b = os.path.join(temp_dir, "snap_02_t0.05.png")
+        snap_c = os.path.join(temp_dir, "snap_03_t0.125.png")
+        for path in (snap_a, snap_b, snap_c):
+            with open(path, 'wb') as f:
+                f.write(b'\x89PNG\r\n\x1a\n')
+
+        params = base_params.copy()
+        params['settings'] = dict(base_params['settings'], **{
+            'use_heatsink': True,
+            'pad_sink_mode': 'heatsink',
+            'heatsink_rth_kw': 4.0,
+            'heatsink_material': 'copper',
+            'heatsink_mass_g': 50.0,
+            'heatsink_cp_j_kgk': 897.0,  # stale aluminium value left in settings
+        })
+        params['k_norm_info'] = {
+            'heatsink_enabled': True,
+            'heatsink_mode': 'heatsink',
+            'heatsink_temp_c': 40.0,
+        }
+        params['snapshot_files'] = [(0.02, snap_a), (0.05, snap_b), (0.125, snap_c)]
+
+        result = write_html_report(**params)
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        assert "Copper (c_p = 385.0 J/kg·K)" in content
+        assert "Copper (c_p = 897.0 J/kg·K)" not in content
+        assert "t = 0.02 s" in content
+        assert "t = 0.05 s" in content
+        assert "t = 0.125 s" in content
+        assert "payload.x_min_mm+(cell.col+0.5)*payload.res_mm" in content
+        assert "payload.y_min_mm+(cell.row+0.5)*payload.res_mm" in content

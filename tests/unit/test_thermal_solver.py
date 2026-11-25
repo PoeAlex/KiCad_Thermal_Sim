@@ -2151,7 +2151,7 @@ class TestDynamicHeatsinkModel:
         res_deriv = run_simulation_matrix_free(
             cfg_std, _DerivStartOp(), C, Q, fb, fhA, heatsink_model=hs_model
         )
-        assert res_deriv.phase_metrics[0].get("startup") == "derivative_bdf2"
+        assert res_deriv.phase_metrics[0].get("startup") == "backward_euler"
         np.testing.assert_allclose(res_deriv.T, res_std.T, rtol=1e-3, atol=0.05)
         assert res_deriv.k_norm_info["heatsink_temp_c"] == pytest.approx(
             res_std.k_norm_info["heatsink_temp_c"], abs=0.05
@@ -3165,5 +3165,376 @@ class TestViaPhysicsAndConvectionV048:
         np.testing.assert_allclose(res_ad_compact.T, res_ad_direct.T, rtol=1e-5, atol=1e-5)
         # All power leaves through top convection
         assert cop_ad.convection_power(res_ad_compact.T, amb) == pytest.approx(float(np.sum(q)), rel=1e-4)
+
+
+class TestPhysicsFixesV049:
+    """Regression tests for v0.4.9 physics & numerical fixes."""
+
+    def test_cu_fr4_harmonic_sheet_conductance_and_parallel_fr4_all_builders(self):
+        """All 3 builders use exact harmonic mean of sheet conductances with parallel FR4."""
+        layers, rows, cols = 2, 4, 5
+        k_cu, k_fr4 = 390.0, 0.3
+        t_cu = np.array([35e-6, 70e-6], dtype=np.float64)
+        t_fr4_eff = np.array([0.8e-3, 0.8e-3], dtype=np.float64)
+        dx, dy = 0.5e-3, 0.25e-3
+
+        copper_mask = np.zeros((layers, rows, cols), dtype=bool)
+        # Adjacent FR4-FR4 ((0,0)-(0,1)), FR4-Cu ((0,1)-(0,2)), Cu-Cu ((0,2)-(0,3))
+        copper_mask[0, :, 2:] = True
+        copper_mask[1, 1:3, 1:4] = True
+
+        V_map = np.ones((rows, cols), dtype=np.float64)
+        gap_m = [1.5e-3]
+        H_map = np.zeros((rows, cols), dtype=np.float64)
+        settings = {"h_conv": 10.0, "pad_th": 1.0, "pad_k": 3.0, "use_heatsink": False}
+        amb = 25.0
+
+        K, _, _, _ = build_stiffness_matrix(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            k_cu, k_fr4, dx, dy, V_map, gap_m, H_map, settings, amb,
+        )
+        struct_op, _, _, _ = build_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            k_cu, k_fr4, dx, dy, V_map, gap_m, H_map, settings, amb,
+        )
+        compact_op = build_compact_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            k_cu, k_fr4, dx, dy, V_map.astype(np.float32), gap_m, H_map, settings, amb,
+        )
+
+        for l in range(layers):
+            s_fr4 = k_fr4 * t_fr4_eff[l]
+            s_cu = k_cu * t_cu[l] + s_fr4
+            s_01 = (2.0 * s_fr4 * s_cu) / (s_fr4 + s_cu)
+            assert compact_op.gx_lut[l, 0] == pytest.approx(s_fr4 * dy / dx, rel=1e-12)
+            assert compact_op.gx_lut[l, 1] == pytest.approx(s_01 * dy / dx, rel=1e-12)
+            assert compact_op.gx_lut[l, 2] == pytest.approx(s_cu * dy / dx, rel=1e-12)
+            assert compact_op.gy_lut[l, 0] == pytest.approx(s_fr4 * dx / dy, rel=1e-12)
+            assert compact_op.gy_lut[l, 1] == pytest.approx(s_01 * dx / dy, rel=1e-12)
+            assert compact_op.gy_lut[l, 2] == pytest.approx(s_cu * dx / dy, rel=1e-12)
+
+        # Layer 0 row 0 checks across K and structured operator
+        assert struct_op.gx[0, 0, 0] == pytest.approx(compact_op.gx_lut[0, 0], rel=1e-12)
+        assert struct_op.gx[0, 0, 1] == pytest.approx(compact_op.gx_lut[0, 1], rel=1e-12)
+        assert struct_op.gx[0, 0, 2] == pytest.approx(compact_op.gx_lut[0, 2], rel=1e-12)
+        assert -K[0, 1] == pytest.approx(compact_op.gx_lut[0, 0], rel=1e-12)
+        assert -K[1, 2] == pytest.approx(compact_op.gx_lut[0, 1], rel=1e-12)
+        assert -K[2, 3] == pytest.approx(compact_op.gx_lut[0, 2], rel=1e-12)
+
+        rng = np.random.default_rng(11)
+        vec = rng.standard_normal(layers * rows * cols)
+        np.testing.assert_allclose(struct_op.dot(vec), K.dot(vec), rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(compact_op.dot(vec), K.dot(vec), rtol=1e-6, atol=1e-10)
+
+    @pytest.mark.physics
+    def test_fixed_sink_custom_temp_energy_balance_and_early_stop(self):
+        """Fixed-mode pad_sink_temp_c != amb achieves exact steady_rel_diff and early_stop."""
+        layers, rows, cols = 2, 12, 12
+        dx = dy = 1.0e-3
+        copper_mask = np.ones((layers, rows, cols), dtype=bool)
+        t_cu = np.full(layers, 35e-6)
+        t_fr4_eff = np.full(layers, 0.75e-3)
+        V_map = np.ones((rows, cols), dtype=np.float64)
+        gap_m = [1.5e-3]
+        H_map = np.zeros((rows, cols), dtype=np.float64)
+        H_map[3:9, 3:9] = 1.0
+        amb = 25.0
+        settings = {
+            "h_conv": 10.0,
+            "pad_th": 1.0,
+            "pad_k": 3.0,
+            "pad_contact_factor": 0.2,
+            "use_heatsink": True,
+            "pad_sink_mode": "fixed",
+            "pad_sink_temp_use_ambient": False,
+            "pad_sink_temp_c": 40.0,
+        }
+
+        K, b, hA, _ = build_stiffness_matrix(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings, amb,
+        )
+        struct_op, sb, shA, _ = build_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings, amb,
+        )
+        compact_op = build_compact_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map.astype(np.float32), gap_m, H_map, settings, amb,
+        )
+
+        pixel_area = dx * dy
+        c_cell = (
+            8960.0 * 385.0 * pixel_area * t_cu[0]
+            + 1850.0 * 1100.0 * pixel_area * t_fr4_eff[0]
+        )
+        C = np.full(layers * rows * cols, c_cell, dtype=np.float64)
+        Q = np.zeros(layers * rows * cols, dtype=np.float64)
+        Q[(rows // 2) * cols + (cols // 2)] = 2.0
+        Q_sp = SparsePowerVector(np.flatnonzero(Q > 0), Q[Q > 0], Q.size)
+
+        ss_cfg = SolverConfig(sim_time=10.0, amb=amb, dt_base=1.0, steps_target=10, steady_state=True)
+        ss_dir = run_steady_state(ss_cfg, K, Q, b, hA, layers, rows, cols)
+        ss_mf = run_steady_state_matrix_free(ss_cfg, compact_op, None, Q_sp, None, None)
+        assert ss_dir.k_norm_info["steady_rel_diff"] < 1e-8
+        assert ss_mf.k_norm_info["steady_rel_diff"] < 1e-4
+        assert ss_mf.k_norm_info["pout_final_w"] == pytest.approx(2.0, rel=1e-4)
+
+        tr_cfg = SolverConfig(
+            sim_time=400.0,
+            amb=amb,
+            dt_base=0.2,
+            steps_target=2000,
+            use_multi_phase=True,
+            time_stepping="multi_phase",
+            early_stop=True,
+            snapshots_enabled=True,
+            snap_times=[10.0, 50.0],
+        )
+        tr_dir = run_simulation(tr_cfg, K, C, Q, b, hA, layers, rows, cols)
+        tr_struct = run_simulation_matrix_free(tr_cfg, struct_op, C, Q, sb, shA)
+        tr_compact = run_simulation_matrix_free(tr_cfg, compact_op, None, Q_sp, None, None)
+
+        for res in (tr_dir, tr_struct, tr_compact):
+            assert res.k_norm_info["early_steady_state_stop"] is True
+            assert res.k_norm_info["steady_rel_diff"] < 1e-4
+            assert res.step_counter < 2000
+            assert all(s["eps_rel"] < 0.01 for s in res.snapshot_stats)
+
+        # Cooling sink (15 C < amb 25 C) with Q=0 should also conserve energy cleanly
+        settings_cold = {**settings, "pad_sink_temp_c": 15.0}
+        K_c, b_c, hA_c, _ = build_stiffness_matrix(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings_cold, amb,
+        )
+        ss_cold = run_steady_state(ss_cfg, K_c, np.zeros_like(Q), b_c, hA_c, layers, rows, cols)
+        assert ss_cold.k_norm_info["pout_final_w"] == pytest.approx(0.0, abs=1e-8)
+
+    @pytest.mark.physics
+    def test_pwl_narrow_pulse_energy_peak_and_eps_rel_after_turnoff(self):
+        """Breakpoint-aligned stepping + step_average resolves narrow PWL pulses without energy_warn."""
+        from ThermalSim.pwl_parser import average_pwl
+
+        layers, rows, cols = 2, 10, 10
+        dx = dy = 1.0e-3
+        copper_mask = np.zeros((layers, rows, cols), dtype=bool)
+        t_cu = np.full(layers, 35e-6)
+        t_fr4_eff = np.full(layers, 0.75e-3)
+        V_map = np.ones((rows, cols), dtype=np.float64)
+        gap_m = [1.5e-3]
+        H_map = np.zeros((rows, cols), dtype=np.float64)
+        settings = {"h_conv": 10.0, "pad_th": 1.0, "pad_k": 3.0, "use_heatsink": False}
+        amb = 25.0
+
+        K, b, hA, _ = build_stiffness_matrix(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings, amb,
+        )
+        compact_op = build_compact_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map.astype(np.float32), gap_m, H_map, settings, amb,
+        )
+        pixel_area = dx * dy
+        c_cell = 1850.0 * 1100.0 * pixel_area * t_fr4_eff[0]
+        C = np.full(layers * rows * cols, c_cell, dtype=np.float64)
+
+        q_unit = np.zeros(layers * rows * cols, dtype=np.float64)
+        q_unit[(rows // 2) * cols + (cols // 2)] = 1.0
+        pwl_times = np.array([0.0, 50.0, 50.001, 50.150, 50.151, 100.0], dtype=np.float64)
+        pwl_powers = np.array([0.0, 0.0, 20.0, 20.0, 0.0, 0.0], dtype=np.float64)
+
+        def q_pwl(t):
+            return float(np.interp(t, pwl_times, pwl_powers)) * q_unit
+
+        q_pwl.breakpoints = tuple(float(t) for t in pwl_times)
+        q_pwl.step_average = lambda t0, t1: average_pwl(pwl_times, pwl_powers, t0, t1) * q_unit
+
+        cfg = SolverConfig(
+            sim_time=100.0,
+            amb=amb,
+            dt_base=100.0 / 600.0,
+            steps_target=600,
+            time_stepping="auto",
+            snapshots_enabled=True,
+            snap_times=[50.15, 60.0, 100.0],
+            early_stop=False,
+        )
+        res_mf = run_simulation_matrix_free(cfg, compact_op, None, q_unit * 0.0, None, None, Q_func=q_pwl)
+        res_sp = run_simulation(cfg, K, C, q_unit * 0.0, b, hA, layers, rows, cols, Q_func=q_pwl)
+
+        # Fine reference over the pulse window [50.0, 50.151]
+        cfg_ref = SolverConfig(
+            sim_time=0.20,
+            amb=amb,
+            dt_base=0.002,
+            steps_target=100,
+            time_stepping="uniform",
+            snapshots_enabled=True,
+            snap_times=[0.15],
+            early_stop=False,
+        )
+        t_shift = pwl_times[1:5] - 50.0
+        p_shift = pwl_powers[1:5]
+
+        def q_ref(t):
+            return float(np.interp(t, t_shift, p_shift)) * q_unit
+
+        q_ref.breakpoints = tuple(float(t) for t in t_shift)
+        q_ref.step_average = lambda t0, t1: average_pwl(t_shift, p_shift, t0, t1) * q_unit
+        res_ref = run_simulation_matrix_free(cfg_ref, compact_op, None, q_unit * 0.0, None, None, Q_func=q_ref)
+        ref_peak = res_ref.snapshot_stats[0]["max_top"]
+
+        for res in (res_mf, res_sp):
+            assert res.k_norm_info["energy_in_j"] == pytest.approx(3.0, rel=1e-9)
+            assert res.k_norm_info["pin_w"] == pytest.approx(3.0 / 100.0, rel=1e-6)
+            assert abs(res.snapshot_stats[0]["max_top"] - ref_peak) / max(ref_peak - amb, 1e-6) < 0.02
+            # Post-turnoff snapshots (60s, 100s) must not blow up eps_rel
+            for snap in res.snapshot_stats:
+                assert snap["eps_rel"] < 0.01
+                assert snap["energy_warn"] is False
+
+    @pytest.mark.physics
+    def test_no_step1_overshoot_on_stiff_fine_grid(self, monkeypatch):
+        """Startup on stiff fine grid must not overshoot steady-state temperature."""
+        layers, rows, cols = 2, 16, 16
+        dx = dy = 0.2e-3
+        copper_mask = np.ones((layers, rows, cols), dtype=bool)
+        t_cu = np.full(layers, 35e-6)
+        t_fr4_eff = np.full(layers, 0.75e-3)
+        V_map = np.ones((rows, cols), dtype=np.float64)
+        V_map[7:9, 7:9] = 50.0
+        gap_m = [1.5e-3]
+        H_map = np.zeros((rows, cols), dtype=np.float64)
+        settings = {"h_conv": 10.0, "pad_th": 1.0, "pad_k": 3.0, "use_heatsink": False}
+        amb = 25.0
+
+        K, b, hA, _ = build_stiffness_matrix(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings, amb,
+        )
+        struct_op, sb, shA, _ = build_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings, amb,
+        )
+        pixel_area = dx * dy
+        c_cell = (
+            8960.0 * 385.0 * pixel_area * t_cu[0]
+            + 1850.0 * 1100.0 * pixel_area * t_fr4_eff[0]
+        )
+        C = np.full(layers * rows * cols, c_cell, dtype=np.float64)
+        Q = np.zeros(layers * rows * cols, dtype=np.float64)
+        Q[(rows // 2) * cols + (cols // 2)] = 0.2
+
+        ss_res = run_steady_state(
+            SolverConfig(sim_time=1.0, amb=amb, dt_base=1.0, steps_target=1, steady_state=True),
+            K, Q, b, hA, layers, rows, cols,
+        )
+        t_ss_max = float(np.max(ss_res.T))
+
+        # 1) Matrix-free with prefer_derivative_start=True (falls back cleanly to BE startup)
+        class _DerivWrapper:
+            prefer_derivative_start = True
+
+            def __getattr__(self, name):
+                return getattr(struct_op, name)
+
+        cfg_1step = SolverConfig(
+            sim_time=1.0, amb=amb, dt_base=1.0, steps_target=1,
+            use_multi_phase=False, time_stepping="uniform", early_stop=False,
+        )
+        res_mf = run_simulation_matrix_free(cfg_1step, _DerivWrapper(), C, Q, sb, shA)
+        assert float(np.max(res_mf.T)) <= t_ss_max + 1e-6
+        assert float(np.min(res_mf.T)) >= amb - 1e-12
+
+        # 2) Direct SciPy auto large-grid single-factorization startup (dt = 1.0 s >> tau_cell)
+        orig_plan = _build_phase_plan
+        monkeypatch.setattr(
+            thermal_solver,
+            "_build_phase_plan",
+            lambda cfg, _n: orig_plan(cfg, 120_000),
+        )
+        cfg_auto = SolverConfig(
+            sim_time=4.0,
+            amb=amb,
+            dt_base=1.0,
+            steps_target=4,
+            time_stepping="auto",
+            snapshots_enabled=True,
+            snap_times=[0.66, 1.33, 2.0, 4.0],
+            early_stop=False,
+        )
+        res_sp = run_simulation(cfg_auto, K, C, Q, b, hA, layers, rows, cols)
+        assert res_sp.factor_count == 1
+        assert all(s["max_top"] <= t_ss_max + 1e-6 for s in res_sp.snapshot_stats)
+        assert all(s["eps_rel"] < 0.01 for s in res_sp.snapshot_stats)
+
+    def test_use_heatsink_false_ignores_nonzero_hmap(self):
+        """use_heatsink=False must zero pad conductance and match across all 3 builders."""
+        layers, rows, cols = 2, 8, 8
+        dx = dy = 0.5e-3
+        copper_mask = np.ones((layers, rows, cols), dtype=bool)
+        t_cu = np.full(layers, 35e-6)
+        t_fr4_eff = np.full(layers, 0.75e-3)
+        V_map = np.ones((rows, cols), dtype=np.float64)
+        gap_m = [1.5e-3]
+        H_map = np.ones((rows, cols), dtype=np.float64)
+        amb = 25.0
+        settings = {
+            "h_conv": 10.0,
+            "h_conv_bottom": 12.0,
+            "pad_th": 1.0,
+            "pad_k": 3.0,
+            "use_heatsink": False,
+            "pad_sink_mode": "fixed",
+            "pad_sink_temp_use_ambient": False,
+            "pad_sink_temp_c": 60.0,
+        }
+
+        K, b, hA, diag = build_stiffness_matrix(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings, amb,
+        )
+        struct_op, sb, shA, sdiag = build_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings, amb,
+        )
+        compact_op = build_compact_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map.astype(np.float32), gap_m, H_map, settings, amb,
+            pad_cap_areal=500.0,
+        )
+
+        assert compact_op.bot_pad_diag == 0.0
+        assert compact_op.bot_pad_rhs == 0.0
+        assert compact_op.bot_pad_ha == 0.0
+        assert compact_op.pad_cap_cell == 0.0
+        assert not np.any(compact_op.heatsink_mask)
+        plane = rows * cols
+        np.testing.assert_allclose(hA[plane:], 12.0 * dx * dy, rtol=1e-12)
+        np.testing.assert_allclose(shA, hA, rtol=1e-12)
+        np.testing.assert_allclose(sb, b, rtol=1e-12)
+        np.testing.assert_allclose(sdiag, diag, rtol=1e-12)
+
+        vec = np.linspace(20.0, 50.0, layers * plane)
+        np.testing.assert_allclose(compact_op.dot(vec), K.dot(vec), rtol=1e-6, atol=1e-10)
+        np.testing.assert_allclose(struct_op.dot(vec), K.dot(vec), rtol=1e-12, atol=1e-12)
+
+    def test_capacity_cache_key_prevents_stale_id_reuse(self):
+        """_capacity_cache_key distinguishes recycled addresses and interior mutations."""
+        import gc
+
+        arr1 = np.ones(100, dtype=np.float64)
+        key1 = thermal_solver._capacity_cache_key(arr1)
+        arr1_id = id(arr1)
+        del arr1
+        gc.collect()
+
+        arr2 = np.ones(100, dtype=np.float64)
+        arr2[50] = 2.0
+        key2 = thermal_solver._capacity_cache_key(arr2)
+        assert key1 != key2
+        assert key1[0]() is None
+        assert key2[0]() is arr2
+        _ = arr1_id
 
 

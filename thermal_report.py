@@ -45,7 +45,7 @@ function getLayer(idx){return payload.layers.find(layer=>layer.index===idx)||pay
 function buildOptions(){sel.innerHTML='';payload.layers.forEach(layer=>{const opt=document.createElement('option');opt.value=String(layer.index);opt.textContent=layer.name;if(layer.index===state.currentLayerIndex)opt.selected=true;sel.appendChild(opt);});}
 function drawHeatmap(){const layer=currentLayer();setSizes(layer);const img=ctx.createImageData(layer.cols,layer.rows);for(let i=0;i<layer.data.length;i++){const rgba=color(layer.data[i],payload.vmin_c,payload.vmax_c),off=i*4;img.data[off]=rgba.r;img.data[off+1]=rgba.g;img.data[off+2]=rgba.b;img.data[off+3]=rgba.a;}ctx.putImageData(img,0,0);active.textContent=layer.name;legendMin.textContent=fmt(payload.vmin_c,1)+' C';legendMax.textContent=fmt(payload.vmax_c,1)+' C';drawOverlay();}
 function canvasCell(evt){const layer=currentLayer(),r=canvas.getBoundingClientRect();if(!r.width||!r.height)return null;const x=c(evt.clientX-r.left,0,r.width-.0001),y=c(evt.clientY-r.top,0,r.height-.0001);return{col:c(Math.floor(x/r.width*layer.cols),0,layer.cols-1),row:c(Math.floor(y/r.height*layer.rows),0,layer.rows-1)};}
-function showTip(evt,cell){const layer=currentLayer();if(!cell){tip.style.display='none';return;}const value=cellValue(layer,cell.row,cell.col),xMm=payload.x_min_mm+cell.col*payload.res_mm,yMm=payload.y_min_mm+cell.row*payload.res_mm;tip.innerHTML='<strong>'+esc(layer.name)+'</strong><br>Temp: '+fmt(value,2)+' C<br>Row/Col: '+cell.row+' / '+cell.col+'<br>X/Y: '+fmt(xMm,3)+' / '+fmt(yMm,3)+' mm';tip.style.left=(evt.clientX+16)+'px';tip.style.top=(evt.clientY+16)+'px';tip.style.display='block';}
+function showTip(evt,cell){const layer=currentLayer();if(!cell){tip.style.display='none';return;}const value=cellValue(layer,cell.row,cell.col),xMm=payload.x_min_mm+(cell.col+0.5)*payload.res_mm,yMm=payload.y_min_mm+(cell.row+0.5)*payload.res_mm;tip.innerHTML='<strong>'+esc(layer.name)+'</strong><br>Temp: '+fmt(value,2)+' C<br>Row/Col: '+cell.row+' / '+cell.col+'<br>X/Y: '+fmt(xMm,3)+' / '+fmt(yMm,3)+' mm';tip.style.left=(evt.clientX+16)+'px';tip.style.top=(evt.clientY+16)+'px';tip.style.display='block';}
 function drawRect(r,stroke,fill,dashed){const w=r.col1-r.col0+1,h=r.row1-r.row0+1;octx.save();octx.strokeStyle=stroke;octx.fillStyle=fill;octx.lineWidth=1.25;octx.setLineDash(dashed?[3,2]:[]);octx.fillRect(r.col0,r.row0,w,h);octx.strokeRect(r.col0+.5,r.row0+.5,Math.max(w-1,1),Math.max(h-1,1));octx.restore();}
 function roiMatchesLayer(roi,layerIndex){return roi.mode==='all_layers'||roi.layerIndex===layerIndex;}
 function drawOverlay(){const layer=currentLayer();octx.clearRect(0,0,overlay.width,overlay.height);state.rois.forEach(roi=>{if(!roiMatchesLayer(roi,layer.index))return;drawRect(roi,'rgba(12,92,152,.95)','rgba(31,95,139,.18)',false);});if(state.dragStart&&state.dragCurrent&&state.dragLayerIndex===layer.index){const draft=rect(state.dragStart,state.dragCurrent,layer);if(draft)drawRect(draft,'rgba(155,44,44,.95)','rgba(155,44,44,.16)',true);}}
@@ -355,12 +355,23 @@ def _build_interactive_viewer(interactive_heatmap):
     )
 
 
-_HEATSINK_MATERIAL_CP = {
-    "aluminium": 897.0,
-    "copper": 385.0,
-    "steel": 490.0,
-    "magnesium": 1020.0,
-}
+try:
+    from .thermal_solver import resolve_heatsink_cp as _resolve_heatsink_cp
+except ImportError:
+    _HEATSINK_MATERIAL_CP = {
+        "aluminium": 897.0,
+        "copper": 385.0,
+        "steel": 490.0,
+        "magnesium": 1020.0,
+    }
+
+    def _resolve_heatsink_cp(settings):
+        """Resolve specific heat capacity (J/(kg*K)) for the heatsink material."""
+        mat = str((settings or {}).get("heatsink_material", "aluminium") or "aluminium").strip().lower()
+        if mat == "custom":
+            val = (settings or {}).get("heatsink_cp_j_kgk", 897.0)
+            return max(0.0, float(897.0 if val is None else val))
+        return float(_HEATSINK_MATERIAL_CP.get(mat, _HEATSINK_MATERIAL_CP["aluminium"]))
 
 
 def _build_solver_physics_rows(settings, k_norm_info):
@@ -417,9 +428,7 @@ def _build_thermal_pad_section(settings, k_norm_info):
         rows.append(("Thermal Pad Mode", "Dynamic heatsink (0D)"))
         rth = k_norm_info.get("heatsink_rth_kw", settings.get("heatsink_rth_kw"))
         mat_raw = str(settings.get("heatsink_material", "aluminium") or "aluminium").strip().lower()
-        cp_val = settings.get("heatsink_cp_j_kgk")
-        if cp_val is None and mat_raw in _HEATSINK_MATERIAL_CP:
-            cp_val = _HEATSINK_MATERIAL_CP[mat_raw]
+        cp_val = _resolve_heatsink_cp(settings)
         mass_g = settings.get("heatsink_mass_g")
         c_hs = k_norm_info.get("heatsink_capacity_j_k")
         if c_hs is None and mass_g is not None and cp_val is not None:
@@ -512,13 +521,23 @@ def _build_snapshot_stats_table(snapshot_debug):
     )
 
 
+def _format_snapshot_time(t_val):
+    """Format snapshot timestamp cleanly without collapsing sub-second runs."""
+    val = float(t_val)
+    if abs(val) < 1.0 and val != 0.0:
+        return f"t = {val:.3g} s"
+    if abs(val - round(val, 1)) < 1e-6:
+        return f"t = {val:.1f} s"
+    return f"t = {val:.3g} s" if abs(val) < 10.0 else f"t = {val:.4g} s"
+
+
 def _build_snapshot_gallery(snapshot_items):
     """Render snapshot gallery HTML."""
     if not snapshot_items:
         return "<div class='empty-state'>No snapshots captured.</div>"
     cards = []
     for t_val, fname in snapshot_items:
-        label = f"t = {t_val:.1f} s" if t_val is not None else fname
+        label = _format_snapshot_time(t_val) if t_val is not None else fname
         cards.append(
             "<figure class='snapshot-card'>"
             f"<a class='image-link' href='{_esc(fname)}' target='_blank' rel='noopener'>"

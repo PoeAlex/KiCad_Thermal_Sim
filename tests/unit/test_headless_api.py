@@ -128,7 +128,7 @@ class TestHeadlessIsolationAndJson:
 
     def test_constants(self):
         assert headless_api.SCHEMA_VERSION == "1.0"
-        assert headless_api.PLUGIN_VERSION == "0.4.8"
+        assert headless_api.PLUGIN_VERSION == "0.4.9"
 
     def test_no_wx_or_gui_imports_in_ast(self):
         for mod in (headless_api, simulation_core):
@@ -1183,3 +1183,79 @@ class TestV048ConvectionAndViaSettings:
         assert captured_k_norm["h_air_bottom"] == pytest.approx(3.0)
         assert captured_k_norm["via_plating_um"] == pytest.approx(35.0)
         assert captured_k_norm["via_fill"] == "copper"
+
+
+class TestV049GapAndValidationFixes:
+    """Tests for v0.4.9 ElectricalConfig gap_m wiring and job parameter validation."""
+
+    def test_headless_passes_gap_m_to_electrical_config(self, monkeypatch):
+        from ThermalSim.electrical_solver import ElectricalResult
+
+        board = _make_board(None, with_eco1=False)
+        captured_configs = []
+
+        def spy_solve_electrical(b, terminals, config):
+            captured_configs.append(config)
+            n = len(config.copper_ids) * config.rows * config.cols
+            return ElectricalResult(
+                q_joule=np.zeros(n, dtype=np.float64),
+                net_summaries=[],
+                warnings=[],
+                errors=[],
+            )
+
+        monkeypatch.setattr(headless_api, "solve_electrical_heating", spy_solve_electrical)
+
+        res = headless_api.run_headless_simulation(
+            board,
+            {
+                "thick": 0.8,
+                "res": 2.0,
+                "steady_state": True,
+                "compute_engine": "legacy",
+                "current_enabled": True,
+                "current_groups": [
+                    {"name": "VIN", "pads": {"U1.1": 2.0, "C1.1": -2.0}},
+                ],
+            },
+            generate_plots=False,
+            generate_html=False,
+        )
+        assert res["status"] == "ok"
+        assert len(captured_configs) == 1
+        assert captured_configs[0].gap_m is not None
+        assert len(captured_configs[0].gap_m) == 1
+        assert captured_configs[0].gap_m[0] == pytest.approx(0.8e-3, rel=1e-4)
+
+    def test_validate_job_rejects_invalid_schema_bounds(self, sample_2layer_board_file):
+        board = _make_board(sample_2layer_board_file)
+        invalid_cases = [
+            ({"pad_th": 0.0}, "pad_th"),
+            ({"pad_th": -0.5}, "pad_th"),
+            ({"pad_k": 0.0}, "pad_k"),
+            ({"pad_contact_factor": 0.01}, "pad_contact_factor"),
+            ({"pad_contact_factor": 1.2}, "pad_contact_factor"),
+            ({"heatsink_mass_g": -1.0}, "heatsink_mass_g"),
+            ({"heatsink_material": "custom", "heatsink_cp_j_kgk": 0.0}, "heatsink_cp_j_kgk"),
+            ({"thick": 0.0}, "thick"),
+            ({"power_scale": -0.1}, "power_scale"),
+            ({"pad_dist_mm": -5.0}, "pad_dist_mm"),
+        ]
+        for overrides, expected_target in invalid_cases:
+            cfg = {"power_pads": {"U1.EP": 1.0}, **overrides}
+            res = headless_api.validate_job(board, cfg)
+            assert res["valid"] is False, f"Expected invalid for {overrides}"
+            assert any(
+                e["code"] == "INVALID_PARAMETER" and e["target"] == expected_target
+                for e in res["errors"]
+            ), f"Expected target {expected_target} in {res['errors']}"
+
+        # Boundary values allowed by schema
+        for valid_overrides in (
+            {"pad_contact_factor": 0.05},
+            {"pad_contact_factor": 1.0},
+            {"heatsink_mass_g": 0.0},
+            {"pad_dist_mm": 0.0},
+        ):
+            res = headless_api.validate_job(board, {"power_pads": {"U1.EP": 1.0}, **valid_overrides})
+            assert res["valid"] is True, f"Expected valid for {valid_overrides}: {res['errors']}"
