@@ -90,7 +90,25 @@
       "type": "number",
       "minimum": 0,
       "default": 10.0,
-      "description": "Top/bottom surface convection coefficient in W/(m^2*K)."
+      "description": "Top surface (and default bottom) effective heat transfer coefficient (convection + radiation) in W/(m^2*K)."
+    },
+    "h_conv_bottom": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "description": "Bottom surface effective heat transfer coefficient (convection + radiation) in W/(m^2*K). Defaults to h_conv when omitted or null."
+    },
+    "via_plating_um": {
+      "type": "number",
+      "minimum": 5.0,
+      "maximum": 100.0,
+      "default": 25.0,
+      "description": "Via and PTH barrel copper plating wall thickness in micrometers (5.0 to 100.0 um)."
+    },
+    "via_fill": {
+      "type": "string",
+      "enum": ["plated", "copper"],
+      "default": "plated",
+      "description": "Via fill type: 'plated' for standard hollow/resin-filled plated barrels, or 'copper' for solid copper-filled vias."
     },
     "grid_detail_level": {
       "type": "string",

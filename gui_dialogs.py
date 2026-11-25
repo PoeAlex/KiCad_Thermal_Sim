@@ -57,8 +57,11 @@ TOOLTIP_TEXTS = {
     'heatsink_material': "Heatsink material preset used to auto-fill specific heat capacity c_p.",
     'heatsink_mass_g': "Heatsink mass in grams. Set 0 for an instantaneous (zero thermal mass) heatsink.",
     'heatsink_cp_j_kgk': "Specific heat capacity c_p in J/(kg\u00b7K). Editable only when material is Custom.",
-    'h_conv': "Convection coefficient in W/(m\u00b2\u00b7K). Still air ~5-10, light fan ~25, forced ~50-100.",
-    'pcb_thick': "PCB thickness override in mm. Usually auto-detected from stackup.",
+    'h_conv': "Effective top-surface heat transfer coefficient (convection + radiation) in W/(m\u00b2\u00b7K). Insulated ~0-2, still air ~8-12, fan ~25-100.",
+    'h_conv_bottom': "Effective bottom-surface heat transfer coefficient (convection + radiation) in W/(m\u00b2\u00b7K). Insulated ~0-2, still air ~8-12, fan ~25-100.",
+    'via_plating_um': "Via and PTH barrel copper plating wall thickness in \u00b5m (IPC Class 2 standard ~25 \u00b5m; range 5-100 \u00b5m). Disabled when copper-filled.",
+    'via_fill': "Via fill type: 'Plated (standard)' models hollow/resin-filled plated barrels; 'Copper-filled' models solid copper VIPPO vias.",
+    'pcb_thick': "Fallback PCB thickness in mm when board stackup thickness is unavailable.",
     'grid_detail': "Compute budget used to preserve the desired cell size on large simulations.",
     'grid_node_budget': (
         "Maximum total solver nodes across all copper layers in Custom mode "
@@ -124,7 +127,7 @@ TOOLTIP_TEXTS = {
     'board_details': "Expand to inspect the detected PCB layer stackup and initially selected KiCad pads.",
     'geometry_pane': "Expand to filter traces or crop the simulation area around active heat sources and current nets.",
     'thermal_pad_pane': "Expand to configure a bottom-layer thermal pad / heatsink boundary (shapes on User.Eco1).",
-    'solver_pane': "Expand to adjust convection, PCB thickness override, compute engine, and transient time stepping.",
+    'solver_pane': "Expand to adjust top/bottom convection, via plating/fill, PCB thickness fallback, compute engine, and transient time stepping.",
 }
 
 
@@ -498,6 +501,7 @@ class SettingsDialog(wx.Dialog):
         board_name="",
         board_size_mm=None,
         defer_initial_preflight=False,
+        stackup_thickness_mm=None,
     ):
         dialog_style = (
             getattr(wx, "DEFAULT_DIALOG_STYLE", 0)
@@ -508,6 +512,11 @@ class SettingsDialog(wx.Dialog):
         self.layer_names = layer_names
         self.board_name = str(board_name or "Unsaved board")
         self.board_size_mm = tuple(board_size_mm or ())
+        try:
+            stack_th = float(stackup_thickness_mm) if stackup_thickness_mm is not None else None
+        except (TypeError, ValueError):
+            stack_th = None
+        self.stackup_thickness_mm = stack_th if (stack_th is not None and stack_th > 0.0) else None
         self.preview_callback = preview_callback
         self.selection_provider = selection_provider
         self.run_callback = run_callback
@@ -1061,16 +1070,51 @@ class SettingsDialog(wx.Dialog):
         box_solver = wx.BoxSizer(wx.VERTICAL)
 
         self.h_conv_input = self._add_spin_field(
-            box_solver, solver_panel, "Convection h (W/m\u00b2K)", 10.0,
-            min_val=1.0, max_val=200.0, inc=1.0, digits=1,
+            box_solver, solver_panel, "Convection top (W/m\u00b2K)", 10.0,
+            min_val=0.0, max_val=200.0, inc=1.0, digits=1,
             tooltip_key='h_conv'
         )
+
+        self.h_conv_bottom_input = self._add_spin_field(
+            box_solver, solver_panel, "Convection bottom (W/m\u00b2K)", 10.0,
+            min_val=0.0, max_val=200.0, inc=1.0, digits=1,
+            tooltip_key='h_conv_bottom'
+        )
+
+        self.via_plating_input = self._add_spin_field(
+            box_solver, solver_panel, "Via plating (\u00b5m)", 25.0,
+            min_val=5.0, max_val=100.0, inc=5.0, digits=1,
+            tooltip_key='via_plating_um'
+        )
+
+        via_fill_row = wx.BoxSizer(wx.HORIZONTAL)
+        via_fill_row.Add(
+            wx.StaticText(solver_panel, label="Via fill", size=(165, -1)),
+            0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5
+        )
+        self.via_fill_choice = wx.Choice(
+            solver_panel,
+            choices=["Plated (standard)", "Copper-filled"],
+        )
+        self.via_fill_choice.SetSelection(0)
+        self.via_fill_choice.SetToolTip(TOOLTIP_TEXTS['via_fill'])
+        if choice_event is not None:
+            self.via_fill_choice.Bind(choice_event, self._on_via_fill_changed)
+        via_fill_row.Add(self.via_fill_choice, 1, wx.EXPAND)
+        box_solver.Add(via_fill_row, 0, wx.EXPAND | wx.ALL, 3)
 
         self.thick_input = self._add_spin_field(
             box_solver, solver_panel, "PCB thickness (mm)", 1.6,
             min_val=0.1, max_val=10.0, inc=0.1, digits=2,
             tooltip_key='pcb_thick'
         )
+        if self.stackup_thickness_mm is not None:
+            self.thick_input.SetValue(self.stackup_thickness_mm)
+            self.thick_input.Enable(False)
+            self.thick_input.SetToolTip(
+                "Auto-detected from the PCB stackup (only editable as fallback when stackup has no thickness)."
+            )
+        self._apply_via_fill_controls()
 
         engine_row = wx.BoxSizer(wx.HORIZONTAL)
         engine_row.Add(
@@ -1753,6 +1797,16 @@ class SettingsDialog(wx.Dialog):
         self.snap_count_input.Enable(
             self.chk_snapshots.GetValue() and not self.chk_steady_state.GetValue()
         )
+        self._refresh_preflight()
+
+    def _apply_via_fill_controls(self):
+        """Disable via plating thickness when copper-filled vias are selected."""
+        is_copper_filled = self.via_fill_choice.GetSelection() == 1
+        self.via_plating_input.Enable(not is_copper_filled)
+
+    def _on_via_fill_changed(self, event):
+        """Handle Via fill selection changes."""
+        self._apply_via_fill_controls()
         self._refresh_preflight()
 
     def _selected_heatsink_material(self):
@@ -2472,6 +2526,9 @@ class SettingsDialog(wx.Dialog):
                 'heatsink_mass_g': float(self.heatsink_mass_input.GetValue()),
                 'heatsink_cp_j_kgk': heatsink_cp,
                 'h_conv': float(self.h_conv_input.GetValue()),
+                'h_conv_bottom': float(self.h_conv_bottom_input.GetValue()),
+                'via_plating_um': float(self.via_plating_input.GetValue()),
+                'via_fill': 'copper' if self.via_fill_choice.GetSelection() == 1 else 'plated',
                 'grid_expert_limits': grid_expert_limits,
                 'grid_max_cells': grid_max_cells,
                 'grid_target_cells': grid_target_cells,
@@ -2504,8 +2561,11 @@ class SettingsDialog(wx.Dialog):
                 self.time_input.SetValue(float(defaults['time']))
             if 'amb' in defaults:
                 self.amb_input.SetValue(float(defaults['amb']))
-            if 'thick' in defaults:
+            if 'thick' in defaults and self.stackup_thickness_mm is None:
                 self.thick_input.SetValue(float(defaults['thick']))
+            elif self.stackup_thickness_mm is not None:
+                self.thick_input.SetValue(self.stackup_thickness_mm)
+                self.thick_input.Enable(False)
             if 'res' in defaults:
                 self.res_input.SetValue(float(defaults['res']))
 
@@ -2584,8 +2644,27 @@ class SettingsDialog(wx.Dialog):
             )
             self._apply_thermal_pad_controls()
 
-            if 'h_conv' in defaults:
+            if 'h_conv' in defaults and defaults['h_conv'] is not None:
                 self.h_conv_input.SetValue(float(defaults['h_conv']))
+            if 'h_conv_bottom' in defaults and defaults['h_conv_bottom'] is not None:
+                self.h_conv_bottom_input.SetValue(float(defaults['h_conv_bottom']))
+            else:
+                self.h_conv_bottom_input.SetValue(float(self.h_conv_input.GetValue()))
+
+            via_plating_val = defaults.get('via_plating_um', 25.0)
+            self.via_plating_input.SetValue(
+                25.0 if via_plating_val is None else float(via_plating_val)
+            )
+            via_fill_norm = (
+                str(defaults.get('via_fill', 'plated') or 'plated')
+                .strip()
+                .lower()
+                .replace('-', '_')
+            )
+            self.via_fill_choice.SetSelection(
+                1 if via_fill_norm in {'copper', 'copper_filled'} else 0
+            )
+            self._apply_via_fill_controls()
 
             compute_engine = str(defaults.get('compute_engine', 'auto')).lower()
             compute_engine_idx = {
@@ -2635,11 +2714,35 @@ class SettingsDialog(wx.Dialog):
             self._render_current_groups()
             if self.chk_heatsink.GetValue():
                 self.thermal_pad_pane.Expand()
+            h_conv_val = float(
+                defaults.get('h_conv', 10.0)
+                if defaults.get('h_conv') is not None
+                else 10.0
+            )
+            raw_h_bot = defaults.get('h_conv_bottom')
+            h_bot_val = h_conv_val if raw_h_bot is None else float(raw_h_bot)
+            via_plating_val = float(
+                defaults.get('via_plating_um', 25.0)
+                if defaults.get('via_plating_um') is not None
+                else 25.0
+            )
+            via_fill_norm = (
+                str(defaults.get('via_fill', 'plated') or 'plated')
+                .strip()
+                .lower()
+                .replace('-', '_')
+            )
             if (
                 str(defaults.get('compute_engine', 'auto') or 'auto').lower() != 'auto'
                 or str(defaults.get('time_stepping', 'auto') or 'auto').lower() != 'auto'
-                or float(defaults.get('h_conv', 10.0)) != 10.0
-                or float(defaults.get('thick', 1.6)) != 1.6
+                or h_conv_val != 10.0
+                or h_bot_val != 10.0
+                or via_plating_val != 25.0
+                or via_fill_norm in {'copper', 'copper_filled'}
+                or (
+                    self.stackup_thickness_mm is None
+                    and float(defaults.get('thick', 1.6)) != 1.6
+                )
             ):
                 self.solver_pane.Expand()
         except Exception:

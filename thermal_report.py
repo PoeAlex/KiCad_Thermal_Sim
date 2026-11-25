@@ -363,6 +363,42 @@ _HEATSINK_MATERIAL_CP = {
 }
 
 
+def _build_solver_physics_rows(settings, k_norm_info):
+    """Build resolved convection and via-barrel parameter rows for report tables."""
+    settings = settings or {}
+    k_norm_info = k_norm_info or {}
+
+    raw_top = k_norm_info.get("h_top")
+    if raw_top is None:
+        raw_top = settings.get("h_conv", 10.0)
+    h_top = max(0.0, float(10.0 if raw_top is None else raw_top))
+
+    raw_bot = k_norm_info.get("h_air_bottom")
+    if raw_bot is None:
+        raw_bot = settings.get("h_conv_bottom")
+    h_bottom = h_top if raw_bot is None else max(0.0, float(raw_bot))
+
+    raw_fill = k_norm_info.get("via_fill", settings.get("via_fill", "plated"))
+    fill_norm = str(raw_fill or "plated").strip().lower().replace("-", "_")
+    is_copper = fill_norm in {"copper", "copper_filled"}
+    fill_label = "Copper-filled" if is_copper else "Plated (standard)"
+
+    raw_plating = k_norm_info.get("via_plating_um", settings.get("via_plating_um", 25.0))
+    via_plating_um = 25.0 if raw_plating is None else float(raw_plating)
+    plating_label = (
+        f"{_fmt_num(via_plating_um, 1, ' um')} (unused; copper-filled)"
+        if is_copper
+        else _fmt_num(via_plating_um, 1, " um")
+    )
+
+    return [
+        ("Convection Top", _fmt_num(h_top, 1, " W/(m^2*K)")),
+        ("Convection Bottom", _fmt_num(h_bottom, 1, " W/(m^2*K)")),
+        ("Via Fill", fill_label),
+        ("Via Plating", plating_label),
+    ]
+
+
 def _build_thermal_pad_section(settings, k_norm_info):
     """Render Thermal Pad settings and dynamic heatsink details when relevant."""
     settings = settings or {}
@@ -755,6 +791,7 @@ def write_html_report(
         ("Layer names", ", ".join(layer_names) if layer_names else "n/a"),
     ]
 
+    physics_rows = _build_solver_physics_rows(settings, k_norm_info)
     solver_summary = {
         "strategy": k_norm_info.get("strategy"),
         "backend": k_norm_info.get("backend"),
@@ -768,6 +805,8 @@ def write_html_report(
         "pout_final_w": k_norm_info.get("pout_final_w"),
         "steady_rel_diff": k_norm_info.get("steady_rel_diff"),
     }
+    for label, val in physics_rows:
+        solver_summary[label] = val
     if k_norm_info.get("heatsink_enabled"):
         solver_summary.update({
             "Heatsink Temp": _fmt_num(k_norm_info.get("heatsink_temp_c"), 2, " C"),
@@ -814,6 +853,8 @@ def write_html_report(
         "</div><div>"
         "<h3 class='section-title'>Simulation Inputs</h3>"
         f"{_table_html(['Setting', 'Value'], settings_rows, empty_text='No settings recorded.')}"
+        "<div class='spacer-sm'></div><h3 class='section-title'>Boundary &amp; Via Model</h3>"
+        f"{_table_html(['Parameter', 'Value'], physics_rows)}"
         f"{_build_thermal_pad_section(settings, k_norm_info)}<div class='spacer-sm'></div>"
         "<h3 class='section-title'>Power per Pad</h3>"
         f"{_table_html(['Pad', 'Power'], pad_rows, empty_text='No pad power recorded.')}"

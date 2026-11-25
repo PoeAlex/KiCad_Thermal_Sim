@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ThermalSim (**v0.4.7**) is a KiCad 9.0 & 10.0 PCB Editor plugin and headless automation tool for fast 2.5D steady-state and transient thermal simulation. It simulates heat spreading across multilayer PCBs using finite volume methods, a Native C++/OpenMP **v4** Compact Low-RAM Multigrid & Fused PCG core (with pure NumPy/SciPy fallback), and BDF2 time integration.
+ThermalSim (**v0.4.8**) is a KiCad 9.0 & 10.0 PCB Editor plugin and headless automation tool for fast 2.5D steady-state and transient thermal simulation. It simulates heat spreading across multilayer PCBs using finite volume methods, a Native C++/OpenMP **v4** Compact Low-RAM Multigrid & Fused PCG core (with pure NumPy/SciPy fallback), and BDF2 time integration.
 
 ## Dependencies
 
@@ -83,8 +83,8 @@ KiCad_Thermal_Sim/
 |----------|-------|--------|
 | `k_Cu` | 390 W/(m·K) | `thermal_plugin.py`, `thermal_solver.py`, `simulation_core.py` |
 | `k_FR4` | 0.3 W/(m·K) | `thermal_plugin.py`, `thermal_solver.py`, `simulation_core.py` |
-| `h_convection` | 10 W/(m²·K) default (configurable via `h_conv`) | `thermal_solver.py`, `gui_dialogs.py` |
-| `via_factor` | 1300 (`k_Cu / k_FR4`) | `geometry_mapper.py`, `thermal_solver.py` |
+| `h_conv` / `h_conv_bottom` | 10 W/(m²·K) default (`>= 0.0`, `h_conv_bottom` defaults to `h_conv`) | `thermal_solver.py`, `gui_dialogs.py`, `headless_api.py` |
+| `via_plating_um` / `via_fill` | `25.0` µm / `"plated"` default (`"plated"` \| `"copper"`), physical barrel conductance | `geometry_mapper.py`, `electrical_solver.py`, `gui_dialogs.py` |
 
 ## Building the Native C++/OpenMP v4 Core
 

@@ -398,6 +398,11 @@ class GeometryCache:
                 from .geometry_mapper import GeometryState
 
                 area_mask = archive["area_mask"] if meta.get("has_area_mask") else None
+                via_map_3d = (
+                    archive["via_map_3d"]
+                    if meta.get("has_via_map_3d") and "via_map_3d" in archive
+                    else None
+                )
                 return GeometryState(
                     copper_mask=archive["copper_mask"],
                     via_map=archive["via_map"],
@@ -410,6 +415,7 @@ class GeometryCache:
                     cols=int(meta["cols"]),
                     x_centers_iu=archive["x_centers_iu"],
                     y_centers_iu=archive["y_centers_iu"],
+                    via_map_3d=via_map_3d,
                 )
             if fmt == "dict_v1":
                 result = _decode_json_safe(meta.get("json_items", {}))
@@ -434,6 +440,10 @@ class GeometryCache:
             has_area_mask = value.area_mask is not None
             if has_area_mask:
                 arrays["area_mask"] = np_mod.asarray(value.area_mask)
+            via_map_3d = getattr(value, "via_map_3d", None)
+            has_via_map_3d = via_map_3d is not None
+            if has_via_map_3d:
+                arrays["via_map_3d"] = np_mod.asarray(via_map_3d)
             meta = {
                 "format": "geometry_state_v1",
                 "x_min": float(value.x_min),
@@ -442,6 +452,7 @@ class GeometryCache:
                 "rows": int(value.rows),
                 "cols": int(value.cols),
                 "has_area_mask": has_area_mask,
+                "has_via_map_3d": has_via_map_3d,
             }
             arrays["__meta__"] = np_mod.frombuffer(
                 json.dumps(meta, sort_keys=True, separators=(",", ":")).encode("utf-8"),
@@ -625,8 +636,13 @@ def stable_fingerprint(value: Any) -> str:
 
 def geometry_cache_key(snapshot: BoardSnapshot, grid: GridEstimate, settings, pad_keys):
     """Build a cache key containing only geometry-affecting inputs."""
+    from .geometry_mapper import normalize_via_fill
+
+    raw_plating = settings.get("via_plating_um", 25.0)
+    via_plating_um = 25.0 if raw_plating is None else float(raw_plating)
+    via_fill = normalize_via_fill(settings.get("via_fill", "plated"))
     payload = {
-        "geometry_cache_version": 3,
+        "geometry_cache_version": 4,
         "board": snapshot.fingerprint,
         "grid": {
             "res": grid.actual_res_mm,
@@ -641,6 +657,8 @@ def geometry_cache_key(snapshot: BoardSnapshot, grid: GridEstimate, settings, pa
         "limit_area": bool(settings.get("limit_area", False)),
         "pad_dist_mm": float(settings.get("pad_dist_mm", 0.0) or 0.0),
         "use_heatsink": bool(settings.get("use_heatsink", False)),
+        "via_plating_um": via_plating_um,
+        "via_fill": via_fill,
         "pads": sorted(str(key) for key in pad_keys),
     }
     return stable_fingerprint(payload)

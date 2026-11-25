@@ -8,6 +8,7 @@ for performance, while keeping numerical behavior unchanged.
 import json
 
 import numpy as np
+import pytest
 
 from ThermalSim.geometry_mapper import get_pad_pixels
 from ThermalSim.thermal_plugin import (
@@ -25,6 +26,7 @@ from tests.mocks.pcbnew_mock import (
     MockPad,
     MockTrack,
     MockZone,
+    PAD_ATTRIB_PTH,
     VECTOR2I,
     EDA_RECT,
     Eco1_User,
@@ -2644,6 +2646,8 @@ class TestSimulationCoreDeduplication:
 
         suite = TestCompactLowRamPluginWiring()
         plugin, board, pad, settings = suite._setup_plugin_env(tmp_path, monkeypatch, with_eco1=False)
+        from ThermalSim.workflow import GeometryCache
+        plugin.geometry_cache = GeometryCache(cache_dir=str(tmp_path / "geom_cache"))
         settings["compute_engine"] = "fast_native"
         settings["mesh_mode"] = "uniform"
         settings["steady_state"] = False
@@ -2687,3 +2691,268 @@ class TestSimulationCoreDeduplication:
             ["U1-1"],
         )
         assert recorded == ["auto", "uniform"]
+
+
+class TestV048PluginWiringAndSnapshot:
+    """Tests for v0.4.8 snapshot invalidation, operator cache key, and 3D via routing."""
+
+    def test_snapshot_invalidates_on_via_drill_layers_and_pad_drill(self):
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        class _DrillVia(MockTrack):
+            def __init__(self, drill_nm, layers):
+                super().__init__(layer=F_Cu, bbox=EDA_RECT(2_000_000, 2_000_000, 600_000, 600_000))
+                self._drill_nm = drill_nm
+                self._layers = list(layers)
+
+            def GetWidth(self, layer=None):
+                return 600_000
+
+            def GetDrillValue(self):
+                return self._drill_nm
+
+            def GetLayerSet(self):
+                return _PluginShapeLayerSet(self._layers)
+
+        class _DrillPad(MockPad):
+            def __init__(self, drill_nm):
+                super().__init__(
+                    position=VECTOR2I(5_000_000, 5_000_000),
+                    layer=F_Cu,
+                    attribute=PAD_ATTRIB_PTH,
+                )
+                self._drill_nm = drill_nm
+
+            def GetDrillSize(self):
+                return VECTOR2I(self._drill_nm, self._drill_nm)
+
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        bbox = EDA_RECT(0, 0, 20_000_000, 20_000_000)
+
+        snap_1 = plugin._capture_board_snapshot(
+            MockBoard(tracks=[_DrillVia(300_000, [F_Cu, B_Cu])]), [F_Cu, B_Cu], bbox
+        )
+        snap_2 = plugin._capture_board_snapshot(
+            MockBoard(tracks=[_DrillVia(450_000, [F_Cu, B_Cu])]), [F_Cu, B_Cu], bbox
+        )
+        snap_3 = plugin._capture_board_snapshot(
+            MockBoard(tracks=[_DrillVia(300_000, [F_Cu])]), [F_Cu, B_Cu], bbox
+        )
+        assert snap_1.fingerprint != snap_2.fingerprint
+        assert snap_1.fingerprint != snap_3.fingerprint
+
+        pad_board_a = MockBoard(footprints=[MockFootprint(reference="J1", pads=[_DrillPad(800_000)])])
+        pad_board_b = MockBoard(footprints=[MockFootprint(reference="J1", pads=[_DrillPad(1_200_000)])])
+        snap_pa = plugin._capture_board_snapshot(pad_board_a, [F_Cu, B_Cu], bbox)
+        snap_pb = plugin._capture_board_snapshot(pad_board_b, [F_Cu, B_Cu], bbox)
+        assert snap_pa.fingerprint != snap_pb.fingerprint
+
+    def test_operator_cache_key_includes_h_conv_bottom(self):
+        from ThermalSim.thermal_plugin import _build_operator_cache_key
+
+        k1 = _build_operator_cache_key(
+            "geom", "legacy", [35e-6, 35e-6], [1.5e-3], [0.75e-3, 0.75e-3], 0.5e-3, 25.0,
+            {"h_conv": 10.0, "h_conv_bottom": 10.0},
+        )
+        k2 = _build_operator_cache_key(
+            "geom", "legacy", [35e-6, 35e-6], [1.5e-3], [0.75e-3, 0.75e-3], 0.5e-3, 25.0,
+            {"h_conv": 10.0, "h_conv_bottom": 2.0},
+        )
+        assert k1 != k2
+
+    def test_run_safe_forwards_stackup_thickness_to_dialog(self, monkeypatch):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        captured_kwargs = {}
+
+        class DummyDialog:
+            def __init__(self, *args, **kwargs):
+                captured_kwargs.update(kwargs)
+
+            def Show(self):
+                pass
+
+        board = MockBoard(footprints=[MockFootprint(reference="U1", pads=[])])
+        monkeypatch.setattr(plugin_mod.pcbnew, "GetBoard", lambda: board, raising=False)
+        monkeypatch.setattr(plugin_mod, "_find_pcb_editor_parent", lambda _b=None: None)
+        monkeypatch.setattr(plugin_mod, "SettingsDialog", DummyDialog)
+        monkeypatch.setattr(
+            plugin_mod,
+            "parse_stackup_from_board_file",
+            lambda *a, **k: {"board_thickness_mm": 0.8},
+        )
+        monkeypatch.setattr(plugin, "_show_startup_progress", lambda *a, **k: None)
+        monkeypatch.setattr(plugin, "_close_startup_progress", lambda *a, **k: None)
+        monkeypatch.setattr(plugin, "_load_settings", lambda *a, **k: {})
+        monkeypatch.setattr(plugin, "_detect_copper_layers", lambda _b: ([F_Cu, B_Cu], ["F.Cu", "B.Cu"]))
+        monkeypatch.setattr(board, "GetBoundingBox", lambda: EDA_RECT(0, 0, 10_000_000, 10_000_000), raising=False)
+
+        plugin.Run()
+        assert captured_kwargs["stackup_thickness_mm"] == pytest.approx(0.8)
+
+    def test_run_simulation_via_map_3d_uses_structured_operator_and_records_k_norm(
+        self, tmp_path, monkeypatch
+    ):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.geometry_mapper import GeometryState
+        from ThermalSim.thermal_solver import SolverResult
+
+        suite = TestCompactLowRamPluginWiring()
+        plugin, board, pad, settings = suite._setup_plugin_env(tmp_path, monkeypatch, with_eco1=False)
+        from ThermalSim.workflow import GeometryCache
+        plugin.geometry_cache = GeometryCache(cache_dir=str(tmp_path / "geom_cache"))
+        settings["compute_engine"] = "fast_native"
+        settings["h_conv"] = 14.0
+        settings["h_conv_bottom"] = 1.5
+        settings["via_plating_um"] = 30.0
+        settings["via_fill"] = "copper"
+
+        def make_3d_state(*args, **kwargs):
+            rows = int(kwargs.get("rows", 24))
+            cols = int(kwargs.get("cols", 24))
+            copper_mask = np.zeros((2, rows, cols), dtype=bool)
+            copper_mask[0, :, :] = True
+            via_map_2d = np.ones((rows, cols), dtype=np.float32)
+            via_map_3d = np.ones((1, rows, cols), dtype=np.float32)
+            via_map_3d[0, 3, 3] = 25.0
+            state = GeometryState(
+                copper_mask=copper_mask,
+                via_map=via_map_2d,
+                heatsink_mask=np.zeros((rows, cols), dtype=bool),
+                area_mask=None,
+                x_min=float(kwargs.get("x_min", 0.0)),
+                y_min=float(kwargs.get("y_min", 0.0)),
+                res=float(kwargs.get("res", 0.5)),
+                rows=rows,
+                cols=cols,
+                x_centers_iu=np.zeros(cols, dtype=np.int64),
+                y_centers_iu=np.zeros(rows, dtype=np.int64),
+                via_map_3d=via_map_3d,
+            )
+            captured_state["via_map_3d"] = via_map_3d
+            return state
+
+        captured_state = {}
+        monkeypatch.setattr(plugin_mod, "build_geometry_state", make_3d_state)
+
+        calls = {"structured": 0, "compact": 0}
+
+        def spy_structured(*args, **kwargs):
+            calls["structured"] += 1
+            assert args[10] is captured_state["via_map_3d"]
+            n_nodes = int(args[0]) * int(args[1]) * int(args[2])
+            return ("K_STRUCT", np.zeros(n_nodes), np.zeros(n_nodes), {})
+
+        def spy_compact(*args, **kwargs):
+            calls["compact"] += 1
+            raise AssertionError("Compact operator must not be used when via_map_3d is present")
+
+        monkeypatch.setattr(plugin_mod, "build_structured_operator", spy_structured)
+        monkeypatch.setattr(plugin_mod, "_ORIG_BUILD_STRUCTURED_OPERATOR", spy_structured)
+        monkeypatch.setattr(plugin_mod, "build_compact_structured_operator", spy_compact)
+        monkeypatch.setattr(
+            plugin_mod,
+            "run_simulation_matrix_free",
+            lambda config, op, C, Q, b, hA, *a, **k: SolverResult(
+                T=np.full((2, int(np.sqrt(C.size // 2)), int(np.sqrt(C.size // 2))), 30.0),
+                k_norm_info={},
+                step_counter=1,
+                total_solve_time=0.01,
+                total_factor_time=0.0,
+                factor_count=0,
+            ),
+        )
+        captured_report = {}
+        monkeypatch.setattr(
+            plugin_mod,
+            "write_html_report",
+            lambda *a, **k: captured_report.update(k) or str(tmp_path / "rep.html"),
+        )
+
+        plugin._run_simulation(
+            board, [F_Cu, B_Cu], ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad], settings, {}, ["U1-1"],
+        )
+        assert calls["structured"] == 1
+        assert calls["compact"] == 0
+        k_norm = captured_report["k_norm_info"]
+        assert k_norm["h_top"] == pytest.approx(14.0)
+        assert k_norm["h_air_bottom"] == pytest.approx(1.5)
+        assert k_norm["via_plating_um"] == pytest.approx(30.0)
+        assert k_norm["via_fill"] == "copper"
+
+    def test_preview_forwards_via_settings_and_handles_3d_via_map(self, tmp_path):
+        from ThermalSim.geometry_mapper import GeometryState
+        from ThermalSim.visualization import save_preview_image
+
+        rows, cols = 16, 16
+        state = GeometryState(
+            copper_mask=np.ones((4, rows, cols), dtype=bool),
+            via_map=np.ones((rows, cols), dtype=np.float32),
+            heatsink_mask=np.zeros((rows, cols), dtype=bool),
+            area_mask=None,
+            x_min=0.0,
+            y_min=0.0,
+            res=1.0,
+            rows=rows,
+            cols=cols,
+            x_centers_iu=np.zeros(cols, dtype=np.int64),
+            y_centers_iu=np.zeros(rows, dtype=np.int64),
+            via_map_3d=np.ones((3, rows, cols), dtype=np.float32),
+        )
+        state.via_map_3d[0, 2, 2] = 15.0
+        board = MockBoard(footprints=[MockFootprint(reference="U1", pads=[])])
+        bbox = EDA_RECT(0, 0, 12_000_000, 12_000_000)
+        out = save_preview_image(
+            board,
+            [F_Cu, 1, 2, B_Cu],
+            bbox,
+            [],
+            {"res": 1.0, "use_heatsink": False},
+            ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"],
+            {},
+            get_pad_pixels,
+            None,
+            lambda *a, **k: {"copper_thickness_mm_used": [0.035] * 4},
+            open_file=False,
+            out_dir=str(tmp_path),
+            geometry_state=state,
+        )
+        assert out is not None and out.endswith("thermal_preview.png")
+
+        captured_extra = {}
+
+        def fake_create_maps(
+            board, copper_ids, rows, cols, x_min, y_min, res,
+            settings, k_fr4_rel, k_cu_layers, via_factor, pads_list,
+            via_plating_um=25.0, via_fill="plated", k_cu=390.0, k_fr4=0.3,
+        ):
+            captured_extra["via_plating_um"] = via_plating_um
+            captured_extra["via_fill"] = via_fill
+            return (
+                np.ones((2, rows, cols), dtype=np.float64),
+                np.ones((rows, cols), dtype=np.float32),
+                np.zeros((rows, cols), dtype=np.float64),
+            )
+
+        out2 = save_preview_image(
+            board,
+            [F_Cu, B_Cu],
+            bbox,
+            [],
+            {"res": 1.0, "use_heatsink": False, "via_plating_um": 40.0, "via_fill": "copper"},
+            ["F.Cu", "B.Cu"],
+            {},
+            get_pad_pixels,
+            fake_create_maps,
+            lambda *a, **k: {"copper_thickness_mm_used": [0.035, 0.035]},
+            open_file=False,
+            out_dir=str(tmp_path),
+        )
+        assert out2 is not None
+        assert captured_extra == {"via_plating_um": 40.0, "via_fill": "copper"}

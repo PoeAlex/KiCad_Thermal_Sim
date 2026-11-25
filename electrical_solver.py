@@ -19,13 +19,19 @@ import pcbnew
 from .geometry_mapper import (
     GeometryCancelledError,
     _ProgressEmitter,
+    _extract_pth_drill_mm,
+    _extract_via_drill_mm,
     _fill_zone_mask_polygons,
     _pad_orientation_radians,
     _pad_shape_center_mm,
+    compute_via_copper_area_m2,
     get_pad_copper_layer_indices,
     get_pad_grid_mask,
     get_pad_primary_layer_id,
+    normalize_via_fill,
+    select_via_grid_cells,
 )
+from .stackup_parser import parse_stackup_from_board_file
 
 _ELECTRICAL_ITERATIVE_NODE_THRESHOLD = 150_000
 _ELECTRICAL_ITERATIVE_RTOL = 1e-8
@@ -85,6 +91,14 @@ class ElectricalConfig:
         Relative current-balance tolerance.
     layer_names : dict, optional
         Optional mapping from KiCad layer ID to display name.
+    via_plating_um : float, optional
+        Via/PTH barrel copper plating thickness in micrometers (default 25.0).
+    via_fill : str, optional
+        Via fill type (``'plated'`` or ``'copper'``, default ``'plated'``).
+    ambient_c : float, optional
+        Reference ambient temperature in Celsius for copper TCR (default 20.0).
+    gap_m : sequence of float, optional
+        Dielectric thicknesses between adjacent copper layers in meters.
     """
 
     copper_ids: List[int]
@@ -99,6 +113,51 @@ class ElectricalConfig:
     balance_abs_tol: float = 1.0e-9
     balance_rel_tol: float = 1.0e-6
     layer_names: Optional[Dict[int, str]] = None
+    via_plating_um: float = 25.0
+    via_fill: str = "plated"
+    ambient_c: float = 20.0
+    gap_m: Optional[Any] = None
+
+
+def _effective_rho_cu(config: ElectricalConfig) -> float:
+    """Return temperature-adjusted copper resistivity ``rho(ambient_c)`` (ohm*m)."""
+    rho_eff = float(config.rho_cu) * (
+        1.0 + 0.00393 * (float(config.ambient_c) - 20.0)
+    )
+    return max(rho_eff, 1e-20)
+
+
+def _resolve_gap_m(board: Any, config: ElectricalConfig) -> List[float]:
+    """Resolve adjacent-layer dielectric gaps in meters."""
+    layer_count = len(config.copper_ids)
+    if layer_count <= 1:
+        return []
+    num_gaps = layer_count - 1
+    if config.gap_m is not None:
+        try:
+            gaps = [max(float(g), 1e-6) for g in config.gap_m]
+            if len(gaps) == num_gaps:
+                return gaps
+            if gaps:
+                return (gaps + [gaps[-1]] * num_gaps)[:num_gaps]
+        except Exception:
+            pass
+    try:
+        stack = parse_stackup_from_board_file(board)
+        if isinstance(stack, dict) and not stack.get("error"):
+            raw_gaps = stack.get("dielectric_gaps_mm") or []
+            if len(raw_gaps) == num_gaps and all(
+                isinstance(g, (int, float)) and g > 0 for g in raw_gaps
+            ):
+                return [max(float(g) * 1e-3, 1e-6) for g in raw_gaps]
+            total_mm = stack.get("board_thickness_mm")
+            if isinstance(total_mm, (int, float)) and total_mm > 0:
+                fb = max(float(total_mm) * 1e-3 / num_gaps, 1e-6)
+                return [fb] * num_gaps
+    except Exception:
+        pass
+    fb = 1.6e-3 / num_gaps
+    return [fb] * num_gaps
 
 
 @dataclass
@@ -327,12 +386,13 @@ def solve_electrical_heating(
             tracker.emit(scaled, 100, msg, force=True)
         mask_progress_cb = _mask_progress
 
-    net_masks, via_masks, primitive_summaries, collision_count = _build_relevant_net_masks(
+    net_masks, via_masks, via_g_maps, primitive_summaries, collision_count = _build_relevant_net_data(
         board,
         config,
         set(terms_by_net),
         progress_callback=mask_progress_cb,
         cancel_check=cancel_check,
+        compute_via_conductance=True,
     )
     if collision_count:
         errors.append(
@@ -364,6 +424,7 @@ def solve_electrical_heating(
             config,
             primitive_summaries.get(key, []),
             cancel_check=cancel_check,
+            via_g_map=via_g_maps.get(key),
         )
         q_total += result.q_joule
         summaries.extend(result.net_summaries)
@@ -383,6 +444,7 @@ def _solve_one_net(
     config: ElectricalConfig,
     primitive_diagnostics: Optional[List[ElectricalPrimitiveDiagnostics]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    via_g_map: Optional[np.ndarray] = None,
 ) -> ElectricalResult:
     """Solve one isolated net and return a full-size heat vector."""
     layer_count = len(config.copper_ids)
@@ -403,7 +465,9 @@ def _solve_one_net(
     node_ids[global_indices] = np.arange(node_count, dtype=np.int64)
     node_ids = node_ids.reshape(copper_mask.shape)
 
-    edge_i, edge_j, edge_g, via_edge_count = _build_net_edges(copper_mask, via_mask, node_ids, config)
+    edge_i, edge_j, edge_g, via_edge_count = _build_net_edges(
+        copper_mask, via_mask, node_ids, config, via_g_map=via_g_map
+    )
     if edge_i.size:
         adj = sp.coo_matrix(
             (
@@ -703,6 +767,32 @@ def _build_relevant_net_masks(
     int,
 ]:
     """Rasterize copper geometry for only the active current nets."""
+    net_masks, via_masks, _, primitive_summaries, collision_count = _build_relevant_net_data(
+        board,
+        config,
+        relevant_nets,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
+        compute_via_conductance=False,
+    )
+    return net_masks, via_masks, primitive_summaries, collision_count
+
+
+def _build_relevant_net_data(
+    board: Any,
+    config: ElectricalConfig,
+    relevant_nets: set,
+    progress_callback: Optional[Callable[[int, int, str], Optional[bool]]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    compute_via_conductance: bool = True,
+) -> Tuple[
+    Dict[str, np.ndarray],
+    Dict[str, np.ndarray],
+    Dict[str, Optional[np.ndarray]],
+    Dict[str, List[ElectricalPrimitiveDiagnostics]],
+    int,
+]:
+    """Rasterize copper geometry and physical via conductances for active nets."""
     tracker = _ProgressEmitter(progress_callback, cancel_check)
     tracker.check_cancel(force=True)
 
@@ -710,10 +800,67 @@ def _build_relevant_net_masks(
     shape = (layer_count, config.rows, config.cols)
     net_masks = {key: np.zeros(shape, dtype=bool) for key in relevant_nets}
     via_masks = {key: np.zeros((config.rows, config.cols), dtype=bool) for key in relevant_nets}
+    via_g_maps: Dict[str, Optional[np.ndarray]] = {key: None for key in relevant_nets}
     primitive_stats: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]] = {
         key: {} for key in relevant_nets
     }
     lid_to_idx = {lid: idx for idx, lid in enumerate(config.copper_ids)}
+    gap_m = _resolve_gap_m(board, config) if (compute_via_conductance and layer_count > 1) else []
+    rho_cu_eff = _effective_rho_cu(config)
+    via_plating_um = max(0.0, float(config.via_plating_um))
+    via_fill = normalize_via_fill(config.via_fill)
+
+    def accumulate_via_conductance(
+        key: str,
+        layer_indices: List[int],
+        cx_mm: float,
+        cy_mm: float,
+        spread_radius_mm: float,
+        a_cu_eff: float,
+        mark_masks: bool = False,
+    ) -> int:
+        if layer_count <= 1 or len(layer_indices) < 2:
+            return 0
+        rs_v, re_v, cs_v, ce_v, mask_v, n_pix = select_via_grid_cells(
+            config.rows,
+            config.cols,
+            config.x_min,
+            config.y_min,
+            config.res,
+            cx_mm,
+            cy_mm,
+            spread_radius_mm,
+        )
+        if n_pix <= 0:
+            return 0
+        added_cells = 0
+        if mark_masks:
+            via_slice = via_masks[key][rs_v:re_v, cs_v:ce_v]
+            before_via = int(np.count_nonzero(via_slice))
+            via_slice |= mask_v
+            added_cells += int(np.count_nonzero(via_slice)) - before_via
+        for l_idx in layer_indices:
+            layer_slice = net_masks[key][l_idx, rs_v:re_v, cs_v:ce_v]
+            before = int(np.count_nonzero(layer_slice))
+            layer_slice |= mask_v
+            if mark_masks:
+                added_cells += int(np.count_nonzero(layer_slice)) - before
+
+        if compute_via_conductance and a_cu_eff > 0.0:
+            min_l = min(layer_indices)
+            max_l = max(layer_indices)
+            if min_l < max_l:
+                g_map = via_g_maps[key]
+                if g_map is None:
+                    g_map = np.zeros(
+                        (layer_count - 1, config.rows, config.cols),
+                        dtype=np.float64,
+                    )
+                    via_g_maps[key] = g_map
+                for g in range(min_l, max_l):
+                    g_cell = a_cu_eff / (rho_cu_eff * gap_m[g] * n_pix)
+                    g_map[g, rs_v:re_v, cs_v:ce_v][mask_v] += g_cell
+        return added_cells
 
     def record_primitive(
         key: str,
@@ -855,6 +1002,44 @@ def _build_relevant_net_masks(
                 else:
                     target_lids = [config.copper_ids[idx] for idx in target_indices]
                     mapped_cells = fill_for_obj(pad, target_lids, bbox=bbox, as_via=True)
+                if compute_via_conductance and layer_count > 1 and len(target_indices) >= 2:
+                    if has_pad_shape:
+                        try:
+                            size = pad.GetSize()
+                            outer_d_mm = min(float(size.x), float(size.y)) * 1e-6
+                            cx_mm, cy_mm = _pad_shape_center_mm(pad)
+                        except Exception:
+                            outer_d_mm = min(
+                                float(bbox.GetWidth()), float(bbox.GetHeight())
+                            ) * 1e-6
+                            cx_mm = (float(bbox.GetX()) + 0.5 * float(bbox.GetWidth())) * 1e-6
+                            cy_mm = (float(bbox.GetY()) + 0.5 * float(bbox.GetHeight())) * 1e-6
+                    else:
+                        outer_d_mm = min(
+                            float(bbox.GetWidth()), float(bbox.GetHeight())
+                        ) * 1e-6
+                        cx_mm = (float(bbox.GetX()) + 0.5 * float(bbox.GetWidth())) * 1e-6
+                        cy_mm = (float(bbox.GetY()) + 0.5 * float(bbox.GetHeight())) * 1e-6
+                    dx_mm, dy_mm = _extract_pth_drill_mm(pad, outer_d_mm)
+                    a_cu_eff = compute_via_copper_area_m2(
+                        dx_mm * 1e-3,
+                        dy_mm * 1e-3,
+                        plating_um=via_plating_um,
+                        via_fill=via_fill,
+                    )
+                    spread_radius_mm = max(
+                        0.5 * max(outer_d_mm, 0.0),
+                        0.5 * max(dx_mm, dy_mm) + via_plating_um * 1e-3,
+                    )
+                    accumulate_via_conductance(
+                        key,
+                        target_indices,
+                        cx_mm,
+                        cy_mm,
+                        spread_radius_mm,
+                        a_cu_eff,
+                        mark_masks=False,
+                    )
                 record_primitive(
                     key, "Pad", "All copper", bbox,
                     mapped_cells=max(0, mapped_cells)
@@ -905,7 +1090,67 @@ def _build_relevant_net_masks(
         is_via = "VIA" in str(type(track)).upper()
         if is_via:
             layer_ids = _via_layer_ids(track, config.copper_ids)
-            mapped_cells = fill_for_obj(track, layer_ids, bbox=bbox, as_via=True)
+            layer_indices = sorted(
+                lid_to_idx[lid] for lid in layer_ids if lid in lid_to_idx
+            )
+            has_pos = hasattr(track, "GetPosition")
+            if has_pos:
+                via_layer_id = (
+                    config.copper_ids[layer_indices[0]]
+                    if layer_indices and config.copper_ids
+                    else None
+                )
+                try:
+                    if via_layer_id is not None:
+                        try:
+                            width_iu = track.GetWidth(int(via_layer_id))
+                        except TypeError:
+                            width_iu = track.GetWidth()
+                    else:
+                        width_iu = track.GetWidth()
+                    outer_d_mm = float(width_iu) * 1e-6
+                    pos = track.GetPosition()
+                    cx_mm = float(pos.x) * 1e-6
+                    cy_mm = float(pos.y) * 1e-6
+                except Exception:
+                    has_pos = False
+            if not has_pos:
+                outer_d_mm = max(
+                    float(bbox.GetWidth()), float(bbox.GetHeight())
+                ) * 1e-6
+                cx_mm = (float(bbox.GetX()) + 0.5 * float(bbox.GetWidth())) * 1e-6
+                cy_mm = (float(bbox.GetY()) + 0.5 * float(bbox.GetHeight())) * 1e-6
+                mapped_cells = fill_for_obj(track, layer_ids, bbox=bbox, as_via=True)
+            drill_mm = _extract_via_drill_mm(track, outer_d_mm)
+            a_cu_eff = compute_via_copper_area_m2(
+                drill_mm * 1e-3,
+                plating_um=via_plating_um,
+                via_fill=via_fill,
+            )
+            spread_radius_mm = max(
+                0.5 * max(outer_d_mm, 0.0),
+                0.5 * drill_mm + via_plating_um * 1e-3,
+            )
+            if has_pos:
+                mapped_cells = accumulate_via_conductance(
+                    key,
+                    layer_indices,
+                    cx_mm,
+                    cy_mm,
+                    spread_radius_mm,
+                    a_cu_eff,
+                    mark_masks=True,
+                )
+            elif compute_via_conductance:
+                accumulate_via_conductance(
+                    key,
+                    layer_indices,
+                    cx_mm,
+                    cy_mm,
+                    spread_radius_mm,
+                    a_cu_eff,
+                    mark_masks=False,
+                )
             record_primitive(
                 key, "Via/PTH", _layers_label(layer_ids, config), bbox,
                 mapped_cells=max(0, mapped_cells)
@@ -1004,7 +1249,7 @@ def _build_relevant_net_masks(
             ))
         primitive_summaries[key] = summaries
 
-    return net_masks, via_masks, primitive_summaries, collision_count
+    return net_masks, via_masks, via_g_maps, primitive_summaries, collision_count
 
 
 def _build_net_edges(
@@ -1012,6 +1257,7 @@ def _build_net_edges(
     via_mask: Optional[np.ndarray],
     node_ids: np.ndarray,
     config: ElectricalConfig,
+    via_g_map: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Build graph edges and conductances for one net mask."""
     edge_i = []
@@ -1020,7 +1266,7 @@ def _build_net_edges(
     via_edge_count = 0
     dx = config.res * 1e-3
     dy = dx
-    sigma = 1.0 / max(config.rho_cu, 1e-20)
+    sigma = 1.0 / _effective_rho_cu(config)
 
     for layer_idx in range(mask.shape[0]):
         t_layer = float(config.t_cu[layer_idx])
@@ -1043,17 +1289,29 @@ def _build_net_edges(
             edge_j.append(j_idx)
             edge_g.append(np.full(i_idx.shape, gy, dtype=np.float64))
 
-    if mask.shape[0] > 1 and via_mask is not None and np.any(via_mask):
-        gz = 1.0 / max(float(config.via_resistance_ohm), 1e-12)
-        for layer_idx in range(mask.shape[0] - 1):
-            both = via_mask & mask[layer_idx] & mask[layer_idx + 1]
-            if np.any(both):
-                i_idx = node_ids[layer_idx][both]
-                j_idx = node_ids[layer_idx + 1][both]
-                edge_i.append(i_idx)
-                edge_j.append(j_idx)
-                edge_g.append(np.full(i_idx.shape, gz, dtype=np.float64))
-                via_edge_count += int(i_idx.size)
+    if mask.shape[0] > 1:
+        if via_g_map is not None:
+            for layer_idx in range(mask.shape[0] - 1):
+                g_layer = via_g_map[layer_idx]
+                both = (g_layer > 0.0) & mask[layer_idx] & mask[layer_idx + 1]
+                if np.any(both):
+                    i_idx = node_ids[layer_idx][both]
+                    j_idx = node_ids[layer_idx + 1][both]
+                    edge_i.append(i_idx)
+                    edge_j.append(j_idx)
+                    edge_g.append(g_layer[both])
+                    via_edge_count += int(i_idx.size)
+        elif via_mask is not None and np.any(via_mask):
+            gz = 1.0 / max(float(config.via_resistance_ohm), 1e-12)
+            for layer_idx in range(mask.shape[0] - 1):
+                both = via_mask & mask[layer_idx] & mask[layer_idx + 1]
+                if np.any(both):
+                    i_idx = node_ids[layer_idx][both]
+                    j_idx = node_ids[layer_idx + 1][both]
+                    edge_i.append(i_idx)
+                    edge_j.append(j_idx)
+                    edge_g.append(np.full(i_idx.shape, gz, dtype=np.float64))
+                    via_edge_count += int(i_idx.size)
 
     if not edge_i:
         return (
@@ -1347,22 +1605,37 @@ def _zone_layer_ids(zone: Any, copper_ids: List[int]) -> List[int]:
 
 
 def _via_layer_ids(via: Any, copper_ids: List[int]) -> List[int]:
-    """Return layer IDs connected by a via-like object."""
-    try:
-        layer_set = via.GetLayerSet()
-        ids = [lid for lid in copper_ids if layer_set.Contains(lid)]
-        if ids:
-            return ids
-    except Exception:
-        pass
-    try:
-        ids = list(via.GetLayerPair())
-        if ids:
-            return [lid for lid in copper_ids if min(ids) <= lid <= max(ids)]
-    except Exception:
-        pass
+    """Return layer IDs connected by a via-like object (KiCad 9/10 safe)."""
+    if hasattr(via, "GetLayerSet"):
+        try:
+            layer_set = via.GetLayerSet()
+        except Exception:
+            layer_set = None
+        if layer_set is not None:
+            if hasattr(layer_set, "Contains"):
+                try:
+                    ids = [lid for lid in copper_ids if layer_set.Contains(lid)]
+                    if ids:
+                        return ids
+                except Exception:
+                    pass
+            if hasattr(layer_set, "CuStack"):
+                try:
+                    cu_stack = {int(lid) for lid in layer_set.CuStack()}
+                    ids = [lid for lid in copper_ids if lid in cu_stack]
+                    if ids:
+                        return ids
+                except Exception:
+                    pass
     if hasattr(via, "_layers"):
         return [lid for lid in getattr(via, "_layers") if lid in copper_ids]
+    if hasattr(via, "GetLayerPair"):
+        try:
+            ids = list(via.GetLayerPair())
+            if ids:
+                return [lid for lid in copper_ids if min(ids) <= lid <= max(ids)]
+        except Exception:
+            pass
     return list(copper_ids)
 
 

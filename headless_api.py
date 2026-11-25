@@ -94,19 +94,23 @@ from .simulation_core import (
     build_sparse_pad_contributions as _build_sparse_pad_contributions,
     build_sparse_power_vector,
     calculate_suggested_resolution as _calculate_suggested_resolution,
+    call_with_supported_kwargs,
     coarsen_grid_resolution as _coarsen_grid_resolution,
     derive_stackup_thicknesses as _derive_stackup_thicknesses,
     effective_fr4_control_volume_thicknesses as _effective_fr4_control_volume_thicknesses,
     estimate_simulation_area as _estimate_simulation_area,
     estimate_solver_cost,
     estimate_solver_grid,
+    normalize_via_fill,
     pad_target_layer_index as _pad_target_layer_index,
+    resolve_convection_settings,
     resolve_grid_policy as _resolve_grid_policy,
     resolve_mesh_mode,
+    resolve_via_settings,
 )
 
 SCHEMA_VERSION = "1.0"
-PLUGIN_VERSION = "0.4.7"
+PLUGIN_VERSION = "0.4.8"
 
 SUPPORTED_SWEEP_PARAMS = frozenset({
     "heatsink_rth_kw",
@@ -117,6 +121,8 @@ SUPPORTED_SWEEP_PARAMS = frozenset({
     "pad_contact_factor",
     "pad_sink_temp_c",
     "h_conv",
+    "h_conv_bottom",
+    "via_plating_um",
     "amb",
     "time",
     "power_scale",
@@ -832,6 +838,10 @@ def normalize_job_config(
     res = float(suggested_res_mm if raw.get("res") is None else raw["res"])
     thick = float(1.6 if raw.get("thick") is None else raw["thick"])
     h_conv = float(10.0 if raw.get("h_conv") is None else raw["h_conv"])
+    raw_h_conv_bottom = raw.get("h_conv_bottom")
+    h_conv_bottom = h_conv if raw_h_conv_bottom is None else float(raw_h_conv_bottom)
+    via_plating_um = float(25.0 if raw.get("via_plating_um") is None else raw["via_plating_um"])
+    via_fill = normalize_via_fill(raw.get("via_fill"))
 
     grid_detail = str(raw.get("grid_detail_level") or DEFAULT_GRID_DETAIL).strip().lower()
     grid_detail = grid_detail.replace(" ", "_").replace("-", "_")
@@ -937,6 +947,9 @@ def normalize_job_config(
         "res": res,
         "thick": thick,
         "h_conv": h_conv,
+        "h_conv_bottom": h_conv_bottom,
+        "via_plating_um": via_plating_um,
+        "via_fill": via_fill,
         "grid_detail_level": grid_detail,
         "grid_node_budget": grid_node_budget,
         "mesh_mode": mesh_mode,
@@ -1155,6 +1168,18 @@ def _validate_with_context(
             "code": "INVALID_PARAMETER",
             "target": "h_conv",
             "message": f"Convection coefficient h_conv must be >= 0 (got {norm['h_conv']}).",
+        })
+    if norm["h_conv_bottom"] < 0.0:
+        errors.append({
+            "code": "INVALID_PARAMETER",
+            "target": "h_conv_bottom",
+            "message": f"Bottom convection coefficient h_conv_bottom must be >= 0 (got {norm['h_conv_bottom']}).",
+        })
+    if not (5.0 <= norm["via_plating_um"] <= 100.0):
+        errors.append({
+            "code": "INVALID_PARAMETER",
+            "target": "via_plating_um",
+            "message": f"Via plating thickness via_plating_um must be between 5.0 and 100.0 um (got {norm['via_plating_um']}).",
         })
     if norm["copper_thickness_scale"] <= 0.0:
         errors.append({
@@ -1914,6 +1939,7 @@ def build_semantic_summary(
 
 
 def _build_geometry_context_key(grid: GridEstimate, settings: Dict[str, Any]) -> Tuple[Any, ...]:
+    via_plating_um, via_fill = resolve_via_settings(settings)
     return (
         int(grid.rows),
         int(grid.cols),
@@ -1926,6 +1952,8 @@ def _build_geometry_context_key(grid: GridEstimate, settings: Dict[str, Any]) ->
         str(settings.get("area_mode", "full")),
         round(float(settings.get("pad_dist_mm", 0.0) or 0.0), 6),
         bool(settings.get("use_heatsink", False)),
+        round(float(via_plating_um), 4),
+        via_fill,
     )
 
 
@@ -2056,6 +2084,8 @@ def run_headless_simulation(
     via_factor = k_cu / k_fr4
     rho_cu, cp_cu = 8960.0, 385.0
     rho_fr4, cp_fr4 = 1850.0, 1100.0
+    via_plating_um, via_fill = resolve_via_settings(settings)
+    h_top, h_bottom = resolve_convection_settings(settings)
 
     cu_thick_m = [max(1e-9, th * 1e-3) for th in stackup_derived["copper_thickness_mm_used"]]
     gap_m = [max(1e-9, g * 1e-3) for g in stackup_derived["gap_mm_used"]]
@@ -2070,7 +2100,8 @@ def run_headless_simulation(
     ):
         geometry_state = cached_context["geometry_state"]
     if geometry_state is None:
-        geometry_state = build_geometry_state(
+        geometry_state = call_with_supported_kwargs(
+            build_geometry_state,
             board=board,
             copper_ids=copper_ids,
             rows=rows,
@@ -2081,13 +2112,21 @@ def run_headless_simulation(
             settings=settings,
             via_factor=via_factor,
             pads_list=focus_pads,
+            optional_kwargs={
+                "via_plating_um": via_plating_um,
+                "via_fill": via_fill,
+                "k_cu": k_cu,
+                "k_fr4": k_fr4,
+            },
         )
         if cached_context is not None:
             cached_context["geometry_state"] = geometry_state
             cached_context["geometry_key"] = geom_key
 
     copper_mask = geometry_state.copper_mask
-    V_map = geometry_state.via_map
+    via_map_3d = getattr(geometry_state, "via_map_3d", None)
+    has_via_map_3d = via_map_3d is not None
+    V_map = via_map_3d if has_via_map_3d else geometry_state.via_map
     H_map = geometry_state.heatsink_mask
 
     dx = res * 1e-3
@@ -2110,6 +2149,7 @@ def run_headless_simulation(
 
     use_compact_uniform = (
         use_fast_engine
+        and not has_via_map_3d
         and build_compact_structured_operator is not None
         and build_structured_operator is _ORIG_BUILD_STRUCTURED_OPERATOR
     )
@@ -2158,7 +2198,8 @@ def run_headless_simulation(
     q_joule = None
     if settings.get("current_enabled"):
         if terminals:
-            electrical_config = ElectricalConfig(
+            electrical_config = call_with_supported_kwargs(
+                ElectricalConfig,
                 copper_ids=list(copper_ids),
                 rows=rows,
                 cols=cols,
@@ -2167,6 +2208,11 @@ def run_headless_simulation(
                 res=res,
                 t_cu=t_cu,
                 layer_names={lid: layer_names[idx] for idx, lid in enumerate(copper_ids) if idx < len(layer_names)},
+                optional_kwargs={
+                    "via_plating_um": via_plating_um,
+                    "via_fill": via_fill,
+                    "ambient_c": amb,
+                },
             )
             electrical_result = solve_electrical_heating(board, terminals, electrical_config)
             if not electrical_result.valid:
@@ -2445,8 +2491,10 @@ def run_headless_simulation(
         "t_fr4_eff_max": float(np.max(t_fr4_eff)),
         "t_fr4_eff_per_plane_mm": t_fr4_eff_mm,
         "pad_cap_input_areal": pad_cap_areal,
-        "h_top": float(settings.get("h_conv", 10.0)),
-        "h_air_bottom": float(settings.get("h_conv", 10.0)),
+        "h_top": h_top,
+        "h_air_bottom": h_bottom,
+        "via_plating_um": via_plating_um,
+        "via_fill": via_fill,
         "compute_engine": result.k_norm_info.get("compute_engine", resolved_engine),
         "electrical_summary": electrical_summary,
     })

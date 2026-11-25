@@ -131,6 +131,11 @@ class GeometryState:
         Precomputed x cell centers in KiCad internal units.
     y_centers_iu : np.ndarray
         Precomputed y cell centers in KiCad internal units.
+    via_map_3d : np.ndarray or None
+        Optional per-gap via enhancement map of shape
+        ``(layer_count - 1, rows, cols)`` when blind/buried vias exist on a
+        multilayer board (``layer_count > 2``); ``None`` when all vias are
+        through-hole.
     """
     copper_mask: np.ndarray
     via_map: np.ndarray
@@ -143,6 +148,79 @@ class GeometryState:
     cols: int
     x_centers_iu: np.ndarray
     y_centers_iu: np.ndarray
+    via_map_3d: Optional[np.ndarray] = None
+
+
+def normalize_via_fill(value: Any) -> str:
+    """Normalize a via fill specification to ``'copper'`` or ``'plated'``."""
+    if value is None:
+        return "plated"
+    norm = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    if norm in {"copper", "copper_filled"}:
+        return "copper"
+    return "plated"
+
+
+def _via_areas_m2(
+    drill_x_m: float,
+    drill_y_m: Optional[float] = None,
+    *,
+    plating_um: float = 25.0,
+) -> Tuple[float, float]:
+    """Return ``(A_barrel, A_core)`` in square meters for a round or oval drill."""
+    dx = max(0.0, float(drill_x_m))
+    dy = dx if drill_y_m is None else max(0.0, float(drill_y_m))
+    if dx <= 0.0 or dy <= 0.0:
+        return 0.0, 0.0
+    t_wall = max(0.0, float(plating_um)) * 1e-6
+    if drill_y_m is None or abs(dx - dy) <= 1e-12:
+        r_i = 0.5 * dx
+        r_o = r_i + t_wall
+        a_barrel = math.pi * (r_o * r_o - r_i * r_i)
+        a_core = math.pi * r_i * r_i
+    else:
+        a = max(dx, dy)
+        b = min(dx, dy)
+        p_hole = 2.0 * (a - b) + math.pi * b
+        a_barrel = p_hole * t_wall + math.pi * t_wall * t_wall
+        a_core = b * (a - b) + 0.25 * math.pi * b * b
+    return a_barrel, a_core
+
+
+def compute_via_copper_area_m2(
+    drill_x_m: float,
+    drill_y_m: Optional[float] = None,
+    *,
+    plating_um: float = 25.0,
+    via_fill: str = "plated",
+) -> float:
+    """Return effective vertical copper cross-sectional area (m^2) of a via/PTH."""
+    a_barrel, a_core = _via_areas_m2(drill_x_m, drill_y_m, plating_um=plating_um)
+    if normalize_via_fill(via_fill) == "copper":
+        return a_barrel + a_core
+    return a_barrel
+
+
+def compute_via_excess_ka(
+    drill_x_m: float,
+    drill_y_m: Optional[float] = None,
+    *,
+    plating_um: float = 25.0,
+    via_fill: str = "plated",
+    k_cu: float = 390.0,
+    k_fr4: float = 0.3,
+) -> float:
+    """Compute excess vertical thermal conductance-times-thickness ``delta(kA)`` (W*m/K)."""
+    a_barrel, a_core = _via_areas_m2(drill_x_m, drill_y_m, plating_um=plating_um)
+    if a_barrel <= 0.0 and a_core <= 0.0:
+        return 0.0
+    fill_mode = normalize_via_fill(via_fill)
+    k_fill = float(k_cu) if fill_mode == "copper" else 0.026
+    return max(
+        0.0,
+        (float(k_cu) - float(k_fr4)) * a_barrel
+        + (k_fill - float(k_fr4)) * a_core,
+    )
 
 
 def _bbox_to_grid_indices(bbox, ctx):
@@ -461,7 +539,7 @@ def _state_fill_arc(state, l_idx, track):
 
 
 def _state_fill_circle(state, layer_indices, bbox, center, diameter_mm):
-    """Rasterize a circular pad or via on one or more layers."""
+    """Rasterize a circular pad or via on one or more layers with sub-pixel fallback."""
     cx = float(center.x) * 1e-6
     cy = float(center.y) * 1e-6
     radius = 0.5 * max(float(diameter_mm), 0.0)
@@ -471,6 +549,28 @@ def _state_fill_circle(state, layer_indices, bbox, center, diameter_mm):
 
     for layer_idx in layer_indices:
         _state_apply_shape(state, layer_idx, bbox, predicate)
+
+    if state.rows <= 0 or state.cols <= 0 or state.res <= 0.0 or not layer_indices:
+        return
+    grid_x_max = state.x_min + state.cols * state.res
+    grid_y_max = state.y_min + state.rows * state.res
+    if (
+        cx + radius < state.x_min
+        or cx - radius > grid_x_max
+        or cy + radius < state.y_min
+        or cy - radius > grid_y_max
+    ):
+        return
+
+    c_c = min(state.cols - 1, max(0, int(math.floor((cx - state.x_min) / state.res))))
+    r_c = min(state.rows - 1, max(0, int(math.floor((cy - state.y_min) / state.res))))
+    if state.area_mask is not None and not bool(state.area_mask[r_c, c_c]):
+        return
+
+    rs, re, cs, ce = _bbox_to_grid_indices(bbox, state)
+    for layer_idx in layer_indices:
+        if cs >= ce or rs >= re or not np.any(state.copper_mask[layer_idx, rs:re, cs:ce]):
+            state.copper_mask[layer_idx, r_c, c_c] = True
 
 
 def _pad_orientation_radians(pad) -> float:
@@ -982,6 +1082,146 @@ def _state_fill_via(state, bbox, val):
         np.maximum(target, val, out=target, where=region_mask)
 
 
+def _extract_via_drill_mm(via: Any, outer_diameter_mm: float) -> float:
+    """Extract finished drill diameter (mm) for a via across KiCad 9/10 and mocks."""
+    for method_name in ("GetDrillValue", "GetDrill"):
+        fn = getattr(via, method_name, None)
+        if callable(fn):
+            try:
+                val = float(fn())
+                if val > 0.0:
+                    return val * 1e-6
+            except Exception:
+                pass
+    return 0.5 * max(0.0, float(outer_diameter_mm))
+
+
+def _extract_pth_drill_mm(pad: Any, outer_diameter_mm: float) -> Tuple[float, float]:
+    """Extract PTH drill size ``(dx_mm, dy_mm)`` across KiCad 9/10 and mocks."""
+    fn = getattr(pad, "GetDrillSize", None)
+    if callable(fn):
+        try:
+            sz = fn()
+            if hasattr(sz, "x") and hasattr(sz, "y"):
+                dx = float(sz.x) * 1e-6
+                dy = float(sz.y) * 1e-6
+            else:
+                dx = float(sz[0]) * 1e-6
+                dy = float(sz[1]) * 1e-6
+            if dx > 0.0 and dy > 0.0:
+                return dx, dy
+        except Exception:
+            pass
+    fallback = 0.5 * max(0.0, float(outer_diameter_mm))
+    return fallback, fallback
+
+
+def select_via_grid_cells(
+    rows: int,
+    cols: int,
+    x_min: float,
+    y_min: float,
+    res: float,
+    cx_mm: float,
+    cy_mm: float,
+    spread_radius_mm: float,
+    area_mask: Optional[np.ndarray] = None,
+) -> Tuple[int, int, int, int, np.ndarray, int]:
+    """Select grid pixels covered by a circular via/pad with nearest-cell fallback.
+
+    Returns ``(rs, re, cs, ce, mask_2d, count)``. Returns ``count == 0`` when the
+    via lies completely outside the simulated domain or active ``area_mask``.
+    """
+    empty = np.zeros((0, 0), dtype=bool)
+    if rows <= 0 or cols <= 0 or res <= 0.0:
+        return 0, 0, 0, 0, empty, 0
+
+    radius = max(0.0, float(spread_radius_mm))
+    grid_x_max = x_min + cols * res
+    grid_y_max = y_min + rows * res
+    if (
+        cx_mm + radius < x_min
+        or cx_mm - radius > grid_x_max
+        or cy_mm + radius < y_min
+        or cy_mm - radius > grid_y_max
+    ):
+        return 0, 0, 0, 0, empty, 0
+
+    cs = max(0, int(math.floor((cx_mm - radius - x_min) / res)))
+    rs = max(0, int(math.floor((cy_mm - radius - y_min) / res)))
+    ce = min(cols, int(math.floor((cx_mm + radius - x_min) / res)) + 1)
+    re = min(rows, int(math.floor((cy_mm + radius - y_min) / res)) + 1)
+
+    if cs < ce and rs < re:
+        y = y_min + (np.arange(rs, re, dtype=np.float64) + 0.5) * res
+        x = x_min + (np.arange(cs, ce, dtype=np.float64) + 0.5) * res
+        inside = (x[None, :] - cx_mm) ** 2 + (y[:, None] - cy_mm) ** 2 <= radius * radius + 1e-12
+        if area_mask is not None:
+            inside &= area_mask[rs:re, cs:ce]
+        count = int(np.count_nonzero(inside))
+        if count > 0:
+            return rs, re, cs, ce, inside, count
+
+    c_c = min(cols - 1, max(0, int(math.floor((cx_mm - x_min) / res))))
+    r_c = min(rows - 1, max(0, int(math.floor((cy_mm - y_min) / res))))
+    if area_mask is not None and not bool(area_mask[r_c, c_c]):
+        return 0, 0, 0, 0, empty, 0
+    return r_c, r_c + 1, c_c, c_c + 1, np.ones((1, 1), dtype=bool), 1
+
+
+def _accumulate_via_conductance(
+    state: GeometryState,
+    cx_mm: float,
+    cy_mm: float,
+    spread_radius_mm: float,
+    delta_ka: float,
+    k_fr4: float,
+    num_layers: int,
+    gap_indices: Optional[List[int]] = None,
+) -> None:
+    """Conservatively accumulate physical via conductance into ``state.via_map`` (and ``via_map_3d``)."""
+    if delta_ka <= 0.0 or k_fr4 <= 0.0 or state.res <= 0.0:
+        return
+    rs, re, cs, ce, inside, n_pix = select_via_grid_cells(
+        state.rows,
+        state.cols,
+        state.x_min,
+        state.y_min,
+        state.res,
+        cx_mm,
+        cy_mm,
+        spread_radius_mm,
+        area_mask=state.area_mask,
+    )
+    if n_pix <= 0:
+        return
+
+    pixel_area_m2 = (float(state.res) * 1e-3) ** 2
+    dv = float(delta_ka / (float(k_fr4) * pixel_area_m2 * n_pix))
+
+    if gap_indices is None or num_layers <= 2:
+        if state.via_map_3d is not None:
+            for g in range(state.via_map_3d.shape[0]):
+                target_g = state.via_map_3d[g, rs:re, cs:ce]
+                target_g[inside] += dv
+        else:
+            target = state.via_map[rs:re, cs:ce]
+            target[inside] += dv
+        return
+
+    if not gap_indices:
+        return
+    if state.via_map_3d is None:
+        state.via_map_3d = np.broadcast_to(
+            state.via_map[None, :, :],
+            (num_layers - 1, state.rows, state.cols),
+        ).copy()
+    for g in gap_indices:
+        if 0 <= g < state.via_map_3d.shape[0]:
+            target_g = state.via_map_3d[g, rs:re, cs:ce]
+            target_g[inside] += dv
+
+
 def _state_fill_via_circle(state, bbox, center, diameter_mm, val, tile_size=512):
     """Apply via enhancement using the actual circular outer diameter."""
     rs, re, cs, ce = _bbox_to_grid_indices(bbox, state)
@@ -1443,10 +1683,14 @@ def build_geometry_state(
     y_min,
     res,
     settings,
-    via_factor,
-    pads_list,
+    via_factor=1300.0,
+    pads_list=None,
     progress_callback=None,
     cancel_check=None,
+    via_plating_um=None,
+    via_fill=None,
+    k_cu=390.0,
+    k_fr4=0.3,
 ):
     """
     Build the internal geometry representation used by the solver.
@@ -1469,10 +1713,18 @@ def build_geometry_state(
         Grid resolution in mm.
     settings : dict
         Simulation settings from the dialog.
-    via_factor : float
-        Enhancement factor for via thermal conductivity.
-    pads_list : list
+    via_factor : float, optional
+        Legacy via enhancement factor kept for signature compatibility.
+    pads_list : list, optional
         List of selected pad objects (heat sources).
+    via_plating_um : float, optional
+        Via barrel copper plating wall thickness in micrometers (default 25.0).
+    via_fill : str, optional
+        Via fill type (``'plated'`` or ``'copper'``, default ``'plated'``).
+    k_cu : float, optional
+        Copper thermal conductivity in W/(m*K) (default 390.0).
+    k_fr4 : float, optional
+        Dielectric thermal conductivity in W/(m*K) (default 0.3).
 
     Returns
     -------
@@ -1484,6 +1736,19 @@ def build_geometry_state(
     RuntimeError
         If KiCad geometry cannot be mapped completely and safely.
     """
+    _ = via_factor
+    pads_list = list(pads_list or [])
+    if via_plating_um is None:
+        raw_plating = settings.get("via_plating_um", 25.0)
+        resolved_plating_um = max(0.0, float(25.0 if raw_plating is None else raw_plating))
+    else:
+        resolved_plating_um = max(0.0, float(via_plating_um))
+    resolved_via_fill = normalize_via_fill(
+        settings.get("via_fill", "plated") if via_fill is None else via_fill
+    )
+    k_cu_val = 390.0 if k_cu is None else float(k_cu)
+    k_fr4_val = 0.3 if k_fr4 is None else float(k_fr4)
+
     num_layers = len(copper_ids)
     limit_area = settings.get('limit_area', False)
     radius_mm = settings.get('pad_dist_mm', 0.0) if limit_area else 0.0
@@ -1600,8 +1865,33 @@ def build_geometry_state(
                         bbox.GetY() + bbox.GetHeight() // 2,
                     )
                 _state_fill_circle(state, via_layers, bbox, center, diameter_mm)
-                _state_fill_via_circle(
-                    state, bbox, center, diameter_mm, via_factor
+                drill_mm = _extract_via_drill_mm(track, diameter_mm)
+                delta_ka = compute_via_excess_ka(
+                    drill_mm * 1e-3,
+                    plating_um=resolved_plating_um,
+                    via_fill=resolved_via_fill,
+                    k_cu=k_cu_val,
+                    k_fr4=k_fr4_val,
+                )
+                spread_radius_mm = max(
+                    0.5 * max(diameter_mm, 0.0),
+                    0.5 * drill_mm + resolved_plating_um * 1e-3,
+                )
+                gap_indices = None
+                if num_layers > 2 and via_layers:
+                    min_l = min(via_layers)
+                    max_l = max(via_layers)
+                    if min_l > 0 or max_l < num_layers - 1:
+                        gap_indices = list(range(min_l, max_l))
+                _accumulate_via_conductance(
+                    state,
+                    float(center.x) * 1e-6,
+                    float(center.y) * 1e-6,
+                    spread_radius_mm,
+                    delta_ka,
+                    k_fr4_val,
+                    num_layers,
+                    gap_indices=gap_indices,
                 )
             elif layer_idx is not None:
                 if hasattr(track, "GetMid"):
@@ -1626,12 +1916,36 @@ def build_geometry_state(
                     try:
                         size = pad.GetSize()
                         diameter_mm = min(float(size.x), float(size.y)) * 1e-6
-                        center = pad.GetPosition()
-                        _state_fill_via_circle(
-                            state, bbox, center, diameter_mm, via_factor
-                        )
+                        cx_mm, cy_mm = _pad_shape_center_mm(pad)
                     except Exception:
-                        _state_fill_via(state, bbox, via_factor)
+                        diameter_mm = min(
+                            float(bbox.GetWidth()), float(bbox.GetHeight())
+                        ) * 1e-6
+                        cx_mm = (float(bbox.GetX()) + 0.5 * float(bbox.GetWidth())) * 1e-6
+                        cy_mm = (float(bbox.GetY()) + 0.5 * float(bbox.GetHeight())) * 1e-6
+                    dx_mm, dy_mm = _extract_pth_drill_mm(pad, diameter_mm)
+                    delta_ka = compute_via_excess_ka(
+                        dx_mm * 1e-3,
+                        dy_mm * 1e-3,
+                        plating_um=resolved_plating_um,
+                        via_fill=resolved_via_fill,
+                        k_cu=k_cu_val,
+                        k_fr4=k_fr4_val,
+                    )
+                    spread_radius_mm = max(
+                        0.5 * max(diameter_mm, 0.0),
+                        0.5 * max(dx_mm, dy_mm) + resolved_plating_um * 1e-3,
+                    )
+                    _accumulate_via_conductance(
+                        state,
+                        cx_mm,
+                        cy_mm,
+                        spread_radius_mm,
+                        delta_ka,
+                        k_fr4_val,
+                        num_layers,
+                        gap_indices=None,
+                    )
         completed += total_fps
 
         for zone_idx, zone in enumerate(zones):
@@ -1733,6 +2047,11 @@ def build_geometry_state(
                         _state_fill_heatsink(state, drawing.GetBoundingBox())
                 except Exception:
                     continue
+
+        if state.via_map_3d is not None:
+            state.via_map = np.max(state.via_map_3d, axis=0).astype(
+                np.float32, copy=False
+            )
 
         tracker.emit(total_items, total_items, "Geometry mapping complete.", force=True)
 
@@ -1851,8 +2170,12 @@ def create_multilayer_maps(
     settings,
     k_fr4,
     k_cu_layers,
-    via_factor,
-    pads_list
+    via_factor=1300.0,
+    pads_list=None,
+    via_plating_um=None,
+    via_fill=None,
+    k_cu=390.0,
+    via_k_fr4=0.3,
 ):
     """
     Create thermal conductivity maps from PCB geometry.
@@ -1918,6 +2241,10 @@ def create_multilayer_maps(
         settings=settings,
         via_factor=via_factor,
         pads_list=pads_list,
+        via_plating_um=via_plating_um,
+        via_fill=via_fill,
+        k_cu=k_cu,
+        k_fr4=via_k_fr4,
     )
 
     num_layers = len(copper_ids)

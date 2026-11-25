@@ -442,3 +442,34 @@ class TestEndToEndSubcommandsWithHeadlessApi:
         assert rc_compare == 0
         assert out_compare["command"] == "compare"
         assert out_compare["delta_max_temp_c"] > 0
+
+    def test_v048_convection_and_via_cli_flags(self, monkeypatch, capsys):
+        captured_calls = []
+
+        class _FakeApi:
+            def validate_job(self, board_path, job_config):
+                captured_calls.append((board_path, job_config))
+                return {
+                    "schema_version": "1.0",
+                    "command": "validate",
+                    "valid": True,
+                    "errors": [],
+                    "warnings": [],
+                }
+
+        monkeypatch.setattr(thermalsim_cli, "headless_api", _FakeApi())
+        rc = thermalsim_cli.main([
+            "validate", "board.kicad_pcb",
+            "--pad", "U1.1=2W",
+            "--h-conv", "15",
+            "--h-conv-bottom", "0",
+            "--via-plating-um", "35",
+            "--via-fill", "copper",
+        ])
+        assert rc == 0
+        _ = json.loads(capsys.readouterr().out)
+        _, cfg = captured_calls[0]
+        assert cfg["h_conv"] == 15.0
+        assert cfg["h_conv_bottom"] == 0.0
+        assert cfg["via_plating_um"] == 35.0
+        assert cfg["via_fill"] == "copper"

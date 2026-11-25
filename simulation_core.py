@@ -8,6 +8,7 @@ derivation, capacity assembly, and sparse pad power distribution shared by
 No GUI or ``wx`` modules may be imported here.
 """
 
+import inspect
 from dataclasses import dataclass
 import math
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -68,6 +69,58 @@ def resolve_mesh_mode(
     """Return the active spatial mesh mode (always ``'uniform'`` since v0.4.7)."""
     _ = (settings, use_fast_engine, node_count, has_native_mg)
     return "uniform"
+
+
+def normalize_via_fill(value: Any) -> str:
+    """Normalize a via-fill setting into ``'copper'`` or ``'plated'``."""
+    raw = str(value or "").strip().lower().replace("-", "_")
+    if raw in {"copper", "copper_filled"}:
+        return "copper"
+    return "plated"
+
+
+def resolve_via_settings(settings: Optional[Dict[str, Any]]) -> Tuple[float, str]:
+    """Return clamped ``(via_plating_um, via_fill)`` from simulation settings."""
+    cfg = settings or {}
+    raw_plating = cfg.get("via_plating_um")
+    via_plating_um = 25.0 if raw_plating is None else float(raw_plating)
+    via_plating_um = max(5.0, min(100.0, via_plating_um))
+    via_fill = normalize_via_fill(cfg.get("via_fill"))
+    return via_plating_um, via_fill
+
+
+def resolve_convection_settings(settings: Optional[Dict[str, Any]]) -> Tuple[float, float]:
+    """Return ``(h_conv_top, h_conv_bottom)`` in W/(m^2*K), >= 0.0."""
+    cfg = settings or {}
+    raw_top = cfg.get("h_conv")
+    h_top = max(0.0, float(10.0 if raw_top is None else raw_top))
+    raw_bot = cfg.get("h_conv_bottom")
+    h_bot = h_top if raw_bot is None else max(0.0, float(raw_bot))
+    return h_top, h_bot
+
+
+def call_with_supported_kwargs(
+    fn: Callable[..., Any],
+    *args: Any,
+    optional_kwargs: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Any:
+    """Invoke ``fn`` passing ``optional_kwargs`` only if accepted by its signature."""
+    call_kwargs = dict(kwargs)
+    if optional_kwargs:
+        try:
+            params = inspect.signature(fn).parameters
+            accepts_var_kw = any(
+                param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+            )
+            for key, value in optional_kwargs.items():
+                if value is None and key in {"progress_callback", "cancel_check"}:
+                    continue
+                if accepts_var_kw or key in params:
+                    call_kwargs[key] = value
+        except (TypeError, ValueError):
+            pass
+    return fn(*args, **call_kwargs)
 
 
 def resolve_grid_limits(settings: Dict[str, Any]) -> Tuple[bool, int, int]:

@@ -231,8 +231,11 @@ The preflight status shows the effective dimensions and percentage of the board.
 
 #### Solver
 
-- **Convection h (W/m2K)** - convection coefficient for top/bottom surfaces. Default is 10.
-- **PCB Thickness (mm)** - overall board thickness. Stackup thickness is used when available.
+- **Convection top (W/m2K)** - effective top-surface heat transfer coefficient (convection + radiation: insulated ~0–2, still air ~8–12, fan ~25–100; minimum `0.0`). Default is `10.0`.
+- **Convection bottom (W/m2K)** - effective bottom-surface heat transfer coefficient (convection + radiation; minimum `0.0`). Default is `10.0` (in headless/legacy configs, omitting `h_conv_bottom` falls back to `h_conv`).
+- **Via plating (um)** - via and PTH barrel copper plating wall thickness (`5.0`–`100.0 um`, default `25.0 um`). Automatically disabled when **Copper-filled** is selected. ThermalSim reads actual KiCad drill diameters (`GetDrillValue()` / `GetDrillSize()`) and computes resolution-invariant physical barrel conductance across all grid cell sizes, with additive overlapping-via accumulation and per-layer-gap blind/buried via isolation.
+- **Via fill** - choose between **Plated (standard)** (hollow/resin-filled plated barrel) and **Copper-filled** (solid copper VIPPO barrel).
+- **PCB Thickness (mm)** - overall board thickness. Automatically filled and locked from the parsed PCB stackup when available; editable only as a fallback when the board file has no stackup thickness.
 - **Compute Engine** - `Auto` selects the matrix-free CPU engine (with FMG-warm-started geometric multigrid PCG) for larger jobs (starting at 50k nodes when the Native C++/OpenMP v4 Compact Low-RAM core is active, or 250k nodes without it) and keeps the sparse SciPy direct solver for small jobs. Both engines remain manually selectable.
 - **Time Stepping** - `Auto` selects 5-phase geometric BDF2 stepping on matrix-free transient runs (5–8x faster on long transients with lossless steady-state convergence), alongside `Legacy 3-phase`, `2-phase`, and `Uniform BDF2`.
 - **Capabilities** - detected solver backend, including the Native C++/OpenMP v4 Compact Low-RAM & Fused PCG core (`thermalsim_core.dll`, `libthermalsim_core.so`, or `libthermalsim_core.dylib`).
@@ -399,12 +402,12 @@ The plugin is split into focused modules:
 ## Limitations
 
 - No explicit component/package thermal model; junction-to-case-to-pad behavior is not modeled.
-- Convection is simplified as uniform top/bottom ambient coupling.
-- Radiation is not modeled.
-- Current-flow heating is static DC only; AC effects, skin effect, and temperature-dependent copper resistance are not modeled.
+- Convection is simplified as uniform top and bottom ambient coupling (`h_conv` and `h_conv_bottom`, lumping linearized radiation).
+- Nonlinear $T^4$ radiation is not modeled explicitly.
+- Current-flow heating is static DC only; copper resistivity is temperature-adjusted at the ambient temperature (`alpha_Cu = 0.00393 /K`), while AC effects and skin effect are not modeled.
 - Current-path accuracy depends on grid resolution; narrow traces and small pads may need a finer grid to match hand calculations closely.
 - Very fine requested resolutions may be auto-coarsened when the selected compute budget is exceeded.
-- Via coupling is an approximation.
+- Via and PTH thermal/electrical coupling uses physical barrel geometry from KiCad drill sizes and `via_plating_um`/`via_fill`, distributed conservatively over grid cells.
 - Results depend strongly on **Target Cell Size**, **Compute Budget**, and the selected simulation area and thermal margin.
 - Thermal Pad (`User.Eco1`) is a simplification of real contact pressure, interface quality, and sink temperature.
 

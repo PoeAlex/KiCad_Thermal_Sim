@@ -88,22 +88,17 @@ _ORIG_BUILD_HEATSINK_MODEL = build_heatsink_model
 
 
 def _call_with_optional_progress_kwargs(
-    fn, *args, progress_callback=None, cancel_check=None, **kwargs
+    fn, *args, progress_callback=None, cancel_check=None, optional_kwargs=None, **kwargs
 ):
-    """Invoke fn passing progress_callback/cancel_check only when supported."""
-    call_kwargs = dict(kwargs)
-    try:
-        params = inspect.signature(fn).parameters
-        accepts_var_kw = any(
-            param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
-        )
-        if progress_callback is not None and (accepts_var_kw or "progress_callback" in params):
-            call_kwargs["progress_callback"] = progress_callback
-        if cancel_check is not None and (accepts_var_kw or "cancel_check" in params):
-            call_kwargs["cancel_check"] = cancel_check
-    except (TypeError, ValueError):
-        pass
-    return fn(*args, **call_kwargs)
+    """Invoke fn passing progress_callback/cancel_check and optional kwargs only when supported."""
+    merged_optional = dict(optional_kwargs or {})
+    if progress_callback is not None:
+        merged_optional["progress_callback"] = progress_callback
+    if cancel_check is not None:
+        merged_optional["cancel_check"] = cancel_check
+    return call_with_supported_kwargs(
+        fn, *args, optional_kwargs=merged_optional, **kwargs
+    )
 
 
 def _message_phase(message):
@@ -347,6 +342,7 @@ from .simulation_core import (
     build_sparse_pad_contributions as _build_sparse_pad_contributions,
     build_sparse_power_vector,
     calculate_suggested_resolution,
+    call_with_supported_kwargs,
     coarsen_grid_resolution,
     derive_stackup_thicknesses,
     effective_fr4_control_volume_thicknesses as _effective_fr4_control_volume_thicknesses,
@@ -354,9 +350,11 @@ from .simulation_core import (
     estimate_solver_cost,
     estimate_solver_grid,
     pad_target_layer_index as _pad_target_layer_index,
+    resolve_convection_settings,
     resolve_grid_limits as _resolve_grid_limits,
     resolve_grid_policy as _resolve_grid_policy,
     resolve_mesh_mode,
+    resolve_via_settings,
 )
 
 
@@ -442,6 +440,7 @@ def _build_operator_cache_key(
     pad_sink_mode = str(settings.get("pad_sink_mode", "fixed") or "fixed").strip().lower()
     pad_contact_factor = settings.get("pad_contact_factor", 0.2)
     pad_sink_temp_c = settings.get("pad_sink_temp_c", 25.0)
+    h_top, h_bottom = resolve_convection_settings(settings)
     return stable_fingerprint({
         "geometry": cache_key,
         "compute_engine": resolved_engine,
@@ -450,7 +449,8 @@ def _build_operator_cache_key(
         "fr4_effective_m": [float(value) for value in t_fr4_eff],
         "cell_size_m": float(dx),
         "ambient_c": float(amb),
-        "h_conv": float(settings.get("h_conv", 10.0)),
+        "h_conv": h_top,
+        "h_conv_bottom": h_bottom,
         "pad_th": float(settings.get("pad_th", 1.0)),
         "pad_k": float(settings.get("pad_k", 3.0)),
         "pad_cap_areal": float(settings.get("pad_cap_areal", 0.0) or 0.0),
@@ -746,6 +746,20 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         _emit_snapshot_progress("Capturing board snapshot...", force=True)
 
+        def _extract_layer_set_tuple(obj):
+            get_layer_set = getattr(obj, "GetLayerSet", None)
+            if get_layer_set is None:
+                return None
+            try:
+                lset = get_layer_set()
+                if hasattr(lset, "CuStack"):
+                    return tuple(int(v) for v in lset.CuStack())
+                if hasattr(lset, "IntSeq"):
+                    return tuple(int(v) for v in lset.IntSeq())
+            except Exception:
+                return None
+            return None
+
         primitive_rows = []
         track_getters = ("GetStart", "GetMid", "GetEnd", "GetPosition")
         for item in tracks:
@@ -784,6 +798,23 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     row.extend(("width", width_val))
                 except Exception:
                     pass
+                if is_via:
+                    drill_val = None
+                    for drill_getter in ("GetDrillValue", "GetDrill"):
+                        fn = getattr(item, drill_getter, None)
+                        if fn is not None:
+                            try:
+                                cand = int(fn())
+                                if cand > 0:
+                                    drill_val = cand
+                                    break
+                            except Exception:
+                                continue
+                    if drill_val is not None:
+                        row.extend(("drill", drill_val))
+                    via_layers = _extract_layer_set_tuple(item)
+                    if via_layers is not None:
+                        row.extend(("layers", via_layers))
                 primitive_rows.append(tuple(row))
             except Exception:
                 continue
@@ -850,7 +881,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 primitive_rows.append(tuple(zone_row))
             except Exception:
                 continue
-        pad_getters = ("GetShape", "GetSize", "GetOrientationDegrees", "GetShapePos", "GetOffset")
+        pad_getters = (
+            "GetShape",
+            "GetSize",
+            "GetOrientationDegrees",
+            "GetShapePos",
+            "GetOffset",
+            "GetAttribute",
+            "GetDrillSize",
+        )
         for fp in footprints:
             done_items += 1
             if progress_callback is not None and (done_items & 31) == 0:
@@ -868,16 +907,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         pad.GetLayer(), rect.GetX(), rect.GetY(),
                         rect.GetWidth(), rect.GetHeight(),
                     ]
-                    get_layer_set = getattr(pad, "GetLayerSet", None)
-                    if get_layer_set is not None:
-                        try:
-                            lset = get_layer_set()
-                            if hasattr(lset, "CuStack"):
-                                row.extend(("layers", tuple(int(v) for v in lset.CuStack())))
-                            elif hasattr(lset, "IntSeq"):
-                                row.extend(("layers", tuple(int(v) for v in lset.IntSeq())))
-                        except Exception:
-                            pass
+                    pad_layers = _extract_layer_set_tuple(pad)
+                    if pad_layers is not None:
+                        row.extend(("layers", pad_layers))
                     for getter in pad_getters:
                         fn = getattr(pad, getter, None)
                         if fn is not None:
@@ -1125,6 +1157,11 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             return self._preflight(board, copper_ids, bbox, settings)
 
         self._show_startup_progress(92, "Creating ThermalSim dialog...")
+        stackup_thickness_mm = (
+            stack_info.get("board_thickness_mm")
+            if isinstance(stack_info, dict)
+            else None
+        )
         dlg = SettingsDialog(
             self.host_window, len(pads_list), suggested_res, layer_names,
             preview_callback=self.generate_preview,
@@ -1142,6 +1179,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             board_name=os.path.basename(board_path) if board_path else "Unsaved board",
             board_size_mm=(w_mm, h_mm),
             defer_initial_preflight=True,
+            stackup_thickness_mm=stackup_thickness_mm,
         )
         self.settings_dialog = dlg
         self._close_startup_progress()
@@ -1612,6 +1650,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 preview_status("Rasterizing exact tracks, pads, vias, and zones...")
                 if not reporter.update(10, "Mapping exact PCB geometry...", force=True):
                     raise GeometryCancelledError("Preview cancelled.")
+                via_plating_um, via_fill = resolve_via_settings(effective_settings)
                 geometry_state = _call_with_optional_progress_kwargs(
                     build_geometry_state,
                     board=self.board,
@@ -1628,6 +1667,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         10, 70, "Rasterizing board geometry..."
                     ),
                     cancel_check=reporter.make_cancel_check(),
+                    optional_kwargs={
+                        "via_plating_um": via_plating_um,
+                        "via_fill": via_fill,
+                        "k_cu": 390.0,
+                        "k_fr4": 0.3,
+                    },
                 )
                 if reporter.cancelled:
                     raise GeometryCancelledError("Preview cancelled.")
@@ -1778,6 +1823,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             k_fr4 = 0.3
             rho_cu, cp_cu = 8960.0, 385.0
             rho_fr4, cp_fr4 = 1850.0, 1100.0
+            via_plating_um, via_fill = resolve_via_settings(settings)
+            h_top, h_bottom = resolve_convection_settings(settings)
 
             cu_thick_mm_used = stackup_derived["copper_thickness_mm_used"]
             gap_mm_used = stackup_derived["gap_mm_used"]
@@ -1827,6 +1874,12 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             5, 32, "Mapping exact PCB geometry..."
                         ),
                         cancel_check=reporter.make_cancel_check(),
+                        optional_kwargs={
+                            "via_plating_um": via_plating_um,
+                            "via_fill": via_fill,
+                            "k_cu": k_cu,
+                            "k_fr4": k_fr4,
+                        },
                     )
                     if reporter.cancelled:
                         raise GeometryCancelledError("Simulation cancelled.")
@@ -1849,7 +1902,9 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             init_timings["geometry_maps_s"] = time.perf_counter() - geometry_start
             init_timings["geometry_cache_hit"] = geometry_cache_hit
             copper_mask = geometry_state.copper_mask
-            V_map = geometry_state.via_map
+            via_map_3d = getattr(geometry_state, "via_map_3d", None)
+            has_via_map_3d = via_map_3d is not None
+            V_map = via_map_3d if has_via_map_3d else geometry_state.via_map
             H_map = geometry_state.heatsink_mask
 
             # Time step calculation
@@ -1885,6 +1940,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
             use_compact_uniform = (
                 use_fast_engine
+                and not has_via_map_3d
                 and build_compact_structured_operator is not None
                 and build_structured_operator is _ORIG_BUILD_STRUCTURED_OPERATOR
             )
@@ -2041,7 +2097,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     set_dialog_state("failed", "One or more current-terminal pads were not found.")
                     return
                 if terminals:
-                    electrical_config = ElectricalConfig(
+                    electrical_config = call_with_supported_kwargs(
+                        ElectricalConfig,
                         copper_ids=list(copper_ids),
                         rows=rows,
                         cols=cols,
@@ -2050,10 +2107,18 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         res=res,
                         t_cu=np.asarray(t_cu, dtype=np.float64),
                         layer_names={lid: layer_names[idx] for idx, lid in enumerate(copper_ids) if idx < len(layer_names)},
+                        optional_kwargs={
+                            "via_plating_um": via_plating_um,
+                            "via_fill": via_fill,
+                            "ambient_c": float(amb),
+                        },
                     )
                     electrical_key = stable_fingerprint({
                         "geometry": cache_key,
                         "copper_thickness_m": [float(value) for value in t_cu],
+                        "via_plating_um": float(via_plating_um),
+                        "via_fill": via_fill,
+                        "ambient_c": float(amb),
                         "terminals": [
                             (item.name, item.net_name, int(item.net_code), float(item.current_a))
                             for item in terminals
@@ -2440,8 +2505,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 "t_fr4_eff_max": float(np.max(t_fr4_eff)),
                 "t_fr4_eff_per_plane_mm": t_fr4_eff_mm,
                 "pad_cap_input_areal": pad_cap_areal,
-                "h_top": float(settings.get('h_conv', 10.0)),
-                "h_air_bottom": float(settings.get('h_conv', 10.0)),
+                "h_top": h_top,
+                "h_air_bottom": h_bottom,
+                "via_plating_um": via_plating_um,
+                "via_fill": via_fill,
                 "init_zone_refill_s": init_timings.get("zone_refill_s"),
                 "init_geometry_maps_s": init_timings.get("geometry_maps_s"),
                 "init_capacity_build_s": init_timings.get("capacity_build_s"),

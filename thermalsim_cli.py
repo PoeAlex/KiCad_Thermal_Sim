@@ -225,6 +225,9 @@ def _build_job_config(args: argparse.Namespace) -> Dict[str, Any]:
         ("res", "res"),
         ("thick", "thick"),
         ("h_conv", "h_conv"),
+        ("h_conv_bottom", "h_conv_bottom"),
+        ("via_plating_um", "via_plating_um"),
+        ("via_fill", "via_fill"),
         ("detail", "grid_detail_level"),
         ("node_budget", "grid_node_budget"),
         ("mesh", "mesh_mode"),
@@ -318,7 +321,26 @@ def _add_common_job_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--amb", type=_finite_float, help="Ambient temperature in C.")
     parser.add_argument("--res", type=_finite_float, help="Target grid resolution in mm.")
     parser.add_argument("--thick", type=_finite_float, help="Fallback board thickness in mm.")
-    parser.add_argument("--h-conv", type=_finite_float, help="Convection coefficient in W/(m^2*K).")
+    parser.add_argument(
+        "--h-conv",
+        type=_finite_float,
+        help="Top (and default bottom) effective convection coefficient in W/(m^2*K).",
+    )
+    parser.add_argument(
+        "--h-conv-bottom",
+        type=_finite_float,
+        help="Bottom effective convection coefficient in W/(m^2*K) (defaults to --h-conv).",
+    )
+    parser.add_argument(
+        "--via-plating-um",
+        type=_finite_float,
+        help="Via and PTH barrel copper plating thickness in um (5.0-100.0, default 25.0).",
+    )
+    parser.add_argument(
+        "--via-fill",
+        choices=["plated", "copper"],
+        help="Via fill mode ('plated' or 'copper', default 'plated').",
+    )
     parser.add_argument(
         "--detail",
         choices=["fast", "balanced", "detailed", "very_detailed", "custom"],

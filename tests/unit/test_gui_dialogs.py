@@ -638,7 +638,8 @@ class TestTooltipTexts:
             'show_all', 'snapshots', 'snap_count', 'output_dir',
             'ignore_traces', 'limit_area', 'limit_dist',
             'enable_pad', 'pad_thick', 'pad_k', 'pad_cap',
-            'h_conv', 'pcb_thick', 'grid_expert_limits',
+            'h_conv', 'h_conv_bottom', 'via_plating_um', 'via_fill',
+            'pcb_thick', 'grid_expert_limits',
             'grid_max_cells', 'grid_target_cells', 'capabilities',
             'help', 'preview', 'load_settings', 'save_settings',
         ]
@@ -1443,3 +1444,102 @@ class TestDynamicHeatsinkSettings:
         dlg.set_run_state("cancelled")
         assert dlg.lbl_preflight_status.GetLabel() == "Cancelled"
         assert dlg.btn_run.IsEnabled()
+
+
+class TestSolverV048Controls:
+    """Tests for v0.4.8 Solver pane convection, via barrel, and stackup thickness controls."""
+
+    def test_solver_defaults_tooltips_and_ranges(self):
+        from ThermalSim.gui_dialogs import SettingsDialog, TOOLTIP_TEXTS
+
+        dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
+        values = dlg.get_values()
+
+        assert values["h_conv"] == 10.0
+        assert values["h_conv_bottom"] == 10.0
+        assert values["via_plating_um"] == 25.0
+        assert values["via_fill"] == "plated"
+        assert dlg.h_conv_input._min == 0.0
+        assert dlg.h_conv_bottom_input._min == 0.0
+        assert dlg.via_plating_input.IsEnabled() is True
+        assert dlg.thick_input.IsEnabled() is True
+        assert not dlg.solver_pane.IsExpanded()
+
+        assert "radiation" in TOOLTIP_TEXTS["h_conv"].lower()
+        for key in ("h_conv", "h_conv_bottom", "via_plating_um", "via_fill"):
+            assert TOOLTIP_TEXTS[key].strip() == TOOLTIP_TEXTS[key]
+
+    def test_via_fill_copper_disables_plating_and_round_trips(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(None, 1, 0.5, ["F.Cu", "B.Cu"])
+        assert dlg.via_fill_choice.GetStringSelection() == "Plated (standard)"
+
+        dlg.via_fill_choice.SetSelection(1)
+        dlg._on_via_fill_changed(None)
+        assert dlg.via_fill_choice.GetStringSelection() == "Copper-filled"
+        assert dlg.via_plating_input.IsEnabled() is False
+        assert dlg.get_values()["via_fill"] == "copper"
+
+        dlg.via_fill_choice.SetSelection(0)
+        dlg._on_via_fill_changed(None)
+        assert dlg.via_plating_input.IsEnabled() is True
+        assert dlg.get_values()["via_fill"] == "plated"
+
+    def test_stackup_thickness_locks_thick_input_and_avoids_auto_expand(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        dlg = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            stackup_thickness_mm=0.8,
+            defaults={"thick": 2.4},
+        )
+        assert dlg.thick_input.GetValue() == pytest.approx(0.8)
+        assert dlg.thick_input.IsEnabled() is False
+        assert "stackup" in dlg.thick_input.GetToolTipText().lower()
+        assert not dlg.solver_pane.IsExpanded()
+        assert dlg.get_values()["thick"] == pytest.approx(0.8)
+
+        # Fallback mode without stackup thickness remains editable and expands when != 1.6
+        dlg_fallback = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            defaults={"thick": 2.0},
+        )
+        assert dlg_fallback.thick_input.GetValue() == pytest.approx(2.0)
+        assert dlg_fallback.thick_input.IsEnabled() is True
+        assert dlg_fallback.solver_pane.IsExpanded()
+
+    def test_apply_defaults_backward_compat_and_auto_expand(self):
+        from ThermalSim.gui_dialogs import SettingsDialog
+
+        # Legacy defaults without h_conv_bottom copy h_conv to bottom
+        dlg = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            defaults={"h_conv": 35.0},
+        )
+        values = dlg.get_values()
+        assert values["h_conv"] == 35.0
+        assert values["h_conv_bottom"] == 35.0
+        assert values["via_plating_um"] == 25.0
+        assert values["via_fill"] == "plated"
+        assert dlg.solver_pane.IsExpanded()
+
+        # copper_filled alias normalizes and disables via_plating_input; h_conv_bottom expands pane
+        dlg_bot = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            defaults={"h_conv": 10.0, "h_conv_bottom": 0.0, "via_fill": "copper_filled"},
+        )
+        vals_bot = dlg_bot.get_values()
+        assert vals_bot["h_conv"] == 10.0
+        assert vals_bot["h_conv_bottom"] == 0.0
+        assert vals_bot["via_fill"] == "copper"
+        assert dlg_bot.via_plating_input.IsEnabled() is False
+        assert dlg_bot.solver_pane.IsExpanded()
+
+        # via_plating_um != 25 expands solver pane
+        dlg_plating = SettingsDialog(
+            None, 1, 0.5, ["F.Cu", "B.Cu"],
+            defaults={"via_plating_um": 35.0},
+        )
+        assert dlg_plating.get_values()["via_plating_um"] == 35.0
+        assert dlg_plating.solver_pane.IsExpanded()

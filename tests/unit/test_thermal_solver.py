@@ -109,12 +109,13 @@ def _build_stiffness_matrix_reference(
         data_list.extend([g, g, -g, -g])
 
     if layer_count > 1 and gap_m:
-        v_enh = np.clip(V_map, 1.0, 50.0)
+        v_enh = np.maximum(np.asarray(V_map, dtype=np.float64), 1.0)
         plane_idx = np.arange(rc, dtype=np.int64)
         for layer in range(layer_count - 1):
             gap_val = max(gap_m[layer], 1e-6)
             gz_base = k_fr4 * pixel_area / gap_val
-            gz = (gz_base * v_enh).ravel()
+            v_slice = v_enh[layer] if v_enh.ndim == 3 else v_enh
+            gz = (gz_base * v_slice).ravel()
             i_idx = layer * rc + plane_idx
             j_idx = (layer + 1) * rc + plane_idx
             rows_list.extend([i_idx, j_idx, i_idx, j_idx])
@@ -130,13 +131,15 @@ def _build_stiffness_matrix_reference(
     diag_extra = np.zeros(n, dtype=np.float64)
     b = np.zeros(n, dtype=np.float64)
 
-    h_top = float(settings.get('h_conv', 10.0))
+    raw_top = settings.get('h_conv', 10.0)
+    h_top = max(0.0, float(10.0 if raw_top is None else raw_top))
     diag_add_top = h_top * pixel_area
     top_idx = np.arange(rc, dtype=np.int64)
     diag_extra[top_idx] += diag_add_top
     b[top_idx] += diag_add_top * amb
 
-    h_air_bot = float(settings.get('h_conv', 10.0))
+    raw_bot = settings.get('h_conv_bottom')
+    h_air_bot = h_top if raw_bot is None else max(0.0, float(raw_bot))
     pad_thick_m = max(0.0001, settings['pad_th'] * 1e-3)
     pad_k = settings['pad_k']
     h_sink = (pad_k / pad_thick_m) * 0.2
@@ -2947,5 +2950,220 @@ class TestGeometricTransientAndFmgWarmStart:
                 res_fmg.k_norm_info["heatsink_temp_c"]
                 - direct.k_norm_info["heatsink_temp_c"]
             ) < 1e-5
+
+
+class TestViaPhysicsAndConvectionV048:
+    """Tests for unclipped via enhancement, 3D V_map, and separate h_conv_bottom."""
+
+    def test_no_50_clip_across_all_three_builders(self):
+        """All three thermal builders preserve V_map > 50.0 without clamping."""
+        layers, rows, cols = 2, 6, 6
+        copper_mask = np.zeros((layers, rows, cols), dtype=bool)
+        t_cu = np.full(layers, 35e-6)
+        t_fr4_eff = np.full(layers, 0.8e-3)
+        dx = dy = 0.25e-3
+        gap_m = [1.5e-3]
+        H_map = np.zeros((rows, cols), dtype=np.float64)
+        settings = {"h_conv": 10.0, "pad_th": 1.0, "pad_k": 3.0}
+        amb = 25.0
+
+        V_map = np.ones((rows, cols), dtype=np.float64)
+        V_map[2, 2] = 450.0
+        V_map[4, 4] = 1800.0
+        V_map[0, 0] = 0.2  # Below 1.0 should still clamp floor to 1.0
+
+        K, _, _, _ = build_stiffness_matrix(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings, amb,
+        )
+        struct_op, _, _, _ = build_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings, amb,
+        )
+        compact_op = build_compact_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map.astype(np.float32), gap_m, H_map, settings, amb,
+        )
+
+        gz_base = 0.3 * (dx * dy) / gap_m[0]
+        assert struct_op.gz[0, 2, 2] == pytest.approx(gz_base * 450.0)
+        assert struct_op.gz[0, 4, 4] == pytest.approx(gz_base * 1800.0)
+        assert struct_op.gz[0, 0, 0] == pytest.approx(gz_base * 1.0)
+
+        # Off-diagonal coupling between (0, 2, 2) and (1, 2, 2) in K
+        n0 = 2 * cols + 2
+        n1 = rows * cols + n0
+        assert -K[n0, n1] == pytest.approx(gz_base * 450.0)
+        n0_hi = 4 * cols + 4
+        n1_hi = rows * cols + n0_hi
+        assert -K[n0_hi, n1_hi] == pytest.approx(gz_base * 1800.0)
+
+        rng = np.random.default_rng(42)
+        vec = rng.standard_normal(layers * rows * cols)
+        np.testing.assert_allclose(struct_op.dot(vec), K.dot(vec), rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(compact_op.dot(vec), K.dot(vec), rtol=1e-6, atol=1e-10)
+
+    def test_3d_vmap_blind_buried_isolation(self):
+        """3D V_map assigns independent conductance per gap in structured & sparse builders."""
+        layers, rows, cols = 4, 6, 6
+        copper_mask = np.zeros((layers, rows, cols), dtype=bool)
+        t_cu = np.full(layers, 35e-6)
+        t_fr4_eff = np.full(layers, 0.4e-3)
+        dx = dy = 0.5e-3
+        gap_m = [0.2e-3, 1.0e-3, 0.2e-3]
+        H_map = np.zeros((rows, cols), dtype=np.float64)
+        settings = {"h_conv": 10.0, "pad_th": 1.0, "pad_k": 3.0}
+        amb = 25.0
+
+        V_3d = np.ones((layers - 1, rows, cols), dtype=np.float32)
+        V_3d[0, 1, 1] = 120.0   # Gap 0 only (F.Cu -> In1.Cu)
+        V_3d[1, 3, 3] = 350.0   # Gap 1 only (In1.Cu -> In2.Cu)
+        V_3d[2, 4, 2] = 200.0   # Gap 2 only (In2.Cu -> B.Cu)
+
+        K, _, _, _ = build_stiffness_matrix(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_3d, gap_m, H_map, settings, amb,
+        )
+        struct_op, _, _, _ = build_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_3d, gap_m, H_map, settings, amb,
+        )
+
+        for g in range(3):
+            gz_base = 0.3 * (dx * dy) / gap_m[g]
+            assert struct_op.gz[g, 1, 1] == pytest.approx(gz_base * (120.0 if g == 0 else 1.0))
+            assert struct_op.gz[g, 3, 3] == pytest.approx(gz_base * (350.0 if g == 1 else 1.0))
+            assert struct_op.gz[g, 4, 2] == pytest.approx(gz_base * (200.0 if g == 2 else 1.0))
+
+        rng = np.random.default_rng(7)
+        vec = rng.standard_normal(layers * rows * cols)
+        np.testing.assert_allclose(struct_op.dot(vec), K.dot(vec), rtol=1e-12, atol=1e-12)
+
+        with pytest.raises(ValueError, match="2D V_map"):
+            build_compact_structured_operator(
+                layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+                390.0, 0.3, dx, dy, V_3d, gap_m, H_map, settings, amb,
+            )
+
+    def test_sum_gz_resolution_invariance_with_geometry_mapper(self):
+        """sum(gz) from geometry_mapper + thermal_solver is invariant across 0.1..1.0 mm."""
+        from ThermalSim.geometry_mapper import build_geometry_state, compute_via_excess_ka
+        from tests.mocks.pcbnew_mock import F_Cu, B_Cu, MockBoard, MockVia, EDA_RECT, VECTOR2I
+
+        class _Via(MockVia):
+            def __init__(self, x_mm, y_mm, outer_mm, drill_mm):
+                r_nm = int(round(0.5 * outer_mm * 1e6))
+                cx_nm = int(round(x_mm * 1e6))
+                cy_nm = int(round(y_mm * 1e6))
+                super().__init__(bbox=EDA_RECT(cx_nm - r_nm, cy_nm - r_nm, 2 * r_nm, 2 * r_nm), layers=[F_Cu, B_Cu])
+                self._pos = VECTOR2I(cx_nm, cy_nm)
+                self._w = int(round(outer_mm * 1e6))
+                self._d = int(round(drill_mm * 1e6))
+
+            def GetPosition(self):
+                return self._pos
+
+            def GetWidth(self, layer=None):
+                return self._w
+
+            def GetDrillValue(self):
+                return self._d
+
+        board = MockBoard(tracks=[_Via(3.2, 3.2, 0.6, 0.3)], layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"})
+        board_w_m = 8e-3
+        board_h_m = 8e-3
+        gap = 1.5e-3
+        expected_sum_gz = (0.3 * board_w_m * board_h_m + compute_via_excess_ka(0.3e-3)) / gap
+
+        for res_mm in (0.1, 0.25, 0.5, 1.0):
+            n = int(round(8.0 / res_mm))
+            dx = dy = res_mm * 1e-3
+            state = build_geometry_state(
+                board=board,
+                copper_ids=[F_Cu, B_Cu],
+                rows=n,
+                cols=n,
+                x_min=0.0,
+                y_min=0.0,
+                res=res_mm,
+                settings={"ignore_traces": False, "ignore_polygons": True, "use_heatsink": False},
+            )
+            op, _, _, _ = build_structured_operator(
+                2, n, n, state.copper_mask,
+                np.full(2, 35e-6), np.full(2, 0.75e-3),
+                390.0, 0.3, dx, dy, state.via_map, [gap],
+                state.heatsink_mask.astype(np.float64),
+                {"h_conv": 10.0, "pad_th": 1.0, "pad_k": 3.0}, 25.0,
+            )
+            assert float(np.sum(op.gz)) == pytest.approx(expected_sum_gz, rel=1e-5)
+
+    def test_separate_h_conv_and_h_conv_bottom_including_adiabatic_zero(self):
+        """All 3 builders honor h_conv_bottom independently, including adiabatic 0.0."""
+        layers, rows, cols = 2, 8, 8
+        copper_mask = np.ones((layers, rows, cols), dtype=bool)
+        t_cu = np.full(layers, 35e-6)
+        t_fr4_eff = np.full(layers, 0.75e-3)
+        dx = dy = 1.0e-3
+        gap_m = [1.5e-3]
+        H_map = np.zeros((rows, cols), dtype=np.float64)
+        V_map = np.ones((rows, cols), dtype=np.float64)
+        amb = 25.0
+
+        # 1) Asymmetric top=25, bottom=5
+        settings_asym = {"h_conv": 25.0, "h_conv_bottom": 5.0, "pad_th": 1.0, "pad_k": 3.0}
+        K, b, hA, diag_extra = build_stiffness_matrix(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings_asym, amb,
+        )
+        op, sb, sha, sdiag = build_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings_asym, amb,
+        )
+        cop = build_compact_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map.astype(np.float32), gap_m, H_map, settings_asym, amb,
+        )
+        np.testing.assert_allclose(sb, b)
+        np.testing.assert_allclose(sha, hA)
+        np.testing.assert_allclose(sdiag, diag_extra)
+        assert cop.top_ha == pytest.approx(25.0 * dx * dy)
+        assert cop.bot_air_ha == pytest.approx(5.0 * dx * dy)
+
+        # Steady-state uniform heating across both layers: top must be cooler than bottom
+        q = np.full(layers * rows * cols, 0.01)
+        cfg = SolverConfig(sim_time=50.0, amb=amb, dt_base=1.0, steps_target=20, steady_state=True)
+        res_ss = run_steady_state(cfg, K, q, b, hA, layers, rows, cols)
+        assert float(np.mean(res_ss.T[0])) < float(np.mean(res_ss.T[1]))
+
+        # 2) Adiabatic bottom (h_conv_bottom = 0.0) without div-by-zero
+        settings_adiab = {"h_conv": 15.0, "h_conv_bottom": 0.0, "pad_th": 1.0, "pad_k": 3.0}
+        K_ad, b_ad, hA_ad, _ = build_stiffness_matrix(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings_adiab, amb,
+        )
+        op_ad, sb_ad, sha_ad, _ = build_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map, gap_m, H_map, settings_adiab, amb,
+        )
+        cop_ad = build_compact_structured_operator(
+            layers, rows, cols, copper_mask, t_cu, t_fr4_eff,
+            390.0, 0.3, dx, dy, V_map.astype(np.float32), gap_m, H_map, settings_adiab, amb,
+        )
+        plane = rows * cols
+        assert np.all(hA_ad[:plane] == pytest.approx(15.0 * dx * dy))
+        assert np.all(hA_ad[plane:] == 0.0)
+        np.testing.assert_allclose(sha_ad, hA_ad)
+        assert cop_ad.bot_air_ha == 0.0
+        assert cop_ad.bot_air_rhs == 0.0
+
+        res_ad_direct = run_steady_state(cfg, K_ad, q, b_ad, hA_ad, layers, rows, cols)
+        res_ad_compact = run_steady_state_matrix_free(
+            cfg, cop_ad, None,
+            thermal_solver.SparsePowerVector(np.arange(q.size), q, q.size),
+            None, None,
+        )
+        np.testing.assert_allclose(res_ad_compact.T, res_ad_direct.T, rtol=1e-5, atol=1e-5)
+        # All power leaves through top convection
+        assert cop_ad.convection_power(res_ad_compact.T, amb) == pytest.approx(float(np.sum(q)), rel=1e-4)
 
 

@@ -128,7 +128,7 @@ class TestHeadlessIsolationAndJson:
 
     def test_constants(self):
         assert headless_api.SCHEMA_VERSION == "1.0"
-        assert headless_api.PLUGIN_VERSION == "0.4.7"
+        assert headless_api.PLUGIN_VERSION == "0.4.8"
 
     def test_no_wx_or_gui_imports_in_ast(self):
         for mod in (headless_api, simulation_core):
@@ -1037,3 +1037,149 @@ class TestPadAlignmentAndBottomLayerRegression:
         )
         assert res["status"] == "ok"
         assert captured_configs == ["auto"]
+
+
+class TestV048ConvectionAndViaSettings:
+    """Tests for v0.4.8 h_conv_bottom, via_plating_um, via_fill, and 3D via_map routing."""
+
+    def test_normalize_and_validate_convection_and_via_fields(self, sample_2layer_board_file):
+        board = _make_board(sample_2layer_board_file)
+
+        # Default normalization: h_conv_bottom inherits h_conv; via defaults to 25 um / plated
+        norm_default = headless_api.normalize_job_config({"h_conv": 18.0})
+        assert norm_default["h_conv"] == pytest.approx(18.0)
+        assert norm_default["h_conv_bottom"] == pytest.approx(18.0)
+        assert norm_default["via_plating_um"] == pytest.approx(25.0)
+        assert norm_default["via_fill"] == "plated"
+
+        # Explicit copper_filled alias & zero convection allowed
+        norm_cu = headless_api.normalize_job_config({
+            "h_conv": 0.0,
+            "h_conv_bottom": 5.0,
+            "via_plating_um": 35.0,
+            "via_fill": "copper_filled",
+        })
+        assert norm_cu["h_conv"] == pytest.approx(0.0)
+        assert norm_cu["h_conv_bottom"] == pytest.approx(5.0)
+        assert norm_cu["via_plating_um"] == pytest.approx(35.0)
+        assert norm_cu["via_fill"] == "copper"
+
+        v_ok = headless_api.validate_job(board, {
+            "power_pads": {"U1.EP": 1.0},
+            "h_conv": 0.0,
+            "h_conv_bottom": 0.0,
+            "via_plating_um": 30.0,
+            "via_fill": "copper",
+        })
+        assert v_ok["valid"] is True
+
+        v_bad_bot = headless_api.validate_job(board, {
+            "power_pads": {"U1.EP": 1.0},
+            "h_conv_bottom": -1.0,
+        })
+        assert v_bad_bot["valid"] is False
+        assert any(e["target"] == "h_conv_bottom" for e in v_bad_bot["errors"])
+
+        v_bad_plating = headless_api.validate_job(board, {
+            "power_pads": {"U1.EP": 1.0},
+            "via_plating_um": 2.0,
+        })
+        assert v_bad_plating["valid"] is False
+        assert any(e["target"] == "via_plating_um" for e in v_bad_plating["errors"])
+
+    def test_geometry_context_key_changes_with_via_settings(self):
+        from ThermalSim.workflow import GridEstimate
+
+        grid = GridEstimate(0.5, 0.5, 0.0, 0.0, 20, 20, 40, 40, 2, False, False, 3000000, 2550000)
+        k1 = headless_api._build_geometry_context_key(grid, {"via_plating_um": 25.0, "via_fill": "plated"})
+        k2 = headless_api._build_geometry_context_key(grid, {"via_plating_um": 35.0, "via_fill": "plated"})
+        k3 = headless_api._build_geometry_context_key(grid, {"via_plating_um": 25.0, "via_fill": "copper"})
+        assert len({k1, k2, k3}) == 3
+
+    def test_job_schema_accepts_v048_fields(self):
+        jsonschema = pytest.importorskip("jsonschema")
+        schema_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "schema",
+            "job.schema.json",
+        )
+        with open(schema_path, "r", encoding="utf-8") as handle:
+            schema = json.load(handle)
+
+        job = {
+            "power_pads": {"U1.EP": 2.0},
+            "h_conv": 0.0,
+            "h_conv_bottom": 12.5,
+            "via_plating_um": 35.0,
+            "via_fill": "copper",
+        }
+        jsonschema.validate(instance=job, schema=schema)
+
+    def test_headless_via_map_3d_bypasses_compact_operator_and_records_k_norm(
+        self, sample_4layer_board_file, monkeypatch
+    ):
+        from tests.mocks.pcbnew_mock import In1_Cu, In2_Cu, MockVia
+
+        board = _make_board(sample_4layer_board_file, with_eco1=False)
+        blind_via = MockVia(
+            bbox=EDA_RECT(12_000_000, 12_000_000, 600_000, 600_000),
+            layers=[F_Cu, In1_Cu],
+            net_code=2,
+            net_name="GND",
+        )
+        board._tracks.append(blind_via)
+
+        monkeypatch.setattr(
+            headless_api,
+            "_resolve_layers_and_stackup",
+            lambda _b: ([F_Cu, In1_Cu, In2_Cu, B_Cu], ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"], {}),
+        )
+
+        called = {"structured": 0, "compact": 0}
+        orig_structured = headless_api.build_structured_operator
+
+        def spy_structured(*args, **kwargs):
+            called["structured"] += 1
+            assert np.asarray(args[10]).ndim == 3
+            return orig_structured(*args, **kwargs)
+
+        def spy_compact(*args, **kwargs):
+            called["compact"] += 1
+            raise AssertionError("Compact operator must not be used when via_map_3d is present")
+
+        monkeypatch.setattr(headless_api, "build_structured_operator", spy_structured)
+        monkeypatch.setattr(headless_api, "_ORIG_BUILD_STRUCTURED_OPERATOR", spy_structured)
+        monkeypatch.setattr(headless_api, "build_compact_structured_operator", spy_compact)
+
+        captured_k_norm = {}
+        orig_summary = headless_api.build_semantic_summary
+
+        def spy_summary(*args, **kwargs):
+            res_obj = kwargs["result"]
+            captured_k_norm.update(res_obj.k_norm_info)
+            return orig_summary(*args, **kwargs)
+
+        monkeypatch.setattr(headless_api, "build_semantic_summary", spy_summary)
+
+        res = headless_api.run_headless_simulation(
+            board,
+            {
+                "power_pads": {"U1.EP": 1.0},
+                "res": 2.0,
+                "steady_state": True,
+                "compute_engine": "fast_native",
+                "h_conv": 15.0,
+                "h_conv_bottom": 3.0,
+                "via_plating_um": 35.0,
+                "via_fill": "copper",
+            },
+            generate_plots=False,
+            generate_html=False,
+        )
+        assert res["status"] == "ok"
+        assert called["structured"] == 1
+        assert called["compact"] == 0
+        assert captured_k_norm["h_top"] == pytest.approx(15.0)
+        assert captured_k_norm["h_air_bottom"] == pytest.approx(3.0)
+        assert captured_k_norm["via_plating_um"] == pytest.approx(35.0)
+        assert captured_k_norm["via_fill"] == "copper"

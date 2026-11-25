@@ -145,6 +145,29 @@ def test_geometry_cache_key_ignores_non_geometry_settings():
     )
 
 
+def test_geometry_cache_key_tracks_and_normalizes_via_settings():
+    snapshot = BoardSnapshot("board", "abc", (0, 0, 10, 10), (0, 2), 1, 1, 1)
+    grid = GridEstimate(0.5, 0.5, 0, 0, 10, 10, 24, 24, 2, False, False, 200000, 100000)
+    default_key = geometry_cache_key(snapshot, grid, {}, ["U1:1"])
+    plated_alias_key = geometry_cache_key(
+        snapshot, grid, {"via_plating_um": 25.0, "via_fill": "unfilled"}, ["U1:1"]
+    )
+    assert default_key == plated_alias_key
+
+    copper_key = geometry_cache_key(
+        snapshot, grid, {"via_plating_um": 25.0, "via_fill": "copper"}, ["U1:1"]
+    )
+    copper_alias_key = geometry_cache_key(
+        snapshot, grid, {"via_plating_um": 25.0, "via_fill": "copper-filled"}, ["U1:1"]
+    )
+    thick_key = geometry_cache_key(
+        snapshot, grid, {"via_plating_um": 35.0, "via_fill": "plated"}, ["U1:1"]
+    )
+    assert copper_key == copper_alias_key
+    assert copper_key != default_key
+    assert thick_key != default_key
+
+
 def test_geometry_cache_invalidates_geometry_changes():
     cache = GeometryCache()
     cache.put("first", object())
@@ -252,6 +275,33 @@ def test_geometry_cache_persists_geometry_state_as_npz(tmp_path):
     loaded_no_area = second.get("geom_no_area")
     assert isinstance(loaded_no_area, GeometryState)
     assert loaded_no_area.area_mask is None
+    assert loaded_no_area.via_map_3d is None
+
+    # Optional via_map_3d round-trip when present, absent in archive when None
+    with np.load(cache_dir / "geom_no_area.npz", allow_pickle=False) as archive:
+        assert "via_map_3d" not in archive
+
+    via_3d = np.ones((3, 2, 2), dtype=np.float32)
+    via_3d[0, 0, 1] = 85.0
+    state_with_3d = GeometryState(
+        copper_mask=state.copper_mask,
+        via_map=state.via_map,
+        heatsink_mask=state.heatsink_mask,
+        area_mask=None,
+        x_min=0.0,
+        y_min=0.0,
+        res=0.5,
+        rows=2,
+        cols=2,
+        x_centers_iu=state.x_centers_iu,
+        y_centers_iu=state.y_centers_iu,
+        via_map_3d=via_3d,
+    )
+    first.put("geom_with_3d", state_with_3d)
+    loaded_3d = second.get("geom_with_3d")
+    assert isinstance(loaded_3d, GeometryState)
+    assert loaded_3d.via_map_3d is not None
+    np.testing.assert_array_equal(loaded_3d.via_map_3d, via_3d)
 
 
 def test_geometry_cache_never_loads_legacy_pickle_and_prunes_it(tmp_path):

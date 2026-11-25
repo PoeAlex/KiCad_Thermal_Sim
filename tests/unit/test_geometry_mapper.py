@@ -25,6 +25,8 @@ from ThermalSim.geometry_mapper import (
     get_pad_power_indices,
     get_pad_primary_layer_id,
     create_multilayer_maps,
+    normalize_via_fill,
+    compute_via_excess_ka,
 )
 
 from tests.mocks.pcbnew_mock import (
@@ -713,7 +715,9 @@ class TestCreateMultilayerMaps:
         )
 
         assert calls == [F_Cu]
-        assert state.via_map[5, 5] == 1300.0
+        expected_delta_ka = compute_via_excess_ka(0.4e-3, plating_um=25.0, via_fill="plated")
+        expected_v = 1.0 + expected_delta_ka / (0.3 * (1.0e-3 ** 2))
+        assert state.via_map[5, 5] == pytest.approx(expected_v, rel=1e-5)
         assert state.copper_mask[0, 5, 5]
         assert state.copper_mask[1, 5, 5]
 
@@ -1417,3 +1421,279 @@ class TestPadGeometryAndAlignment:
             power_idx = get_pad_power_indices(pad, 0, 80, 80, 0.0, 0.0, 0.5)
             assert power_idx.size > 0
             assert np.all(state.copper_mask.reshape(-1)[power_idx])
+
+
+class _PhysicalVia(MockVia):
+    """Via mock supporting GetPosition, GetWidth(layer), GetDrillValue, GetDrill."""
+
+    def __init__(
+        self,
+        *,
+        x_mm,
+        y_mm,
+        outer_d_mm,
+        drill_mm=None,
+        get_drill_ret=-1,
+        layers=None,
+        net_code=0,
+        net_name="",
+    ):
+        r_nm = int(round(0.5 * outer_d_mm * 1e6))
+        cx_nm = int(round(x_mm * 1e6))
+        cy_nm = int(round(y_mm * 1e6))
+        super().__init__(
+            bbox=EDA_RECT(cx_nm - r_nm, cy_nm - r_nm, 2 * r_nm, 2 * r_nm),
+            layers=layers or [F_Cu, B_Cu],
+            net_code=net_code,
+            net_name=net_name,
+        )
+        self._pos = VECTOR2I(cx_nm, cy_nm)
+        self._outer_nm = int(round(outer_d_mm * 1e6))
+        self._drill_nm = int(round(drill_mm * 1e6)) if drill_mm is not None else None
+        self._get_drill_ret = get_drill_ret
+
+    def GetPosition(self):
+        return self._pos
+
+    def GetWidth(self, layer=None):
+        return self._outer_nm
+
+    def GetDrillValue(self):
+        if self._drill_nm is None:
+            raise AttributeError("no GetDrillValue")
+        return self._drill_nm
+
+    def GetDrill(self):
+        return self._get_drill_ret
+
+
+class _PhysicalPthPad(MockPad):
+    """PTH pad mock supporting GetSize, GetShape, GetDrillSize."""
+
+    def __init__(self, *, x_mm, y_mm, size_x_mm, size_y_mm, drill_x_mm, drill_y_mm=None):
+        cx_nm = int(round(x_mm * 1e6))
+        cy_nm = int(round(y_mm * 1e6))
+        sx_nm = int(round(size_x_mm * 1e6))
+        sy_nm = int(round(size_y_mm * 1e6))
+        super().__init__(
+            position=VECTOR2I(cx_nm, cy_nm),
+            layer=F_Cu,
+            attribute=PAD_ATTRIB_PTH,
+            bbox=EDA_RECT(cx_nm - sx_nm // 2, cy_nm - sy_nm // 2, sx_nm, sy_nm),
+        )
+        self._size = VECTOR2I(sx_nm, sy_nm)
+        dy_mm = drill_x_mm if drill_y_mm is None else drill_y_mm
+        self._drill_size = VECTOR2I(int(round(drill_x_mm * 1e6)), int(round(dy_mm * 1e6)))
+
+    def GetSize(self):
+        return self._size
+
+    def GetShape(self):
+        import pcbnew
+        return getattr(pcbnew, "PAD_SHAPE_CIRCLE", 0)
+
+    def GetDrillSize(self):
+        return self._drill_size
+
+
+class TestViaBarrelPhysicsV048:
+    """Tests for v0.4.8 resolution-invariant physical via & PTH conductance."""
+
+    def test_normalize_via_fill_and_excess_ka(self):
+        assert normalize_via_fill("copper") == "copper"
+        assert normalize_via_fill("copper_filled") == "copper"
+        assert normalize_via_fill("copper-filled") == "copper"
+        assert normalize_via_fill("COPPER-FILLED") == "copper"
+        for alias in ("plated", "unfilled", "air", "resin", "epoxy", None, ""):
+            assert normalize_via_fill(alias) == "plated"
+
+        ka_plated = compute_via_excess_ka(0.3e-3, plating_um=25.0, via_fill="plated")
+        ka_copper = compute_via_excess_ka(0.3e-3, plating_um=25.0, via_fill="copper")
+        r_i = 0.15e-3
+        r_o = r_i + 25e-6
+        a_barrel = math.pi * (r_o ** 2 - r_i ** 2)
+        a_core = math.pi * r_i ** 2
+        assert ka_plated == pytest.approx((390.0 - 0.3) * a_barrel + (0.026 - 0.3) * a_core)
+        assert ka_copper == pytest.approx((390.0 - 0.3) * (a_barrel + a_core))
+        assert ka_copper > ka_plated * 3.0
+
+        # Zero plating with air core clamps to >= 0.0
+        assert compute_via_excess_ka(0.3e-3, plating_um=0.0, via_fill="plated") == 0.0
+
+        # Oval / slotted drill continuity with round drill
+        ka_round = compute_via_excess_ka(0.4e-3, 0.4e-3, plating_um=25.0, via_fill="copper")
+        ka_round_none = compute_via_excess_ka(0.4e-3, None, plating_um=25.0, via_fill="copper")
+        assert ka_round == pytest.approx(ka_round_none)
+        ka_slot = compute_via_excess_ka(1.2e-3, 0.4e-3, plating_um=25.0, via_fill="plated")
+        p_hole = 2.0 * (1.2e-3 - 0.4e-3) + math.pi * 0.4e-3
+        a_b_slot = p_hole * 25e-6 + math.pi * (25e-6) ** 2
+        a_c_slot = 0.4e-3 * (1.2e-3 - 0.4e-3) + 0.25 * math.pi * (0.4e-3) ** 2
+        assert ka_slot == pytest.approx((390.0 - 0.3) * a_b_slot + (0.026 - 0.3) * a_c_slot)
+
+    @pytest.mark.parametrize("via_fill", ["plated", "copper"])
+    def test_resolution_invariance_of_total_via_conductance(self, via_fill):
+        """Total excess kA sum((V - 1) * k_fr4 * A_pix) is invariant across 0.1..1.0 mm."""
+        via = _PhysicalVia(x_mm=5.0, y_mm=5.0, outer_d_mm=0.6, drill_mm=0.3)
+        board = MockBoard(tracks=[via], layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"})
+        expected_ka = compute_via_excess_ka(
+            0.3e-3, plating_um=25.0, via_fill=via_fill, k_cu=390.0, k_fr4=0.3
+        )
+        settings = {"ignore_traces": False, "ignore_polygons": True, "use_heatsink": False}
+
+        for res_mm in (0.1, 0.25, 0.5, 1.0):
+            n = int(round(10.0 / res_mm))
+            state = build_geometry_state(
+                board=board,
+                copper_ids=[F_Cu, B_Cu],
+                rows=n,
+                cols=n,
+                x_min=0.0,
+                y_min=0.0,
+                res=res_mm,
+                settings=settings,
+                via_plating_um=25.0,
+                via_fill=via_fill,
+            )
+            pixel_area_m2 = (res_mm * 1e-3) ** 2
+            total_excess_ka = float(np.sum(state.via_map.astype(np.float64) - 1.0)) * 0.3 * pixel_area_m2
+            assert total_excess_ka == pytest.approx(expected_ka, rel=1e-5)
+            assert state.via_map_3d is None
+
+    def test_off_center_subpixel_via_never_vanishes(self):
+        """A small 0.2 mm drill / 0.45 mm pad near a pixel corner never vanishes at res=0.5 or 1.0."""
+        via = _PhysicalVia(x_mm=1.99, y_mm=1.99, outer_d_mm=0.45, drill_mm=0.2)
+        board = MockBoard(tracks=[via], layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"})
+        expected_ka = compute_via_excess_ka(0.2e-3, plating_um=25.0, via_fill="plated")
+        settings = {"ignore_traces": False, "ignore_polygons": True, "use_heatsink": False}
+
+        for res_mm in (0.5, 1.0):
+            n = int(round(6.0 / res_mm))
+            state = build_geometry_state(
+                board=board,
+                copper_ids=[F_Cu, B_Cu],
+                rows=n,
+                cols=n,
+                x_min=0.0,
+                y_min=0.0,
+                res=res_mm,
+                settings=settings,
+            )
+            pixel_area_m2 = (res_mm * 1e-3) ** 2
+            total_excess_ka = float(np.sum(state.via_map.astype(np.float64) - 1.0)) * 0.3 * pixel_area_m2
+            assert total_excess_ka == pytest.approx(expected_ka, rel=1e-5)
+            assert np.any(state.copper_mask[0])
+            assert np.any(state.copper_mask[1])
+
+    def test_overlapping_vias_sum_additively(self):
+        """Co-located vias and PTH pads sum parallel barrel conductances instead of max()."""
+        via1 = _PhysicalVia(x_mm=2.5, y_mm=2.5, outer_d_mm=0.6, drill_mm=0.3)
+        via2 = _PhysicalVia(x_mm=2.5, y_mm=2.5, outer_d_mm=0.6, drill_mm=0.3)
+        pth = _PhysicalPthPad(x_mm=2.5, y_mm=2.5, size_x_mm=0.9, size_y_mm=0.9, drill_x_mm=0.5)
+        board = MockBoard(
+            tracks=[via1, via2],
+            footprints=[MockFootprint("J1", [pth])],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+        )
+        expected_ka = (
+            2.0 * compute_via_excess_ka(0.3e-3, plating_um=25.0, via_fill="plated")
+            + compute_via_excess_ka(0.5e-3, plating_um=25.0, via_fill="plated")
+        )
+        res_mm = 0.5
+        state = build_geometry_state(
+            board=board,
+            copper_ids=[F_Cu, B_Cu],
+            rows=10,
+            cols=10,
+            x_min=0.0,
+            y_min=0.0,
+            res=res_mm,
+            settings={"ignore_traces": False, "ignore_polygons": True, "use_heatsink": False},
+        )
+        total_excess_ka = float(np.sum(state.via_map.astype(np.float64) - 1.0)) * 0.3 * ((res_mm * 1e-3) ** 2)
+        assert total_excess_ka == pytest.approx(expected_ka, rel=1e-5)
+
+    def test_kicad9_getdrill_fallback_and_slotted_pth_drill(self):
+        """Verify GetDrillValue > GetDrill > 0.5*outer and slotted PTH GetDrillSize."""
+        class KiCad9Via(MockVia):
+            def GetPosition(self):
+                return VECTOR2I(2_500_000, 2_500_000)
+
+            def GetWidth(self, layer=None):
+                return 800_000
+
+            def GetDrill(self):
+                return 350_000
+
+        via_k9 = KiCad9Via(bbox=EDA_RECT(2_100_000, 2_100_000, 800_000, 800_000))
+        pth_slot = _PhysicalPthPad(
+            x_mm=6.5, y_mm=2.5, size_x_mm=2.0, size_y_mm=1.2, drill_x_mm=1.2, drill_y_mm=0.5
+        )
+        board = MockBoard(
+            tracks=[via_k9],
+            footprints=[MockFootprint("J1", [pth_slot])],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+        )
+        expected_ka = (
+            compute_via_excess_ka(0.35e-3, plating_um=30.0, via_fill="copper")
+            + compute_via_excess_ka(1.2e-3, 0.5e-3, plating_um=30.0, via_fill="copper")
+        )
+        res_mm = 0.5
+        state = build_geometry_state(
+            board=board,
+            copper_ids=[F_Cu, B_Cu],
+            rows=10,
+            cols=20,
+            x_min=0.0,
+            y_min=0.0,
+            res=res_mm,
+            settings={"ignore_traces": False, "ignore_polygons": True, "use_heatsink": False},
+            via_plating_um=30.0,
+            via_fill="copper-filled",
+        )
+        total_excess_ka = float(np.sum(state.via_map.astype(np.float64) - 1.0)) * 0.3 * ((res_mm * 1e-3) ** 2)
+        assert total_excess_ka == pytest.approx(expected_ka, rel=1e-5)
+
+    def test_blind_buried_via_populates_via_map_3d_isolated_by_gap(self):
+        """Blind/buried vias populate via_map_3d ONLY on spanned layer gaps."""
+        copper_ids = [F_Cu, In1_Cu, In2_Cu, B_Cu]
+        # Through-hole via at (1.5, 1.5) -> spans gaps 0, 1, 2
+        via_th = _PhysicalVia(x_mm=1.5, y_mm=1.5, outer_d_mm=0.6, drill_mm=0.3, layers=copper_ids)
+        # Blind via at (4.5, 4.5) F.Cu -> In1.Cu -> spans gap 0 only
+        via_blind = _PhysicalVia(x_mm=4.5, y_mm=4.5, outer_d_mm=0.6, drill_mm=0.3, layers=[F_Cu, In1_Cu])
+        # Buried via at (7.5, 7.5) In1.Cu -> In2.Cu -> spans gap 1 only
+        via_buried = _PhysicalVia(x_mm=7.5, y_mm=7.5, outer_d_mm=0.6, drill_mm=0.3, layers=[In1_Cu, In2_Cu])
+
+        board = MockBoard(
+            tracks=[via_th, via_blind, via_buried],
+            layer_names={F_Cu: "F.Cu", In1_Cu: "In1.Cu", In2_Cu: "In2.Cu", B_Cu: "B.Cu"},
+        )
+        res_mm = 1.0
+        state = build_geometry_state(
+            board=board,
+            copper_ids=copper_ids,
+            rows=10,
+            cols=10,
+            x_min=0.0,
+            y_min=0.0,
+            res=res_mm,
+            settings={"ignore_traces": False, "ignore_polygons": True, "use_heatsink": False},
+        )
+        assert state.via_map_3d is not None
+        assert state.via_map_3d.shape == (3, 10, 10)
+        assert state.via_map_3d.dtype == np.float32
+
+        expected_v = 1.0 + compute_via_excess_ka(0.3e-3) / (0.3 * (1.0e-3 ** 2))
+        # Through-hole at (1, 1): all 3 gaps
+        for g in range(3):
+            assert state.via_map_3d[g, 1, 1] == pytest.approx(expected_v, rel=1e-5)
+        # Blind at (4, 4): gap 0 only
+        assert state.via_map_3d[0, 4, 4] == pytest.approx(expected_v, rel=1e-5)
+        assert state.via_map_3d[1, 4, 4] == 1.0
+        assert state.via_map_3d[2, 4, 4] == 1.0
+        # Buried at (7, 7): gap 1 only
+        assert state.via_map_3d[0, 7, 7] == 1.0
+        assert state.via_map_3d[1, 7, 7] == pytest.approx(expected_v, rel=1e-5)
+        assert state.via_map_3d[2, 7, 7] == 1.0
+
+        # 2D via_map equals max across gaps
+        np.testing.assert_array_equal(state.via_map, np.max(state.via_map_3d, axis=0))

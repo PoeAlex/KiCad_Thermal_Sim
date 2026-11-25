@@ -2133,6 +2133,15 @@ class CompactStructuredThermalOperator:
         return operator, preconditioner
 
 
+def _resolve_convection_coefficients(settings: Dict) -> tuple[float, float]:
+    """Resolve non-negative top and bottom air convection coefficients (W/(m^2*K))."""
+    raw_top = settings.get("h_conv", 10.0)
+    h_top = max(0.0, float(10.0 if raw_top is None else raw_top))
+    raw_bot = settings.get("h_conv_bottom")
+    h_bot = h_top if raw_bot is None else max(0.0, float(raw_bot))
+    return h_top, h_bot
+
+
 def build_compact_structured_operator(
     layer_count: int,
     rows: int,
@@ -2177,20 +2186,25 @@ def build_compact_structured_operator(
     )
 
     hs_mask_u8 = np.ascontiguousarray(np.asarray(H_map, dtype=bool), dtype=np.uint8)
+    v_arr = np.asarray(V_map, dtype=np.float32)
+    if layer_count > 1 and v_arr.ndim != 2:
+        raise ValueError(
+            "build_compact_structured_operator requires a 2D V_map; "
+            "use build_structured_operator or build_stiffness_matrix for 3D V_map."
+        )
     via_enh = np.ascontiguousarray(
-        np.clip(np.asarray(V_map, dtype=np.float32), 1.0, 50.0),
+        np.maximum(v_arr, np.float32(1.0)),
         dtype=np.float32,
     )
     copper_u8 = np.ascontiguousarray(
         np.asarray(copper_mask, dtype=bool), dtype=np.uint8
     )
 
-    h_top = float(settings.get("h_conv", 10.0))
+    h_top, h_air_bot = _resolve_convection_coefficients(settings)
     top_diag = h_top * pixel_area
     top_rhs = top_diag * float(amb)
     top_ha = top_diag
 
-    h_air_bot = float(settings.get("h_conv", 10.0))
     pad_thick_m = max(0.0001, float(settings.get("pad_th", 1.0)) * 1e-3)
     pad_k = float(settings.get("pad_k", 3.0))
     contact_factor = max(1e-6, float(settings.get("pad_contact_factor", 0.2)))
@@ -2253,7 +2267,7 @@ def _compute_bottom_boundary_terms(
     amb: float,
 ):
     """Compute bottom-surface diagonal conductance, RHS contribution, and hA."""
-    h_air_bot = float(settings.get("h_conv", 10.0))
+    _, h_air_bot = _resolve_convection_coefficients(settings)
     pad_thick_m = max(0.0001, float(settings.get("pad_th", 1.0)) * 1e-3)
     pad_k = float(settings.get("pad_k", 3.0))
     contact_factor = max(1e-6, float(settings.get("pad_contact_factor", 0.2)))
@@ -2332,12 +2346,26 @@ def build_structured_operator(
 
     if layer_count > 1 and gap_m:
         gz = np.empty((layer_count - 1, rows, cols), dtype=np.float64)
-        via_enhancement = np.clip(V_map, 1.0, 50.0)
-        for layer_idx in range(layer_count - 1):
-            gap_value = max(gap_m[layer_idx], 1e-6)
-            gz[layer_idx] = (
-                k_fr4 * pixel_area / gap_value
-            ) * via_enhancement
+        via_enhancement = np.maximum(np.asarray(V_map, dtype=np.float64), 1.0)
+        if via_enhancement.ndim == 3:
+            if via_enhancement.shape != (layer_count - 1, rows, cols):
+                raise ValueError(
+                    f"3D V_map shape {via_enhancement.shape} does not match expected "
+                    f"({layer_count - 1}, {rows}, {cols})."
+                )
+            for layer_idx in range(layer_count - 1):
+                gap_value = max(gap_m[layer_idx], 1e-6)
+                gz[layer_idx] = (
+                    k_fr4 * pixel_area / gap_value
+                ) * via_enhancement[layer_idx]
+        elif via_enhancement.ndim == 2:
+            for layer_idx in range(layer_count - 1):
+                gap_value = max(gap_m[layer_idx], 1e-6)
+                gz[layer_idx] = (
+                    k_fr4 * pixel_area / gap_value
+                ) * via_enhancement
+        else:
+            raise ValueError(f"V_map must be 2D or 3D, got ndim={via_enhancement.ndim}.")
     else:
         gz = np.empty((0, rows, cols), dtype=np.float64)
 
@@ -2347,7 +2375,7 @@ def build_structured_operator(
     plane_cells = rows * cols
     plane_indices = np.arange(plane_cells, dtype=np.int64)
 
-    h_top = float(settings.get("h_conv", 10.0))
+    h_top, _ = _resolve_convection_coefficients(settings)
     top_addition = h_top * pixel_area
     boundary_diag[plane_indices] += top_addition
     boundary_rhs[plane_indices] += top_addition * amb
@@ -2539,11 +2567,20 @@ def build_stiffness_matrix(
 
     # Inter-layer coupling through vias
     if layer_count > 1 and gap_m:
-        V_enh = np.clip(V_map, 1.0, 50.0)
+        V_enh = np.maximum(np.asarray(V_map, dtype=np.float64), 1.0)
+        if V_enh.ndim == 3:
+            if V_enh.shape != (layer_count - 1, rows, cols):
+                raise ValueError(
+                    f"3D V_map shape {V_enh.shape} does not match expected "
+                    f"({layer_count - 1}, {rows}, {cols})."
+                )
+        elif V_enh.ndim != 2:
+            raise ValueError(f"V_map must be 2D or 3D, got ndim={V_enh.ndim}.")
         for l in range(layer_count - 1):
             gap_val = max(gap_m[l], 1e-6)
             Gz_base = k_fr4 * pixel_area / gap_val
-            Gz = (Gz_base * V_enh).ravel()
+            v_slice = V_enh[l] if V_enh.ndim == 3 else V_enh
+            Gz = (Gz_base * v_slice).ravel()
             i_idx = l * RC + plane_idx
             j_idx = (l + 1) * RC + plane_idx
             n = Gz.size
@@ -2580,7 +2617,7 @@ def build_stiffness_matrix(
     b = np.zeros(N, dtype=np.float64)
 
     # Top surface convection
-    h_top = float(settings.get('h_conv', 10.0))
+    h_top, _ = _resolve_convection_coefficients(settings)
     diag_add_top = h_top * pixel_area
     top_idx = np.arange(RC, dtype=np.int64)
     diag_extra[top_idx] += diag_add_top

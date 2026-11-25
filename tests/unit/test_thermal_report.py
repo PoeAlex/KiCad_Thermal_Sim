@@ -1025,3 +1025,48 @@ class TestWriteHtmlReportDynamicHeatsink:
         assert "Dynamic heatsink (0D)" in content
         assert "No User.Eco1 thermal pad shapes found on board" in content
         assert "Copper (c_p = 385.0 J/kg·K)" in content
+
+    def test_report_renders_convection_and_via_settings(self, base_params):
+        """Report renders top/bottom convection and via plating/fill cleanly."""
+        params = base_params.copy()
+        params['settings'] = dict(base_params['settings'], **{
+            'h_conv': 18.0,
+            'h_conv_bottom': 2.5,
+            'via_plating_um': 35.0,
+            'via_fill': 'plated',
+        })
+        params['k_norm_info'] = {
+            'h_top': 18.0,
+            'h_air_bottom': 2.5,
+            'via_plating_um': 35.0,
+            'via_fill': 'plated',
+        }
+        result = write_html_report(**params)
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        assert "Convection Top" in content
+        assert "18.0 W/(m^2*K)" in content
+        assert "Convection Bottom" in content
+        assert "2.5 W/(m^2*K)" in content
+        assert "Plated (standard)" in content
+        assert "35.0 um" in content
+
+        # Copper-filled via mode indicates plating is unused
+        params_cu = base_params.copy()
+        params_cu['settings'] = dict(base_params['settings'], **{
+            'h_conv': 10.0,
+            'via_fill': 'copper',
+        })
+        params_cu['k_norm_info'] = {
+            'h_top': 10.0,
+            'h_air_bottom': 10.0,
+            'via_plating_um': 25.0,
+            'via_fill': 'copper',
+        }
+        result_cu = write_html_report(**params_cu)
+        with open(result_cu, 'r', encoding='utf-8') as f:
+            content_cu = f.read()
+
+        assert "Copper-filled" in content_cu
+        assert "unused; copper-filled" in content_cu

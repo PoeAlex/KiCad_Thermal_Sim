@@ -5,6 +5,7 @@ This module provides Matplotlib-based plotting functions for thermal
 simulation results and geometry previews.
 """
 
+import inspect
 import os
 import sys
 import math
@@ -646,15 +647,35 @@ def save_preview_image(
 
     try:
         if geometry_state is None:
+            raw_plating = settings.get("via_plating_um")
+            via_plating_um = max(5.0, min(100.0, 25.0 if raw_plating is None else float(raw_plating)))
+            raw_fill = str(settings.get("via_fill", "plated") or "plated").strip().lower().replace("-", "_")
+            via_fill = "copper" if raw_fill in {"copper", "copper_filled"} else "plated"
+            extra_kwargs = {}
+            try:
+                params = inspect.signature(create_maps_func).parameters
+                accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                for k_name, k_val in (
+                    ("via_plating_um", via_plating_um),
+                    ("via_fill", via_fill),
+                    ("k_cu", 390.0),
+                    ("k_fr4", 0.3),
+                ):
+                    if accepts_var_kw or k_name in params:
+                        extra_kwargs[k_name] = k_val
+            except (TypeError, ValueError):
+                pass
             K, V_map, H_map = create_maps_func(
                 board, copper_ids, rows, cols, x_min, y_min, res,
-                settings, k_fr4_rel, k_cu_layers, via_factor, pads_list
+                settings, k_fr4_rel, k_cu_layers, via_factor, pads_list,
+                **extra_kwargs
             )
         else:
             K = np.empty((layer_count, rows, cols), dtype=np.float64)
             for idx, k_cu_layer in enumerate(k_cu_layers):
                 K[idx] = np.where(geometry_state.copper_mask[idx], k_cu_layer, k_fr4_rel)
-            V_map = geometry_state.via_map
+            via_map_3d = getattr(geometry_state, "via_map_3d", None)
+            V_map = via_map_3d if via_map_3d is not None else geometry_state.via_map
             H_map = geometry_state.heatsink_mask.astype(np.float64, copy=False)
 
         out_dir = out_dir or settings.get('output_dir') or os.path.dirname(__file__)
@@ -729,8 +750,18 @@ def save_preview_image(
                         cmap='Blues', origin='upper', interpolation='none', alpha=0.45, extent=extent
                     )
 
-            # Overlay vias in red
-            v_mask = V_map > 1.0
+            # Overlay vias in red (supports both 2D and 3D gap-indexed V_map)
+            v_arr = np.asarray(V_map)
+            if v_arr.ndim == 3 and v_arr.shape[0] > 0:
+                if i == 0:
+                    v_layer = v_arr[0]
+                elif i >= v_arr.shape[0]:
+                    v_layer = v_arr[-1]
+                else:
+                    v_layer = np.maximum(v_arr[i - 1], v_arr[i])
+            else:
+                v_layer = v_arr
+            v_mask = v_layer > 1.0
             if np.any(v_mask):
                 v_disp = (_downsample_layer_block_max(v_mask, stride) > 0) if stride > 1 else v_mask
                 ax.imshow(

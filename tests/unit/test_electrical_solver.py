@@ -748,3 +748,179 @@ def test_b_cu_smd_current_terminals_with_kicad10_getlayer_zero():
     q_3d = result.q_joule.reshape(2, 4, 12)
     assert np.sum(q_3d[0]) == 0.0
     assert np.sum(q_3d[1]) > 0.0
+
+
+class _ElectricalVia(MockVia):
+    """Via mock with explicit position, outer width, drill value, and KiCad 10 LayerPair guard."""
+
+    def __init__(self, x_mm, y_mm, outer_d_mm, drill_mm, layers, net_code=1, net_name="PWR"):
+        r_nm = int(round(0.5 * outer_d_mm * 1e6))
+        cx_nm = int(round(x_mm * 1e6))
+        cy_nm = int(round(y_mm * 1e6))
+        super().__init__(
+            bbox=EDA_RECT(cx_nm - r_nm, cy_nm - r_nm, 2 * r_nm, 2 * r_nm),
+            layers=layers,
+            net_code=net_code,
+            net_name=net_name,
+        )
+        self._pos = VECTOR2I(cx_nm, cy_nm)
+        self._outer_nm = int(round(outer_d_mm * 1e6))
+        self._drill_nm = int(round(drill_mm * 1e6))
+
+    def GetPosition(self):
+        return self._pos
+
+    def GetWidth(self, layer=None):
+        return self._outer_nm
+
+    def GetDrillValue(self):
+        return self._drill_nm
+
+    def GetLayerPair(self):
+        raise TypeError("PCB_VIA::GetLayerPair requires 2 args in KiCad 10")
+
+
+def test_physical_via_resistance_resolution_invariance_and_fill():
+    """Via barrel resistance is resolution-invariant and reflects plated vs copper fill."""
+    from ThermalSim.geometry_mapper import compute_via_copper_area_m2
+
+    via_x, via_y = 2.0, 2.0
+    drill_mm = 0.3
+    outer_mm = 0.6
+    gap_m = 1.6e-3
+
+    for via_fill in ("plated", "copper"):
+        a_cu = compute_via_copper_area_m2(drill_mm * 1e-3, plating_um=25.0, via_fill=via_fill)
+        expected_r_via = 1.724e-8 * gap_m / a_cu
+        resistances = []
+
+        for res_mm in (0.1, 0.25, 0.5, 1.0):
+            n = int(round(4.0 / res_mm))
+            # Point-like pads centered inside the via so in-plane spreading is negligible
+            pad_top = MockPad(
+                position=VECTOR2I(int(via_x * 1e6), int(via_y * 1e6)),
+                layer=F_Cu,
+                bbox=EDA_RECT(int(via_x * 1e6) - 10_000, int(via_y * 1e6) - 10_000, 20_000, 20_000),
+                net_code=1,
+                net_name="PWR",
+                number="1",
+            )
+            pad_bot = MockPad(
+                position=VECTOR2I(int(via_x * 1e6), int(via_y * 1e6)),
+                layer=B_Cu,
+                bbox=EDA_RECT(int(via_x * 1e6) - 10_000, int(via_y * 1e6) - 10_000, 20_000, 20_000),
+                net_code=1,
+                net_name="PWR",
+                number="2",
+            )
+            via = _ElectricalVia(via_x, via_y, outer_mm, drill_mm, [F_Cu, B_Cu])
+            board = MockBoard(
+                footprints=[MockFootprint(pads=[pad_top, pad_bot])],
+                tracks=[via],
+                layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+            )
+            # Thick pads/copper planes? No: at res > outer_mm, single pixel; at res=0.1, sheet conductance is small
+            # unless we use thick t_cu or compare edge G directly; check via_g_maps sum & full solve with high t_cu
+            config = ElectricalConfig(
+                copper_ids=[F_Cu, B_Cu],
+                rows=n,
+                cols=n,
+                x_min=0.0,
+                y_min=0.0,
+                res=res_mm,
+                t_cu=np.array([1.0, 1.0], dtype=np.float64),  # isolate via resistance from sheet spreading
+                via_plating_um=25.0,
+                via_fill=via_fill,
+                ambient_c=20.0,
+                gap_m=[gap_m],
+            )
+            result = solve_electrical_heating(
+                board,
+                [
+                    CurrentTerminal(pad_top, "TP1", "PWR", 1, 2.0),
+                    CurrentTerminal(pad_bot, "TP2", "PWR", 1, -2.0),
+                ],
+                config,
+            )
+            assert result.valid, result.errors
+            resistances.append(result.net_summaries[0].effective_resistance_ohm)
+
+        for r_val in resistances:
+            np.testing.assert_allclose(r_val, expected_r_via, rtol=1e-4)
+
+
+def test_blind_via_does_not_short_adjacent_layers_in_electrical_solver():
+    """A blind via F.Cu->In1.Cu must not connect to a same-net island on In2.Cu."""
+    from tests.mocks.pcbnew_mock import In1_Cu, In2_Cu
+
+    pad_top = _pad(2.5, 2.5, "1", layer=F_Cu)
+    pad_in2 = _pad(2.5, 2.5, "2", layer=In2_Cu)
+    blind_via = _ElectricalVia(2.5, 2.5, 0.6, 0.3, [F_Cu, In1_Cu])
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_top, pad_in2])],
+        tracks=[blind_via],
+        layer_names={F_Cu: "F.Cu", In1_Cu: "In1.Cu", In2_Cu: "In2.Cu", B_Cu: "B.Cu"},
+    )
+    config = ElectricalConfig(
+        copper_ids=[F_Cu, In1_Cu, In2_Cu, B_Cu],
+        rows=6,
+        cols=6,
+        x_min=0.0,
+        y_min=0.0,
+        res=1.0,
+        t_cu=np.full(4, 35e-6),
+        gap_m=[0.2e-3, 1.0e-3, 0.2e-3],
+    )
+    result = solve_electrical_heating(
+        board,
+        [
+            CurrentTerminal(pad_top, "TP1", "PWR", 1, 1.0),
+            CurrentTerminal(pad_in2, "TP2", "PWR", 1, -1.0),
+        ],
+        config,
+    )
+    assert not result.valid
+    assert any("not electrically connected" in err for err in result.errors)
+
+
+def test_copper_tcr_scales_resistance_and_loss_at_85c():
+    """Electrical resistivity scales by 1 + 0.00393 * (ambient_c - 20.0) at 85 C."""
+    pad_a = _pad(0.25, 1.25, "1")
+    pad_b = _pad(9.25, 1.25, "2")
+    track = MockTrack(
+        layer=F_Cu,
+        bbox=EDA_RECT(250000, 1250000, 9100000, 100000),
+        start=VECTOR2I(500000, 1500000),
+        end=VECTOR2I(9500000, 1500000),
+        width=1000000,
+        net_code=1,
+        net_name="PWR",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_a, pad_b])],
+        tracks=[track],
+    )
+    terms = [
+        CurrentTerminal(pad_a, "J1-1", "PWR", 1, 2.0),
+        CurrentTerminal(pad_b, "J2-1", "PWR", 1, -2.0),
+    ]
+    cfg_20 = _config()
+    cfg_85 = ElectricalConfig(
+        copper_ids=[F_Cu],
+        rows=4,
+        cols=12,
+        x_min=0.0,
+        y_min=0.0,
+        res=1.0,
+        t_cu=np.array([35e-6], dtype=np.float64),
+        ambient_c=85.0,
+    )
+    res_20 = solve_electrical_heating(board, terms, cfg_20)
+    res_85 = solve_electrical_heating(board, terms, cfg_85)
+    assert res_20.valid and res_85.valid
+    expected_ratio = 1.0 + 0.00393 * (85.0 - 20.0)
+    assert res_85.total_loss_w / res_20.total_loss_w == pytest.approx(expected_ratio, rel=1e-12)
+    assert (
+        res_85.net_summaries[0].effective_resistance_ohm
+        / res_20.net_summaries[0].effective_resistance_ohm
+    ) == pytest.approx(expected_ratio, rel=1e-12)
