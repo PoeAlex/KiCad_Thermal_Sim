@@ -9,6 +9,7 @@ import inspect
 import os
 import sys
 import math
+import re
 import tempfile
 import subprocess
 
@@ -17,8 +18,97 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
 
 import pcbnew
+
+from .geometry_mapper import GeometryCancelledError
+
+
+def save_full_grid_temperature_pngs(T, layer_names, res_mm, out_dir, cancel_check=None):
+    """Write one annotated PNG per layer, preserving the solver grid pixel for pixel."""
+    temperatures = np.asarray(T)
+    if temperatures.ndim != 3 or not temperatures.size:
+        raise ValueError("Temperature array must have shape (layers, rows, cols).")
+    _, rows, cols = temperatures.shape
+    # Bound temporary arrays even when a layer has tens of millions of cells.
+    batch_rows = max(1, 1_000_000 // cols)
+
+    def batches(layer):
+        for start in range(0, rows, batch_rows):
+            if cancel_check is not None and cancel_check():
+                raise GeometryCancelledError("Full-grid PNG export cancelled.")
+            yield start, np.asarray(layer[start:start + batch_rows], dtype=np.float64)
+
+    limits = []
+    for layer in temperatures:
+        low, high = np.inf, -np.inf
+        for _, block in batches(layer):
+            finite = np.isfinite(block)
+            low = min(low, np.min(block, where=finite, initial=np.inf))
+            high = max(high, np.max(block, where=finite, initial=-np.inf))
+        limits.append((low, high))
+    scale_min = min(low for low, _ in limits)
+    scale_max = max(high for _, high in limits)
+    if not np.isfinite(scale_min):
+        raise ValueError("The temperature grid has no finite cells.")
+
+    last_color = 252
+    missing, background, ink = 253, 254, 255
+    palette = plt.get_cmap("inferno")(np.linspace(0, 1, last_color + 1), bytes=True)[:, :3]
+    palette = np.vstack((palette, [[140, 140, 140], [255, 255, 255], [0, 0, 0]]))
+    color_range = scale_max - scale_min
+    font_size = min(48, max(16, cols // 150))
+    font = ImageFont.truetype(
+        os.path.join(matplotlib.get_data_path(), "fonts", "ttf", "DejaVuSans.ttf"), font_size
+    )
+    margin = font_size
+    bar_y = rows + 4 * font_size
+    paths = []
+    for index, (layer, (low, high)) in enumerate(zip(temperatures, limits)):
+        name = str(layer_names[index]) if index < len(layer_names) else f"Layer {index + 1}"
+        limits_text = f"Min {low:.6g} °C   Max {high:.6g} °C" if low <= high else "No finite cells"
+        heading = f"{name}  ·  {limits_text}"
+        width = max(cols, 32 * font_size, math.ceil(font.getlength(heading)) + 2 * margin)
+        bar_width = min(width - 2 * margin, 36 * font_size)
+        image = Image.new("P", (width, rows + 7 * font_size), background)
+        image.putpalette(palette.astype(np.uint8).tobytes())
+        for start, block in batches(layer):
+            finite = np.isfinite(block)
+            pixels = np.full(block.shape, missing, dtype=np.uint8)
+            if color_range:
+                pixels[finite] = np.rint((block[finite] - scale_min) / color_range * last_color)
+            else:
+                pixels[finite] = last_color // 2
+            image.paste(Image.fromarray(pixels), ((width - cols) // 2, start))
+
+        draw = ImageDraw.Draw(image)
+        draw.text((margin, rows + margin), heading, font=font, fill=ink)
+        draw.text(
+            (margin, rows + int(2.5 * font_size)),
+            f"{res_mm:.6g} mm per cell  ·  {cols:,} × {rows:,} cells",
+            font=font, fill=ink,
+        )
+        colors = (
+            np.rint(np.linspace(0, last_color, bar_width)).astype(np.uint8)
+            if color_range else np.full(bar_width, last_color // 2, dtype=np.uint8)
+        )
+        image.paste(Image.fromarray(np.tile(colors, (font_size, 1))), (margin, bar_y))
+        for fraction in ((0, 0.5, 1) if color_range else (0,)):
+            x = margin + round(fraction * (bar_width - 1))
+            value = scale_min + fraction * color_range
+            anchor = "lt" if fraction == 0 else "rt" if fraction == 1 else "mt"
+            draw.text((x, bar_y + int(1.35 * font_size)), f"{value:.6g} °C",
+                      font=font, fill=ink, anchor=anchor)
+
+        metadata = PngImagePlugin.PngInfo()
+        metadata.add_text("Solver grid", f"{cols} x {rows}, {res_mm:g} mm per cell")
+        metadata.add_text("Temperature scale (C)", f"{scale_min} to {scale_max}")
+        safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", name).strip("._-")[:60]
+        path = os.path.join(out_dir, f"temperature_full_grid_{index + 1:02d}_{safe_name or 'layer'}.png")
+        image.save(path, pnginfo=metadata)
+        paths.append(path)
+    return paths
 
 
 def _downsample_layer_block_max(layer, stride):

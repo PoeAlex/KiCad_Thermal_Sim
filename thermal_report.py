@@ -748,7 +748,8 @@ def write_html_report(
     snapshot_files=None,
     interactive_heatmap=None,
     electrical_summary=None,
-    joule_map_path=None
+    joule_map_path=None,
+    full_grid_png_paths=None,
 ):
     """Generate an HTML report for the thermal simulation."""
     out_dir = out_dir or os.path.dirname(__file__)
@@ -843,11 +844,23 @@ def write_html_report(
         f"{_build_image_card('Final Heatmap', heatmap_rel, 'Heatmap image not available.')}" \
         "</div>"
 
+    full_grid_links = ""
+    if full_grid_png_paths:
+        links = []
+        for index, path in enumerate(full_grid_png_paths):
+            name = layer_names[index] if index < len(layer_names) else f"Layer {index + 1}"
+            links.append(
+                f"<li><a class='inline-link' href='{_esc(os.path.basename(path))}'>"
+                f"{_esc(name)} PNG</a></li>"
+            )
+        full_grid_links = f"<h3>Full-grid temperature maps</h3><ul>{''.join(links)}</ul>"
+
     results_overview_html = (
         "<section class='section-card'>"
         "<h2 class='section-title'>Results Overview</h2>"
         "<p class='section-note'>Static deliverables are embedded here and stay useful in browser and PDF exports. Open each image directly for a larger view.</p>"
         f"{images_html}"
+        f"{full_grid_links}"
         "</section>"
     )
 
