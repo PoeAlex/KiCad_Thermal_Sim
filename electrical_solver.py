@@ -1,7 +1,8 @@
 """
 Electrical DC solver for trace and copper-area Joule heating.
 
-This module builds a net-isolated resistor network on the thermal grid. It
+This module builds a resistor network on the thermal grid for each active net
+or group of bridged nets. It
 solves the copper potential for configured pad currents and converts the edge
 losses into a thermal heat-source vector.
 """
@@ -28,7 +29,11 @@ from .geometry_mapper import (
     _mark_centerline_points,
     _pad_orientation_radians,
     _pad_shape_center_mm,
+    _stroke_midpoint,
+    bridge_footprint_ids,
     compute_via_copper_area_m2,
+    footprint_copper_strokes,
+    footprint_library_id,
     get_pad_copper_layer_indices,
     get_pad_grid_mask,
     get_pad_primary_layer_id,
@@ -121,6 +126,8 @@ class ElectricalConfig:
     via_fill: str = "plated"
     ambient_c: float = 20.0
     gap_m: Optional[Any] = None
+    net_aliases: Optional[Dict[str, str]] = None
+    bridge_footprints: Tuple[str, ...] = ()
 
 
 def _effective_rho_cu(config: ElectricalConfig) -> float:
@@ -319,6 +326,53 @@ def net_key_from_obj(obj: Any) -> Tuple[str, str, int]:
     return net_key_from_values(net_code, net_name), net_name, net_code
 
 
+def footprint_pad_net_pair(footprint):
+    pad_nets = {}
+    for pad in footprint.Pads():
+        number = pad.GetNumber()
+        if number:
+            pad_nets.setdefault(number, set()).add(net_key_from_obj(pad)[0])
+    if len(pad_nets) == 2 and all(len(nets) == 1 for nets in pad_nets.values()):
+        pair = sorted(set().union(*pad_nets.values()))
+        if len(pair) == 2 and "NO_NET" not in pair:
+            return tuple(pair)
+    return None
+
+
+def footprint_net_bridges(board: Any) -> Dict[str, List[Tuple[str, str]]]:
+    """Find the net pairs of two-terminal footprint instances, grouped by library ID."""
+    bridges = {}
+    footprints = board.Footprints() if hasattr(board, "Footprints") else board.GetFootprints()
+    for footprint in footprints:
+        footprint_id = footprint_library_id(footprint)
+        pair = footprint_pad_net_pair(footprint) if footprint_id else None
+        if pair:
+            bridges.setdefault(footprint_id, []).append(pair)
+    return bridges
+
+
+def merge_net_pairs(pairs: List[Tuple[str, str]]) -> Dict[str, str]:
+    """Map nets joined by one or more selected footprint instances to one key."""
+    aliases = {}
+    for first, second in pairs:
+        first = aliases.get(first, first)
+        second = aliases.get(second, second)
+        if first == second:
+            continue
+        aliases = {key: first if value == second else value for key, value in aliases.items()}
+        aliases[first] = first
+        aliases[second] = first
+    return aliases
+
+
+def selected_net_aliases(board: Any, settings: Dict[str, Any]) -> Dict[str, str]:
+    footprint_ids = bridge_footprint_ids(settings)
+    if not footprint_ids or not settings.get("current_enabled"):
+        return {}
+    bridges = footprint_net_bridges(board)
+    return merge_net_pairs([pair for footprint_id in footprint_ids for pair in bridges.get(footprint_id, [])])
+
+
 def solve_electrical_heating(
     board: Any,
     terminals: List[CurrentTerminal],
@@ -363,10 +417,17 @@ def solve_electrical_heating(
 
     terms_by_net: Dict[str, List[CurrentTerminal]] = {}
     net_display: Dict[str, str] = {}
+    aliases = config.net_aliases or {}
+    display_names = {}
     for term in active_terms:
         key = net_key_from_values(term.net_code, term.net_name)
+        key = aliases.get(key, key)
         terms_by_net.setdefault(key, []).append(term)
-        net_display[key] = term.net_name or key
+        if key in aliases:
+            display_names.setdefault(key, set()).add(term.net_name or key)
+            net_display[key] = " + ".join(sorted(display_names[key]))
+        else:
+            net_display[key] = term.net_name or key
         if key == "NO_NET":
             errors.append(f"{term.name}: current terminal has no KiCad net.")
 
@@ -801,6 +862,7 @@ def _build_relevant_net_data(
     tracker.check_cancel(force=True)
 
     layer_count = len(config.copper_ids)
+    aliases = config.net_aliases or {}
     shape = (layer_count, config.rows, config.cols)
     net_masks = {key: np.zeros(shape, dtype=bool) for key in relevant_nets}
     via_masks = {key: np.zeros((config.rows, config.cols), dtype=bool) for key in relevant_nets}
@@ -894,6 +956,7 @@ def _build_relevant_net_data(
 
     def fill_for_obj(obj: Any, layer_ids: List[int], bbox=None, as_via=False, use_track_shape=False):
         key, _, _ = net_key_from_obj(obj)
+        key = aliases.get(key, key)
         if key not in net_masks:
             return 0
         bbox_obj = bbox if bbox is not None else obj.GetBoundingBox()
@@ -953,8 +1016,24 @@ def _build_relevant_net_data(
             f"Mapping electrical pads ({fp_idx + 1} / {total_fps})...",
             force=(fp_idx == 0),
         )
+        if config.bridge_footprints and footprint_library_id(fp) in config.bridge_footprints:
+            pair = footprint_pad_net_pair(fp)
+            key = aliases.get(pair[0]) if pair else None
+            if key in net_masks and aliases.get(pair[1]) == key:
+                for shape in footprint_copper_strokes(fp, config.copper_ids):
+                    layer = shape.GetLayer()
+                    idx = lid_to_idx[layer]
+                    bbox = shape.GetBoundingBox()
+                    rs, re, cs, ce = _bbox_indices(bbox, config)
+                    cells = net_masks[key][idx, rs:re, cs:ce]
+                    before = int(np.count_nonzero(cells))
+                    _fill_track(net_masks[key], idx, shape, config)
+                    mapped = int(np.count_nonzero(cells)) - before
+                    record_primitive(key, "Footprint copper", _layer_label(layer, config),
+                                     bbox, mapped_cells=mapped)
         for pad in fp.Pads():
             key, _, _ = net_key_from_obj(pad)
+            key = aliases.get(key, key)
             if key not in net_masks:
                 continue
             bbox = pad.GetBoundingBox()
@@ -1088,6 +1167,7 @@ def _build_relevant_net_data(
             force=(tr_idx == 0),
         )
         key, _, _ = net_key_from_obj(track)
+        key = aliases.get(key, key)
         if key not in net_masks:
             continue
         bbox = track.GetBoundingBox()
@@ -1183,6 +1263,7 @@ def _build_relevant_net_data(
         if _is_rule_or_keepout_zone(zone):
             continue
         key, _, _ = net_key_from_obj(zone)
+        key = aliases.get(key, key)
         if key not in net_masks:
             continue
         if hasattr(zone, "IsFilled") and not zone.IsFilled():
@@ -1514,13 +1595,12 @@ def _fill_track(mask: np.ndarray, layer_idx: int, track: Any, config: Electrical
     radius = 0.5 * width_mm
 
     arc = None
-    if hasattr(track, "GetMid"):
-        try:
-            middle = track.GetMid()
-            if middle is not None:
-                arc = _arc_parameters(start, middle, end)
-        except Exception:
-            arc = None
+    try:
+        middle = _stroke_midpoint(track)
+        if middle is not None:
+            arc = _arc_parameters(start, middle, end)
+    except Exception:
+        arc = None
 
     if arc is not None:
         cx, cy, arc_radius, start_angle, signed_span = arc

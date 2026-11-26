@@ -636,7 +636,7 @@ def stable_fingerprint(value: Any) -> str:
 
 def geometry_cache_key(snapshot: BoardSnapshot, grid: GridEstimate, settings, pad_keys):
     """Build a cache key containing only geometry-affecting inputs."""
-    from .geometry_mapper import normalize_via_fill
+    from .geometry_mapper import bridge_footprint_ids, normalize_via_fill
 
     raw_plating = settings.get("via_plating_um", 25.0)
     via_plating_um = 25.0 if raw_plating is None else float(raw_plating)
@@ -647,7 +647,7 @@ def geometry_cache_key(snapshot: BoardSnapshot, grid: GridEstimate, settings, pa
         if raw_area_mode is not None else None
     )
     payload = {
-        "geometry_cache_version": 4,
+        "geometry_cache_version": 5,
         "board": snapshot.fingerprint,
         "grid": {
             "res": grid.actual_res_mm,
@@ -658,6 +658,7 @@ def geometry_cache_key(snapshot: BoardSnapshot, grid: GridEstimate, settings, pa
         },
         "layers": snapshot.copper_layers,
         "ignore_traces": bool(settings.get("ignore_traces", False)),
+        "bridge_footprints": bridge_footprint_ids(settings) if settings.get("current_enabled") else (),
         "ignore_polygons": bool(settings.get("ignore_polygons", False)),
         "area_mode": area_mode,
         "limit_area": bool(settings.get("limit_area", False)),

@@ -35,6 +35,7 @@ class _WxMock:
     FD_FILE_MUST_EXIST = 0x02
     SP_ARROW_KEYS = 0x1000
     SP_WRAP = 0x2000
+    LB_EXTENDED = 0x0400
     LC_REPORT = 0x4000
     LC_SINGLE_SEL = 0x8000
     LIST_NEXT_ALL = 0
@@ -254,6 +255,30 @@ class _WxMock:
 
         def Bind(self, event, handler):
             pass
+
+    class ListBox:
+        def __init__(self, parent, choices=None, **kwargs):
+            self._items = list(choices or [])
+            self._selections = []
+
+        def SetMinSize(self, size):
+            pass
+
+        def SetToolTip(self, tip):
+            pass
+
+        def GetItems(self):
+            return list(self._items)
+
+        def Set(self, items):
+            self._items = list(items)
+            self._selections = []
+
+        def GetSelections(self):
+            return list(self._selections)
+
+        def Delete(self, index):
+            del self._items[index]
 
     class ListCtrl:
         def __init__(self, parent, style=0, **kwargs):

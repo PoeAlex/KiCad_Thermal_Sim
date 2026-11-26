@@ -47,10 +47,16 @@ from .electrical_solver import (
     ElectricalConfig,
     net_key_from_obj,
     net_key_from_values,
+    footprint_net_bridges,
+    selected_net_aliases,
     solve_electrical_heating,
 )
 from .geometry_mapper import (
     build_geometry_state,
+    bridge_footprint_ids,
+    footprint_copper_strokes,
+    footprint_library_id,
+    _stroke_midpoint,
     create_multilayer_maps,
     get_pad_copper_layer_indices,
     get_pad_pixels,
@@ -898,6 +904,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 reference = fp.GetReference()
             except Exception:
                 reference = ""
+            for stroke in footprint_copper_strokes(fp, copper_ids):
+                points = (stroke.GetStart(), _stroke_midpoint(stroke), stroke.GetEnd())
+                primitive_rows.append((
+                    "footprint copper", reference, footprint_library_id(fp),
+                    int(stroke.GetLayer()), int(stroke.GetWidth()),
+                    tuple((int(p.x), int(p.y)) if p is not None else None for p in points),
+                ))
             for pad in fp.Pads():
                 try:
                     pos = pad.GetPosition()
@@ -1180,6 +1193,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             board_size_mm=(w_mm, h_mm),
             defer_initial_preflight=True,
             stackup_thickness_mm=stackup_thickness_mm,
+            current_bridge_options=footprint_net_bridges(board),
         )
         self.settings_dialog = dlg
         self._close_startup_progress()
@@ -1539,11 +1553,22 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             if missing_current:
                 result.errors.append(f"{len(missing_current)} current-terminal pad(s) are missing from the board.")
             has_current = any(abs(float(item.current_a)) > 0.0 for item in terminals)
+            aliases = selected_net_aliases(board, settings)
+            bridge_ids = bridge_footprint_ids(settings)
+            if bridge_ids and not aliases:
+                result.warnings.append("The selected bridge footprints have no eligible pad pairs on the board.")
             totals = {}
+            labels = {}
             for item in terminals:
                 net = item.net_name or f"net:{item.net_code}"
-                totals[net] = totals.get(net, 0.0) + float(item.current_a)
-            unbalanced = [name for name, total in totals.items() if abs(total) > 1e-9]
+                key = net_key_from_values(item.net_code, item.net_name)
+                group = aliases.get(key, net)
+                totals[group] = totals.get(group, 0.0) + float(item.current_a)
+                labels.setdefault(group, set()).add(net)
+            unbalanced = [
+                " + ".join(sorted(labels[group]))
+                for group, total in totals.items() if abs(total) > 1e-9
+            ]
             if unbalanced:
                 result.errors.append("Current is not balanced for: " + ", ".join(unbalanced[:3]))
 
@@ -2095,6 +2120,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     set_dialog_state("failed", "One or more current-terminal pads were not found.")
                     return
                 if terminals:
+                    net_aliases = selected_net_aliases(board, settings)
                     electrical_config = call_with_supported_kwargs(
                         ElectricalConfig,
                         copper_ids=list(copper_ids),
@@ -2110,6 +2136,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             "via_fill": via_fill,
                             "ambient_c": float(amb),
                             "gap_m": gap_m,
+                            "net_aliases": net_aliases,
+                            "bridge_footprints": bridge_footprint_ids(settings),
                         },
                     )
                     electrical_key = stable_fingerprint({
@@ -2119,6 +2147,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         "via_plating_um": float(via_plating_um),
                         "via_fill": via_fill,
                         "ambient_c": float(amb),
+                        "net_aliases": net_aliases,
                         "terminals": [
                             (item.name, item.net_name, int(item.net_code), float(item.current_a))
                             for item in terminals
