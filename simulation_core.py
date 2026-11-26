@@ -19,10 +19,14 @@ import pcbnew
 from .capabilities import HAS_NATIVE_COMPACT, HAS_NATIVE_MG
 from .electrical_solver import (
     CurrentTerminal,
+    footprint_pad_net_pair,
     net_key_from_obj,
     net_key_from_values,
+    selected_net_aliases,
 )
 from .geometry_mapper import (
+    bridge_footprint_ids,
+    footprint_library_id,
     get_pad_copper_layer_indices,
     get_pad_power_indices,
 )
@@ -298,6 +302,9 @@ def estimate_simulation_area(
     active_keys = {
         net_key_from_values(item.net_code, item.net_name) for item in active_terms
     }
+    aliases = selected_net_aliases(board, settings)
+    active_roots = {aliases.get(key, key) for key in active_keys}
+    active_keys.update(key for key, root in aliases.items() if root in active_roots)
     active_names = tuple(sorted({
         str(item.net_name or net_key_from_values(item.net_code, item.net_name))
         for item in active_terms
@@ -338,7 +345,12 @@ def estimate_simulation_area(
             footprints = list(
                 board.Footprints() if hasattr(board, "Footprints") else board.GetFootprints()
             )
+            bridge_ids = set(bridge_footprint_ids(settings)) if aliases else set()
             for footprint in footprints:
+                if bridge_ids and footprint_library_id(footprint) in bridge_ids:
+                    pair = footprint_pad_net_pair(footprint)
+                    if pair and any(key in active_keys for key in pair):
+                        add_bbox(footprint)
                 for pad in footprint.Pads():
                     if net_key_from_obj(pad)[0] in active_keys:
                         add_bbox(pad)

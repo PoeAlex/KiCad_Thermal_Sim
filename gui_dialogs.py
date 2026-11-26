@@ -11,6 +11,9 @@ import json
 import os
 import wx
 
+from .electrical_solver import merge_net_pairs, net_key_from_values
+from .geometry_mapper import bridge_footprint_ids
+
 try:
     import wx.adv
     _HAS_WX_ADV = True
@@ -399,7 +402,7 @@ def prepare_current_groups(groups):
     return prepared
 
 
-def summarize_current_groups(groups):
+def summarize_current_groups(groups, net_aliases=None):
     """
     Build user-readable group and net balance summaries.
 
@@ -416,6 +419,8 @@ def summarize_current_groups(groups):
     prepared = prepare_current_groups(groups)
     group_rows = []
     net_totals = {}
+    net_labels = {}
+    aliases = net_aliases or {}
     for group in prepared:
         nets = sorted({p.get('net_name') or "(no net)" for p in group.get('pads', [])})
         if not nets:
@@ -433,12 +438,15 @@ def summarize_current_groups(groups):
         ))
         for pad in group.get('pads', []):
             net = pad.get('net_name') or "(no net)"
-            net_totals[net] = net_totals.get(net, 0.0) + float(pad.get('current_a', 0.0))
+            key = net_key_from_values(pad.get('net_code'), pad.get('net_name'))
+            group_key = aliases.get(key, net)
+            net_totals[group_key] = net_totals.get(group_key, 0.0) + float(pad.get('current_a', 0.0))
+            net_labels.setdefault(group_key, set()).add(net)
     balance_rows = []
-    for net, total in sorted(net_totals.items()):
+    for net, total in net_totals.items():
         status = "OK" if abs(total) <= max(1e-9, 1e-6 * abs(total)) else "Needs balance"
-        balance_rows.append((net, f"{total:.9g} A", status))
-    return group_rows, balance_rows
+        balance_rows.append((" + ".join(sorted(net_labels[net])), f"{total:.9g} A", status))
+    return group_rows, sorted(balance_rows)
 
 
 class SettingsDialog(wx.Dialog):
@@ -502,6 +510,7 @@ class SettingsDialog(wx.Dialog):
         board_size_mm=None,
         defer_initial_preflight=False,
         stackup_thickness_mm=None,
+        current_bridge_options=None,
     ):
         dialog_style = (
             getattr(wx, "DEFAULT_DIALOG_STYLE", 0)
@@ -525,6 +534,7 @@ class SettingsDialog(wx.Dialog):
         self.load_settings_callback = load_settings_callback
         self.save_settings_callback = save_settings_callback
         self.current_groups = []
+        self.current_bridge_options = current_bridge_options or {}
         self.current_group_index = -1
         self.power_pads = []
         self.initial_power_pads = [
@@ -1177,6 +1187,26 @@ class SettingsDialog(wx.Dialog):
             label="Positive currents enter the PCB; negative currents leave it."
         )
         sizer.Add(help_text, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        bridge_row = wx.StaticBoxSizer(wx.HORIZONTAL, panel, "Bridge footprints")
+        bridge_parent = bridge_row.GetStaticBox()
+        self.current_bridge_list = wx.ListBox(bridge_parent, style=wx.LB_EXTENDED)
+        self.current_bridge_list.SetMinSize((-1, 54))
+        self.current_bridge_list.SetToolTip(
+            "Solve both pad nets of every instance of the selected footprint types together. "
+            "Includes routed tracks on the pad nets and copper lines and arcs inside the footprint."
+        )
+        bridge_row.Add(self.current_bridge_list, 1, wx.EXPAND | wx.ALL, 4)
+        bridge_buttons = wx.BoxSizer(wx.VERTICAL)
+        add_bridge = wx.Button(bridge_parent, label="Add…")
+        add_bridge.Bind(wx.EVT_BUTTON, self._on_add_current_bridge)
+        add_bridge.Enable(bool(self.current_bridge_options))
+        bridge_buttons.Add(add_bridge, 0, wx.EXPAND | wx.BOTTOM, 3)
+        remove_bridge = wx.Button(bridge_parent, label="Remove")
+        remove_bridge.Bind(wx.EVT_BUTTON, self._on_remove_current_bridge)
+        bridge_buttons.Add(remove_bridge, 0, wx.EXPAND)
+        bridge_row.Add(bridge_buttons, 0, wx.ALL, 4)
+        sizer.Add(bridge_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
         balance_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Net Balance")
         balance_parent = balance_box.GetStaticBox()
@@ -2119,7 +2149,7 @@ class SettingsDialog(wx.Dialog):
         if not self.chk_current_enabled.GetValue():
             current_text = "Current heating off"
         else:
-            _, balance_rows = summarize_current_groups(self.current_groups)
+            _, balance_rows = self._summarize_current_groups()
             if not balance_rows:
                 current_text = "Current heating on / no terminals"
             elif any(status != "OK" for _, _, status in balance_rows):
@@ -2312,6 +2342,36 @@ class SettingsDialog(wx.Dialog):
         group['mode'] = 'total' if self.current_mode_choice.GetSelection() == 1 else 'per_pad'
         group['total_current_a'] = float(self.current_total_input.GetValue())
 
+    def _on_add_current_bridge(self, event):
+        selected = set(self.current_bridge_list.GetItems())
+        available = sorted(self.current_bridge_options.keys() - selected)
+        if not available:
+            return
+        dialog = wx.MultiChoiceDialog(
+            self, "Select footprint types with two copper-connected terminals.",
+            "Add bridge footprints", available,
+        )
+        try:
+            if dialog.ShowModal() == wx.ID_OK:
+                selected.update(available[index] for index in dialog.GetSelections())
+                self.current_bridge_list.Set(sorted(selected))
+                self._render_current_groups()
+        finally:
+            dialog.Destroy()
+
+    def _on_remove_current_bridge(self, event):
+        for index in sorted(self.current_bridge_list.GetSelections(), reverse=True):
+            self.current_bridge_list.Delete(index)
+        self._render_current_groups()
+
+    def _summarize_current_groups(self):
+        pairs = [
+            pair for footprint_id in self.current_bridge_list.GetItems()
+            for pair in self.current_bridge_options.get(footprint_id, [])
+        ]
+        aliases = merge_net_pairs(pairs) if self.chk_current_enabled.GetValue() else {}
+        return summarize_current_groups(self.current_groups, aliases)
+
     def _render_current_groups(self):
         """Refresh group list, pad table, and net-balance text."""
         self.current_groups = prepare_current_groups(self.current_groups)
@@ -2319,7 +2379,7 @@ class SettingsDialog(wx.Dialog):
             self.current_group_index = 0
         try:
             self.current_group_list.DeleteAllItems()
-            rows, balance_rows = summarize_current_groups(self.current_groups)
+            rows, balance_rows = self._summarize_current_groups()
             for row_idx, row in enumerate(rows):
                 self.current_group_list.InsertItem(row_idx, row[0])
                 for col_idx, value in enumerate(row[1:], start=1):
@@ -2327,7 +2387,7 @@ class SettingsDialog(wx.Dialog):
             if 0 <= self.current_group_index < len(self.current_groups):
                 self.current_group_list.Select(self.current_group_index)
         except Exception:
-            _, balance_rows = summarize_current_groups(self.current_groups)
+            _, balance_rows = self._summarize_current_groups()
 
         lines = []
         for net, total, status in balance_rows:
@@ -2538,6 +2598,7 @@ class SettingsDialog(wx.Dialog):
                 'mesh_mode': 'uniform',
                 'time_stepping': time_stepping,
                 'current_enabled': self.chk_current_enabled.GetValue(),
+                'current_bridge_footprints': self.current_bridge_list.GetItems(),
                 'current_groups': current_groups,
             }
         except ValueError:
@@ -2710,6 +2771,7 @@ class SettingsDialog(wx.Dialog):
                 bool(defaults.get('current_enabled', self.chk_current_enabled.GetValue()))
             )
             self.current_groups = prepare_current_groups(defaults.get('current_groups', []))
+            self.current_bridge_list.Set(list(bridge_footprint_ids(defaults)))
             self.current_group_index = 0 if self.current_groups else -1
             self._render_current_groups()
             if self.chk_heatsink.GetValue():

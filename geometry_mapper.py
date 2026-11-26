@@ -455,6 +455,42 @@ def _segment_parameters(start, end):
     return sx, sy, vx, vy, vx * vx + vy * vy
 
 
+def footprint_library_id(footprint):
+    getter = getattr(footprint, "GetFPID", None)
+    return getter().GetUniStringLibId() if getter is not None else ""
+
+
+def bridge_footprint_ids(settings):
+    """Read the selection, including settings saved with the single-footprint UI."""
+    values = settings.get("current_bridge_footprints")
+    if values is None:
+        values = [settings.get("current_bridge_footprint")]
+    if not isinstance(values, (list, tuple)):
+        return ()
+    return tuple(sorted({value for value in values if isinstance(value, str) and value}))
+
+
+def footprint_copper_strokes(footprint, copper_ids):
+    """Yield the straight and curved copper strokes inside a footprint."""
+    if not hasattr(footprint, "GraphicalItems"):
+        return
+    supported = {getattr(pcbnew, name, None) for name in ("SHAPE_T_SEGMENT", "SHAPE_T_ARC")}
+    supported.discard(None)
+    for shape in footprint.GraphicalItems():
+        if (shape.GetLayer() in copper_ids and hasattr(shape, "GetShape")
+                and shape.GetShape() in supported and shape.GetWidth() > 0):
+            yield shape
+
+
+def _stroke_midpoint(stroke):
+    if hasattr(stroke, "GetMid"):
+        return stroke.GetMid()
+    if (hasattr(stroke, "GetArcMid") and hasattr(stroke, "GetShape")
+            and stroke.GetShape() == getattr(pcbnew, "SHAPE_T_ARC", None)):
+        return stroke.GetArcMid()
+    return None
+
+
 def _state_fill_segment(state, l_idx, track):
     """Rasterize a straight track using its centreline and actual width."""
     try:
@@ -538,7 +574,7 @@ def _state_fill_arc(state, l_idx, track):
     """Rasterize a circular PCB arc when start/mid/end are available."""
     try:
         start = track.GetStart()
-        middle = track.GetMid()
+        middle = _stroke_midpoint(track)
         end = track.GetEnd()
         arc = _arc_parameters(start, middle, end)
         if arc is None:
@@ -1799,6 +1835,7 @@ def build_geometry_state(
 
     lid_to_idx = {lid: i for i, lid in enumerate(copper_ids)}
     ignore_traces = settings.get('ignore_traces')
+    bridge_ids = set(bridge_footprint_ids(settings)) if settings.get("current_enabled") else set()
     ignore_polygons = settings.get('ignore_polygons')
     use_heatsink = settings.get('use_heatsink')
     tracker = _ProgressEmitter(progress_callback, cancel_check)
@@ -1910,6 +1947,13 @@ def build_geometry_state(
                 f"Mapping footprint pads ({fp_idx + 1} / {total_fps})...",
                 force=(fp_idx == 0),
             )
+            if not ignore_traces and bridge_ids and footprint_library_id(fp) in bridge_ids:
+                for shape in footprint_copper_strokes(fp, copper_ids):
+                    layer_idx = lid_to_idx[shape.GetLayer()]
+                    if _stroke_midpoint(shape) is not None:
+                        _state_fill_arc(state, layer_idx, shape)
+                    else:
+                        _state_fill_segment(state, layer_idx, shape)
             for pad in fp.Pads():
                 pad_layers = get_pad_copper_layer_indices(pad, copper_ids, lid_to_idx)
                 if pad_layers:
