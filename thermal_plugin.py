@@ -307,7 +307,7 @@ class _UiProgressReporter:
 from .pwl_parser import parse_pwl_file
 from .visualization import (
     save_snapshot, show_results_top_bot, show_results_all_layers, save_preview_image,
-    build_interactive_heatmap_payload, save_joule_loss_map
+    build_interactive_heatmap_payload, save_full_grid_temperature_pngs, save_joule_loss_map
 )
 from .thermal_report import write_html_report
 from .workflow import (
@@ -2611,6 +2611,16 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             if reporter.cancelled:
                 raise GeometryCancelledError("Simulation cancelled.")
 
+            full_grid_png_paths = []
+            if settings.get("full_grid_pngs"):
+                full_grid_png_paths = reporter.run_in_background(
+                    lambda: save_full_grid_temperature_pngs(
+                        result.T, layer_names, res, run_dir,
+                        cancel_check=reporter.make_cancel_check(),
+                    ),
+                    97, 98, "Exporting full-grid temperature PNGs...",
+                )
+
             snapshot_debug = {
                 "snapshots_enabled": settings.get('snapshots'),
                 "snap_count": settings.get('snap_count'),
@@ -2651,9 +2661,10 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     snapshot_files=result.snapshot_files,
                     interactive_heatmap=interactive_heatmap,
                     electrical_summary=electrical_summary,
-                    joule_map_path=joule_map_path
+                    joule_map_path=joule_map_path,
+                    full_grid_png_paths=full_grid_png_paths,
                 ),
-                97,
+                98 if full_grid_png_paths else 97,
                 99,
                 "Writing HTML report...",
             )
@@ -2669,6 +2680,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 report_path=report_path,
                 heatmap_path=heatmap_path,
                 preview_path=preview_path,
+                **({"full_grid_png_paths": full_grid_png_paths} if full_grid_png_paths else {}),
             )
             elapsed_s = time.perf_counter() - run_started_at
             max_temp_c = float(np.max(result.T))

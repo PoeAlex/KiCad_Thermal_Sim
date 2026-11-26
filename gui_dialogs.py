@@ -820,6 +820,12 @@ class SettingsDialog(wx.Dialog):
         box_out.Add(output_options, 0, wx.EXPAND | wx.ALL, 3)
         self.chk_snapshots.Bind(wx.EVT_CHECKBOX, self._on_snapshots_toggle)
 
+        self.chk_full_grid_pngs = wx.CheckBox(output_parent, label="Export full-grid temperature PNGs")
+        self.chk_full_grid_pngs.SetToolTip(
+            "Save an annotated image for each copper layer with one pixel per solver cell."
+        )
+        box_out.Add(self.chk_full_grid_pngs, 0, wx.ALL, 3)
+
         # Output folder
         row_path = wx.BoxSizer(wx.HORIZONTAL)
         lbl_path = wx.StaticText(output_parent, label="Output folder", size=(160, -1))
@@ -2504,6 +2510,7 @@ class SettingsDialog(wx.Dialog):
                 'thick': float(self.thick_input.GetValue()),
                 'res': float(self.res_input.GetValue()),
                 'show_all': self.chk_all_layers.GetValue(),
+                'full_grid_pngs': self.chk_full_grid_pngs.GetValue(),
                 'snapshots': self.chk_snapshots.GetValue(),
                 'snap_count': int(self.snap_count_input.GetValue()),
                 'output_dir': self.output_dir_input.GetValue().strip(),
@@ -2572,6 +2579,7 @@ class SettingsDialog(wx.Dialog):
             self.chk_all_layers.SetValue(
                 bool(defaults.get('show_all', self.chk_all_layers.GetValue()))
             )
+            self.chk_full_grid_pngs.SetValue(bool(defaults.get('full_grid_pngs', False)))
             self.chk_snapshots.SetValue(
                 bool(defaults.get('snapshots', self.chk_snapshots.GetValue()))
             )
