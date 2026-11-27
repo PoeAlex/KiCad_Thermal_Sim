@@ -290,6 +290,8 @@ def _build_image_card(title, path, empty_message):
         caption = "Inspect the mapped board geometry used for the simulation."
     elif title == "Joule Loss Map":
         caption = "Static per-layer map of current-induced copper losses."
+    elif title == "Current Density Map":
+        caption = "Static per-layer map of DC current density (A/mm^2) with peak-preserving pooling."
     else:
         caption = "Static export of the final multilayer temperature field."
     return (
@@ -631,7 +633,12 @@ def _build_warning_block(warnings):
     return f"<div class='warning-list'><strong>Warnings</strong><ul>{items}</ul></div>"
 
 
-def _build_current_path_diagnostics(electrical_summary, k_norm_info, joule_map_path):
+def _build_current_path_diagnostics(
+    electrical_summary,
+    k_norm_info,
+    joule_map_path,
+    current_density_path=None,
+):
     """Render current-path diagnostics for the report."""
     if not electrical_summary or not electrical_summary.get("nets"):
         return "<div class='empty-state'>No current path diagnostics recorded.</div>"
@@ -641,17 +648,36 @@ def _build_current_path_diagnostics(electrical_summary, k_norm_info, joule_map_p
     total_source = sum(float(net.get("source_current_a", 0.0) or 0.0) for net in nets)
     total_sink = sum(float(net.get("sink_current_a", 0.0) or 0.0) for net in nets)
     max_cell = max((float(net.get("max_node_power_w", 0.0) or 0.0) for net in nets), default=0.0)
+    max_j = max((float(net.get("max_current_density_a_mm2", 0.0) or 0.0) for net in nets), default=0.0)
+    max_via_i = max((float(net.get("max_via_current_a", 0.0) or 0.0) for net in nets), default=0.0)
     first_net = nets[0] if len(nets) == 1 else {}
     actual_res = (k_norm_info or {}).get("grid_res_mm")
 
-    cards = _build_cards([
+    card_items = [
         ("Copper Loss", _fmt_compact(total_loss, " W"), "all active nets"),
         ("R_eff", _fmt_compact(first_net.get("effective_resistance_ohm"), " ohm") if first_net else "see table", "P / I_source^2"),
         ("V_eq", _fmt_compact(first_net.get("equivalent_voltage_drop_v"), " V") if first_net else "see table", "P / I_source"),
         ("Source/Sink Current", f"{_fmt_num(total_source, 4, ' A')} / {_fmt_num(total_sink, 4, ' A')}", "sum over active nets"),
         ("Max Cell Loss", _fmt_compact(max_cell, " W"), None),
         ("Actual Resolution", _fmt_num(actual_res, 3, " mm"), "used by electrical grid"),
-    ])
+    ]
+    et_passes = electrical_summary.get("electro_thermal_passes")
+    if et_passes is not None:
+        init_loss = electrical_summary.get("initial_loss_w")
+        coup_loss = electrical_summary.get("coupled_loss_w")
+        pass_label = f"{int(et_passes)} pass" if int(et_passes) == 1 else f"{int(et_passes)} passes"
+        detail_label = (
+            f"{_fmt_compact(init_loss, ' W')} -> {_fmt_compact(coup_loss, ' W')}"
+            if init_loss is not None and coup_loss is not None
+            else "rho_cu(T)"
+        )
+        card_items.append(("Electro-Thermal Coupling", pass_label, detail_label))
+    if max_j > 0.0:
+        card_items.append(("Max Current Density", f"{max_j:.2f} A/mm^2", "peak across nets"))
+    if max_via_i > 0.0:
+        card_items.append(("Peak Via Current", f"{max_via_i:.3f} A", "highest loaded via"))
+
+    cards = _build_cards(card_items)
 
     net_rows = []
     for net in nets:
@@ -673,25 +699,49 @@ def _build_current_path_diagnostics(electrical_summary, k_norm_info, joule_map_p
     terminal_rows = []
     for net in nets:
         for term in net.get("terminal_diagnostics", []) or []:
-            bbox = term.get("bbox_mm") or []
-            bbox_label = "n/a"
-            if len(bbox) == 4:
-                bbox_label = (
-                    f"{_fmt_num(bbox[0], 3)}, {_fmt_num(bbox[1], 3)}, "
-                    f"{_fmt_num(bbox[2], 3)} x {_fmt_num(bbox[3], 3)} mm"
-                )
+            current_val = float(term.get("current_a", 0.0) or 0.0)
+            bus_name = term.get("bus_name")
+            if bus_name:
+                role_label = str(bus_name)
+            elif current_val > 0.0:
+                role_label = "Source (Fixed)"
+            elif current_val < 0.0:
+                role_label = "Sink (Fixed)"
+            else:
+                role_label = "Terminal"
+            mean_v = term.get("mean_potential_v")
+            mv_label = f"{float(mean_v) * 1000.0:.3f} mV" if mean_v is not None else "n/a"
             comps = term.get("component_ids", [])
             terminal_rows.append((
                 term.get("name", ""),
                 net.get("net", net.get("net_name", "")),
+                role_label,
                 _fmt_num(term.get("current_a"), 4, " A"),
+                mv_label,
                 term.get("layer", ""),
                 f"{_fmt_num(term.get('x_mm'), 3)}, {_fmt_num(term.get('y_mm'), 3)} mm",
-                bbox_label,
                 term.get("cell_count", ""),
                 ", ".join(str(comp) for comp in comps) if comps else "n/a",
-                _fmt_compact(term.get("mean_potential_v"), " V"),
             ))
+
+    top_via_rows = []
+    all_vias = []
+    for net in nets:
+        net_label = net.get("net", net.get("net_name", ""))
+        for via in net.get("top_vias", []) or []:
+            all_vias.append((float(via.get("current_a", 0.0) or 0.0), net_label, via))
+    all_vias.sort(key=lambda item: item[0], reverse=True)
+    for _, net_label, via in all_vias[:15]:
+        pwr_w = via.get("power_w")
+        pwr_mw = f"{float(pwr_w) * 1000.0:.3f} mW" if pwr_w is not None else "n/a"
+        top_via_rows.append((
+            via.get("net_name") or net_label,
+            f"{_fmt_num(via.get('x_mm'), 3)}, {_fmt_num(via.get('y_mm'), 3)} mm",
+            _fmt_num(via.get("drill_mm"), 3, " mm"),
+            via.get("layers", ""),
+            _fmt_num(via.get("current_a"), 4, " A"),
+            pwr_mw,
+        ))
 
     primitive_rows = []
     for net in nets:
@@ -714,20 +764,31 @@ def _build_current_path_diagnostics(electrical_summary, k_norm_info, joule_map_p
                 prim.get("mapped_cell_count", ""),
             ))
 
-    image_html = ""
+    image_cards = []
     if joule_map_path:
-        image_html = (
-            "<div class='spacer-sm'></div>"
-            f"{_build_image_card('Joule Loss Map', os.path.basename(joule_map_path), 'Joule loss map not available.')}"
+        image_cards.append(
+            _build_image_card('Joule Loss Map', os.path.basename(joule_map_path), 'Joule loss map not available.')
         )
+    if current_density_path:
+        image_cards.append(
+            _build_image_card('Current Density Map', os.path.basename(current_density_path), 'Current density map not available.')
+        )
+    image_html = ""
+    if image_cards:
+        if len(image_cards) > 1:
+            image_html = f"<div class='spacer-sm'></div><div class='image-grid'>{''.join(image_cards)}</div>"
+        else:
+            image_html = f"<div class='spacer-sm'></div>{image_cards[0]}"
 
     return (
         f"{cards}<div class='spacer-sm'></div>"
         f"{_build_warning_block(_current_path_warnings(electrical_summary, k_norm_info))}"
         "<h3 class='section-title'>Net Path Metrics</h3>"
         f"{_table_html(['Net', 'Terminals', 'Source/Sink', 'Balance', 'Loss', 'R_eff', 'V_eq', 'Pad R', 'Cells', 'Edges', 'Via Edges', 'Islands'], net_rows, empty_text='No net path metrics recorded.')}"
-        "<div class='spacer-sm'></div><h3 class='section-title'>Current Terminals</h3>"
-        f"{_table_html(['Pad', 'Net', 'Current', 'Layer', 'Position', 'BBox', 'Cells', 'Island', 'Potential'], terminal_rows, empty_text='No terminal diagnostics recorded.')}"
+        "<div class='spacer-sm'></div><h3 class='section-title'>Terminal Current Sharing &amp; Voltage</h3>"
+        f"{_table_html(['Pad', 'Net', 'Bus / Role', 'Solved Current', 'Potential', 'Layer', 'Position', 'Cells', 'Island'], terminal_rows, empty_text='No terminal diagnostics recorded.')}"
+        "<div class='spacer-sm'></div><h3 class='section-title'>Top Vias by Current</h3>"
+        f"{_table_html(['Net', 'Coordinates', 'Drill', 'Layers', 'Current', 'Joule Power'], top_via_rows, empty_text='No via current diagnostics recorded.')}"
         "<div class='spacer-sm'></div><h3 class='section-title'>Mapped KiCad Primitives</h3>"
         f"{_table_html(['Net', 'Type', 'Layer', 'Count', 'Track Length', 'Width min/avg/max', 'BBox Area', 'Mapped Cells'], primitive_rows, empty_text='No primitive diagnostics recorded.')}"
         f"{image_html}"
@@ -748,7 +809,8 @@ def write_html_report(
     snapshot_files=None,
     interactive_heatmap=None,
     electrical_summary=None,
-    joule_map_path=None
+    joule_map_path=None,
+    current_density_path=None,
 ):
     """Generate an HTML report for the thermal simulation."""
     out_dir = out_dir or os.path.dirname(__file__)
@@ -881,7 +943,7 @@ def write_html_report(
         f"{_table_html(['Net', 'Terminals', 'Path Current', 'Source/Sink Current', 'Copper Loss', 'Max Cell Loss'], current_rows, empty_text='No current heating recorded.')}"
         f"{_table_html(['#', 'Warning'], current_warning_rows, empty_text='No current heating warnings.')}"
         "<div class='spacer-sm'></div><h3 class='section-title'>Current Path Diagnostics</h3>"
-        f"{_build_current_path_diagnostics(electrical_summary, k_norm_info, joule_map_path)}"
+        f"{_build_current_path_diagnostics(electrical_summary, k_norm_info, joule_map_path, current_density_path=current_density_path)}"
         "</div></div>"
         f"{_details_block('Snapshots', _build_snapshot_gallery(snapshot_items) + _build_snapshot_stats_table(snapshot_debug), open_by_default=False)}"
         "</section>"

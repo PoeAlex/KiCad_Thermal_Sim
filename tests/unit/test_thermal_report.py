@@ -1107,3 +1107,100 @@ class TestWriteHtmlReportDynamicHeatsink:
         assert "t = 0.125 s" in content
         assert "payload.x_min_mm+(cell.col+0.5)*payload.res_mm" in content
         assert "payload.y_min_mm+(cell.row+0.5)*payload.res_mm" in content
+
+    def test_v050_report_renders_coupling_sharing_top_vias_and_current_density(self, base_params, temp_dir):
+        """Report embeds current_density.png, Electro-Thermal Coupling, Terminal Sharing & Voltage, and Top Vias."""
+        joule_map = os.path.join(temp_dir, "joule_loss_map.png")
+        j_dens_map = os.path.join(temp_dir, "current_density.png")
+        for p in (joule_map, j_dens_map):
+            with open(p, 'wb') as f:
+                f.write(b'\x89PNG\r\n\x1a\n')
+
+        params = base_params.copy()
+        params['joule_map_path'] = joule_map
+        params['current_density_path'] = j_dens_map
+        params['electrical_summary'] = {
+            'total_loss_w': 1.25,
+            'electro_thermal_passes': 2,
+            'initial_loss_w': 1.00,
+            'coupled_loss_w': 1.25,
+            'warnings': [],
+            'nets': [
+                {
+                    'net': '+12V',
+                    'net_name': '+12V',
+                    'terminal_count': 3,
+                    'source_current_a': 10.0,
+                    'sink_current_a': 10.0,
+                    'current_balance_a': 0.0,
+                    'total_loss_w': 1.25,
+                    'max_node_power_w': 0.05,
+                    'effective_resistance_ohm': 0.0125,
+                    'equivalent_voltage_drop_v': 0.125,
+                    'pad_resistance_ohm': None,
+                    'copper_cell_count': 200,
+                    'edge_count': 350,
+                    'via_edge_count': 4,
+                    'connected_component_count': 1,
+                    'max_via_current_a': 4.85,
+                    'max_current_density_a_mm2': 38.4,
+                    'terminal_diagnostics': [
+                        {
+                            'name': 'J1.1',
+                            'net_name': '+12V',
+                            'bus_name': None,
+                            'current_a': 10.0,
+                            'layer': 'F.Cu',
+                            'x_mm': 5.0,
+                            'y_mm': 5.0,
+                            'cell_count': 10,
+                            'component_ids': [0],
+                            'mean_potential_v': 0.125,
+                        },
+                        {
+                            'name': 'U1.1',
+                            'net_name': '+12V',
+                            'bus_name': 'LoadBus (To)',
+                            'current_a': -6.25,
+                            'layer': 'F.Cu',
+                            'x_mm': 15.0,
+                            'y_mm': 5.0,
+                            'cell_count': 8,
+                            'component_ids': [0],
+                            'mean_potential_v': 0.0,
+                        },
+                    ],
+                    'top_vias': [
+                        {
+                            'net_name': '+12V',
+                            'x_mm': 10.0,
+                            'y_mm': 5.0,
+                            'drill_mm': 0.3,
+                            'layers': 'F.Cu-B.Cu',
+                            'current_a': 4.85,
+                            'power_w': 0.0142,
+                        }
+                    ],
+                    'primitive_diagnostics': [],
+                }
+            ],
+        }
+
+        result = write_html_report(**params)
+        with open(result, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        assert "Electro-Thermal Coupling" in content
+        assert "2 passes" in content
+        assert "1.0000 W -&gt; 1.2500 W" in content
+        assert "Terminal Current Sharing &amp; Voltage" in content
+        assert "LoadBus (To)" in content
+        assert "125.000 mV" in content
+        assert "-6.2500 A" in content
+        assert "Top Vias by Current" in content
+        assert "4.8500 A" in content
+        assert "14.200 mW" in content
+        assert "F.Cu-B.Cu" in content
+        assert "current_density.png" in content
+        assert "joule_loss_map.png" in content
+        assert "38.40 A/mm^2" in content

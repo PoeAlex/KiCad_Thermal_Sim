@@ -69,6 +69,32 @@ class CurrentTerminal:
 
 
 @dataclass
+class EquipotentialBus:
+    """
+    Multi-pad equipotential bus group sharing current naturally by copper resistance.
+
+    Parameters
+    ----------
+    name : str
+        Human-readable bus group name.
+    net_name : str
+        KiCad net name.
+    net_code : int
+        KiCad net code.
+    pads : list of (object, str)
+        List of ``(kicad_pad_obj, pad_display_name)`` belonging to the bus.
+    total_current_a : float
+        Total bus current in amperes. Positive enters PCB, negative leaves PCB.
+    """
+
+    name: str
+    net_name: str
+    net_code: int
+    pads: List[Tuple[Any, str]]
+    total_current_a: float
+
+
+@dataclass
 class ElectricalConfig:
     """
     Geometry and material settings for the electrical solve.
@@ -103,6 +129,8 @@ class ElectricalConfig:
         Reference ambient temperature in Celsius for copper TCR (default 20.0).
     gap_m : sequence of float, optional
         Dielectric thicknesses between adjacent copper layers in meters.
+    equipotential_pads : bool, optional
+        Contract all copper cells of each single pad into an equipotential supernode (default True).
     """
 
     copper_ids: List[int]
@@ -121,6 +149,7 @@ class ElectricalConfig:
     via_fill: str = "plated"
     ambient_c: float = 20.0
     gap_m: Optional[Any] = None
+    equipotential_pads: bool = True
 
 
 def _effective_rho_cu(config: ElectricalConfig) -> float:
@@ -178,6 +207,38 @@ class ElectricalTerminalDiagnostics:
     cell_count: int
     component_ids: List[int] = field(default_factory=list)
     mean_potential_v: Optional[float] = None
+    bus_name: Optional[str] = None
+
+
+@dataclass
+class ElectricalViaDiagnostics:
+    """Solved current and Joule-power diagnostics for one physical via."""
+
+    net_name: str
+    x_mm: float
+    y_mm: float
+    drill_mm: float
+    layers: str
+    current_a: float
+    power_w: float
+
+
+@dataclass
+class _ViaRecord:
+    """Internal per-via grid footprint and reference barrel conductances."""
+
+    x_mm: float
+    y_mm: float
+    drill_mm: float
+    layers: str
+    rs: int
+    re: int
+    cs: int
+    ce: int
+    mask_v: np.ndarray
+    min_l: int
+    max_l: int
+    g_per_gap: Tuple[float, ...]
 
 
 @dataclass
@@ -223,6 +284,10 @@ class ElectricalNetSummary:
     sink_pad_potential_v: Optional[float] = None
     terminal_diagnostics: List[ElectricalTerminalDiagnostics] = field(default_factory=list)
     primitive_diagnostics: List[ElectricalPrimitiveDiagnostics] = field(default_factory=list)
+    top_vias: List[ElectricalViaDiagnostics] = field(default_factory=list)
+    max_via_current_a: float = 0.0
+    current_density_a_mm2: Optional[np.ndarray] = None
+    max_current_density_a_mm2: float = 0.0
 
 
 @dataclass
@@ -240,12 +305,15 @@ class ElectricalResult:
         Non-blocking diagnostics.
     errors : list of str
         Blocking validation failures.
+    current_density_map : np.ndarray or None
+        Maximum current density (A/mm^2) across solved nets with shape ``(L, R, C)``.
     """
 
     q_joule: np.ndarray
     net_summaries: List[ElectricalNetSummary]
     warnings: List[str]
     errors: List[str]
+    current_density_map: Optional[np.ndarray] = None
 
     @property
     def valid(self) -> bool:
@@ -325,6 +393,8 @@ def solve_electrical_heating(
     config: ElectricalConfig,
     progress_callback: Optional[Callable[[int, int, str], Optional[bool]]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    equipotential_buses: Optional[List[EquipotentialBus]] = None,
+    temperature_field: Optional[np.ndarray] = None,
 ) -> ElectricalResult:
     """
     Solve electrical DC current flow and return Joule heat per thermal node.
@@ -341,6 +411,10 @@ def solve_electrical_heating(
         Callback ``(done, total, message) -> Optional[bool]``. Returning False cancels.
     cancel_check : callable, optional
         Callable returning True to cancel.
+    equipotential_buses : list of EquipotentialBus, optional
+        Multi-pad equipotential bus groups sharing current naturally by copper resistance.
+    temperature_field : np.ndarray, optional
+        Optional 3D ``(L, R, C)`` board temperature field in Celsius for local copper TCR.
 
     Returns
     -------
@@ -357,11 +431,29 @@ def solve_electrical_heating(
     warnings: List[str] = []
     summaries: List[ElectricalNetSummary] = []
 
+    sigma_grid: Optional[np.ndarray] = None
+    if temperature_field is not None:
+        t_arr = np.asarray(temperature_field, dtype=np.float64)
+        if t_arr.ndim == 1 and t_arr.size == total_nodes:
+            t_arr = t_arr.reshape((layer_count, config.rows, config.cols))
+        elif t_arr.shape != (layer_count, config.rows, config.cols):
+            raise ValueError(
+                f"temperature_field shape {t_arr.shape} does not match expected "
+                f"{(layer_count, config.rows, config.cols)}."
+            )
+        rho_local = np.maximum(
+            float(config.rho_cu) * (1.0 + 0.00393 * (t_arr - 20.0)),
+            1e-20,
+        )
+        sigma_grid = 1.0 / rho_local
+
     active_terms = [t for t in terminals if abs(float(t.current_a)) > 0.0]
-    if not active_terms:
+    active_buses = [b for b in (equipotential_buses or []) if abs(float(b.total_current_a)) > 0.0]
+    if not active_terms and not active_buses:
         return ElectricalResult(q_total, summaries, warnings, errors)
 
     terms_by_net: Dict[str, List[CurrentTerminal]] = {}
+    buses_by_net: Dict[str, List[EquipotentialBus]] = {}
     net_display: Dict[str, str] = {}
     for term in active_terms:
         key = net_key_from_values(term.net_code, term.net_name)
@@ -369,10 +461,23 @@ def solve_electrical_heating(
         net_display[key] = term.net_name or key
         if key == "NO_NET":
             errors.append(f"{term.name}: current terminal has no KiCad net.")
+    for bus in active_buses:
+        key = net_key_from_values(bus.net_code, bus.net_name)
+        buses_by_net.setdefault(key, []).append(bus)
+        net_display.setdefault(key, bus.net_name or key)
+        if bus.net_name and net_display.get(key) == key:
+            net_display[key] = bus.net_name
+        if key == "NO_NET":
+            errors.append(f"{bus.name}: equipotential bus has no KiCad net.")
+        if not bus.pads:
+            errors.append(f"{bus.name}: equipotential bus has no pads.")
 
-    for key, terms in terms_by_net.items():
-        total = float(sum(t.current_a for t in terms))
-        total_abs = float(sum(abs(t.current_a) for t in terms))
+    relevant_nets = set(terms_by_net) | set(buses_by_net)
+    for key in relevant_nets:
+        terms = terms_by_net.get(key, [])
+        buses = buses_by_net.get(key, [])
+        total = float(sum(t.current_a for t in terms) + sum(b.total_current_a for b in buses))
+        total_abs = float(sum(abs(t.current_a) for t in terms) + sum(abs(b.total_current_a) for b in buses))
         tol = max(config.balance_abs_tol, config.balance_rel_tol * total_abs)
         if abs(total) > tol:
             errors.append(
@@ -390,10 +495,18 @@ def solve_electrical_heating(
             tracker.emit(scaled, 100, msg, force=True)
         mask_progress_cb = _mask_progress
 
-    net_masks, via_masks, via_g_maps, primitive_summaries, collision_count = _build_relevant_net_data(
+    (
+        net_masks,
+        via_masks,
+        via_g_maps,
+        width_scales,
+        via_records,
+        primitive_summaries,
+        collision_count,
+    ) = _build_relevant_net_bundle(
         board,
         config,
-        set(terms_by_net),
+        relevant_nets,
         progress_callback=mask_progress_cb,
         cancel_check=cancel_check,
         compute_via_conductance=True,
@@ -405,8 +518,12 @@ def solve_electrical_heating(
         )
         return ElectricalResult(q_total, summaries, warnings, errors)
 
-    total_nets = max(1, len(terms_by_net))
-    for net_idx, (key, terms) in enumerate(terms_by_net.items()):
+    ordered_nets = list(dict.fromkeys(list(terms_by_net.keys()) + list(buses_by_net.keys())))
+    total_nets = max(1, len(ordered_nets))
+    current_density_map: Optional[np.ndarray] = None
+    for net_idx, key in enumerate(ordered_nets):
+        terms = terms_by_net.get(key, [])
+        buses = buses_by_net.get(key, [])
         net_label = net_display.get(key, key)
         tracker.emit(
             50 + int(50 * net_idx / total_nets),
@@ -429,14 +546,49 @@ def solve_electrical_heating(
             primitive_summaries.get(key, []),
             cancel_check=cancel_check,
             via_g_map=via_g_maps.get(key),
+            buses=buses,
+            width_scale=width_scales.get(key),
+            via_records=via_records.get(key, []),
+            sigma_grid=sigma_grid,
         )
         q_total += result.q_joule
         summaries.extend(result.net_summaries)
         warnings.extend(result.warnings)
         errors.extend(result.errors)
+        if result.current_density_map is not None:
+            if current_density_map is None:
+                current_density_map = result.current_density_map.copy()
+            else:
+                np.maximum(current_density_map, result.current_density_map, out=current_density_map)
 
     tracker.emit(100, 100, "Electrical solve complete.", force=True)
-    return ElectricalResult(q_total, summaries, warnings, errors)
+    return ElectricalResult(
+        q_total,
+        summaries,
+        warnings,
+        errors,
+        current_density_map=current_density_map,
+    )
+
+
+def _merge_duplicate_terminals(terms: List[CurrentTerminal]) -> List[CurrentTerminal]:
+    """Merge multiple CurrentTerminal entries targeting the same pad object by summing currents."""
+    merged: Dict[int, CurrentTerminal] = {}
+    order: List[int] = []
+    for term in terms:
+        pid = id(term.pad)
+        if pid not in merged:
+            merged[pid] = CurrentTerminal(
+                pad=term.pad,
+                name=term.name,
+                net_name=term.net_name,
+                net_code=term.net_code,
+                current_a=float(term.current_a),
+            )
+            order.append(pid)
+        else:
+            merged[pid].current_a += float(term.current_a)
+    return [merged[pid] for pid in order]
 
 
 def _solve_one_net(
@@ -449,6 +601,10 @@ def _solve_one_net(
     primitive_diagnostics: Optional[List[ElectricalPrimitiveDiagnostics]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     via_g_map: Optional[np.ndarray] = None,
+    buses: Optional[List[EquipotentialBus]] = None,
+    width_scale: Optional[np.ndarray] = None,
+    via_records: Optional[List[_ViaRecord]] = None,
+    sigma_grid: Optional[np.ndarray] = None,
 ) -> ElectricalResult:
     """Solve one isolated net and return a full-size heat vector."""
     layer_count = len(config.copper_ids)
@@ -470,42 +626,148 @@ def _solve_one_net(
     node_ids = node_ids.reshape(copper_mask.shape)
 
     edge_i, edge_j, edge_g, via_edge_count = _build_net_edges(
-        copper_mask, via_mask, node_ids, config, via_g_map=via_g_map
+        copper_mask,
+        via_mask,
+        node_ids,
+        config,
+        via_g_map=via_g_map,
+        width_scale=width_scale,
+        sigma_grid=sigma_grid,
     )
-    if edge_i.size:
-        adj = sp.coo_matrix(
-            (
-                np.ones(edge_i.size * 2, dtype=np.int8),
-                (np.concatenate([edge_i, edge_j]), np.concatenate([edge_j, edge_i])),
-            ),
-            shape=(node_count, node_count),
-        ).tocsr()
-        comp_count, labels = connected_components(adj, directed=False, return_labels=True)
-    else:
-        comp_count = node_count
-        labels = np.arange(node_count, dtype=np.int64)
 
-    rhs = np.zeros(node_count, dtype=np.float64)
-    terminal_components = set()
-    terminal_component_current: Dict[int, float] = {}
-    terminal_records = []
+    merged_terms = _merge_duplicate_terminals(terms)
+    active_buses = list(buses or [])
 
-    for term in terms:
+    parent = np.arange(node_count, dtype=np.int64)
+    touched_nodes: set = set()
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = int(parent[x])
+        return x
+
+    def _union_nodes(nodes: np.ndarray) -> None:
+        if nodes.size == 0:
+            return
+        for item in nodes:
+            touched_nodes.add(int(item))
+        if nodes.size == 1:
+            return
+        r0 = _find(int(nodes[0]))
+        for item in nodes[1:]:
+            rk = _find(int(item))
+            if rk != r0:
+                parent[rk] = r0
+
+    term_entries: List[Tuple[CurrentTerminal, np.ndarray]] = []
+    for term in merged_terms:
         pad_nodes = _pad_node_indices(term.pad, node_ids, config)
         if pad_nodes.size == 0:
             errors.append(f"{term.name}: no copper cell found for current injection on net {net_name}.")
             continue
-        current = float(term.current_a)
         unique_pad_nodes = np.unique(pad_nodes)
-        rhs[pad_nodes] += current / float(pad_nodes.size)
-        comps = set(int(labels[node]) for node in unique_pad_nodes)
-        terminal_components.update(comps)
-        for comp in comps:
-            in_comp = labels[pad_nodes] == comp
-            terminal_component_current[comp] = terminal_component_current.get(comp, 0.0) + (
-                current * float(np.count_nonzero(in_comp)) / float(pad_nodes.size)
+        if config.equipotential_pads:
+            _union_nodes(unique_pad_nodes)
+        term_entries.append((term, unique_pad_nodes))
+
+    bus_entries: List[Tuple[EquipotentialBus, List[Tuple[Any, str, np.ndarray]], np.ndarray]] = []
+    for bus in active_buses:
+        pad_list: List[Tuple[Any, str, np.ndarray]] = []
+        all_nodes_parts: List[np.ndarray] = []
+        for pad_obj, pad_label in bus.pads:
+            pad_nodes = _pad_node_indices(pad_obj, node_ids, config)
+            if pad_nodes.size == 0:
+                errors.append(
+                    f"{pad_label}: no copper cell found for equipotential bus "
+                    f"{bus.name} on net {net_name}."
+                )
+                continue
+            unique_pad_nodes = np.unique(pad_nodes)
+            pad_list.append((pad_obj, str(pad_label), unique_pad_nodes))
+            all_nodes_parts.append(unique_pad_nodes)
+        if not all_nodes_parts:
+            continue
+        all_bus_nodes = np.unique(np.concatenate(all_nodes_parts))
+        _union_nodes(all_bus_nodes)
+        bus_entries.append((bus, pad_list, all_bus_nodes))
+
+    if errors:
+        return ElectricalResult(q_full, [], warnings, errors)
+
+    roots = np.arange(node_count, dtype=np.int64)
+    for node in touched_nodes:
+        roots[node] = _find(node)
+    _, supernode_of = np.unique(roots, return_inverse=True)
+    super_count = int(np.max(supernode_of)) + 1 if node_count > 0 else 0
+
+    if edge_i.size:
+        su = supernode_of[edge_i]
+        sv = supernode_of[edge_j]
+        keep = su != sv
+        c_i = su[keep]
+        c_j = sv[keep]
+        c_g = edge_g[keep]
+    else:
+        c_i = np.empty(0, dtype=np.int64)
+        c_j = np.empty(0, dtype=np.int64)
+        c_g = np.empty(0, dtype=np.float64)
+
+    if c_i.size:
+        adj = sp.coo_matrix(
+            (
+                np.ones(c_i.size * 2, dtype=np.int8),
+                (np.concatenate([c_i, c_j]), np.concatenate([c_j, c_i])),
+            ),
+            shape=(super_count, super_count),
+        ).tocsr()
+        comp_count, labels = connected_components(adj, directed=False, return_labels=True)
+    else:
+        comp_count = super_count
+        labels = np.arange(super_count, dtype=np.int64)
+
+    rhs_super = np.zeros(super_count, dtype=np.float64)
+    terminal_components = set()
+    terminal_component_current: Dict[int, float] = {}
+    terminal_records: List[Tuple[CurrentTerminal, np.ndarray, List[int]]] = []
+
+    for term, unique_pad_nodes in term_entries:
+        current = float(term.current_a)
+        s_nodes = supernode_of[unique_pad_nodes]
+        if config.equipotential_pads:
+            s_id = int(s_nodes[0])
+            rhs_super[s_id] += current
+            comps = {int(labels[s_id])}
+            terminal_components.update(comps)
+            terminal_component_current[int(labels[s_id])] = (
+                terminal_component_current.get(int(labels[s_id]), 0.0) + current
             )
+        else:
+            np.add.at(rhs_super, s_nodes, current / float(unique_pad_nodes.size))
+            comps = {int(labels[int(sn)]) for sn in s_nodes}
+            terminal_components.update(comps)
+            for comp in comps:
+                in_comp = labels[s_nodes] == comp
+                terminal_component_current[comp] = terminal_component_current.get(comp, 0.0) + (
+                    current * float(np.count_nonzero(in_comp)) / float(unique_pad_nodes.size)
+                )
         terminal_records.append((term, unique_pad_nodes, sorted(comps)))
+
+    bus_records: List[Tuple[EquipotentialBus, List[Tuple[Any, str, np.ndarray, List[int]]], np.ndarray]] = []
+    for bus, pad_list, all_bus_nodes in bus_entries:
+        bus_current = float(bus.total_current_a)
+        s_bus = int(supernode_of[all_bus_nodes[0]])
+        rhs_super[s_bus] += bus_current
+        bus_comp = int(labels[s_bus])
+        terminal_components.add(bus_comp)
+        terminal_component_current[bus_comp] = (
+            terminal_component_current.get(bus_comp, 0.0) + bus_current
+        )
+        pad_recs = []
+        for pad_obj, pad_label, unique_pad_nodes in pad_list:
+            p_comps = sorted({int(labels[int(supernode_of[n])]) for n in unique_pad_nodes})
+            pad_recs.append((pad_obj, pad_label, unique_pad_nodes, p_comps))
+        bus_records.append((bus, pad_recs, all_bus_nodes))
 
     if len(terminal_components) > 1:
         errors.append(
@@ -513,7 +775,10 @@ def _solve_one_net(
             f"({len(terminal_components)} separate copper islands)."
         )
 
-    total_abs = float(sum(abs(t.current_a) for t in terms))
+    total_abs = float(
+        sum(abs(float(t.current_a)) for t in terms)
+        + sum(abs(float(b.total_current_a)) for b in active_buses)
+    )
     tol = max(config.balance_abs_tol, config.balance_rel_tol * total_abs)
     for comp, comp_current in terminal_component_current.items():
         if abs(comp_current) > tol:
@@ -525,16 +790,16 @@ def _solve_one_net(
     if errors:
         return ElectricalResult(q_full, [], warnings, errors)
 
-    if edge_i.size:
-        rows = np.concatenate([edge_i, edge_j, edge_i, edge_j])
-        cols = np.concatenate([edge_i, edge_j, edge_j, edge_i])
-        data = np.concatenate([edge_g, edge_g, -edge_g, -edge_g])
-        lap = sp.coo_matrix((data, (rows, cols)), shape=(node_count, node_count)).tocsr()
+    if c_i.size:
+        rows = np.concatenate([c_i, c_j, c_i, c_j])
+        cols = np.concatenate([c_i, c_j, c_j, c_i])
+        data = np.concatenate([c_g, c_g, -c_g, -c_g])
+        lap = sp.coo_matrix((data, (rows, cols)), shape=(super_count, super_count)).tocsr()
     else:
-        lap = sp.csr_matrix((node_count, node_count), dtype=np.float64)
+        lap = sp.csr_matrix((super_count, super_count), dtype=np.float64)
 
-    potentials = np.zeros(node_count, dtype=np.float64)
-    active_nodes = np.flatnonzero(np.abs(rhs) > 0.0)
+    potentials_super = np.zeros(super_count, dtype=np.float64)
+    active_nodes = np.flatnonzero(np.abs(rhs_super) > 0.0)
     active_components = sorted({int(labels[node]) for node in active_nodes})
 
     for comp in active_components:
@@ -547,25 +812,63 @@ def _solve_one_net(
         solve_nodes = comp_nodes[comp_nodes != ref]
         try:
             sub_lap = lap[solve_nodes][:, solve_nodes]
-            sub_rhs = rhs[solve_nodes]
-            potentials[solve_nodes] = _solve_electrical_system(sub_lap, sub_rhs)
+            sub_rhs = rhs_super[solve_nodes]
+            potentials_super[solve_nodes] = _solve_electrical_system(sub_lap, sub_rhs)
         except Exception as exc:
             errors.append(f"Electrical solve failed for net {net_name}: {exc}")
             return ElectricalResult(q_full, [], warnings, errors)
 
+    potentials = potentials_super[supernode_of]
+
     q_nodes = np.zeros(node_count, dtype=np.float64)
+    edge_current = np.empty(0, dtype=np.float64)
     if edge_i.size:
         dv = potentials[edge_i] - potentials[edge_j]
-        p_edge = edge_g * dv * dv
+        edge_current = edge_g * dv
+        p_edge = edge_current * dv
         np.add.at(q_nodes, edge_i, 0.5 * p_edge)
         np.add.at(q_nodes, edge_j, 0.5 * p_edge)
 
     q_full[global_indices] = q_nodes
     total_loss = float(np.sum(q_nodes))
-    source_current = float(sum(max(float(t.current_a), 0.0) for t in terms))
-    sink_current = float(-sum(min(float(t.current_a), 0.0) for t in terms))
-    current_balance = float(sum(t.current_a for t in terms))
-    effective_current = source_current if source_current > 0.0 else 0.5 * total_abs
+
+    # Current density map (A/mm^2) across in-plane X and Y edges
+    n_inplane = int(edge_i.size) - int(via_edge_count)
+    i_cell_sum = np.zeros(node_count, dtype=np.float64)
+    if n_inplane > 0:
+        i_inplane = np.abs(edge_current[:n_inplane])
+        np.add.at(i_cell_sum, edge_i[:n_inplane], 0.5 * i_inplane)
+        np.add.at(i_cell_sum, edge_j[:n_inplane], 0.5 * i_inplane)
+
+    if width_scale is not None:
+        ws_flat = np.maximum(width_scale.reshape(-1)[global_indices].astype(np.float64), 1e-6)
+    else:
+        ws_flat = np.ones(node_count, dtype=np.float64)
+    layer_of_node = global_indices // rc
+    t_cu_mm_of_node = np.asarray(config.t_cu, dtype=np.float64)[layer_of_node] * 1e3
+    area_mm2 = np.maximum(float(config.res) * ws_flat * t_cu_mm_of_node, 1e-18)
+    j_nodes = (i_cell_sum / area_mm2).astype(np.float32)
+    current_density_a_mm2 = np.zeros(copper_mask.shape, dtype=np.float32)
+    current_density_a_mm2.reshape(-1)[global_indices] = j_nodes
+    max_current_density_a_mm2 = float(np.max(j_nodes)) if j_nodes.size else 0.0
+
+    merged_abs = float(
+        sum(abs(float(t.current_a)) for t in merged_terms)
+        + sum(abs(float(b.total_current_a)) for b in active_buses)
+    )
+    source_current = float(
+        sum(max(float(t.current_a), 0.0) for t in merged_terms)
+        + sum(max(float(b.total_current_a), 0.0) for b in active_buses)
+    )
+    sink_current = float(
+        -sum(min(float(t.current_a), 0.0) for t in merged_terms)
+        - sum(min(float(b.total_current_a), 0.0) for b in active_buses)
+    )
+    current_balance = float(
+        sum(float(t.current_a) for t in merged_terms)
+        + sum(float(b.total_current_a) for b in active_buses)
+    )
+    effective_current = source_current if source_current > 0.0 else 0.5 * merged_abs
     effective_resistance = (
         total_loss / (effective_current * effective_current)
         if effective_current > 0.0 else None
@@ -590,7 +893,86 @@ def _solve_one_net(
             cell_count=int(pad_nodes.size),
             component_ids=[int(comp) for comp in comps],
             mean_potential_v=mean_potential,
+            bus_name=None,
         ))
+
+    for bus, pad_recs, all_bus_nodes in bus_records:
+        bus_node_out = np.zeros(node_count, dtype=np.float64)
+        if edge_i.size:
+            in_bus = np.zeros(node_count, dtype=bool)
+            in_bus[all_bus_nodes] = True
+            out_mask = in_bus[edge_i] & (~in_bus[edge_j])
+            in_mask = (~in_bus[edge_i]) & in_bus[edge_j]
+            if np.any(out_mask):
+                np.add.at(bus_node_out, edge_i[out_mask], edge_current[out_mask])
+            if np.any(in_mask):
+                np.add.at(bus_node_out, edge_j[in_mask], -edge_current[in_mask])
+
+        assigned_nodes: set = set()
+        for pad_obj, pad_label, unique_pad_nodes, p_comps in pad_recs:
+            owned = np.array(
+                [int(n) for n in unique_pad_nodes if int(n) not in assigned_nodes],
+                dtype=np.int64,
+            )
+            assigned_nodes.update(int(n) for n in owned)
+            actual_current_a = float(np.sum(bus_node_out[owned])) if owned.size else 0.0
+            mean_potential = float(np.mean(potentials[unique_pad_nodes])) if unique_pad_nodes.size else None
+            x_mm, y_mm = _pad_center_mm(pad_obj)
+            terminal_diagnostics.append(ElectricalTerminalDiagnostics(
+                name=str(pad_label),
+                net_name=str(net_name),
+                current_a=actual_current_a,
+                layer=_pad_layer_label(pad_obj, config),
+                x_mm=x_mm,
+                y_mm=y_mm,
+                bbox_mm=_bbox_mm(pad_obj.GetBoundingBox()),
+                cell_count=int(unique_pad_nodes.size),
+                component_ids=[int(comp) for comp in p_comps],
+                mean_potential_v=mean_potential,
+                bus_name=str(bus.name),
+            ))
+
+    # Via current & Joule power diagnostics
+    via_diagnostics: List[ElectricalViaDiagnostics] = []
+    if via_records:
+        sigma_ref = 1.0 / _effective_rho_cu(config)
+        for vr in via_records:
+            gap_currents: List[float] = []
+            total_via_power = 0.0
+            for gap_offset, g_idx in enumerate(range(vr.min_l, vr.max_l)):
+                g_ref = vr.g_per_gap[gap_offset]
+                u_ids = node_ids[g_idx, vr.rs:vr.re, vr.cs:vr.ce][vr.mask_v]
+                v_ids = node_ids[g_idx + 1, vr.rs:vr.re, vr.cs:vr.ce][vr.mask_v]
+                valid = (u_ids >= 0) & (v_ids >= 0)
+                if not np.any(valid):
+                    continue
+                u_v = u_ids[valid]
+                v_v = v_ids[valid]
+                dv = potentials[u_v] - potentials[v_v]
+                if sigma_grid is not None:
+                    s_g = sigma_grid[g_idx, vr.rs:vr.re, vr.cs:vr.ce][vr.mask_v][valid]
+                    s_g1 = sigma_grid[g_idx + 1, vr.rs:vr.re, vr.cs:vr.ce][vr.mask_v][valid]
+                    s_gap = (2.0 * s_g * s_g1) / np.maximum(s_g + s_g1, 1e-30)
+                    g_pix = g_ref * (s_gap / sigma_ref)
+                else:
+                    g_pix = g_ref
+                i_gap = float(np.sum(g_pix * dv))
+                p_gap = float(np.sum(g_pix * dv * dv))
+                gap_currents.append(abs(i_gap))
+                total_via_power += p_gap
+            via_current = max(gap_currents) if gap_currents else 0.0
+            via_diagnostics.append(ElectricalViaDiagnostics(
+                net_name=str(net_name),
+                x_mm=float(vr.x_mm),
+                y_mm=float(vr.y_mm),
+                drill_mm=float(vr.drill_mm),
+                layers=str(vr.layers),
+                current_a=float(via_current),
+                power_w=float(total_via_power),
+            ))
+        via_diagnostics.sort(key=lambda item: (-item.current_a, -item.power_w))
+    top_vias = via_diagnostics[:15]
+    max_via_current_a = float(top_vias[0].current_a) if top_vias else 0.0
 
     pad_voltage = None
     pad_resistance = None
@@ -629,9 +1011,9 @@ def _solve_one_net(
     summary = ElectricalNetSummary(
         net_key=net_key,
         net_name=net_name,
-        terminal_count=len(terms),
+        terminal_count=len(terminal_diagnostics),
         total_current_a=current_balance,
-        total_abs_current_a=total_abs,
+        total_abs_current_a=merged_abs,
         total_loss_w=total_loss,
         max_node_power_w=float(np.max(q_nodes)) if q_nodes.size else 0.0,
         connected_component_count=int(comp_count),
@@ -650,13 +1032,23 @@ def _solve_one_net(
         sink_pad_potential_v=sink_pad_potential,
         terminal_diagnostics=terminal_diagnostics,
         primitive_diagnostics=primitives,
+        top_vias=top_vias,
+        max_via_current_a=max_via_current_a,
+        current_density_a_mm2=current_density_a_mm2,
+        max_current_density_a_mm2=max_current_density_a_mm2,
     )
     if comp_count > 1:
         warnings.append(
             f"Net {net_name} has {comp_count} mapped copper islands; "
             "only islands with current terminals affect Joule heating."
         )
-    return ElectricalResult(q_full, [summary], warnings, errors)
+    return ElectricalResult(
+        q_full,
+        [summary],
+        warnings,
+        errors,
+        current_density_map=current_density_a_mm2,
+    )
 
 
 def _relative_residual(
@@ -797,6 +1189,42 @@ def _build_relevant_net_data(
     int,
 ]:
     """Rasterize copper geometry and physical via conductances for active nets."""
+    (
+        net_masks,
+        via_masks,
+        via_g_maps,
+        _width_scales,
+        _via_records,
+        primitive_summaries,
+        collision_count,
+    ) = _build_relevant_net_bundle(
+        board,
+        config,
+        relevant_nets,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
+        compute_via_conductance=compute_via_conductance,
+    )
+    return net_masks, via_masks, via_g_maps, primitive_summaries, collision_count
+
+
+def _build_relevant_net_bundle(
+    board: Any,
+    config: ElectricalConfig,
+    relevant_nets: set,
+    progress_callback: Optional[Callable[[int, int, str], Optional[bool]]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    compute_via_conductance: bool = True,
+) -> Tuple[
+    Dict[str, np.ndarray],
+    Dict[str, np.ndarray],
+    Dict[str, Optional[np.ndarray]],
+    Dict[str, np.ndarray],
+    Dict[str, List[_ViaRecord]],
+    Dict[str, List[ElectricalPrimitiveDiagnostics]],
+    int,
+]:
+    """Rasterize copper geometry, width scales, via records, and conductances for active nets."""
     tracker = _ProgressEmitter(progress_callback, cancel_check)
     tracker.check_cancel(force=True)
 
@@ -805,6 +1233,10 @@ def _build_relevant_net_data(
     net_masks = {key: np.zeros(shape, dtype=bool) for key in relevant_nets}
     via_masks = {key: np.zeros((config.rows, config.cols), dtype=bool) for key in relevant_nets}
     via_g_maps: Dict[str, Optional[np.ndarray]] = {key: None for key in relevant_nets}
+    width_scales: Dict[str, np.ndarray] = {
+        key: np.zeros(shape, dtype=np.float32) for key in relevant_nets
+    }
+    via_records: Dict[str, List[_ViaRecord]] = {key: [] for key in relevant_nets}
     primitive_stats: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]] = {
         key: {} for key in relevant_nets
     }
@@ -822,6 +1254,9 @@ def _build_relevant_net_data(
         spread_radius_mm: float,
         a_cu_eff: float,
         mark_masks: bool = False,
+        drill_mm: float = 0.0,
+        layers_label: str = "",
+        record_via: bool = False,
     ) -> int:
         if layer_count <= 1 or len(layer_indices) < 2:
             return 0
@@ -847,6 +1282,7 @@ def _build_relevant_net_data(
             layer_slice = net_masks[key][l_idx, rs_v:re_v, cs_v:ce_v]
             before = int(np.count_nonzero(layer_slice))
             layer_slice |= mask_v
+            width_scales[key][l_idx, rs_v:re_v, cs_v:ce_v][mask_v] = np.float32(1.0)
             if mark_masks:
                 added_cells += int(np.count_nonzero(layer_slice)) - before
 
@@ -861,9 +1297,26 @@ def _build_relevant_net_data(
                         dtype=np.float64,
                     )
                     via_g_maps[key] = g_map
+                g_per_gap: List[float] = []
                 for g in range(min_l, max_l):
                     g_cell = a_cu_eff / (rho_cu_eff * gap_m[g] * n_pix)
                     g_map[g, rs_v:re_v, cs_v:ce_v][mask_v] += g_cell
+                    g_per_gap.append(float(g_cell))
+                if record_via:
+                    via_records[key].append(_ViaRecord(
+                        x_mm=float(cx_mm),
+                        y_mm=float(cy_mm),
+                        drill_mm=float(drill_mm),
+                        layers=str(layers_label),
+                        rs=int(rs_v),
+                        re=int(re_v),
+                        cs=int(cs_v),
+                        ce=int(ce_v),
+                        mask_v=mask_v.copy(),
+                        min_l=int(min_l),
+                        max_l=int(max_l),
+                        g_per_gap=tuple(g_per_gap),
+                    ))
         return added_cells
 
     def record_primitive(
@@ -911,7 +1364,7 @@ def _build_relevant_net_data(
                 if layer_idx is not None:
                     layer_slice = net_masks[key][layer_idx, rs:re, cs:ce]
                     before = int(np.count_nonzero(layer_slice))
-                    _fill_bbox_3d(net_masks[key], layer_idx, bbox_obj, config)
+                    _fill_bbox_3d(net_masks[key], layer_idx, bbox_obj, config, width_scale=width_scales[key])
                     mapped_cells += int(np.count_nonzero(layer_slice)) - before
             return mapped_cells
         for lid in layer_ids:
@@ -921,9 +1374,9 @@ def _build_relevant_net_data(
             layer_slice = net_masks[key][layer_idx, rs:re, cs:ce]
             before = int(np.count_nonzero(layer_slice))
             if use_track_shape:
-                _fill_track(net_masks[key], layer_idx, obj, config)
+                _fill_track(net_masks[key], layer_idx, obj, config, width_scale=width_scales[key])
             else:
-                _fill_bbox_3d(net_masks[key], layer_idx, bbox_obj, config)
+                _fill_bbox_3d(net_masks[key], layer_idx, bbox_obj, config, width_scale=width_scales[key])
             mapped_cells += int(np.count_nonzero(layer_slice)) - before
         return mapped_cells
 
@@ -1002,6 +1455,7 @@ def _build_relevant_net_data(
                             layer_slice = net_masks[key][layer_idx, rs_l:re_l, cs_l:ce_l]
                             before = int(np.count_nonzero(layer_slice))
                             layer_slice |= pad_mask
+                            width_scales[key][layer_idx, rs_l:re_l, cs_l:ce_l][pad_mask] = np.float32(1.0)
                             mapped_cells += int(np.count_nonzero(layer_slice)) - before
                 else:
                     target_lids = [config.copper_ids[idx] for idx in target_indices]
@@ -1069,6 +1523,7 @@ def _build_relevant_net_data(
                             layer_slice = net_masks[key][layer_idx, rs:re, cs:ce]
                             before = int(np.count_nonzero(layer_slice))
                             layer_slice |= pad_mask
+                            width_scales[key][layer_idx, rs:re, cs:ce][pad_mask] = np.float32(1.0)
                             mapped_cells = int(np.count_nonzero(layer_slice)) - before
                         else:
                             mapped_cells = 0
@@ -1135,6 +1590,7 @@ def _build_relevant_net_data(
                 0.5 * max(outer_d_mm, 0.0),
                 0.5 * drill_mm + via_plating_um * 1e-3,
             )
+            layers_lbl = _layers_label(layer_ids, config)
             if has_pos:
                 mapped_cells = accumulate_via_conductance(
                     key,
@@ -1144,6 +1600,9 @@ def _build_relevant_net_data(
                     spread_radius_mm,
                     a_cu_eff,
                     mark_masks=True,
+                    drill_mm=drill_mm,
+                    layers_label=layers_lbl,
+                    record_via=True,
                 )
             elif compute_via_conductance:
                 accumulate_via_conductance(
@@ -1154,9 +1613,12 @@ def _build_relevant_net_data(
                     spread_radius_mm,
                     a_cu_eff,
                     mark_masks=False,
+                    drill_mm=drill_mm,
+                    layers_label=layers_lbl,
+                    record_via=True,
                 )
             record_primitive(
-                key, "Via/PTH", _layers_label(layer_ids, config), bbox,
+                key, "Via/PTH", layers_lbl, bbox,
                 mapped_cells=max(0, mapped_cells)
             )
         else:
@@ -1220,6 +1682,7 @@ def _build_relevant_net_data(
                         config,
                         progress_callback=zone_progress_cb,
                         cancel_check=cancel_check,
+                        width_scale=width_scales[key],
                     )
                     mapped_cells = int(np.count_nonzero(layer_slice)) - before
                 else:
@@ -1255,7 +1718,15 @@ def _build_relevant_net_data(
             ))
         primitive_summaries[key] = summaries
 
-    return net_masks, via_masks, via_g_maps, primitive_summaries, collision_count
+    return (
+        net_masks,
+        via_masks,
+        via_g_maps,
+        width_scales,
+        via_records,
+        primitive_summaries,
+        collision_count,
+    )
 
 
 def _build_net_edges(
@@ -1264,6 +1735,8 @@ def _build_net_edges(
     node_ids: np.ndarray,
     config: ElectricalConfig,
     via_g_map: Optional[np.ndarray] = None,
+    width_scale: Optional[np.ndarray] = None,
+    sigma_grid: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Build graph edges and conductances for one net mask."""
     edge_i = []
@@ -1272,12 +1745,21 @@ def _build_net_edges(
     via_edge_count = 0
     dx = config.res * 1e-3
     dy = dx
-    sigma = 1.0 / _effective_rho_cu(config)
+    sigma_ref = 1.0 / _effective_rho_cu(config)
 
     for layer_idx in range(mask.shape[0]):
         t_layer = float(config.t_cu[layer_idx])
-        gx = sigma * t_layer * dy / dx
-        gy = sigma * t_layer * dx / dy
+        if sigma_grid is not None:
+            sig_layer = sigma_grid[layer_idx]
+        else:
+            sig_layer = sigma_ref
+        if width_scale is not None:
+            ws_layer = np.maximum(width_scale[layer_idx].astype(np.float64), 1e-6)
+        else:
+            ws_layer = 1.0
+
+        g_cell = sig_layer * t_layer * ws_layer
+        uniform_cell = np.ndim(g_cell) == 0
 
         both = mask[layer_idx, :, :-1] & mask[layer_idx, :, 1:]
         if np.any(both):
@@ -1285,7 +1767,14 @@ def _build_net_edges(
             j_idx = node_ids[layer_idx, :, 1:][both]
             edge_i.append(i_idx)
             edge_j.append(j_idx)
-            edge_g.append(np.full(i_idx.shape, gx, dtype=np.float64))
+            if uniform_cell:
+                gx = float(g_cell) * (dy / dx)
+                edge_g.append(np.full(i_idx.shape, gx, dtype=np.float64))
+            else:
+                gi = g_cell[:, :-1][both]
+                gj = g_cell[:, 1:][both]
+                gx_arr = (2.0 * gi * gj / np.maximum(gi + gj, 1e-30)) * (dy / dx)
+                edge_g.append(gx_arr)
 
         both = mask[layer_idx, :-1, :] & mask[layer_idx, 1:, :]
         if np.any(both):
@@ -1293,7 +1782,14 @@ def _build_net_edges(
             j_idx = node_ids[layer_idx, 1:, :][both]
             edge_i.append(i_idx)
             edge_j.append(j_idx)
-            edge_g.append(np.full(i_idx.shape, gy, dtype=np.float64))
+            if uniform_cell:
+                gy = float(g_cell) * (dx / dy)
+                edge_g.append(np.full(i_idx.shape, gy, dtype=np.float64))
+            else:
+                gi = g_cell[:-1, :][both]
+                gj = g_cell[1:, :][both]
+                gy_arr = (2.0 * gi * gj / np.maximum(gi + gj, 1e-30)) * (dx / dy)
+                edge_g.append(gy_arr)
 
     if mask.shape[0] > 1:
         if via_g_map is not None:
@@ -1305,7 +1801,13 @@ def _build_net_edges(
                     j_idx = node_ids[layer_idx + 1][both]
                     edge_i.append(i_idx)
                     edge_j.append(j_idx)
-                    edge_g.append(g_layer[both])
+                    g_vals = g_layer[both]
+                    if sigma_grid is not None:
+                        s_0 = sigma_grid[layer_idx][both]
+                        s_1 = sigma_grid[layer_idx + 1][both]
+                        s_gap = (2.0 * s_0 * s_1) / np.maximum(s_0 + s_1, 1e-30)
+                        g_vals = g_vals * (s_gap / sigma_ref)
+                    edge_g.append(g_vals)
                     via_edge_count += int(i_idx.size)
         elif via_mask is not None and np.any(via_mask):
             gz = 1.0 / max(float(config.via_resistance_ohm), 1e-12)
@@ -1316,7 +1818,14 @@ def _build_net_edges(
                     j_idx = node_ids[layer_idx + 1][both]
                     edge_i.append(i_idx)
                     edge_j.append(j_idx)
-                    edge_g.append(np.full(i_idx.shape, gz, dtype=np.float64))
+                    if sigma_grid is not None:
+                        s_0 = sigma_grid[layer_idx][both]
+                        s_1 = sigma_grid[layer_idx + 1][both]
+                        s_gap = (2.0 * s_0 * s_1) / np.maximum(s_0 + s_1, 1e-30)
+                        g_vals = gz * (s_gap / sigma_ref)
+                    else:
+                        g_vals = np.full(i_idx.shape, gz, dtype=np.float64)
+                    edge_g.append(g_vals)
                     via_edge_count += int(i_idx.size)
 
     if not edge_i:
@@ -1476,11 +1985,19 @@ def _bbox_indices(bbox: Any, config: ElectricalConfig) -> Tuple[int, int, int, i
     return rs, re, cs, ce
 
 
-def _fill_bbox_3d(mask: np.ndarray, layer_idx: int, bbox: Any, config: ElectricalConfig):
+def _fill_bbox_3d(
+    mask: np.ndarray,
+    layer_idx: int,
+    bbox: Any,
+    config: ElectricalConfig,
+    width_scale: Optional[np.ndarray] = None,
+):
     """Fill a rectangular region on one layer."""
     rs, re, cs, ce = _bbox_indices(bbox, config)
     if rs < re and cs < ce:
         mask[layer_idx, rs:re, cs:ce] = True
+        if width_scale is not None:
+            width_scale[layer_idx, rs:re, cs:ce] = np.float32(1.0)
 
 
 def _fill_bbox_2d(mask: np.ndarray, bbox: Any, config: ElectricalConfig):
@@ -1490,28 +2007,92 @@ def _fill_bbox_2d(mask: np.ndarray, bbox: Any, config: ElectricalConfig):
         mask[rs:re, cs:ce] = True
 
 
-def _fill_track(mask: np.ndarray, layer_idx: int, track: Any, config: ElectricalConfig):
+def _apply_track_patch(
+    mask: np.ndarray,
+    layer_idx: int,
+    config: ElectricalConfig,
+    rs: int,
+    re: int,
+    cs: int,
+    ce: int,
+    local_hit: np.ndarray,
+    xs: Optional[np.ndarray],
+    ys: Optional[np.ndarray],
+    track_scale: float,
+    width_scale: Optional[np.ndarray],
+):
+    """Commit rasterized track cells + 4-connected centerline and update width_scale."""
+    rs_p, re_p, cs_p, ce_p = rs, re, cs, ce
+    has_cl = xs is not None and ys is not None and xs.size > 0 and config.res > 0.0
+    if has_cl:
+        grid_x_max = config.x_min + config.cols * config.res
+        grid_y_max = config.y_min + config.rows * config.res
+        inb = (
+            (xs >= config.x_min)
+            & (xs <= grid_x_max)
+            & (ys >= config.y_min)
+            & (ys <= grid_y_max)
+        )
+        if np.any(inb):
+            c_min = max(0, min(config.cols - 1, int(math.floor((float(np.min(xs[inb])) - config.x_min) / config.res))))
+            c_max = max(0, min(config.cols - 1, int(math.floor((float(np.max(xs[inb])) - config.x_min) / config.res))))
+            r_min = max(0, min(config.rows - 1, int(math.floor((float(np.min(ys[inb])) - config.y_min) / config.res))))
+            r_max = max(0, min(config.rows - 1, int(math.floor((float(np.max(ys[inb])) - config.y_min) / config.res))))
+            cs_p = min(cs_p, c_min)
+            ce_p = min(config.cols, max(ce_p, c_max + 2))
+            rs_p = min(rs_p, r_min)
+            re_p = min(config.rows, max(re_p, r_max + 2))
+    if rs_p >= re_p or cs_p >= ce_p:
+        return
+    patch = np.zeros((re_p - rs_p, ce_p - cs_p), dtype=bool)
+    if rs < re and cs < ce and np.any(local_hit):
+        patch[(rs - rs_p):(re - rs_p), (cs - cs_p):(ce - cs_p)] |= local_hit
+    if has_cl:
+        _mark_centerline_points(
+            patch,
+            re_p - rs_p,
+            ce_p - cs_p,
+            config.x_min + cs_p * config.res,
+            config.y_min + rs_p * config.res,
+            config.res,
+            xs,
+            ys,
+        )
+    if np.any(patch):
+        mask[layer_idx, rs_p:re_p, cs_p:ce_p] |= patch
+        if width_scale is not None:
+            ws_slice = width_scale[layer_idx, rs_p:re_p, cs_p:ce_p]
+            ws_slice[patch] = np.maximum(ws_slice[patch], np.float32(track_scale))
+
+
+def _fill_track(
+    mask: np.ndarray,
+    layer_idx: int,
+    track: Any,
+    config: ElectricalConfig,
+    width_scale: Optional[np.ndarray] = None,
+):
     """Rasterize a straight track or circular PCB_ARC, falling back to its bounding box."""
     if not all(hasattr(track, attr) for attr in ("GetStart", "GetEnd", "GetWidth")):
-        _fill_bbox_3d(mask, layer_idx, track.GetBoundingBox(), config)
+        _fill_bbox_3d(mask, layer_idx, track.GetBoundingBox(), config, width_scale=width_scale)
         return
     try:
         start = track.GetStart()
         end = track.GetEnd()
-        width_mm = max(float(track.GetWidth()) * 1e-6, config.res)
+        raw_width_mm = float(track.GetWidth()) * 1e-6
     except Exception:
-        _fill_bbox_3d(mask, layer_idx, track.GetBoundingBox(), config)
+        _fill_bbox_3d(mask, layer_idx, track.GetBoundingBox(), config, width_scale=width_scale)
         return
+
+    if 0.0 < raw_width_mm < config.res and config.res > 0.0:
+        track_scale = min(1.0, raw_width_mm / config.res)
+        radius = 0.5 * raw_width_mm
+    else:
+        track_scale = 1.0
+        radius = 0.5 * max(raw_width_mm, config.res)
 
     bbox = track.GetBoundingBox()
     rs, re, cs, ce = _bbox_indices(bbox, config)
-    if rs >= re or cs >= ce:
-        return
-
-    y = config.y_min + (np.arange(rs, re, dtype=np.float64) + 0.5) * config.res
-    x = config.x_min + (np.arange(cs, ce, dtype=np.float64) + 0.5) * config.res
-    xx, yy = np.meshgrid(x, y)
-    radius = 0.5 * width_mm
 
     arc = None
     if hasattr(track, "GetMid"):
@@ -1522,31 +2103,42 @@ def _fill_track(mask: np.ndarray, layer_idx: int, track: Any, config: Electrical
         except Exception:
             arc = None
 
+    if rs < re and cs < ce:
+        y = config.y_min + (np.arange(rs, re, dtype=np.float64) + 0.5) * config.res
+        x = config.x_min + (np.arange(cs, ce, dtype=np.float64) + 0.5) * config.res
+        xx, yy = np.meshgrid(x, y)
+    else:
+        xx = np.empty((0, 0), dtype=np.float64)
+        yy = np.empty((0, 0), dtype=np.float64)
+
     if arc is not None:
         cx, cy, arc_radius, start_angle, signed_span = arc
-        dx = xx - cx
-        dy = yy - cy
-        radial = np.abs(np.hypot(dx, dy) - arc_radius) <= radius
-        angles = np.arctan2(dy, dx)
-        tau = 2.0 * np.pi
-        if signed_span >= 0.0:
-            angular = np.mod(angles - start_angle, tau) <= signed_span
+        if xx.size:
+            dx = xx - cx
+            dy = yy - cy
+            radial = np.abs(np.hypot(dx, dy) - arc_radius) <= radius
+            angles = np.arctan2(dy, dx)
+            tau = 2.0 * np.pi
+            if signed_span >= 0.0:
+                angular = np.mod(angles - start_angle, tau) <= signed_span
+            else:
+                angular = np.mod(start_angle - angles, tau) <= (-signed_span)
+            sx, sy = float(start.x) * 1e-6, float(start.y) * 1e-6
+            ex, ey = float(end.x) * 1e-6, float(end.y) * 1e-6
+            endcaps = (np.hypot(xx - sx, yy - sy) <= radius) | (np.hypot(xx - ex, yy - ey) <= radius)
+            local_hit = (radial & angular) | endcaps
         else:
-            angular = np.mod(start_angle - angles, tau) <= (-signed_span)
-        sx, sy = float(start.x) * 1e-6, float(start.y) * 1e-6
-        ex, ey = float(end.x) * 1e-6, float(end.y) * 1e-6
-        endcaps = (np.hypot(xx - sx, yy - sy) <= radius) | (np.hypot(xx - ex, yy - ey) <= radius)
-        mask[layer_idx, rs:re, cs:ce] |= (radial & angular) | endcaps
+            local_hit = np.zeros((0, 0), dtype=bool)
+        xs = ys = None
         if config.res > 0.0:
             arc_len = arc_radius * abs(signed_span)
             n_steps = max(1, int(math.ceil(arc_len / (0.4 * config.res))))
             theta = start_angle + np.linspace(0.0, signed_span, n_steps + 1)
             xs = cx + arc_radius * np.cos(theta)
             ys = cy + arc_radius * np.sin(theta)
-            _mark_centerline_points(
-                mask[layer_idx], config.rows, config.cols,
-                config.x_min, config.y_min, config.res, xs, ys,
-            )
+        _apply_track_patch(
+            mask, layer_idx, config, rs, re, cs, ce, local_hit, xs, ys, track_scale, width_scale
+        )
         return
 
     sx, sy = float(start.x) * 1e-6, float(start.y) * 1e-6
@@ -1554,24 +2146,28 @@ def _fill_track(mask: np.ndarray, layer_idx: int, track: Any, config: Electrical
     vx, vy = ex - sx, ey - sy
     seg_len_sq = vx * vx + vy * vy
 
-    if seg_len_sq <= 1e-24:
-        dist = np.hypot(xx - sx, yy - sy)
+    if xx.size:
+        if seg_len_sq <= 1e-24:
+            dist = np.hypot(xx - sx, yy - sy)
+        else:
+            t = ((xx - sx) * vx + (yy - sy) * vy) / seg_len_sq
+            t = np.clip(t, 0.0, 1.0)
+            px = sx + t * vx
+            py = sy + t * vy
+            dist = np.hypot(xx - px, yy - py)
+        local_hit = dist <= radius
     else:
-        t = ((xx - sx) * vx + (yy - sy) * vy) / seg_len_sq
-        t = np.clip(t, 0.0, 1.0)
-        px = sx + t * vx
-        py = sy + t * vy
-        dist = np.hypot(xx - px, yy - py)
-    mask[layer_idx, rs:re, cs:ce] |= dist <= radius
+        local_hit = np.zeros((0, 0), dtype=bool)
+    xs = ys = None
     if config.res > 0.0:
         seg_len = math.sqrt(seg_len_sq)
         n_steps = max(1, int(math.ceil(seg_len / (0.4 * config.res))))
         t_vals = np.linspace(0.0, 1.0, n_steps + 1)
-        _mark_centerline_points(
-            mask[layer_idx], config.rows, config.cols,
-            config.x_min, config.y_min, config.res,
-            sx + t_vals * vx, sy + t_vals * vy,
-        )
+        xs = sx + t_vals * vx
+        ys = sy + t_vals * vy
+    _apply_track_patch(
+        mask, layer_idx, config, rs, re, cs, ce, local_hit, xs, ys, track_scale, width_scale
+    )
 
 
 def _fill_zone(
@@ -1582,6 +2178,7 @@ def _fill_zone(
     config: ElectricalConfig,
     progress_callback: Optional[Callable[[int, int, str], Optional[bool]]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    width_scale: Optional[np.ndarray] = None,
 ):
     """Rasterize a filled copper zone with KiCad hit-testing where available."""
     bbox = zone.GetBoundingBox()
@@ -1615,6 +2212,8 @@ def _fill_zone(
         cancel_check=cancel_check,
     ):
         mask[layer_idx, rs:re, cs:ce] |= zone_mask
+        if width_scale is not None and np.any(zone_mask):
+            width_scale[layer_idx, rs:re, cs:ce][zone_mask] = np.float32(1.0)
         return
 
     has_hit = hasattr(zone, "HitTestFilledArea")
@@ -1632,15 +2231,21 @@ def _fill_zone(
         for c in range(cs, ce):
             if not has_hit:
                 mask[layer_idx, r, c] = True
+                if width_scale is not None:
+                    width_scale[layer_idx, r, c] = np.float32(1.0)
                 continue
             x_mm = config.x_min + (c + 0.5) * config.res
             pos = pcbnew.VECTOR2I(_to_iu(x_mm), y_iu)
             try:
                 if zone.HitTestFilledArea(lid, pos, 1):
                     mask[layer_idx, r, c] = True
+                    if width_scale is not None:
+                        width_scale[layer_idx, r, c] = np.float32(1.0)
             except TypeError:
                 if zone.HitTestFilledArea(lid, pos):
                     mask[layer_idx, r, c] = True
+                    if width_scale is not None:
+                        width_scale[layer_idx, r, c] = np.float32(1.0)
 
 
 def _zone_layer_ids(zone: Any, copper_ids: List[int]) -> List[int]:

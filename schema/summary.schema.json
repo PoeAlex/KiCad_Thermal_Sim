@@ -198,7 +198,26 @@
     "electrical": {
       "type": ["object", "null"],
       "description": "DC current-flow Joule heating summary when current_enabled is true, otherwise null.",
-      "additionalProperties": true
+      "additionalProperties": true,
+      "properties": {
+        "total_loss_w": {"type": "number"},
+        "electro_thermal_passes": {"type": "integer", "minimum": 1},
+        "initial_loss_w": {"type": "number"},
+        "coupled_loss_w": {"type": "number"},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "nets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "max_via_current_a": {"type": "number"},
+              "max_current_density_a_mm2": {"type": "number"},
+              "top_vias": {"type": "array", "items": {"type": "object", "additionalProperties": true}}
+            }
+          }
+        }
+      }
     },
     "solver": {
       "type": "object",
@@ -244,7 +263,8 @@
         "report_html": {"type": ["string", "null"]},
         "heatmap_png": {"type": ["string", "null"]},
         "preview_png": {"type": ["string", "null"]},
-        "joule_map_png": {"type": ["string", "null"]}
+        "joule_map_png": {"type": ["string", "null"]},
+        "current_density_png": {"type": ["string", "null"]}
       }
     }
   }

@@ -23,12 +23,12 @@ This is **not** a full 3D CFD/FEA solver. It is intended as a practical engineer
 - **Geometric multi-phase transient time integration** (5-phase geometrically growing BDF2 stepping — 5–8x faster on long transients — with linear PCG warm-start extrapolation, PWL breakpoint alignment and step-averaged power integration, and lossless early steady-state stop).
 - **Native C++/OpenMP v4 Compact Low-RAM Multigrid & Fused PCG core** (`thermalsim_core.dll`, `libthermalsim_core.so`, `libthermalsim_core.dylib`) solving **6M-node steady-state boards in ~5 s at ~725 MB Peak RSS**, with on-the-fly Level-0 mask+LUT evaluation, mixed-precision `float32` multigrid V-cycles, fused OpenMP PCG kernels, and automatic fallback to pure NumPy/SciPy.
 - **Manual power injection** from explicitly configured **Heat Sources** (constant power or time-varying **PWL power profiles**) with **exact KiCad 9/10 pad rasterization** (`GetLayerSet()` `B.Cu` SMD pads, multi-layer PTH power injection across spanned copper layers, rotated & offset pads, and zero FR4 power bleed).
-- Optional **DC current-flow heating** from source/sink pads on KiCad nets (with arc-accurate `PCB_ARC` trace discretization and stackup dielectric `gap_m` via coupling).
+- Optional **DC current-flow heating** with Pad-to-Pad flows (`1->1`, `1->N`, `N->M`), **Equipotential** natural copper current sharing, sub-grid narrow trace resistance correction, and **2-pass electro-thermal coupling** ($\rho_{\text{Cu}}(T)$).
 - **Convection** to ambient on top and bottom outer surfaces.
 - Optional **Thermal Pad (`User.Eco1`)** geometry with **Fixed temperature** (exact energy balance against `pad_sink_temp_c`) or **Dynamic heatsink (0D)** ($R_{\text{th}}$, mass/material presets, live $C_{\text{hs}}$ & $\tau$, plus **Heatsink Temp** and **Heat Removal Split** in reports).
 - **Calibrated RAM & runtime estimates** across Compact Native C++ and Legacy solver modes (~80–125 MB per 1M nodes; 25M+ nodes in ~2 GB RAM).
 - **Fast scanline zone polygon rasterization** and **continuous cancellable progress** (with elapsed time and English phase ETA) across both **Preview** and **Run**.
-- Current-path diagnostics: copper loss, effective resistance, equivalent voltage drop, grid quality, and a Joule loss map.
+- Current-path diagnostics: copper loss, effective resistance, equivalent voltage drop, terminal current sharing & potentials (`mV`), **Top Vias by Current**, **Joule loss map**, and **Current density map (`A/mm²`)**.
 - Persistent compressed `.npz` disk geometry cache and hotspot-preserving downsampled HTML interactive heatmaps for million-node grids.
 - **Headless CLI & AI Agent JSON API** (`inspect`, `validate`, `run`, `sweep`, `compare`, `summary.json`, `schema/*.json`).
 
@@ -191,12 +191,14 @@ PWL files are LTspice-style text files with two columns:
 
 ### Current Heating Tab
 
-Enable current heating to calculate copper losses from DC current flow.
+Enable current heating to calculate copper `I^2R` losses from **Pad-to-Pad Current Flows** (`1->1`, `1->N`, `N->M`, and multiple superposed flows on the same net):
 
-1. Select source/sink pads in KiCad.
-2. Add them to a current group.
-3. Enter positive current for source pads and negative current for sink pads.
-4. Make sure every active KiCad net balances to `0 A`.
+1. Click **New Flow** and add **From (Source)** and **To (Sink)** pads using **Add Selected** (from KiCad selection) or **Pick...** (browse all board pads filtered by net directly inside the dialog).
+2. Choose how current is distributed on each side:
+   - **Equipotential (Auto)** — models parallel pins tied by a low-impedance external bus/package lead (`EquipotentialBus`), letting the solver compute **natural copper-resistance current sharing** and per-pad currents automatically.
+   - **Equal Split** — divides the total flow current evenly across the listed pads.
+   - **Fixed per Pad** — assigns explicit per-pad currents (e.g. `3, 3, 3 A` across 3 sink pads), automatically balancing the total flow current on the opposite side with no manual `+`/`-` sign math.
+3. ThermalSim automatically applies **equipotential pad contraction** (modeling true pad-edge current crowding without artificial intra-pad loss), **sub-grid narrow trace width correction** (`w / res`), and **2-pass electro-thermal coupling** ($\rho_{\text{Cu}}(T)$ updated from the solved 3D temperature field, with a thermal runaway warning if Joule loss increases by more than 50% or fails to converge within 3 passes).
 
 Current heating is additive with **Heat Sources**:
 
@@ -206,7 +208,7 @@ total heat = manual pad power + calculated Joule copper loss
 
 Power pads and current terminals may be different pads. Area limiting remains available with current heating: ThermalSim includes every pad, track, via/PTH, and filled zone belonging to the active current nets, then expands that geometry by the configured thermal margin. A large active plane may therefore require almost the full board.
 
-The report shows **Path Current** as the useful current value. For a `+5 A` source and a `-5 A` sink, the path current is `5 A`. The internal sum of absolute terminal currents (`10 A` in that example) is kept only in raw diagnostics.
+The report shows **Path Current** as the useful current value. For a `+5 A` source and a `-5 A` sink, the path current is `5 A`. The internal sum of absolute terminal currents (`10 A` in that example) is kept only in raw diagnostics. Legacy `current_groups` configs are automatically migrated when loaded.
 
 ### Advanced Tab
 
@@ -268,6 +270,7 @@ Typical files:
 - `thermal_preview.png` - mapped geometry preview.
 - `thermal_stackup.png` or `thermal_final.png` - final temperature heatmap.
 - `joule_loss_map.png` - current-induced copper loss map when current heating is active.
+- `current_density.png` - per-layer DC current density map (`A/mm²`) with peak-preserving pooling when current heating is active.
 - `snap_*.png` - optional time-series snapshots (transient mode).
 - `summary.json` - semantic machine-readable summary (written by `headless_api` / CLI).
 
@@ -277,15 +280,17 @@ Typical files:
 
 When current heating is enabled, the HTML report includes **Current Path Diagnostics**:
 
-- **Copper Loss** - total calculated Joule heating for active nets.
+- **Copper Loss** - total calculated Joule heating for active nets (plus **Electro-Thermal Coupling** pass count and `initial -> coupled` loss when active).
 - **R_eff** - effective resistance, computed from `P / I_source^2`.
 - **V_eq** - equivalent voltage drop, computed from `P / I_source`.
 - **Source/Sink Current** - source and sink totals per active net.
 - **Path Current** - useful current value for the path, not the doubled absolute terminal sum.
+- **Max Current Density** & **Peak Via Current** - peak `A/mm²` and highest loaded via current across active nets.
 - **Net Path Metrics** - terminals, balance, loss, resistance, voltage drop, cell count, edge count, via edges, and copper islands.
-- **Current Terminals** - pad positions, matched grid cells, island IDs, and mean potentials.
+- **Terminal Current Sharing & Voltage** - pad name, net, bus/role, actual solved current (`A`), potential (`mV`), matched grid cells, and island IDs.
+- **Top Vias by Current** - top 15 vias sorted by current (`A`) with coordinates, drill, spanned layers, and Joule power (`mW`).
 - **Mapped KiCad Primitives** - pads, tracks, vias/PTHs, zones, track length, and width summary.
-- **Joule Loss Map** - per-layer static image of current-induced copper loss.
+- **Joule Loss Map** & **Current Density Map** - per-layer static maps of current-induced copper loss (`W/cell`) and current density (`A/mm²`).
 
 The report records requested and actual grid resolution, grid size, compute-budget preset, node budget, and the simulated percentage of the board.
 
@@ -404,8 +409,8 @@ The plugin is split into focused modules:
 - No explicit component/package thermal model; junction-to-case-to-pad behavior is not modeled.
 - Convection is simplified as uniform top and bottom ambient coupling (`h_conv` and `h_conv_bottom`, lumping linearized radiation).
 - Nonlinear $T^4$ radiation is not modeled explicitly.
-- Current-flow heating is static DC only; copper resistivity is temperature-adjusted at the ambient temperature (`alpha_Cu = 0.00393 /K`), while AC effects and skin effect are not modeled.
-- Current-path accuracy depends on grid resolution; narrow traces and small pads may need a finer grid to match hand calculations closely.
+- Current-flow heating is static DC only; copper resistivity (`alpha_Cu = 0.00393 /K`) is coupled iteratively to the solved 3D temperature field (`electro_thermal_coupling = true`), while AC effects and skin effect are not modeled.
+- Sub-grid narrow trace correction (`width / res`) preserves resistance accuracy for narrow tracks, though very small pads or complex bottlenecks still benefit from finer grids.
 - Very fine requested resolutions may be auto-coarsened when the selected compute budget is exceeded.
 - Via and PTH thermal/electrical coupling uses physical barrel geometry from KiCad drill sizes and `via_plating_um`/`via_fill`, distributed conservatively over grid cells.
 - Results depend strongly on **Target Cell Size**, **Compute Budget**, and the selected simulation area and thermal margin.

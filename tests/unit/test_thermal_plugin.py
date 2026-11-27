@@ -3106,3 +3106,293 @@ class TestV049PluginElectricalGapAndCleanup:
         )
         assert any("uniform nodes" in w for w in res.warnings)
         assert all("Adaptive reduction depends" not in w for w in res.warnings)
+
+
+class TestV050PluginFlowsCouplingAndBoardPads:
+    """Tests for v0.5.0 current_flows resolution, board_pads picker wiring, and 2-pass coupling."""
+
+    def test_run_safe_passes_board_pads_to_settings_dialog(self, monkeypatch):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        pad1 = MockPad(
+            position=VECTOR2I(2_000_000, 2_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(1_500_000, 1_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="+12V",
+            number="1",
+        )
+        pad_npth = MockPad(
+            position=VECTOR2I(5_000_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(4_500_000, 4_500_000, 1_000_000, 1_000_000),
+            attribute=getattr(plugin_mod.pcbnew, "PAD_ATTRIB_NPTH", 3),
+            net_code=0,
+            net_name="",
+            number="MH1",
+        )
+        board = MockBoard(footprints=[MockFootprint("J1", [pad1, pad_npth])])
+
+        captured_kwargs = {}
+
+        class DummyDialog:
+            def __init__(self, *args, **kwargs):
+                captured_kwargs.update(kwargs)
+
+            def Show(self):
+                pass
+
+        monkeypatch.setattr(plugin_mod.pcbnew, "GetBoard", lambda: board, raising=False)
+        monkeypatch.setattr(plugin_mod, "_find_pcb_editor_parent", lambda _b=None: None)
+        monkeypatch.setattr(plugin_mod, "SettingsDialog", DummyDialog)
+        monkeypatch.setattr(plugin_mod, "parse_stackup_from_board_file", lambda *a, **k: {})
+        monkeypatch.setattr(plugin, "_show_startup_progress", lambda *a, **k: None)
+        monkeypatch.setattr(plugin, "_close_startup_progress", lambda *a, **k: None)
+        monkeypatch.setattr(plugin, "_load_settings", lambda *a, **k: {})
+        monkeypatch.setattr(plugin, "_detect_copper_layers", lambda _b: ([F_Cu, B_Cu], ["F.Cu", "B.Cu"]))
+        monkeypatch.setattr(board, "GetBoundingBox", lambda: EDA_RECT(0, 0, 10_000_000, 10_000_000), raising=False)
+
+        plugin.RunSafe()
+        assert "board_pads" in captured_kwargs
+        assert len(captured_kwargs["board_pads"]) == 1
+        assert captured_kwargs["board_pads"][0]["name"] == "J1-1 [+12V]"
+
+    def test_resolve_current_flows_equipotential_equal_fixed(self, tmp_path):
+        from ThermalSim.electrical_solver import EquipotentialBus
+        from ThermalSim.thermal_plugin import ThermalPlugin
+
+        plugin = ThermalPlugin()
+        plugin.defaults()
+        j1 = MockPad(
+            position=VECTOR2I(1_000_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(500_000, 4_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="+12V",
+            number="1",
+        )
+        u1 = MockPad(
+            position=VECTOR2I(8_000_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(7_500_000, 4_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="+12V",
+            number="1",
+        )
+        u2 = MockPad(
+            position=VECTOR2I(12_000_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(11_500_000, 4_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="+12V",
+            number="1",
+        )
+        board = MockBoard(
+            footprints=[
+                MockFootprint("J1", [j1]),
+                MockFootprint("U1", [u1]),
+                MockFootprint("U2", [u2]),
+            ],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+        )
+        d_j1 = plugin._pad_descriptor(board, "J1", j1)
+        d_u1 = plugin._pad_descriptor(board, "U1", u1)
+        d_u2 = plugin._pad_descriptor(board, "U2", u2)
+
+        settings = {
+            "res": 0.5,
+            "output_dir": str(tmp_path),
+            "current_enabled": True,
+            "current_flows": [
+                {
+                    "name": "BusFlow",
+                    "net_name": "+12V",
+                    "net_code": 1,
+                    "total_current_a": 10.0,
+                    "from_sharing": "equipotential",
+                    "to_sharing": "equipotential",
+                    "from_pads": [d_j1],
+                    "to_pads": [d_u1, d_u2],
+                },
+                {
+                    "name": "EqualFlow",
+                    "net_name": "+12V",
+                    "net_code": 1,
+                    "total_current_a": 4.0,
+                    "from_sharing": "equal",
+                    "to_sharing": "fixed",
+                    "from_pads": [d_j1],
+                    "to_pads": [{**d_u1, "current_a": 1.5}, {**d_u2, "current_a": 2.5}],
+                },
+            ],
+        }
+        terminals, buses, missing, flow_errors = plugin._resolve_current_targets(board, settings)
+        assert missing == []
+        assert flow_errors == []
+        assert len(buses) == 1
+        assert isinstance(buses[0], EquipotentialBus)
+        assert buses[0].name == "BusFlow (To)"
+        assert buses[0].total_current_a == pytest.approx(-10.0)
+        assert [p for p, _ in buses[0].pads] == [u1, u2]
+
+        # From BusFlow (+10 on J1) + EqualFlow (+4 on J1, -1.5 on U1, -2.5 on U2)
+        assert sum(t.current_a for t in terminals) + sum(b.total_current_a for b in buses) == pytest.approx(0.0)
+        assert plugin._resolve_current_pad_objects(board, settings) == [j1, u1, u2]
+
+        pf = plugin._preflight(board, [F_Cu, B_Cu], EDA_RECT(0, 0, 20_000_000, 10_000_000), settings)
+        assert pf.errors == []
+        assert pf.area.active_net_names == ("+12V",)
+
+    def test_run_simulation_2_pass_coupling_pwl_and_bus_cache_key(self, tmp_path, monkeypatch):
+        import ThermalSim.thermal_plugin as plugin_mod
+        from ThermalSim.electrical_solver import ElectricalNetSummary, ElectricalResult
+        from ThermalSim.thermal_solver import SolverResult
+        from ThermalSim.workflow import GeometryCache
+
+        suite = TestCompactLowRamPluginWiring()
+        plugin, board, pad, settings = suite._setup_plugin_env(tmp_path, monkeypatch, with_eco1=False)
+        plugin.geometry_cache = GeometryCache(cache_dir=str(tmp_path / "geom_cache"))
+
+        pwl_file = tmp_path / "pulse.pwl"
+        pwl_file.write_text("0.0 1.0\n1.0 1.0\n", encoding="utf-8")
+
+        u2 = MockPad(
+            position=VECTOR2I(7_000_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(6_500_000, 4_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="VIN",
+            number="2",
+        )
+        u3 = MockPad(
+            position=VECTOR2I(8_500_000, 5_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(8_000_000, 4_500_000, 1_000_000, 1_000_000),
+            net_code=1,
+            net_name="VIN",
+            number="3",
+        )
+        board.Footprints()[0].Pads().extend([u2, u3])
+        d1 = plugin._pad_descriptor(board, "U1", pad)
+        d2 = plugin._pad_descriptor(board, "U1", u2)
+        d3 = plugin._pad_descriptor(board, "U1", u3)
+
+        settings["compute_engine"] = "legacy"
+        settings["steady_state"] = False
+        settings["time"] = 1.0
+        settings["power_pads"] = [{**d1, "power": str(pwl_file)}]
+        settings["current_enabled"] = True
+        settings["electro_thermal_coupling"] = True
+        settings["current_flows"] = [
+            {
+                "name": "FlowBus",
+                "net_name": "VIN",
+                "net_code": 1,
+                "total_current_a": 10.0,
+                "from_sharing": "equipotential",
+                "to_sharing": "equipotential",
+                "from_pads": [d1],
+                "to_pads": [d2, d3],
+            }
+        ]
+
+        electrical_calls = []
+        qfunc_totals = []
+        captured_report = {}
+
+        def spy_solve_electrical(b, terminals, config, equipotential_buses=None, temperature_field=None, **kwargs):
+            electrical_calls.append((equipotential_buses, temperature_field))
+            n = len(config.copper_ids) * config.rows * config.cols
+            loss = 2.0 if temperature_field is None else 2.25
+            q = np.zeros(n, dtype=np.float64)
+            q[0] = loss
+            j_map = np.zeros((len(config.copper_ids), config.rows, config.cols), dtype=np.float32)
+            j_map[0, 1, 1] = 15.0
+            return ElectricalResult(
+                q_joule=q,
+                net_summaries=[ElectricalNetSummary(
+                    net_key="net:1",
+                    net_name="VIN",
+                    terminal_count=3,
+                    total_current_a=10.0,
+                    total_abs_current_a=20.0,
+                    total_loss_w=loss,
+                    max_node_power_w=loss,
+                    connected_component_count=1,
+                    source_current_a=10.0,
+                    sink_current_a=10.0,
+                    current_balance_a=0.0,
+                    effective_resistance_ohm=loss / 100.0,
+                    equivalent_voltage_drop_v=loss / 10.0,
+                    pad_resistance_ohm=None,
+                    copper_cell_count=10,
+                    edge_count=10,
+                    via_edge_count=0,
+                )],
+                warnings=[],
+                errors=[],
+                current_density_map=j_map,
+            )
+
+        def spy_run_sim(config, K, C, Q, b, hA, lc, r, c, *args, **kwargs):
+            q_func = kwargs.get("Q_func")
+            qfunc_totals.append(float(np.sum(q_func(0.5))))
+            return SolverResult(
+                T=np.full((lc, r, c), 65.0),
+                aborted=False,
+                step_counter=1,
+                total_solve_time=0.01,
+                total_factor_time=0.0,
+                factor_count=1,
+                snapshot_stats=[],
+                snapshot_files=[],
+                phase_metrics=[],
+                balance_history=[],
+                k_norm_info={},
+            )
+
+        monkeypatch.setattr(plugin_mod, "solve_electrical_heating", spy_solve_electrical)
+        monkeypatch.setattr(plugin_mod, "run_simulation", spy_run_sim)
+        monkeypatch.setattr(
+            plugin_mod,
+            "write_html_report",
+            lambda *a, **k: captured_report.update(k) or str(tmp_path / "rep.html"),
+        )
+
+        plugin._run_simulation(
+            board, [F_Cu, B_Cu], ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad, u2, u3], settings, {}, ["U1-1", "U1-2", "U1-3"],
+        )
+
+        # Pass 1 (temp=None), Pass 2 (temp=65C -> 2.25W, +12.5% -> triggers Pass 3), Pass 3 (temp=65C -> 2.25W, 0% change -> stops)
+        assert len(electrical_calls) == 3
+        assert electrical_calls[0][1] is None
+        assert electrical_calls[1][1] is not None
+        assert len(electrical_calls[0][0]) == 1
+        # Verify PWL Q_func replaced q_joule rather than accumulating (1.0 W manual + 2.0 W, then 1.0 W + 2.25 W)
+        assert qfunc_totals[0] == pytest.approx(3.0)
+        assert qfunc_totals[1] == pytest.approx(3.25)
+        assert qfunc_totals[2] == pytest.approx(3.25)
+
+        el_sum = captured_report["electrical_summary"]
+        assert el_sum["electro_thermal_passes"] == 3
+        assert el_sum["initial_loss_w"] == pytest.approx(2.0)
+        assert el_sum["coupled_loss_w"] == pytest.approx(2.25)
+        import os
+        assert captured_report["current_density_path"] is not None
+        assert os.path.isfile(captured_report["current_density_path"])
+
+        # Changing bus total_current_a must change electrical cache key
+        key_a = plugin.electrical_cache.key
+        settings_b = dict(settings)
+        settings_b["current_flows"] = [dict(settings["current_flows"][0], total_current_a=20.0)]
+        plugin._run_simulation(
+            board, [F_Cu, B_Cu], ["F.Cu", "B.Cu"],
+            EDA_RECT(0, 0, 10_000_000, 10_000_000),
+            [pad, u2, u3], settings_b, {}, ["U1-1", "U1-2", "U1-3"],
+        )
+        assert plugin.electrical_cache.key != key_a

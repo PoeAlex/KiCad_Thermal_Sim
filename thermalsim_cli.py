@@ -117,6 +117,106 @@ def _parse_pad_spec(spec: str) -> Dict[str, str]:
     }
 
 
+def _parse_flow_side(raw_side: str, side_name: str) -> List[Tuple[str, Optional[float]]]:
+    """Parse one side of a ``--current-flow`` spec into ``[(pad_name, current_a_or_None)]``."""
+    tokens = [tok.strip() for tok in raw_side.split(",") if tok.strip()]
+    if not tokens:
+        raise _CliUsageError(f"Empty {side_name} pad list in --current-flow specification.")
+    parsed: List[Tuple[str, Optional[float]]] = []
+    for tok in tokens:
+        if ":" in tok:
+            pad_part, val_part = tok.rsplit(":", 1)
+            pad_part = pad_part.strip()
+            val_part = val_part.strip()
+            if val_part.lower().endswith("a"):
+                val_part = val_part[:-1].strip()
+            if not pad_part or "." not in pad_part or not val_part:
+                raise _CliUsageError(
+                    f"Invalid pad/current token {tok!r} in --current-flow; expected REF.PAD or REF.PAD:CURRENT[A]."
+                )
+            try:
+                fval = float(val_part)
+            except ValueError as exc:
+                raise _CliUsageError(f"Invalid current value {val_part!r} in --current-flow.") from exc
+            if not math.isfinite(fval) or fval < 0.0:
+                raise _CliUsageError(f"Current value {val_part!r} in --current-flow must be >= 0 and finite.")
+            parsed.append((pad_part, fval))
+        else:
+            if "." not in tok:
+                raise _CliUsageError(f"Invalid pad identifier {tok!r} in --current-flow; expected REF.PAD.")
+            ref_p, num_p = tok.split(".", 1)
+            if not ref_p.strip() or not num_p.strip():
+                raise _CliUsageError(f"Invalid pad identifier {tok!r} in --current-flow; expected REF.PAD.")
+            parsed.append((tok, None))
+    return parsed
+
+
+def _parse_current_flow_spec(spec: str) -> Dict[str, Any]:
+    """Parse ``FROM->TO`` current flow CLI spec (e.g. ``'J1.1->U1.1:3,U2.1:3,U3.1:3'`` or ``'J1.1->U1.1,U1.2:12A'``)."""
+    if "->" not in spec:
+        raise _CliUsageError(
+            f"Invalid --current-flow syntax {spec!r}; expected 'FROM->TO' (e.g. 'J1.1->U1.1:3,U2.1:3')."
+        )
+    lhs, rhs = spec.split("->", 1)
+    lhs = lhs.strip()
+    rhs = rhs.strip()
+    if not lhs or not rhs:
+        raise _CliUsageError(f"Invalid --current-flow syntax {spec!r}; both source and sink sides are required.")
+
+    explicit_total: Optional[float] = None
+    if "=" in rhs:
+        rhs_pads, total_raw = rhs.rsplit("=", 1)
+        rhs = rhs_pads.strip()
+        total_clean = total_raw.strip()
+        if total_clean.lower().endswith("a"):
+            total_clean = total_clean[:-1].strip()
+        try:
+            explicit_total = float(total_clean)
+        except ValueError as exc:
+            raise _CliUsageError(f"Invalid total current {total_raw!r} in --current-flow.") from exc
+        if not math.isfinite(explicit_total) or explicit_total < 0.0:
+            raise _CliUsageError(f"Total current {total_raw!r} in --current-flow must be >= 0 and finite.")
+
+    from_items = _parse_flow_side(lhs, "source")
+    to_items = _parse_flow_side(rhs, "sink")
+
+    def _finalize_side(
+        items: List[Tuple[str, Optional[float]]],
+        side_label: str,
+    ) -> Tuple[Any, str, Optional[float]]:
+        vals = [v for _, v in items]
+        if all(v is not None for v in vals):
+            return {p: float(v) for p, v in items if v is not None}, "fixed", None
+        if all(v is None for v in vals):
+            return [p for p, _ in items], "equipotential", None
+        if len(items) >= 2 and all(v is None for v in vals[:-1]) and vals[-1] is not None:
+            return [p for p, _ in items], "equipotential", float(vals[-1])
+        raise _CliUsageError(
+            f"Ambiguous {side_label} current specification in --current-flow {spec!r}; "
+            "specify current on every pad (REF.PAD:A) or once at the end for equipotential sharing."
+        )
+
+    from_sel, from_sharing, from_tail_total = _finalize_side(from_items, "source")
+    to_sel, to_sharing, to_tail_total = _finalize_side(to_items, "sink")
+
+    flow: Dict[str, Any] = {
+        "from": from_sel,
+        "from_sharing": from_sharing,
+        "to": to_sel,
+        "to_sharing": to_sharing,
+    }
+    inferred_total = explicit_total if explicit_total is not None else (
+        to_tail_total if to_tail_total is not None else from_tail_total
+    )
+    if inferred_total is not None:
+        flow["total_current_a"] = float(inferred_total)
+    elif from_sharing != "fixed" and to_sharing != "fixed":
+        raise _CliUsageError(
+            f"Missing current value in --current-flow {spec!r}; add ':12A' or '=12A' or per-pad ':A' values."
+        )
+    return flow
+
+
 def _parse_limit_comp_spec(spec: str) -> Tuple[str, float]:
     """Parse ``PATTERN=MAX_TEMP_C`` for component thermal limits."""
     if "=" not in spec:
@@ -218,6 +318,22 @@ def _build_job_config(args: argparse.Namespace) -> Dict[str, Any]:
         parsed_pads = [_parse_pad_spec(spec) for spec in args.pad]
         config["power_pads"] = _merge_power_pads(config.get("power_pads"), parsed_pads)
 
+    if getattr(args, "current_flow", None):
+        existing_flows = config.get("current_flows")
+        if existing_flows is None:
+            flows_list: List[Any] = []
+        elif isinstance(existing_flows, list):
+            flows_list = list(existing_flows)
+        else:
+            raise _CliUsageError("Config field 'current_flows' must be a list.")
+        for spec in args.current_flow:
+            flows_list.append(_parse_current_flow_spec(spec))
+        config["current_flows"] = flows_list
+        config["current_enabled"] = True
+
+    if getattr(args, "electro_thermal_coupling", None) is not None:
+        config["electro_thermal_coupling"] = bool(args.electro_thermal_coupling)
+
     simple_mappings = [
         ("steady_state", "steady_state"),
         ("time", "time"),
@@ -299,6 +415,19 @@ def _add_common_job_flags(parser: argparse.ArgumentParser) -> None:
         action="append",
         metavar="SPEC",
         help="Heat source pad spec REF.PAD=VALUE (e.g. U1.37=5W or U1.37=pwl.csv).",
+    )
+    parser.add_argument(
+        "--current-flow",
+        action="append",
+        metavar="SPEC",
+        help="Pad-to-pad DC current flow spec FROM->TO (e.g. 'J1.1->U1.1:3,U2.1:3,U3.1:3' or 'J1.1->U1.1,U1.2:12A').",
+    )
+    parser.add_argument(
+        "--no-electro-thermal",
+        dest="electro_thermal_coupling",
+        action="store_false",
+        default=None,
+        help="Disable iterative rho_cu(T) electro-thermal coupling when current heating is enabled.",
     )
 
     mode_group = parser.add_mutually_exclusive_group()

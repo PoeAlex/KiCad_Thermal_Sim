@@ -154,17 +154,17 @@ class TestBuildPcmPackage:
             assert "kicad.org/pcm/schemas/v1" in meta["$schema"]
 
     def test_metadata_default_version_and_no_pypardiso(self, tmp_path):
-        """Test default version is 0.4.9, kicad_version is 9.0, and no pypardiso reference exists."""
+        """Test default version is 0.5.0, kicad_version is 9.0, and no pypardiso reference exists."""
         result = self._run_build(tmp_path)
         assert result.returncode == 0, f"Build failed: {result.stderr}"
         zips = list(tmp_path.glob("*.zip"))
         assert len(zips) == 1
-        assert zips[0].name == "ThermalSim-v0.4.9.zip"
+        assert zips[0].name == "ThermalSim-v0.5.0.zip"
         with zipfile.ZipFile(zips[0], 'r') as zf:
             raw_meta = zf.read("metadata.json").decode("utf-8")
             assert "pardiso" not in raw_meta.lower()
             meta = json.loads(raw_meta)
-            assert meta["versions"][0]["version"] == "0.4.9"
+            assert meta["versions"][0]["version"] == "0.5.0"
             assert meta["versions"][0]["kicad_version"] == "9.0"
 
     def test_zip_packages_present_native_binaries(self, tmp_path):

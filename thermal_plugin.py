@@ -42,6 +42,10 @@ from .gui_dialogs import (
     prepare_power_pads,
     resolve_heatsink_cp,
 )
+try:
+    from .gui_dialogs import prepare_current_flows
+except ImportError:  # pragma: no cover - optional during staged updates
+    prepare_current_flows = None
 from .electrical_solver import (
     CurrentTerminal,
     ElectricalConfig,
@@ -49,6 +53,10 @@ from .electrical_solver import (
     net_key_from_values,
     solve_electrical_heating,
 )
+try:
+    from .electrical_solver import EquipotentialBus
+except ImportError:  # pragma: no cover - optional during staged updates
+    EquipotentialBus = None
 from .geometry_mapper import (
     build_geometry_state,
     create_multilayer_maps,
@@ -309,6 +317,10 @@ from .visualization import (
     save_snapshot, show_results_top_bot, show_results_all_layers, save_preview_image,
     build_interactive_heatmap_payload, save_joule_loss_map
 )
+try:
+    from .visualization import save_current_density_map
+except ImportError:  # pragma: no cover
+    save_current_density_map = None
 from .thermal_report import write_html_report
 from .workflow import (
     AreaEstimate,
@@ -492,8 +504,47 @@ def _build_factorization_cache_key(operator_key, config, steady_state, settings)
 def _electrical_net_summary_dict(summary):
     """Convert electrical net diagnostics to report-friendly dictionaries."""
     data = asdict(summary)
+    data.pop("current_density_a_mm2", None)
     data["net"] = data.get("net_name", "")
     return data
+
+
+def _supports_kwarg(fn, kw_name):
+    """Return True if ``fn`` accepts ``kw_name`` explicitly or via ``**kwargs``."""
+    try:
+        params = inspect.signature(fn).parameters
+        return kw_name in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _normalize_flow_sharing_mode(raw_mode, default="equipotential"):
+    """Normalize sharing mode strings for Pad-to-Pad current flows."""
+    mode = str(raw_mode or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if mode in {"equipotential", "equipotential_(auto)", "auto", "natural"}:
+        return "equipotential"
+    if mode in {"equal", "equal_split", "split"}:
+        return "equal"
+    if mode in {"fixed", "fixed_per_pad", "per_pad"}:
+        return "fixed"
+    return default
+
+
+def _area_terminals_with_buses(terminals, buses):
+    """Build combined terminal list so area estimation covers EquipotentialBus nets."""
+    combined = list(terminals or [])
+    for bus in buses or []:
+        if getattr(bus, "pads", None) and abs(float(getattr(bus, "total_current_a", 0.0))) > 0.0:
+            combined.append(CurrentTerminal(
+                pad=bus.pads[0][0],
+                name=bus.name,
+                net_name=bus.net_name,
+                net_code=int(bus.net_code),
+                current_a=float(bus.total_current_a),
+            ))
+    return combined
 
 
 def _format_timing_summary(timings):
@@ -1157,12 +1208,14 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             return self._preflight(board, copper_ids, bbox, settings)
 
         self._show_startup_progress(92, "Creating ThermalSim dialog...")
+        board_pads = self._collect_board_pad_descriptors(board)
         stackup_thickness_mm = (
             stack_info.get("board_thickness_mm")
             if isinstance(stack_info, dict)
             else None
         )
-        dlg = SettingsDialog(
+        dlg = call_with_supported_kwargs(
+            SettingsDialog,
             self.host_window, len(pads_list), suggested_res, layer_names,
             preview_callback=self.generate_preview,
             selection_provider=selection_provider,
@@ -1180,6 +1233,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             board_size_mm=(w_mm, h_mm),
             defer_initial_preflight=True,
             stackup_thickness_mm=stackup_thickness_mm,
+            optional_kwargs={"board_pads": board_pads},
         )
         self.settings_dialog = dlg
         self._close_startup_progress()
@@ -1354,6 +1408,26 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         descriptors.sort(key=lambda item: item.get("name", ""))
         return descriptors
 
+    def _collect_board_pad_descriptors(self, board):
+        """Collect serializable descriptors for all copper pads on the board."""
+        descriptors = []
+        npth_attrib = getattr(pcbnew, "PAD_ATTRIB_NPTH", None)
+        try:
+            footprints = board.Footprints() if hasattr(board, 'Footprints') else board.GetFootprints()
+            for fp in footprints:
+                fp_ref = fp.GetReference()
+                for pad in fp.Pads():
+                    try:
+                        if npth_attrib is not None and pad.GetAttribute() == npth_attrib:
+                            continue
+                    except Exception:
+                        pass
+                    descriptors.append(self._pad_descriptor(board, fp_ref, pad))
+        except Exception:
+            return []
+        descriptors.sort(key=lambda item: item.get("name", ""))
+        return descriptors
+
     def _build_pad_lookup(self, board):
         """Build lookup maps from persisted pad descriptors to live pad objects."""
         by_key = {}
@@ -1411,7 +1485,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         return self._unique_pads([pad for _, pad, _ in entries])
 
     def _resolve_current_pad_objects(self, board, settings, pad_lookup=None):
-        """Resolve current-group pad descriptors to live pad objects."""
+        """Resolve current-flow or legacy current-group pad descriptors to live pad objects."""
         if not settings.get("current_enabled"):
             return []
         by_key, by_name = (
@@ -1419,6 +1493,27 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         )
         pads = []
         seen = set()
+        raw_flows = settings.get("current_flows") or []
+        if raw_flows:
+            prepared_flows = (
+                prepare_current_flows(raw_flows)
+                if prepare_current_flows is not None
+                else list(raw_flows)
+            )
+            for flow in prepared_flows:
+                if not isinstance(flow, dict):
+                    continue
+                for pad_info in list(flow.get("from_pads") or []) + list(flow.get("to_pads") or []):
+                    if not isinstance(pad_info, dict):
+                        continue
+                    match = by_key.get(pad_info.get("pad_key")) or by_name.get(pad_info.get("name"))
+                    if not match:
+                        continue
+                    _, pad = match
+                    if id(pad) not in seen:
+                        pads.append(pad)
+                        seen.add(id(pad))
+            return pads
         for group in prepare_current_groups(settings.get("current_groups", [])):
             for pad_info in group.get("pads", []):
                 match = by_key.get(pad_info.get("pad_key")) or by_name.get(pad_info.get("name"))
@@ -1430,8 +1525,163 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     seen.add(id(pad))
         return pads
 
-    def _resolve_current_terminals(self, board, settings, pad_lookup=None):
-        """Resolve current-group settings into CurrentTerminal objects."""
+    @staticmethod
+    def _emit_flow_side(
+        side_label,
+        resolved_items,
+        sharing,
+        total_a,
+        sign,
+        flow_name,
+        flow_net_name,
+        flow_net_code,
+        terminals,
+        buses,
+    ):
+        """Emit EquipotentialBus or CurrentTerminal entries for one side of a flow."""
+        if not resolved_items:
+            return
+        if sharing == "equipotential":
+            if abs(total_a) <= 0.0:
+                return
+            if len(resolved_items) >= 2 and EquipotentialBus is not None:
+                buses.append(EquipotentialBus(
+                    name=f"{flow_name} ({side_label})",
+                    net_name=flow_net_name,
+                    net_code=int(flow_net_code),
+                    pads=[(pad, desc.get("name", "")) for desc, pad, _ in resolved_items],
+                    total_current_a=float(sign * total_a),
+                ))
+            else:
+                per_pad = (sign * total_a) / float(len(resolved_items))
+                for desc, pad, _ in resolved_items:
+                    terminals.append(CurrentTerminal(
+                        pad=pad,
+                        name=desc.get("name", ""),
+                        net_name=desc.get("net_name", ""),
+                        net_code=int(desc.get("net_code", 0) or 0),
+                        current_a=float(per_pad),
+                    ))
+        elif sharing == "equal":
+            if abs(total_a) <= 0.0:
+                return
+            per_pad = (sign * total_a) / float(len(resolved_items))
+            for desc, pad, _ in resolved_items:
+                terminals.append(CurrentTerminal(
+                    pad=pad,
+                    name=desc.get("name", ""),
+                    net_name=desc.get("net_name", ""),
+                    net_code=int(desc.get("net_code", 0) or 0),
+                    current_a=float(per_pad),
+                ))
+        else:  # fixed
+            for desc, pad, item_curr in resolved_items:
+                curr = float(sign * abs(float(item_curr)))
+                if abs(curr) <= 0.0:
+                    continue
+                terminals.append(CurrentTerminal(
+                    pad=pad,
+                    name=desc.get("name", ""),
+                    net_name=desc.get("net_name", ""),
+                    net_code=int(desc.get("net_code", 0) or 0),
+                    current_a=curr,
+                ))
+
+    def _resolve_current_flows(self, board, settings, pad_lookup=None):
+        """Resolve ``current_flows`` into ``(terminals, buses, missing_pads, flow_errors)``."""
+        terminals = []
+        buses = []
+        missing = []
+        flow_errors = []
+        if not settings.get("current_enabled"):
+            return terminals, buses, missing, flow_errors
+
+        by_key, by_name = (
+            pad_lookup if pad_lookup is not None else self._build_pad_lookup(board)
+        )
+        raw_flows = settings.get("current_flows") or []
+        prepared_flows = (
+            prepare_current_flows(raw_flows)
+            if prepare_current_flows is not None
+            else list(raw_flows)
+        )
+
+        for idx, flow in enumerate(prepared_flows):
+            if not isinstance(flow, dict):
+                continue
+            flow_name = str(flow.get("name") or f"Flow {idx + 1}")
+            from_pads = list(flow.get("from_pads") or [])
+            to_pads = list(flow.get("to_pads") or [])
+            from_sharing = _normalize_flow_sharing_mode(flow.get("from_sharing"), default="equipotential")
+            to_sharing = _normalize_flow_sharing_mode(flow.get("to_sharing"), default="equipotential")
+            total_a = abs(float(flow.get("total_current_a", 0.0) or 0.0))
+            if to_sharing == "fixed" and from_sharing != "fixed":
+                total_a = sum(abs(float(p.get("current_a", 0.0) or 0.0)) for p in to_pads if isinstance(p, dict))
+            elif from_sharing == "fixed" and to_sharing != "fixed":
+                total_a = sum(abs(float(p.get("current_a", 0.0) or 0.0)) for p in from_pads if isinstance(p, dict))
+            elif from_sharing == "fixed" and to_sharing == "fixed":
+                total_a = sum(abs(float(p.get("current_a", 0.0) or 0.0)) for p in from_pads if isinstance(p, dict))
+
+            if (from_pads or to_pads or total_a > 0.0) and (not from_pads or not to_pads):
+                flow_errors.append(
+                    f"Flow '{flow_name}' must specify both From and To pads."
+                )
+
+            def _resolve_side(side_list):
+                resolved = []
+                for pad_info in side_list:
+                    if not isinstance(pad_info, dict):
+                        continue
+                    match = by_key.get(pad_info.get("pad_key")) or by_name.get(pad_info.get("name"))
+                    if not match:
+                        missing.append(pad_info.get("name", pad_info.get("pad_key", "<unknown>")))
+                        continue
+                    desc, pad = match
+                    resolved.append((desc, pad, abs(float(pad_info.get("current_a", 0.0) or 0.0))))
+                return resolved
+
+            resolved_from = _resolve_side(from_pads)
+            resolved_to = _resolve_side(to_pads)
+            all_resolved = resolved_from + resolved_to
+            if not all_resolved:
+                continue
+
+            net_keys = {
+                net_key_from_values(int(desc.get("net_code", 0) or 0), desc.get("net_name", ""))
+                for desc, _, _ in all_resolved
+            }
+            if len(net_keys) > 1:
+                flow_errors.append(
+                    f"Flow '{flow_name}' mixes pads from different nets; all pads in a flow must share one net."
+                )
+                continue
+
+            first_desc = all_resolved[0][0]
+            flow_net_name = str(first_desc.get("net_name") or flow.get("net_name", "") or "")
+            flow_net_code = int(first_desc.get("net_code", flow.get("net_code", 0)) or 0)
+
+            self._emit_flow_side(
+                "From", resolved_from, from_sharing, total_a, +1.0,
+                flow_name, flow_net_name, flow_net_code, terminals, buses,
+            )
+            self._emit_flow_side(
+                "To", resolved_to, to_sharing, total_a, -1.0,
+                flow_name, flow_net_name, flow_net_code, terminals, buses,
+            )
+
+        return terminals, buses, missing, flow_errors
+
+    def _resolve_current_targets(self, board, settings, pad_lookup=None):
+        """Resolve ``current_flows`` (or legacy ``current_groups``) into ``(terminals, buses, missing, flow_errors)``."""
+        if not settings.get("current_enabled"):
+            return [], [], [], []
+        if settings.get("current_flows"):
+            return self._resolve_current_flows(board, settings, pad_lookup=pad_lookup)
+        terminals, missing = self._resolve_legacy_current_terminals(board, settings, pad_lookup=pad_lookup)
+        return terminals, [], missing, []
+
+    def _resolve_legacy_current_terminals(self, board, settings, pad_lookup=None):
+        """Resolve legacy ``current_groups`` settings into CurrentTerminal objects."""
         terminals = []
         missing = []
         if not settings.get("current_enabled"):
@@ -1456,6 +1706,13 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     net_code=int(descriptor.get("net_code", pad_info.get("net_code", 0)) or 0),
                     current_a=current,
                 ))
+        return terminals, missing
+
+    def _resolve_current_terminals(self, board, settings, pad_lookup=None):
+        """Resolve current-flow or current-group settings into ``(terminals, missing)``."""
+        terminals, _, missing, _ = self._resolve_current_targets(
+            board, settings, pad_lookup=pad_lookup
+        )
         return terminals, missing
 
     def _unique_pads(self, pads):
@@ -1494,15 +1751,21 @@ class ThermalPlugin(pcbnew.ActionPlugin):
         )
         power_pads = [pad for _, pad, _ in power_entries]
         terminals = []
+        buses = []
         missing_current = []
+        flow_errors = []
         if settings.get("current_enabled"):
-            terminals, missing_current = self._resolve_current_terminals(
+            terminals, buses, missing_current, flow_errors = self._resolve_current_targets(
                 board, settings, pad_lookup=pad_lookup
             )
-        current_pads = [item.pad for item in terminals]
+        current_pads = (
+            [item.pad for item in terminals]
+            + [pad_obj for bus in buses for pad_obj, _ in getattr(bus, "pads", [])]
+        )
         focus_pads = self._unique_pads(power_pads + current_pads)
         result.area = _estimate_simulation_area(
-            board, bbox, settings, power_pads=power_pads, terminals=terminals
+            board, bbox, settings, power_pads=power_pads,
+            terminals=_area_terminals_with_buses(terminals, buses),
         )
         result.grid = _estimate_solver_grid(
             bbox, float(settings.get("res", 0.5)), settings, len(copper_ids),
@@ -1536,14 +1799,27 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
         has_current = False
         if settings.get("current_enabled"):
+            result.errors.extend(flow_errors)
             if missing_current:
                 result.errors.append(f"{len(missing_current)} current-terminal pad(s) are missing from the board.")
-            has_current = any(abs(float(item.current_a)) > 0.0 for item in terminals)
+            has_current = (
+                any(abs(float(item.current_a)) > 0.0 for item in terminals)
+                or any(abs(float(bus.total_current_a)) > 0.0 for bus in buses)
+            )
             totals = {}
+            abs_totals = {}
             for item in terminals:
                 net = item.net_name or f"net:{item.net_code}"
                 totals[net] = totals.get(net, 0.0) + float(item.current_a)
-            unbalanced = [name for name, total in totals.items() if abs(total) > 1e-9]
+                abs_totals[net] = abs_totals.get(net, 0.0) + abs(float(item.current_a))
+            for bus in buses:
+                net = bus.net_name or f"net:{bus.net_code}"
+                totals[net] = totals.get(net, 0.0) + float(bus.total_current_a)
+                abs_totals[net] = abs_totals.get(net, 0.0) + abs(float(bus.total_current_a))
+            unbalanced = [
+                name for name, total in totals.items()
+                if abs(total) > max(1e-9, 1e-6 * abs_totals.get(name, 0.0))
+            ]
             if unbalanced:
                 result.errors.append("Current is not balanced for: " + ", ".join(unbalanced[:3]))
 
@@ -1607,15 +1883,19 @@ class ThermalPlugin(pcbnew.ActionPlugin):
             power_pads = self._resolve_power_pad_objects(
                 self.board, settings, legacy_pads=self.pads_list, pad_lookup=pad_lookup
             )
-            terminals, _ = self._resolve_current_terminals(
+            terminals, buses, _, _ = self._resolve_current_targets(
                 self.board, settings, pad_lookup=pad_lookup
             )
-            current_pads = [item.pad for item in terminals]
+            current_pads = (
+                [item.pad for item in terminals]
+                + [pad_obj for bus in buses for pad_obj, _ in getattr(bus, "pads", [])]
+            )
             preview_pads = self._unique_pads(power_pads + current_pads)
             effective_settings = dict(settings)
             area = _estimate_simulation_area(
                 self.board, self.bbox, effective_settings,
-                power_pads=power_pads, terminals=terminals,
+                power_pads=power_pads,
+                terminals=_area_terminals_with_buses(terminals, buses),
             )
             effective_settings["_preview_area_summary"] = (
                 f"{area.width_mm:.1f} x {area.height_mm:.1f} mm / "
@@ -1766,14 +2046,15 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 board, settings, legacy_pads=pads_list, pad_lookup=pad_lookup
             )
             area_terminals = []
+            area_buses = []
             if settings.get("current_enabled"):
-                area_terminals, _ = self._resolve_current_terminals(
+                area_terminals, area_buses, _, _ = self._resolve_current_targets(
                     board, settings, pad_lookup=pad_lookup
                 )
             area = _estimate_simulation_area(
                 board, bbox, settings,
                 power_pads=area_power_pads,
-                terminals=area_terminals,
+                terminals=_area_terminals_with_buses(area_terminals, area_buses),
             )
             # Derive thicknesses
             stackup_derived = self._derive_stackup_thicknesses(board, copper_ids, stack_info, settings)
@@ -2077,14 +2358,43 @@ class ThermalPlugin(pcbnew.ActionPlugin):
 
             # Electrical solve (37-46 %)
             electrical_summary = None
+            electrical_result = None
+            electrical_config = None
             q_joule = None
+            q_base = Q
+            base_q_func = Q_func
+            electro_thermal_passes = 0
+            initial_loss_w = 0.0
+            coupled_loss_w = 0.0
+
+            def _apply_joule_heating(q_j):
+                nonlocal Q, Q_func, q_base, base_q_func
+                if q_base is None:
+                    q_base, base_q_func = _build_power_vector(pad_sources, pad_contributions, N)
+                Q = q_base + q_j
+                if base_q_func is not None:
+                    def q_func_with_joule(t, _base=base_q_func, _q_joule=q_j):
+                        return _base(t) + _q_joule
+                    Q_func = q_func_with_joule
+
+            terminals = []
+            buses = []
             if settings.get("current_enabled"):
                 set_dialog_state("running", "Solving active electrical paths...")
                 electrical_start = time.perf_counter()
                 electrical_cache_hit = False
-                terminals, missing_pads = self._resolve_current_terminals(
+                terminals, buses, missing_pads, flow_errors = self._resolve_current_targets(
                     board, settings, pad_lookup=pad_lookup
                 )
+                if flow_errors:
+                    reporter.close()
+                    wx.MessageBox(
+                        "Current simulation configuration is invalid:\n"
+                        + "\n".join(str(msg) for msg in flow_errors),
+                        "Current Path Error"
+                    )
+                    set_dialog_state("failed", "Current-flow configuration is invalid.")
+                    return
                 if missing_pads:
                     reporter.close()
                     wx.MessageBox(
@@ -2094,7 +2404,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     )
                     set_dialog_state("failed", "One or more current-terminal pads were not found.")
                     return
-                if terminals:
+                if terminals or buses:
                     electrical_config = call_with_supported_kwargs(
                         ElectricalConfig,
                         copper_ids=list(copper_ids),
@@ -2110,6 +2420,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                             "via_fill": via_fill,
                             "ambient_c": float(amb),
                             "gap_m": gap_m,
+                            "equipotential_pads": True,
                         },
                     )
                     electrical_key = stable_fingerprint({
@@ -2119,9 +2430,23 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         "via_plating_um": float(via_plating_um),
                         "via_fill": via_fill,
                         "ambient_c": float(amb),
+                        "equipotential_pads": bool(getattr(electrical_config, "equipotential_pads", True)),
                         "terminals": [
                             (item.name, item.net_name, int(item.net_code), float(item.current_a))
                             for item in terminals
+                        ],
+                        "buses": [
+                            (
+                                bus.name,
+                                bus.net_name,
+                                int(bus.net_code),
+                                float(bus.total_current_a),
+                                [
+                                    (pad_name, self._pad_key("", pad_obj))
+                                    for pad_obj, pad_name in bus.pads
+                                ],
+                            )
+                            for bus in buses
                         ],
                     })
                     electrical_result = reporter.run_in_background(
@@ -2145,6 +2470,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                                 38, 46, "Solving active electrical paths..."
                             ),
                             cancel_check=reporter.make_cancel_check(),
+                            optional_kwargs={"equipotential_buses": buses or None},
                         )
                         if reporter.cancelled:
                             raise GeometryCancelledError("Simulation cancelled.")
@@ -2160,20 +2486,17 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         set_dialog_state("failed", "Current-path validation failed.")
                         return
                     q_joule = electrical_result.q_joule
+                    electro_thermal_passes = 1
+                    initial_loss_w = float(electrical_result.total_loss_w)
+                    coupled_loss_w = initial_loss_w
                     if np.any(q_joule):
-                        if Q is None:
-                            Q, Q_func = _build_power_vector(pad_sources, pad_contributions, N)
-                        Q = Q + q_joule
-                        if Q_func is not None:
-                            base_q_func = Q_func
-
-                            def q_func_with_joule(t, _base=base_q_func, _q_joule=q_joule):
-                                return _base(t) + _q_joule
-
-                            Q_func = q_func_with_joule
+                        _apply_joule_heating(q_joule)
                     electrical_summary = {
                         "total_loss_w": electrical_result.total_loss_w,
-                        "warnings": electrical_result.warnings,
+                        "electro_thermal_passes": electro_thermal_passes,
+                        "initial_loss_w": initial_loss_w,
+                        "coupled_loss_w": coupled_loss_w,
+                        "warnings": list(electrical_result.warnings),
                         "nets": [_electrical_net_summary_dict(item) for item in electrical_result.net_summaries],
                     }
                 else:
@@ -2471,31 +2794,119 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                         text += f" ({_format_eta_seconds(eta_s)})"
                 return text
 
-            try:
+            def _run_thermal_pass(start_pct, end_pct, start_msg):
+                progress_state["current"] = 0
+                progress_state["total"] = 1
+                progress_state["message"] = ""
+                progress_state["started_at"] = None
+                worker_result.clear()
                 reporter.run_in_background(
                     solver_worker,
-                    54,
-                    88,
-                    solver_start_msg,
+                    start_pct,
+                    end_pct,
+                    start_msg,
                     progress_state=progress_state,
                     message_fn=_solver_progress_message,
                 )
+                if "traceback" in worker_result:
+                    error_text = worker_result["traceback"]
+                    reporter.close()
+                    _write_run_manifest(run_dir, "error", traceback=error_text)
+                    wx.MessageBox(f"Solver failed:\n{error_text}", "Solver Error")
+                    set_dialog_state("failed", "The thermal solver failed. See the error dialog for details.")
+                    return None
+                res_obj = worker_result["result"]
+                if res_obj.aborted or reporter.cancelled:
+                    raise GeometryCancelledError("Simulation cancelled.")
+                return res_obj
+
+            try:
+                result = _run_thermal_pass(54, 82, solver_start_msg)
+                if result is None:
+                    return
+
+                # 2-pass (up to 3-pass) electro-thermal coupling: update rho_cu(T)
+                if (
+                    settings.get("current_enabled")
+                    and settings.get("electro_thermal_coupling", True)
+                    and electrical_result is not None
+                    and electrical_result.valid
+                    and initial_loss_w > 0.0
+                    and q_joule is not None
+                    and np.any(q_joule)
+                    and not result.aborted
+                    and not reporter.cancelled
+                    and (float(np.max(result.T)) - float(amb)) > 5.0
+                    and _supports_kwarg(solve_electrical_heating, "temperature_field")
+                ):
+                    did_not_converge = False
+                    for pass_idx in (2, 3):
+                        pass_pct = 82 if pass_idx == 2 else 85
+                        et_msg = f"Electro-thermal coupling pass {pass_idx}: updating rho_cu(T)..."
+                        set_dialog_state("running", et_msg)
+                        if not reporter.update(pass_pct, et_msg, force=True):
+                            raise GeometryCancelledError("Simulation cancelled.")
+                        next_electrical = _call_with_optional_progress_kwargs(
+                            solve_electrical_heating,
+                            board,
+                            terminals,
+                            electrical_config,
+                            progress_callback=reporter.make_stage_callback(
+                                pass_pct, pass_pct + 1, et_msg
+                            ),
+                            cancel_check=reporter.make_cancel_check(),
+                            optional_kwargs={
+                                "equipotential_buses": buses or None,
+                                "temperature_field": result.T,
+                            },
+                        )
+                        if reporter.cancelled:
+                            raise GeometryCancelledError("Simulation cancelled.")
+                        if not next_electrical.valid:
+                            break
+                        loss_prev = coupled_loss_w
+                        loss_new = float(next_electrical.total_loss_w)
+                        electrical_result = next_electrical
+                        coupled_loss_w = loss_new
+                        electro_thermal_passes = pass_idx
+                        q_joule = electrical_result.q_joule
+                        _apply_joule_heating(q_joule)
+
+                        solve_msg = f"Solving coupled thermal model (pass {pass_idx})..."
+                        set_dialog_state("running", solve_msg)
+                        result = _run_thermal_pass(pass_pct + 1, pass_pct + 3, solve_msg)
+                        if result is None:
+                            return
+
+                        rel_change = abs(loss_new - loss_prev) / max(loss_prev, 1e-9)
+                        if rel_change <= 0.02:
+                            break
+                        if pass_idx == 3:
+                            did_not_converge = True
+
+                    et_warnings = list(electrical_result.warnings)
+                    if initial_loss_w > 0.0 and coupled_loss_w > 1.5 * initial_loss_w:
+                        et_warnings.append(
+                            f"Electro-thermal coupling increased copper Joule loss by more than 50% "
+                            f"({initial_loss_w:.4f} W -> {coupled_loss_w:.4f} W): thermal runaway risk."
+                        )
+                    if did_not_converge:
+                        et_warnings.append(
+                            "Electro-thermal coupling did not converge within 3 passes "
+                            "(thermal runaway risk)."
+                        )
+                    electrical_summary = {
+                        "total_loss_w": electrical_result.total_loss_w,
+                        "electro_thermal_passes": int(electro_thermal_passes),
+                        "initial_loss_w": float(initial_loss_w),
+                        "coupled_loss_w": float(coupled_loss_w),
+                        "warnings": et_warnings,
+                        "nets": [_electrical_net_summary_dict(item) for item in electrical_result.net_summaries],
+                    }
             finally:
                 if K_matrix is not None and hasattr(K_matrix, "clear_caches"):
                     K_matrix.clear_caches()
                 clear_native_scratch()
-
-            if "traceback" in worker_result:
-                error_text = worker_result["traceback"]
-                reporter.close()
-                _write_run_manifest(run_dir, "error", traceback=error_text)
-                wx.MessageBox(f"Solver failed:\n{error_text}", "Solver Error")
-                set_dialog_state("failed", "The thermal solver failed. See the error dialog for details.")
-                return
-            result = worker_result["result"]
-
-            if result.aborted or reporter.cancelled:
-                raise GeometryCancelledError("Simulation cancelled.")
 
             # Add extra info to k_norm_info
             result.k_norm_info.update({
@@ -2562,6 +2973,7 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                 raise GeometryCancelledError("Simulation cancelled.")
 
             joule_map_path = None
+            current_density_path = None
             if q_joule is not None and np.any(q_joule):
                 if not reporter.update(90, "Rendering Joule loss map...", force=True):
                     raise GeometryCancelledError("Simulation cancelled.")
@@ -2575,6 +2987,25 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     y_min_mm=y_min,
                     res_mm=res,
                     electrical_summary=electrical_summary,
+                    out_dir=run_dir,
+                )
+                if reporter.cancelled:
+                    raise GeometryCancelledError("Simulation cancelled.")
+            current_density_map = (
+                getattr(electrical_result, "current_density_map", None)
+                if electrical_result is not None
+                else None
+            )
+            if (
+                save_current_density_map is not None
+                and current_density_map is not None
+                and np.any(current_density_map)
+            ):
+                if not reporter.update(91, "Rendering current density map...", force=True):
+                    raise GeometryCancelledError("Simulation cancelled.")
+                current_density_path = save_current_density_map(
+                    current_density_map,
+                    layer_names=layer_names,
                     out_dir=run_dir,
                 )
                 if reporter.cancelled:
@@ -2651,7 +3082,8 @@ class ThermalPlugin(pcbnew.ActionPlugin):
                     snapshot_files=result.snapshot_files,
                     interactive_heatmap=interactive_heatmap,
                     electrical_summary=electrical_summary,
-                    joule_map_path=joule_map_path
+                    joule_map_path=joule_map_path,
+                    current_density_path=current_density_path,
                 ),
                 97,
                 99,

@@ -104,26 +104,28 @@ TOOLTIP_TEXTS = {
     'power_add': "Add the pads currently selected in KiCad PCB Editor to the heat-source list.",
     'power_remove': "Remove the selected rows from the heat-source list.",
     'power_clear': "Remove all manual heat sources from the list.",
-    'current_enable': "Enable DC current-flow simulation for Joule heating in traces and copper pours.",
-    'current_balance': "Per-net current sum check. Every active net must sum to 0 A (Kirchhoff's current law).",
+    'current_enable': "Enable DC current-flow simulation for Joule heating in traces, vias, and copper pours.",
+    'current_balance': "Live per-flow current balance and net validation summary.",
+    'current_flows': "Pad-to-pad DC current flows. Each flow defines current from From (source) pads to To (sink) pads on the same net.",
+    'flow_new': "Create a new pad-to-pad current flow.",
+    'flow_duplicate': "Duplicate the selected current flow and its pads.",
+    'flow_delete': "Delete the selected current flow.",
+    'flow_name': "Descriptive label for the selected current flow (e.g. +12V Load, VCore).",
+    'flow_apply_name': "Save the edited flow name.",
+    'flow_total': "Total DC current magnitude (A) flowing from From pads to To pads. Auto-calculated when either side uses Fixed per Pad.",
+    'flow_from_sharing': "How current is shared across From pads: Equipotential (Auto) lets copper resistance decide; Equal Split divides evenly; Fixed per Pad uses explicit values.",
+    'flow_to_sharing': "How current is shared across To pads: Equipotential (Auto) lets copper resistance decide; Equal Split divides evenly; Fixed per Pad uses explicit values.",
+    'flow_add_pads': "Add the pads currently selected in KiCad PCB Editor to this side of the flow.",
+    'flow_pick_pads': "Open the Pad Picker dialog to filter and select pads by net or search text.",
+    'flow_remove_pads': "Remove the selected pad rows from this side of the flow.",
+    'flow_per_pad': "Current magnitude (A) applied to selected pad rows (or all rows on this side if none is selected).",
+    'flow_apply_pad': "Apply the Set A value to selected pad rows (or all pads on this side).",
+    'flow_pad_list': "Comma-separated non-negative per-pad current magnitudes in table order, e.g. 3, 3, 3 or 6, 4, 2.",
+    'flow_apply_list': "Apply the comma-separated current values to the pads on this side in table order.",
+    'flow_from_pads': "Source pads where current enters the PCB copper for this flow.",
+    'flow_to_pads': "Sink pads where current leaves the PCB copper for this flow.",
     'current_groups': "Pad groups used as current sources or sinks. Positive current enters the PCB; negative current leaves it.",
-    'current_new_group': "Create a new current group from the pads currently selected in KiCad.",
-    'current_add_pads': "Add the pads currently selected in KiCad to the selected current group.",
-    'current_remove_pads': "Remove the selected pad row from the current group.",
-    'current_duplicate_group': "Duplicate the selected current group and its pads.",
-    'current_delete_group': "Delete the selected current group.",
-    'current_name': "Descriptive label for the selected current group (e.g. VIN_IN, GND_OUT).",
-    'current_apply_name': "Save the edited group name.",
-    'current_mode': (
-        "Choose whether to assign individual currents to each pad ('Per-Pad Currents') "
-        "or split one total current evenly across all pads in the group."
-    ),
-    'current_total': "Total current for the selected group. In distribution mode it is split evenly across all pads.",
-    'current_per_pad': "Current value applied to selected pad rows in per-pad mode. If no row is selected, it is applied to all pads in the group.",
-    'current_apply_pad': "Apply the 'Selected Pad A' current value to the selected pad row (or all pads if none is selected).",
-    'current_pad_list': "Comma-separated per-pad currents in the same order as the pad table, for example: +6, -4, -2.",
-    'current_apply_list': "Apply the comma-separated current values to the pads in this group in table order.",
-    'current_pads_table': "Pads belonging to the selected current group, their nets, layers, and assigned currents.",
+    'current_mode': "Choose whether to assign individual currents per pad or distribute a total current evenly.",
     'board_details': "Expand to inspect the detected PCB layer stackup and initially selected KiCad pads.",
     'geometry_pane': "Expand to filter traces or crop the simulation area around active heat sources and current nets.",
     'thermal_pad_pane': "Expand to configure a bottom-layer thermal pad / heatsink boundary (shapes on User.Eco1).",
@@ -441,6 +443,558 @@ def summarize_current_groups(groups):
     return group_rows, balance_rows
 
 
+SHARING_MODE_OPTIONS = [
+    ("Equipotential (Auto)", "equipotential"),
+    ("Equal Split", "equal"),
+    ("Fixed per Pad", "fixed"),
+]
+SHARING_MODE_LABELS = [label for label, _ in SHARING_MODE_OPTIONS]
+SHARING_MODE_KEYS = [key for _, key in SHARING_MODE_OPTIONS]
+
+
+def normalize_sharing_mode(mode):
+    """
+    Normalize a flow-side sharing mode to ``equipotential``, ``equal``, or ``fixed``.
+
+    Parameters
+    ----------
+    mode : str
+        Saved sharing mode or UI display label.
+
+    Returns
+    -------
+    str
+        One of ``"equipotential"``, ``"equal"``, or ``"fixed"``.
+    """
+    value = str(mode or "").strip().lower()
+    if value in (
+        "equipotential", "equipotential (auto)", "auto", "auto (cu)", "copper", "cu", "bus"
+    ):
+        return "equipotential"
+    if value in ("equal", "equal split", "equal_split", "split", "even", "total", "distributed"):
+        return "equal"
+    if value in ("fixed", "fixed per pad", "fixed_per_pad", "per_pad", "per-pad", "manual"):
+        return "fixed"
+    return "equipotential"
+
+
+def current_groups_to_pad_currents(groups):
+    """
+    Aggregate signed per-pad currents across legacy current groups.
+
+    Parameters
+    ----------
+    groups : list of dict
+        Legacy current-group dictionaries.
+
+    Returns
+    -------
+    dict
+        Mapping from ``pad_key`` (or ``name``) to summed signed current in Amperes.
+    """
+    totals = {}
+    for group in prepare_current_groups(groups):
+        for pad in group.get("pads", []):
+            key = pad.get("pad_key") or pad.get("name") or ""
+            if not key:
+                continue
+            totals[key] = totals.get(key, 0.0) + float(pad.get("current_a", 0.0))
+    return totals
+
+
+def _normalize_flow_pad(pad):
+    """Normalize a pad descriptor inside a flow, enforcing non-negative magnitude."""
+    desc = normalize_pad_descriptor(pad)
+    desc["current_a"] = abs(_safe_float(desc.get("current_a", 0.0), 0.0))
+    return desc
+
+
+def _flow_pad_nets(flow):
+    """Return sorted distinct non-empty net names across both sides of a flow."""
+    all_pads = list(flow.get("from_pads", [])) + list(flow.get("to_pads", []))
+    return sorted({p.get("net_name", "") for p in all_pads if p.get("net_name")})
+
+
+def prepare_current_flows(flows):
+    """
+    Normalize pad-to-pad current flows and auto-balance sharing modes.
+
+    Parameters
+    ----------
+    flows : list of dict
+        Raw current-flow dictionaries from UI or saved settings.
+
+    Returns
+    -------
+    list of dict
+        Serializable flow dictionaries matching the canonical v0.5.0 schema.
+    """
+    prepared = []
+    for idx, raw in enumerate(flows or []):
+        if not isinstance(raw, dict):
+            continue
+        from_pads = [_normalize_flow_pad(p) for p in raw.get("from_pads", [])]
+        to_pads = [_normalize_flow_pad(p) for p in raw.get("to_pads", [])]
+        from_sharing = normalize_sharing_mode(raw.get("from_sharing", "equipotential"))
+        to_sharing = normalize_sharing_mode(raw.get("to_sharing", "fixed"))
+        total_current_a = abs(
+            _safe_float(raw.get("total_current_a", raw.get("total_current", 0.0)), 0.0)
+        )
+
+        if to_sharing == "fixed" and from_sharing != "fixed":
+            total_current_a = float(sum(p["current_a"] for p in to_pads))
+        elif from_sharing == "fixed" and to_sharing != "fixed":
+            total_current_a = float(sum(p["current_a"] for p in from_pads))
+        elif from_sharing == "fixed" and to_sharing == "fixed":
+            sum_from = float(sum(p["current_a"] for p in from_pads))
+            sum_to = float(sum(p["current_a"] for p in to_pads))
+            total_current_a = sum_from if from_pads else sum_to
+
+        if from_sharing == "equal" and from_pads:
+            per_pad = total_current_a / float(len(from_pads))
+            for pad in from_pads:
+                pad["current_a"] = per_pad
+        elif from_sharing == "equipotential":
+            if len(from_pads) == 1:
+                from_pads[0]["current_a"] = total_current_a
+            else:
+                for pad in from_pads:
+                    pad["current_a"] = 0.0
+
+        if to_sharing == "equal" and to_pads:
+            per_pad = total_current_a / float(len(to_pads))
+            for pad in to_pads:
+                pad["current_a"] = per_pad
+        elif to_sharing == "equipotential":
+            if len(to_pads) == 1:
+                to_pads[0]["current_a"] = total_current_a
+            else:
+                for pad in to_pads:
+                    pad["current_a"] = 0.0
+
+        all_pads = from_pads + to_pads
+        net_name = str(raw.get("net_name", "") or "")
+        net_code = _safe_int(raw.get("net_code", 0), 0)
+        non_empty_nets = [p for p in all_pads if p.get("net_name")]
+        if non_empty_nets:
+            unique_nets = {p["net_name"] for p in non_empty_nets}
+            if len(unique_nets) == 1:
+                net_name = non_empty_nets[0]["net_name"]
+                if non_empty_nets[0]["net_code"]:
+                    net_code = int(non_empty_nets[0]["net_code"])
+            elif not net_name:
+                net_name = non_empty_nets[0]["net_name"]
+                net_code = int(non_empty_nets[0]["net_code"])
+
+        prepared.append({
+            "name": str(raw.get("name") or f"Flow {idx + 1}"),
+            "net_name": net_name,
+            "net_code": net_code,
+            "total_current_a": float(total_current_a),
+            "from_sharing": from_sharing,
+            "to_sharing": to_sharing,
+            "from_pads": from_pads,
+            "to_pads": to_pads,
+        })
+    return prepared
+
+
+def convert_current_groups_to_flows(groups):
+    """
+    Losslessly convert legacy ``current_groups`` into ``current_flows`` per net.
+
+    Positive-current pads become ``from_pads`` and negative-current pads become
+    ``to_pads`` (with non-negative magnitudes), grouped by net name.
+
+    Parameters
+    ----------
+    groups : list of dict
+        Legacy current-group dictionaries.
+
+    Returns
+    -------
+    list of dict
+        Normalized pad-to-pad flow dictionaries.
+    """
+    prepared_groups = prepare_current_groups(groups)
+    if not prepared_groups:
+        return []
+
+    buckets = {}
+    order = []
+    for group in prepared_groups:
+        gname = str(group.get("name") or "").strip()
+        for pad in group.get("pads", []):
+            net_name = str(pad.get("net_name") or "")
+            net_code = _safe_int(pad.get("net_code", 0), 0)
+            if net_name not in buckets:
+                buckets[net_name] = {
+                    "net_name": net_name,
+                    "net_code": net_code,
+                    "group_names": [],
+                    "from_pads": [],
+                    "to_pads": [],
+                    "zero_pads": [],
+                }
+                order.append(net_name)
+            bucket = buckets[net_name]
+            if net_code and not bucket["net_code"]:
+                bucket["net_code"] = net_code
+            if gname and gname not in bucket["group_names"]:
+                bucket["group_names"].append(gname)
+
+            current = _safe_float(pad.get("current_a", 0.0), 0.0)
+            norm_pad = _normalize_flow_pad(pad)
+            if current > 0.0:
+                norm_pad["current_a"] = float(current)
+                bucket["from_pads"].append(norm_pad)
+            elif current < 0.0:
+                norm_pad["current_a"] = float(abs(current))
+                bucket["to_pads"].append(norm_pad)
+            else:
+                norm_pad["current_a"] = 0.0
+                bucket["zero_pads"].append(norm_pad)
+
+    flows = []
+    for idx, net_name in enumerate(order):
+        bucket = buckets[net_name]
+        from_pads = bucket["from_pads"]
+        to_pads = bucket["to_pads"]
+        if not from_pads and not to_pads and bucket["zero_pads"]:
+            from_pads = bucket["zero_pads"]
+        if len(bucket["group_names"]) == 1:
+            flow_name = bucket["group_names"][0]
+        elif net_name:
+            flow_name = f"{net_name} Flow"
+        else:
+            flow_name = f"Flow {idx + 1}"
+        sum_from = sum(p["current_a"] for p in from_pads)
+        sum_to = sum(p["current_a"] for p in to_pads)
+        flows.append({
+            "name": flow_name,
+            "net_name": net_name,
+            "net_code": bucket["net_code"],
+            "total_current_a": sum_from if from_pads else sum_to,
+            "from_sharing": "fixed",
+            "to_sharing": "fixed",
+            "from_pads": from_pads,
+            "to_pads": to_pads,
+        })
+    return prepare_current_flows(flows)
+
+
+def summarize_current_flows(flows):
+    """
+    Return a compact summary of configured current flows (e.g. ``"2 flows / 15 A"``).
+
+    Parameters
+    ----------
+    flows : list of dict
+        Current-flow dictionaries.
+
+    Returns
+    -------
+    str
+        Compact human-readable summary string.
+    """
+    prepared = prepare_current_flows(flows)
+    if not prepared:
+        return "0 flows"
+    total_a = sum(float(flow.get("total_current_a", 0.0)) for flow in prepared)
+    count = len(prepared)
+    noun = "flow" if count == 1 else "flows"
+    return f"{count} {noun} / {total_a:.6g} A"
+
+
+def validate_current_flows(flows):
+    """
+    Validate pad-to-pad current flows and return ``(errors, warnings)``.
+
+    Checks for missing From/To pads, unassigned nets, mismatched nets within a
+    flow, fixed/fixed current mismatches, zero-current flows, and duplicate pads
+    appearing on both sides of the same flow.
+
+    Parameters
+    ----------
+    flows : list of dict
+        Current-flow dictionaries.
+
+    Returns
+    -------
+    tuple of (list of str, list of str)
+        ``(errors, warnings)`` describing any flow balance or configuration issues.
+    """
+    prepared = prepare_current_flows(flows)
+    errors = []
+    warnings = []
+    for flow in prepared:
+        name = flow.get("name", "Flow")
+        from_pads = flow.get("from_pads", [])
+        to_pads = flow.get("to_pads", [])
+        all_pads = from_pads + to_pads
+        nets = _flow_pad_nets(flow)
+        net_label = flow.get("net_name") or (nets[0] if len(nets) == 1 else "(no net)")
+
+        if not from_pads:
+            errors.append(f"{name}: missing From pads.")
+        if not to_pads:
+            errors.append(f"{name}: missing To pads.")
+
+        if all_pads and any(not p.get("net_name") for p in all_pads):
+            errors.append(f"{name}: one or more pads have no net assigned.")
+        if len(nets) > 1:
+            errors.append(f"{name}: mismatched nets ({', '.join(nets)}).")
+
+        if flow.get("from_sharing") == "fixed" and flow.get("to_sharing") == "fixed":
+            sum_from = sum(float(p.get("current_a", 0.0)) for p in from_pads)
+            sum_to = sum(float(p.get("current_a", 0.0)) for p in to_pads)
+            tol = max(1e-9, 1e-6 * max(abs(sum_from), abs(sum_to)))
+            if abs(sum_from - sum_to) > tol:
+                errors.append(
+                    f"{name} ({net_label}): From ({sum_from:.6g} A) != To ({sum_to:.6g} A)."
+                )
+
+        if from_pads and to_pads:
+            from_ids = {
+                p.get("pad_key") or p.get("name")
+                for p in from_pads if (p.get("pad_key") or p.get("name"))
+            }
+            overlap = [
+                p.get("name") or p.get("pad_key")
+                for p in to_pads
+                if (p.get("pad_key") or p.get("name")) in from_ids
+            ]
+            if overlap:
+                warnings.append(
+                    f"{name} ({net_label}): pad in both From and To ({', '.join(overlap)})."
+                )
+            if float(flow.get("total_current_a", 0.0)) <= 1e-12:
+                warnings.append(f"{name} ({net_label}): total current is 0 A.")
+
+    return errors, warnings
+
+
+def _format_flow_balance_lines(flows):
+    """Build per-flow live status lines for the Current Heating balance box."""
+    prepared = prepare_current_flows(flows)
+    if not prepared:
+        return ["No current flows configured."]
+    lines = []
+    for flow in prepared:
+        from_pads = flow.get("from_pads", [])
+        to_pads = flow.get("to_pads", [])
+        all_pads = from_pads + to_pads
+        nets = _flow_pad_nets(flow)
+        if len(nets) > 1:
+            net_label = f"Mixed ({', '.join(nets)})"
+        elif nets:
+            net_label = nets[0]
+        else:
+            net_label = flow.get("net_name") or "(no net)"
+        total_a = float(flow.get("total_current_a", 0.0))
+
+        if not from_pads or not to_pads:
+            status = "Needs From/To pads"
+        elif any(not p.get("net_name") for p in all_pads):
+            status = "No net"
+        elif len(nets) > 1:
+            status = "Mismatched nets"
+        elif flow.get("from_sharing") == "fixed" and flow.get("to_sharing") == "fixed":
+            sum_from = sum(float(p.get("current_a", 0.0)) for p in from_pads)
+            sum_to = sum(float(p.get("current_a", 0.0)) for p in to_pads)
+            tol = max(1e-9, 1e-6 * max(abs(sum_from), abs(sum_to)))
+            if abs(sum_from - sum_to) > tol:
+                status = f"Mismatch (From {sum_from:.6g} A != To {sum_to:.6g} A)"
+            elif total_a <= 1e-12:
+                status = "0 A"
+            else:
+                status = "OK"
+        elif total_a <= 1e-12:
+            status = "0 A"
+        else:
+            status = "OK"
+        lines.append(
+            f"{net_label}: {total_a:.6g} A ({len(from_pads)} -> {len(to_pads)} pads, {status})"
+        )
+    return lines
+
+
+class PadPickerDialog(wx.Dialog):
+    """
+    Modal dialog allowing engineers to filter and pick board pads by net or search text.
+
+    Parameters
+    ----------
+    parent : wx.Window or None
+        Parent window.
+    board_pads : list of dict
+        Available copper pad descriptors from the board.
+    initial_net : str, optional
+        Net name to pre-select in the filter dropdown.
+    title : str, optional
+        Dialog window title.
+    """
+
+    def __init__(self, parent, board_pads, initial_net="", title="Pick Pads from Board"):
+        dialog_style = (
+            getattr(wx, "DEFAULT_DIALOG_STYLE", 0)
+            | getattr(wx, "RESIZE_BORDER", 0)
+        )
+        super().__init__(parent, title=title, style=dialog_style)
+
+        seen_keys = set()
+        self.all_pads = []
+        for raw in (board_pads or []):
+            desc = _normalize_flow_pad(raw)
+            ident = desc["pad_key"] or (desc["name"], desc["net_name"], desc["layer"])
+            if ident in seen_keys:
+                continue
+            seen_keys.add(ident)
+            self.all_pads.append(desc)
+
+        self.all_pads.sort(key=lambda p: (p.get("net_name", ""), p.get("name", "")))
+        self.filtered_pads = []
+
+        nets = sorted({p.get("net_name") or "(no net)" for p in self.all_pads})
+        self._net_choices = ["All Nets"] + nets
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        filter_row = wx.BoxSizer(wx.HORIZONTAL)
+        filter_row.Add(wx.StaticText(self, label="Net:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.net_choice = wx.Choice(self, choices=self._net_choices)
+        if initial_net and initial_net in nets:
+            self.net_choice.SetSelection(self._net_choices.index(initial_net))
+        else:
+            self.net_choice.SetSelection(0)
+        self.net_choice.Bind(wx.EVT_CHOICE, self._on_filter_changed)
+        filter_row.Add(self.net_choice, 1, wx.EXPAND | wx.RIGHT, 8)
+
+        filter_row.Add(wx.StaticText(self, label="Search:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.search_input = wx.TextCtrl(self, value="")
+        evt_text = getattr(wx, "EVT_TEXT", None)
+        if evt_text is not None:
+            self.search_input.Bind(evt_text, self._on_filter_changed)
+        filter_row.Add(self.search_input, 1, wx.EXPAND)
+        sizer.Add(filter_row, 0, wx.EXPAND | wx.ALL, 8)
+
+        self.pad_list = wx.ListCtrl(self, style=getattr(wx, "LC_REPORT", 0))
+        for idx, (col_title, width) in enumerate([
+            ("Pad", 180), ("Net", 140), ("Layer", 80),
+        ]):
+            self.pad_list.InsertColumn(idx, col_title, width=width)
+        self.pad_list.SetMinSize((440, 260))
+        sizer.Add(self.pad_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
+
+        btn_row = wx.BoxSizer(wx.HORIZONTAL)
+        btn_all = wx.Button(self, label="Select All")
+        btn_all.Bind(wx.EVT_BUTTON, self._on_select_all)
+        btn_row.Add(btn_all, 0, wx.RIGHT, 6)
+        btn_row.AddStretchSpacer()
+        btn_ok = wx.Button(self, wx.ID_OK, label="Add Selected")
+        btn_ok.SetDefault()
+        btn_ok.Bind(wx.EVT_BUTTON, self._on_ok)
+        btn_cancel = wx.Button(self, wx.ID_CANCEL, label="Cancel")
+        btn_cancel.Bind(wx.EVT_BUTTON, self._on_cancel)
+        btn_row.Add(btn_ok, 0, wx.RIGHT, 6)
+        btn_row.Add(btn_cancel, 0)
+        sizer.Add(btn_row, 0, wx.EXPAND | wx.ALL, 8)
+
+        self.SetSizer(sizer)
+        self.SetSize((480, 380))
+        self.SetMinSize((420, 320))
+        self.Center()
+        self._apply_filter()
+
+    def get_selected_net(self):
+        """Return the active net filter, or empty string when 'All Nets' is selected."""
+        idx = self.net_choice.GetSelection()
+        if idx <= 0 or idx >= len(self._net_choices):
+            return ""
+        return self._net_choices[idx]
+
+    def set_net_filter(self, net_name):
+        """Select a net filter programmatically and refresh the table."""
+        if net_name and net_name in self._net_choices:
+            self.net_choice.SetSelection(self._net_choices.index(net_name))
+        else:
+            self.net_choice.SetSelection(0)
+        self._apply_filter()
+
+    def set_search_text(self, text):
+        """Set search filter text programmatically and refresh the table."""
+        self.search_input.SetValue(str(text or ""))
+        self._apply_filter()
+
+    def _on_filter_changed(self, event):
+        """Refresh visible pads when net or search filter changes."""
+        self._apply_filter()
+
+    def _apply_filter(self):
+        """Filter ``all_pads`` by net and search query and update ``pad_list``."""
+        selected_net = self.get_selected_net()
+        query = self.search_input.GetValue().strip().lower()
+        filtered = []
+        for pad in self.all_pads:
+            pad_net = pad.get("net_name") or "(no net)"
+            if selected_net and pad_net != selected_net:
+                continue
+            if query:
+                haystack = f"{pad.get('name', '')} {pad_net} {pad.get('layer', '')}".lower()
+                if query not in haystack:
+                    continue
+            filtered.append(pad)
+        self.filtered_pads = filtered
+        try:
+            self.pad_list.DeleteAllItems()
+            for row_idx, pad in enumerate(self.filtered_pads):
+                self.pad_list.InsertItem(row_idx, pad.get("name", ""))
+                self.pad_list.SetItem(row_idx, 1, pad.get("net_name") or "(no net)")
+                self.pad_list.SetItem(row_idx, 2, pad.get("layer", ""))
+        except Exception:
+            pass
+
+    def _on_select_all(self, event):
+        """Select all currently filtered pad rows."""
+        for row_idx in range(len(self.filtered_pads)):
+            try:
+                self.pad_list.Select(row_idx)
+            except Exception:
+                pass
+
+    def _on_ok(self, event):
+        """Confirm pad selection."""
+        try:
+            self.EndModal(wx.ID_OK)
+        except Exception:
+            pass
+
+    def _on_cancel(self, event):
+        """Cancel pad selection."""
+        try:
+            self.EndModal(wx.ID_CANCEL)
+        except Exception:
+            pass
+
+    def get_selected_pads(self):
+        """Return copies of all currently selected filtered pad descriptors."""
+        indices = []
+        try:
+            idx = self.pad_list.GetFirstSelected()
+            while idx != -1:
+                indices.append(idx)
+                idx = self.pad_list.GetNextItem(
+                    idx, getattr(wx, "LIST_NEXT_ALL", 0), getattr(wx, "LIST_STATE_SELECTED", 0)
+                )
+        except Exception:
+            pass
+        return [
+            copy.deepcopy(self.filtered_pads[i])
+            for i in indices
+            if 0 <= i < len(self.filtered_pads)
+        ]
+
+
 class SettingsDialog(wx.Dialog):
     """
     Dialog for configuring thermal simulation parameters.
@@ -502,6 +1056,7 @@ class SettingsDialog(wx.Dialog):
         board_size_mm=None,
         defer_initial_preflight=False,
         stackup_thickness_mm=None,
+        board_pads=None,
     ):
         dialog_style = (
             getattr(wx, "DEFAULT_DIALOG_STYLE", 0)
@@ -526,6 +1081,10 @@ class SettingsDialog(wx.Dialog):
         self.save_settings_callback = save_settings_callback
         self.current_groups = []
         self.current_group_index = -1
+        self.current_flows = []
+        self.current_flow_index = -1
+        self._current_flows_edited = False
+        self.board_pads = [_normalize_flow_pad(p) for p in (board_pads or [])]
         self.power_pads = []
         self.initial_power_pads = [
             normalize_power_pad_descriptor(pad) for pad in (initial_power_pads or [])
@@ -686,7 +1245,7 @@ class SettingsDialog(wx.Dialog):
         else:
             self.power_pads = prepare_power_pads(self.initial_power_pads, self.power_input.GetValue())
             self._render_power_pads()
-            self._render_current_groups()
+            self._render_current_flows()
         self._bind_estimate_controls()
         self._refresh_context_summary()
         if defer_initial_preflight:
@@ -1163,7 +1722,7 @@ class SettingsDialog(wx.Dialog):
         panel.SetSizer(sizer)
 
     def _build_current_tab(self, panel):
-        """Build the current-path/Joule-heating tab."""
+        """Build the Pad-to-Pad Current Flows / Joule-heating tab."""
         sizer = wx.BoxSizer(wx.VERTICAL)
 
         self.chk_current_enabled = wx.CheckBox(panel, label="Enable current heating")
@@ -1174,138 +1733,170 @@ class SettingsDialog(wx.Dialog):
 
         help_text = wx.StaticText(
             panel,
-            label="Positive currents enter the PCB; negative currents leave it."
+            label="Define pad-to-pad DC current flows (From -> To) on each net."
         )
-        sizer.Add(help_text, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        sizer.Add(help_text, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 4)
 
-        balance_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Net Balance")
+        balance_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Flow Balance")
         balance_parent = balance_box.GetStaticBox()
         self.current_balance_text = wx.TextCtrl(
             balance_parent, value="", style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP
         )
-        self.current_balance_text.SetMinSize((-1, 48))
+        self.current_balance_text.SetMinSize((-1, 44))
         self.current_balance_text.SetToolTip(TOOLTIP_TEXTS['current_balance'])
         balance_box.Add(self.current_balance_text, 0, wx.EXPAND | wx.ALL, 3)
         sizer.Add(balance_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
         current_content = wx.BoxSizer(wx.HORIZONTAL)
 
-        group_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Current Groups")
-        group_parent = group_box.GetStaticBox()
-        self.current_group_list = wx.ListCtrl(
-            group_parent,
+        flow_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Current Flows")
+        flow_parent = flow_box.GetStaticBox()
+        self.current_flow_list = wx.ListCtrl(
+            flow_parent,
             style=getattr(wx, "LC_REPORT", 0) | getattr(wx, "LC_SINGLE_SEL", 0)
         )
         for idx, (title, width) in enumerate([
-            ("Name", 65), ("Net", 75), ("Pads", 35), ("Current", 55),
+            ("Name", 70), ("Net", 65), ("From->To", 60), ("Current", 55),
         ]):
-            self.current_group_list.InsertColumn(idx, title, width=width)
-        self.current_group_list.SetToolTip(TOOLTIP_TEXTS['current_groups'])
-        self.current_group_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self._on_current_group_selected)
-        self.current_group_list.SetMinSize((255, -1))
-        group_box.Add(self.current_group_list, 1, wx.EXPAND | wx.ALL, 3)
+            self.current_flow_list.InsertColumn(idx, title, width=width)
+        self.current_flow_list.SetToolTip(TOOLTIP_TEXTS['current_flows'])
+        self.current_flow_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self._on_current_flow_selected)
+        self.current_flow_list.SetMinSize((255, -1))
+        flow_box.Add(self.current_flow_list, 1, wx.EXPAND | wx.ALL, 3)
 
-        group_buttons = wx.BoxSizer(wx.HORIZONTAL)
-        btn_new = wx.Button(group_parent, label="New")
-        btn_new.SetToolTip(TOOLTIP_TEXTS['current_new_group'])
-        btn_new.Bind(wx.EVT_BUTTON, self._on_current_new_group)
-        group_buttons.Add(btn_new, 0, wx.ALL, 2)
-        btn_add = wx.Button(group_parent, label="Add")
-        btn_add.SetToolTip(TOOLTIP_TEXTS['current_add_pads'])
-        btn_add.Bind(wx.EVT_BUTTON, self._on_current_add_selection)
-        group_buttons.Add(btn_add, 0, wx.ALL, 2)
-        btn_remove = wx.Button(group_parent, label="Remove")
-        btn_remove.SetToolTip(TOOLTIP_TEXTS['current_remove_pads'])
-        btn_remove.Bind(wx.EVT_BUTTON, self._on_current_remove_pads)
-        group_buttons.Add(btn_remove, 0, wx.ALL, 2)
-        group_box.Add(group_buttons, 0, wx.EXPAND | wx.ALL, 3)
+        flow_buttons = wx.BoxSizer(wx.HORIZONTAL)
+        btn_new = wx.Button(flow_parent, label="New Flow")
+        btn_new.SetToolTip(TOOLTIP_TEXTS['flow_new'])
+        btn_new.Bind(wx.EVT_BUTTON, self._on_flow_new)
+        flow_buttons.Add(btn_new, 0, wx.ALL, 2)
+        btn_duplicate = wx.Button(flow_parent, label="Duplicate")
+        btn_duplicate.SetToolTip(TOOLTIP_TEXTS['flow_duplicate'])
+        btn_duplicate.Bind(wx.EVT_BUTTON, self._on_flow_duplicate)
+        flow_buttons.Add(btn_duplicate, 0, wx.ALL, 2)
+        btn_delete = wx.Button(flow_parent, label="Delete")
+        btn_delete.SetToolTip(TOOLTIP_TEXTS['flow_delete'])
+        btn_delete.Bind(wx.EVT_BUTTON, self._on_flow_delete)
+        flow_buttons.Add(btn_delete, 0, wx.ALL, 2)
+        flow_box.Add(flow_buttons, 0, wx.EXPAND | wx.ALL, 3)
+        current_content.Add(flow_box, 0, wx.EXPAND | wx.RIGHT, 5)
 
-        group_more_buttons = wx.BoxSizer(wx.HORIZONTAL)
-        btn_duplicate = wx.Button(group_parent, label="Duplicate")
-        btn_duplicate.SetToolTip(TOOLTIP_TEXTS['current_duplicate_group'])
-        btn_duplicate.Bind(wx.EVT_BUTTON, self._on_current_duplicate_group)
-        group_more_buttons.Add(btn_duplicate, 0, wx.ALL, 2)
-        btn_delete = wx.Button(group_parent, label="Delete")
-        btn_delete.SetToolTip(TOOLTIP_TEXTS['current_delete_group'])
-        btn_delete.Bind(wx.EVT_BUTTON, self._on_current_delete_group)
-        group_more_buttons.Add(btn_delete, 0, wx.ALL, 2)
-        group_box.Add(group_more_buttons, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 3)
-        current_content.Add(group_box, 0, wx.EXPAND | wx.RIGHT, 5)
-
-        edit_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Selected Group")
+        edit_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Selected Flow")
         selected_parent = edit_box.GetStaticBox()
-        row_name = wx.BoxSizer(wx.HORIZONTAL)
-        row_name.Add(wx.StaticText(selected_parent, label="Name:", size=(105, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
-        self.current_name_input = wx.TextCtrl(selected_parent, value="")
-        self.current_name_input.SetToolTip(TOOLTIP_TEXTS['current_name'])
-        row_name.Add(self.current_name_input, 1, wx.EXPAND | wx.RIGHT, 5)
+
+        row_top = wx.BoxSizer(wx.HORIZONTAL)
+        row_top.Add(wx.StaticText(selected_parent, label="Name:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.flow_name_input = wx.TextCtrl(selected_parent, value="")
+        self.flow_name_input.SetToolTip(TOOLTIP_TEXTS['flow_name'])
+        row_top.Add(self.flow_name_input, 1, wx.EXPAND | wx.RIGHT, 4)
         btn_apply_name = wx.Button(selected_parent, label="Apply")
-        btn_apply_name.SetToolTip(TOOLTIP_TEXTS['current_apply_name'])
-        btn_apply_name.Bind(wx.EVT_BUTTON, self._on_current_apply_group_fields)
-        row_name.Add(btn_apply_name, 0)
-        edit_box.Add(row_name, 0, wx.EXPAND | wx.ALL, 2)
+        btn_apply_name.SetToolTip(TOOLTIP_TEXTS['flow_apply_name'])
+        btn_apply_name.Bind(wx.EVT_BUTTON, self._on_flow_apply_fields)
+        row_top.Add(btn_apply_name, 0, wx.RIGHT, 8)
 
-        row_mode = wx.BoxSizer(wx.HORIZONTAL)
-        row_mode.Add(wx.StaticText(selected_parent, label="Mode:", size=(105, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
-        self.current_mode_choice = wx.Choice(
-            selected_parent,
-            choices=["Per-Pad Currents", "Distribute Total Current"]
+        row_top.Add(wx.StaticText(selected_parent, label="Total (A):"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.flow_total_input = wx.SpinCtrlDouble(
+            selected_parent, value="0.0", min=0.0, max=10000.0, inc=0.5
         )
-        self.current_mode_choice.SetSelection(0)
-        self.current_mode_choice.SetToolTip(TOOLTIP_TEXTS['current_mode'])
-        self.current_mode_choice.Bind(wx.EVT_CHOICE, self._on_current_mode_changed)
-        row_mode.Add(self.current_mode_choice, 1, wx.EXPAND)
-        edit_box.Add(row_mode, 0, wx.EXPAND | wx.ALL, 2)
+        self.flow_total_input.SetDigits(3)
+        self.flow_total_input.SetMinSize((88, -1))
+        self.flow_total_input.SetToolTip(TOOLTIP_TEXTS['flow_total'])
+        self.flow_total_input.Bind(wx.EVT_SPINCTRLDOUBLE, self._on_flow_total_changed)
+        row_top.Add(self.flow_total_input, 0)
+        edit_box.Add(row_top, 0, wx.EXPAND | wx.ALL, 3)
 
-        self.current_total_input = self._add_spin_field(
-            edit_box, selected_parent, "Group Current (A):", 0.0,
-            min_val=-10000.0, max_val=10000.0, inc=0.1, digits=3,
-            tooltip_key='current_total'
+        self._flow_side_widgets = {}
+        from_box = self._build_flow_side_box(
+            selected_parent, "from", "From (Source Pads)", default_sharing_idx=0
         )
-        self.current_total_row = self.current_total_input._thermal_row_sizer
+        edit_box.Add(from_box, 1, wx.EXPAND | wx.ALL, 2)
 
-        row_pad_current = wx.BoxSizer(wx.HORIZONTAL)
-        row_pad_current.Add(wx.StaticText(selected_parent, label="Selected Pad A:", size=(105, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
-        self.current_pad_value_input = wx.SpinCtrlDouble(
-            selected_parent, value="0.0", min=-10000.0, max=10000.0, inc=0.1
+        to_box = self._build_flow_side_box(
+            selected_parent, "to", "To (Sink Pads)", default_sharing_idx=2
         )
-        self.current_pad_value_input.SetDigits(3)
-        self.current_pad_value_input.SetToolTip(TOOLTIP_TEXTS['current_per_pad'])
-        row_pad_current.Add(self.current_pad_value_input, 1, wx.EXPAND | wx.RIGHT, 5)
-        btn_set_pad_current = wx.Button(selected_parent, label="Apply to Selected")
-        btn_set_pad_current.SetToolTip(TOOLTIP_TEXTS['current_apply_pad'])
-        btn_set_pad_current.Bind(wx.EVT_BUTTON, self._on_current_apply_pad_current)
-        row_pad_current.Add(btn_set_pad_current, 0)
-        edit_box.Add(row_pad_current, 0, wx.EXPAND | wx.ALL, 2)
-        self.current_pad_current_row = row_pad_current
+        edit_box.Add(to_box, 1, wx.EXPAND | wx.ALL, 2)
 
-        row_pad_list = wx.BoxSizer(wx.HORIZONTAL)
-        row_pad_list.Add(wx.StaticText(selected_parent, label="Pad Currents:", size=(105, -1)), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
-        self.current_pad_list_input = wx.TextCtrl(selected_parent, value="")
-        self.current_pad_list_input.SetToolTip(TOOLTIP_TEXTS['current_pad_list'])
-        row_pad_list.Add(self.current_pad_list_input, 1, wx.EXPAND | wx.RIGHT, 5)
-        btn_apply_list = wx.Button(selected_parent, label="Apply List")
-        btn_apply_list.SetToolTip(TOOLTIP_TEXTS['current_apply_list'])
-        btn_apply_list.Bind(wx.EVT_BUTTON, self._on_current_apply_pad_current_list)
-        row_pad_list.Add(btn_apply_list, 0)
-        edit_box.Add(row_pad_list, 0, wx.EXPAND | wx.ALL, 2)
-        self.current_pad_list_row = row_pad_list
-
-        self.current_pad_list = wx.ListCtrl(
-            selected_parent,
-            style=getattr(wx, "LC_REPORT", 0) | getattr(wx, "LC_SINGLE_SEL", 0)
-        )
-        for idx, (title, width) in enumerate([
-            ("Pad", 145), ("Net", 110), ("Layer", 60), ("Current A", 75), ("Status", 80),
-        ]):
-            self.current_pad_list.InsertColumn(idx, title, width=width)
-        self.current_pad_list.SetMinSize((-1, 130))
-        self.current_pad_list.SetToolTip(TOOLTIP_TEXTS['current_pads_table'])
-        edit_box.Add(self.current_pad_list, 1, wx.EXPAND | wx.ALL, 3)
         current_content.Add(edit_box, 1, wx.EXPAND)
         sizer.Add(current_content, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
         panel.SetSizer(sizer)
+
+    def _build_flow_side_box(self, parent, side, title, default_sharing_idx=0):
+        """Build a compact From or To pad-side editor box."""
+        side_box = wx.StaticBoxSizer(wx.VERTICAL, parent, title)
+        box_parent = side_box.GetStaticBox()
+
+        top_row = wx.BoxSizer(wx.HORIZONTAL)
+        top_row.Add(wx.StaticText(box_parent, label="Sharing:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        sharing_choice = wx.Choice(box_parent, choices=SHARING_MODE_LABELS)
+        sharing_choice.SetSelection(default_sharing_idx)
+        sharing_choice.SetToolTip(TOOLTIP_TEXTS[f'flow_{side}_sharing'])
+        sharing_choice.Bind(wx.EVT_CHOICE, lambda evt, s=side: self._on_flow_sharing_changed(s))
+        top_row.Add(sharing_choice, 0, wx.RIGHT, 6)
+
+        btn_add = wx.Button(box_parent, label="Add Selected")
+        btn_add.SetToolTip(TOOLTIP_TEXTS['flow_add_pads'])
+        btn_add.Bind(wx.EVT_BUTTON, lambda evt, s=side: self._on_flow_add_selection(s))
+        top_row.Add(btn_add, 0, wx.RIGHT, 3)
+
+        btn_pick = wx.Button(box_parent, label="Pick...")
+        btn_pick.SetToolTip(TOOLTIP_TEXTS['flow_pick_pads'])
+        btn_pick.Bind(wx.EVT_BUTTON, lambda evt, s=side: self._on_flow_pick_pads(s))
+        top_row.Add(btn_pick, 0, wx.RIGHT, 3)
+
+        btn_remove = wx.Button(box_parent, label="Remove")
+        btn_remove.SetToolTip(TOOLTIP_TEXTS['flow_remove_pads'])
+        btn_remove.Bind(wx.EVT_BUTTON, lambda evt, s=side: self._on_flow_remove_pads(s))
+        top_row.Add(btn_remove, 0)
+        side_box.Add(top_row, 0, wx.EXPAND | wx.ALL, 2)
+
+        fixed_row = wx.BoxSizer(wx.HORIZONTAL)
+        fixed_row.Add(wx.StaticText(box_parent, label="Set A:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        pad_value_input = wx.SpinCtrlDouble(
+            box_parent, value="0.0", min=0.0, max=10000.0, inc=0.1
+        )
+        pad_value_input.SetDigits(3)
+        pad_value_input.SetMinSize((76, -1))
+        pad_value_input.SetToolTip(TOOLTIP_TEXTS['flow_per_pad'])
+        fixed_row.Add(pad_value_input, 0, wx.RIGHT, 3)
+
+        btn_set_pad = wx.Button(box_parent, label="Set")
+        btn_set_pad.SetToolTip(TOOLTIP_TEXTS['flow_apply_pad'])
+        btn_set_pad.Bind(wx.EVT_BUTTON, lambda evt, s=side: self._on_flow_apply_pad_current(s))
+        fixed_row.Add(btn_set_pad, 0, wx.RIGHT, 6)
+
+        fixed_row.Add(wx.StaticText(box_parent, label="List:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        pad_list_input = wx.TextCtrl(box_parent, value="")
+        pad_list_input.SetToolTip(TOOLTIP_TEXTS['flow_pad_list'])
+        fixed_row.Add(pad_list_input, 1, wx.EXPAND | wx.RIGHT, 3)
+
+        btn_apply_list = wx.Button(box_parent, label="Apply")
+        btn_apply_list.SetToolTip(TOOLTIP_TEXTS['flow_apply_list'])
+        btn_apply_list.Bind(wx.EVT_BUTTON, lambda evt, s=side: self._on_flow_apply_pad_current_list(s))
+        fixed_row.Add(btn_apply_list, 0)
+        side_box.Add(fixed_row, 0, wx.EXPAND | wx.ALL, 2)
+
+        pad_list = wx.ListCtrl(box_parent, style=getattr(wx, "LC_REPORT", 0))
+        for idx, (col_title, width) in enumerate([
+            ("Pad", 160), ("Layer", 70), ("Current A", 95),
+        ]):
+            pad_list.InsertColumn(idx, col_title, width=width)
+        pad_list.SetMinSize((-1, 82))
+        pad_list.SetToolTip(TOOLTIP_TEXTS[f'flow_{side}_pads'])
+        side_box.Add(pad_list, 1, wx.EXPAND | wx.ALL, 2)
+
+        setattr(self, f"flow_{side}_sharing", sharing_choice)
+        setattr(self, f"flow_{side}_fixed_row", fixed_row)
+        setattr(self, f"flow_{side}_pad_value_input", pad_value_input)
+        setattr(self, f"flow_{side}_pad_list_input", pad_list_input)
+        setattr(self, f"flow_{side}_list", pad_list)
+        self._flow_side_widgets[side] = {
+            "sharing": sharing_choice,
+            "fixed_row": fixed_row,
+            "pad_value": pad_value_input,
+            "pad_list_input": pad_list_input,
+            "list_ctrl": pad_list,
+        }
+        return side_box
 
     # ------------------------------------------------------------------
     # Helper: add spinner fields
@@ -1904,137 +2495,216 @@ class SettingsDialog(wx.Dialog):
 
     def _on_current_enabled_toggle(self, event):
         """Refresh summaries when current simulation is toggled."""
-        self._render_current_groups()
+        self._render_current_flows()
 
-    def _apply_current_mode_visibility(self):
-        """Show only the current-entry controls relevant to the selected mode."""
-        total_mode = self.current_mode_choice.GetSelection() == 1
-        self.current_total_row.ShowItems(total_mode)
-        self.current_pad_current_row.ShowItems(not total_mode)
-        self.current_pad_list_row.ShowItems(not total_mode)
+    def _apply_flow_mode_visibility(self):
+        """Enable/show controls based on selected flow sharing modes."""
+        flow = self._selected_current_flow()
+        has_flow = flow is not None
+        from_sharing = flow.get("from_sharing", "equipotential") if has_flow else "equipotential"
+        to_sharing = flow.get("to_sharing", "fixed") if has_flow else "fixed"
+        total_editable = has_flow and (from_sharing != "fixed") and (to_sharing != "fixed")
+        self.flow_total_input.Enable(total_editable)
+        self.flow_name_input.Enable(has_flow)
+        _set_control_enabled(self.flow_from_sharing, has_flow)
+        _set_control_enabled(self.flow_to_sharing, has_flow)
+        for side, sharing in (("from", from_sharing), ("to", to_sharing)):
+            widgets = self._flow_side_widgets[side]
+            widgets["fixed_row"].ShowItems(has_flow and sharing == "fixed")
         try:
             self.tab_current.Layout()
         except Exception:
             pass
 
-    def _on_current_mode_changed(self, event):
-        """Apply a current distribution mode and refresh its summary."""
-        self._sync_current_group_from_fields()
-        self._apply_current_mode_visibility()
-        self._render_current_groups()
+    def _make_empty_flow(self, idx=None):
+        """Return a default empty flow dictionary."""
+        if idx is None:
+            idx = len(self.current_flows)
+        return {
+            "name": f"Flow {idx + 1}",
+            "net_name": "",
+            "net_code": 0,
+            "total_current_a": 0.0,
+            "from_sharing": "equipotential",
+            "to_sharing": "fixed",
+            "from_pads": [],
+            "to_pads": [],
+        }
 
-    def _on_current_new_group(self, event):
-        """Create a current group from the live KiCad pad selection."""
-        pads = self._selection_descriptors()
-        if not pads:
-            wx.MessageBox("Select one or more pads in KiCad first.", "ThermalSim")
-            return
-        group_idx = len(self.current_groups)
-        self.current_groups.append({
-            'name': f"Group {group_idx + 1}",
-            'color': CURRENT_GROUP_COLORS[group_idx % len(CURRENT_GROUP_COLORS)],
-            'mode': 'per_pad',
-            'total_current_a': 0.0,
-            'pads': [normalize_pad_descriptor(p) for p in pads],
-        })
-        self.current_group_index = group_idx
+    def _on_flow_new(self, event):
+        """Create a new pad-to-pad current flow."""
+        self._sync_current_flow_from_fields()
+        self.current_flows.append(self._make_empty_flow())
+        self.current_flow_index = len(self.current_flows) - 1
+        self._current_flows_edited = True
         self.chk_current_enabled.SetValue(True)
-        self._render_current_groups()
+        self._render_current_flows()
 
-    def _on_current_add_selection(self, event):
-        """Add the live KiCad pad selection to the selected current group."""
-        self._sync_current_group_from_fields()
-        group = self._selected_current_group()
-        if group is None:
-            self._on_current_new_group(event)
+    def _on_flow_duplicate(self, event):
+        """Duplicate the selected current flow."""
+        self._sync_current_flow_from_fields()
+        flow = self._selected_current_flow()
+        if flow is None:
             return
-        pads = self._selection_descriptors()
-        if not pads:
-            wx.MessageBox("Select one or more pads in KiCad first.", "ThermalSim")
-            return
-        existing = {p.get('pad_key') for p in group.get('pads', [])}
-        for pad in pads:
-            descriptor = normalize_pad_descriptor(pad)
-            if descriptor['pad_key'] not in existing:
-                group.setdefault('pads', []).append(descriptor)
-                existing.add(descriptor['pad_key'])
-        self._render_current_groups()
+        duplicate = copy.deepcopy(flow)
+        duplicate["name"] = f"{flow.get('name', 'Flow')} Copy"
+        self.current_flows.append(duplicate)
+        self.current_flow_index = len(self.current_flows) - 1
+        self._current_flows_edited = True
+        self._render_current_flows()
 
-    def _on_current_remove_pads(self, event):
-        """Remove selected pad rows from the selected group."""
-        self._sync_current_group_from_fields()
-        group = self._selected_current_group()
-        if group is None:
-            return
-        indices = self._selected_current_pad_indices()
-        if not indices:
-            return
-        group['pads'] = [
-            pad for idx, pad in enumerate(group.get('pads', []))
-            if idx not in set(indices)
-        ]
-        self._render_current_groups()
+    def _on_flow_delete(self, event):
+        """Delete the selected current flow."""
+        self._sync_current_flow_from_fields()
+        if 0 <= self.current_flow_index < len(self.current_flows):
+            del self.current_flows[self.current_flow_index]
+        self.current_flow_index = min(self.current_flow_index, len(self.current_flows) - 1)
+        self._current_flows_edited = True
+        if not self.current_flows:
+            self.current_groups = []
+        self._render_current_flows()
 
-    def _on_current_duplicate_group(self, event):
-        """Duplicate the selected group."""
-        self._sync_current_group_from_fields()
-        group = self._selected_current_group()
-        if group is None:
-            return
-        duplicate = copy.deepcopy(group)
-        duplicate['name'] = f"{group.get('name', 'Group')} Copy"
-        duplicate['color'] = CURRENT_GROUP_COLORS[len(self.current_groups) % len(CURRENT_GROUP_COLORS)]
-        self.current_groups.append(duplicate)
-        self.current_group_index = len(self.current_groups) - 1
-        self._render_current_groups()
-
-    def _on_current_delete_group(self, event):
-        """Delete the selected group."""
-        self._sync_current_group_from_fields()
-        if 0 <= self.current_group_index < len(self.current_groups):
-            del self.current_groups[self.current_group_index]
-        self.current_group_index = min(self.current_group_index, len(self.current_groups) - 1)
-        self._render_current_groups()
-
-    def _on_current_group_selected(self, event):
-        """Handle current group list selection changes."""
-        self._sync_current_group_from_fields()
+    def _on_current_flow_selected(self, event):
+        """Handle current-flow list selection changes."""
+        self._sync_current_flow_from_fields()
         try:
-            self.current_group_index = event.GetIndex()
+            self.current_flow_index = event.GetIndex()
         except Exception:
             try:
-                self.current_group_index = self.current_group_list.GetFirstSelected()
+                self.current_flow_index = self.current_flow_list.GetFirstSelected()
             except Exception:
-                self.current_group_index = -1
-        self._render_current_group_editor()
+                self.current_flow_index = -1
+        self._render_current_flow_editor()
 
-    def _on_current_apply_group_fields(self, event):
-        """Apply name, mode, and total current edits to the selected group."""
-        self._sync_current_group_from_fields()
-        self._render_current_groups()
+    def _on_flow_apply_fields(self, event):
+        """Apply edited flow name and sharing/total settings."""
+        self._sync_current_flow_from_fields()
+        self._current_flows_edited = True
+        self._render_current_flows()
 
-    def _on_current_apply_pad_current(self, event):
-        """Apply a per-pad current to selected pad rows or all pads."""
-        group = self._selected_current_group()
-        if group is None:
+    def _on_flow_total_changed(self, event):
+        """Update flow total current when user edits the Total (A) spinner."""
+        self._sync_current_flow_from_fields()
+        self._current_flows_edited = True
+        self._render_current_flows()
+        try:
+            event.Skip()
+        except Exception:
+            pass
+
+    def _on_flow_sharing_changed(self, side):
+        """Handle sharing mode change on From or To side."""
+        self._sync_current_flow_from_fields()
+        self._current_flows_edited = True
+        self._render_current_flows()
+
+    def _append_pads_to_flow_side(self, flow, side, pads):
+        """Append normalized unique pad descriptors to ``from_pads`` or ``to_pads``."""
+        key = f"{side}_pads"
+        target = flow.setdefault(key, [])
+        existing = {p.get("pad_key") or p.get("name") for p in target if (p.get("pad_key") or p.get("name"))}
+        for pad in (pads or []):
+            desc = _normalize_flow_pad(pad)
+            desc["current_a"] = 0.0
+            ident = desc.get("pad_key") or desc.get("name")
+            if ident and ident in existing:
+                continue
+            target.append(desc)
+            if ident:
+                existing.add(ident)
+
+    def _on_flow_add_selection(self, side):
+        """Add live KiCad selected pads to the From or To side of the selected flow."""
+        self._sync_current_flow_from_fields()
+        pads = self._selection_descriptors()
+        if not pads:
+            wx.MessageBox("Select one or more pads in KiCad first.", "ThermalSim")
             return
-        group['mode'] = 'per_pad'
-        current = float(self.current_pad_value_input.GetValue())
-        indices = self._selected_current_pad_indices()
+        flow = self._selected_current_flow()
+        if flow is None:
+            flow = self._make_empty_flow()
+            self.current_flows.append(flow)
+            self.current_flow_index = len(self.current_flows) - 1
+            self.chk_current_enabled.SetValue(True)
+        self._append_pads_to_flow_side(flow, side, pads)
+        self._current_flows_edited = True
+        self._render_current_flows()
+
+    def _on_flow_pick_pads(self, side):
+        """Open ``PadPickerDialog`` to add pads from any net on the board."""
+        self._sync_current_flow_from_fields()
+        if not self.board_pads:
+            wx.MessageBox(
+                "No board pad list available. Select pads in KiCad and click 'Add Selected'.",
+                "ThermalSim",
+            )
+            return
+        flow = self._selected_current_flow()
+        initial_net = ""
+        if flow is not None:
+            nets = _flow_pad_nets(flow)
+            initial_net = flow.get("net_name") or (nets[0] if nets else "")
+        picker = PadPickerDialog(self, self.board_pads, initial_net=initial_net)
+        try:
+            if picker.ShowModal() != wx.ID_OK:
+                return
+            picked = picker.get_selected_pads()
+        finally:
+            picker.Destroy()
+        if not picked:
+            return
+        if flow is None:
+            flow = self._make_empty_flow()
+            self.current_flows.append(flow)
+            self.current_flow_index = len(self.current_flows) - 1
+            self.chk_current_enabled.SetValue(True)
+        self._append_pads_to_flow_side(flow, side, picked)
+        self._current_flows_edited = True
+        self._render_current_flows()
+
+    def _on_flow_remove_pads(self, side):
+        """Remove selected pad rows from the From or To side of the flow."""
+        self._sync_current_flow_from_fields()
+        flow = self._selected_current_flow()
+        if flow is None:
+            return
+        indices = set(self._selected_flow_pad_indices(side))
         if not indices:
-            indices = list(range(len(group.get('pads', []))))
-        for idx in indices:
-            if 0 <= idx < len(group.get('pads', [])):
-                group['pads'][idx]['current_a'] = current
-        self.current_mode_choice.SetSelection(0)
-        self._render_current_groups()
-
-    def _on_current_apply_pad_current_list(self, event):
-        """Apply a comma-separated list of pad currents to the selected group."""
-        group = self._selected_current_group()
-        if group is None:
             return
-        text = self.current_pad_list_input.GetValue().strip()
+        key = f"{side}_pads"
+        flow[key] = [
+            pad for idx, pad in enumerate(flow.get(key, []))
+            if idx not in indices
+        ]
+        self._current_flows_edited = True
+        self._render_current_flows()
+
+    def _on_flow_apply_pad_current(self, side):
+        """Apply the ``Set A`` value to selected rows (or all rows) on one side."""
+        flow = self._selected_current_flow()
+        if flow is None:
+            return
+        widgets = self._flow_side_widgets[side]
+        flow[f"{side}_sharing"] = "fixed"
+        widgets["sharing"].SetSelection(SHARING_MODE_KEYS.index("fixed"))
+        current = abs(float(widgets["pad_value"].GetValue()))
+        pads = flow.get(f"{side}_pads", [])
+        indices = self._selected_flow_pad_indices(side)
+        if not indices:
+            indices = list(range(len(pads)))
+        for idx in indices:
+            if 0 <= idx < len(pads):
+                pads[idx]["current_a"] = current
+        self._current_flows_edited = True
+        self._render_current_flows()
+
+    def _on_flow_apply_pad_current_list(self, side):
+        """Apply comma-separated non-negative currents to pads on one side."""
+        flow = self._selected_current_flow()
+        if flow is None:
+            return
+        widgets = self._flow_side_widgets[side]
+        text = widgets["pad_list_input"].GetValue().strip()
         if not text:
             return
         try:
@@ -2044,20 +2714,34 @@ class SettingsDialog(wx.Dialog):
                 if part.strip()
             ]
         except ValueError:
-            wx.MessageBox("Enter comma-separated numeric currents, e.g. +6, -4, -2.", "ThermalSim")
-            return
-        pads = group.get('pads', [])
-        if len(values) != len(pads):
             wx.MessageBox(
-                f"Current list has {len(values)} values, but the group has {len(pads)} pads.",
-                "ThermalSim"
+                "Enter comma-separated numeric currents, e.g. 3, 3, 3.",
+                "ThermalSim",
             )
             return
-        group['mode'] = 'per_pad'
-        for idx, value in enumerate(values):
-            pads[idx]['current_a'] = value
-        self.current_mode_choice.SetSelection(0)
-        self._render_current_groups()
+        if any(v < 0.0 for v in values):
+            wx.MessageBox(
+                "Enter non-negative current magnitudes (flow direction is From -> To).",
+                "ThermalSim",
+            )
+            return
+        pads = flow.get(f"{side}_pads", [])
+        if len(values) == 1 and pads:
+            for pad in pads:
+                pad["current_a"] = values[0]
+        elif len(values) == len(pads):
+            for idx, value in enumerate(values):
+                pads[idx]["current_a"] = value
+        else:
+            wx.MessageBox(
+                f"Current list has {len(values)} values, but this side has {len(pads)} pads.",
+                "ThermalSim",
+            )
+            return
+        flow[f"{side}_sharing"] = "fixed"
+        widgets["sharing"].SetSelection(SHARING_MODE_KEYS.index("fixed"))
+        self._current_flows_edited = True
+        self._render_current_flows()
 
     def _on_browse_pwl(self, event):
         """Handle Browse PWL button click to select a PWL file."""
@@ -2118,14 +2802,21 @@ class SettingsDialog(wx.Dialog):
         power_text = summarize_power_pads(self.power_pads)
         if not self.chk_current_enabled.GetValue():
             current_text = "Current heating off"
-        else:
+        elif self.current_flows:
+            errors, _ = validate_current_flows(self.current_flows)
+            flow_summary = summarize_current_flows(self.current_flows)
+            if errors:
+                current_text = f"Current heating on / {flow_summary} / needs attention"
+            else:
+                current_text = f"Current heating on / {flow_summary}"
+        elif self.current_groups:
             _, balance_rows = summarize_current_groups(self.current_groups)
-            if not balance_rows:
-                current_text = "Current heating on / no terminals"
-            elif any(status != "OK" for _, _, status in balance_rows):
+            if any(status != "OK" for _, _, status in balance_rows):
                 current_text = "Current heating on / needs balance"
             else:
                 current_text = "Current heating on / balanced"
+        else:
+            current_text = "Current heating on / no flows"
         self.lbl_context.SetLabel(f"{power_text} / {current_text}")
         if hasattr(self, "lbl_heat_summary"):
             self.lbl_heat_summary.SetLabel(power_text)
@@ -2285,107 +2976,137 @@ class SettingsDialog(wx.Dialog):
             pads = []
         return [normalize_pad_descriptor(pad) for pad in (pads or [])]
 
-    def _selected_current_group(self):
-        """Return the selected current group or None."""
-        if 0 <= self.current_group_index < len(self.current_groups):
-            return self.current_groups[self.current_group_index]
+    def _selected_current_flow(self):
+        """Return the selected current flow or None."""
+        if 0 <= self.current_flow_index < len(self.current_flows):
+            return self.current_flows[self.current_flow_index]
         return None
 
-    def _selected_current_pad_indices(self):
-        """Return selected pad row indices in the pad table."""
+    def _selected_flow_pad_indices(self, side):
+        """Return selected row indices in ``flow_from_list`` or ``flow_to_list``."""
+        list_ctrl = self._flow_side_widgets[side]["list_ctrl"]
         indices = []
         try:
-            idx = self.current_pad_list.GetFirstSelected()
+            idx = list_ctrl.GetFirstSelected()
             while idx != -1:
                 indices.append(idx)
-                idx = self.current_pad_list.GetNextItem(idx, getattr(wx, "LIST_NEXT_ALL", 0), getattr(wx, "LIST_STATE_SELECTED", 0))
+                idx = list_ctrl.GetNextItem(
+                    idx, getattr(wx, "LIST_NEXT_ALL", 0), getattr(wx, "LIST_STATE_SELECTED", 0)
+                )
         except Exception:
             pass
         return indices
 
-    def _sync_current_group_from_fields(self):
-        """Copy editor fields into the selected group."""
-        group = self._selected_current_group()
-        if group is None:
+    def _sync_current_flow_from_fields(self):
+        """Copy editor fields into the selected current flow."""
+        flow = self._selected_current_flow()
+        if flow is None:
             return
-        group['name'] = self.current_name_input.GetValue().strip() or group.get('name', 'Group')
-        group['mode'] = 'total' if self.current_mode_choice.GetSelection() == 1 else 'per_pad'
-        group['total_current_a'] = float(self.current_total_input.GetValue())
+        flow["name"] = self.flow_name_input.GetValue().strip() or flow.get("name", "Flow")
+        from_sel = self.flow_from_sharing.GetSelection()
+        to_sel = self.flow_to_sharing.GetSelection()
+        from_sharing = (
+            SHARING_MODE_KEYS[from_sel]
+            if 0 <= from_sel < len(SHARING_MODE_KEYS)
+            else "equipotential"
+        )
+        to_sharing = (
+            SHARING_MODE_KEYS[to_sel]
+            if 0 <= to_sel < len(SHARING_MODE_KEYS)
+            else "fixed"
+        )
+        flow["from_sharing"] = from_sharing
+        flow["to_sharing"] = to_sharing
+        if from_sharing != "fixed" and to_sharing != "fixed":
+            flow["total_current_a"] = abs(float(self.flow_total_input.GetValue()))
 
-    def _render_current_groups(self):
-        """Refresh group list, pad table, and net-balance text."""
-        self.current_groups = prepare_current_groups(self.current_groups)
-        if self.current_groups and not (0 <= self.current_group_index < len(self.current_groups)):
-            self.current_group_index = 0
+    def _render_current_flows(self):
+        """Refresh the Current Flows table, balance status, and flow editor."""
+        self.current_flows = prepare_current_flows(self.current_flows)
+        if self.current_flows and not (0 <= self.current_flow_index < len(self.current_flows)):
+            self.current_flow_index = 0
         try:
-            self.current_group_list.DeleteAllItems()
-            rows, balance_rows = summarize_current_groups(self.current_groups)
-            for row_idx, row in enumerate(rows):
-                self.current_group_list.InsertItem(row_idx, row[0])
-                for col_idx, value in enumerate(row[1:], start=1):
-                    self.current_group_list.SetItem(row_idx, col_idx, value)
-            if 0 <= self.current_group_index < len(self.current_groups):
-                self.current_group_list.Select(self.current_group_index)
+            self.current_flow_list.DeleteAllItems()
+            for row_idx, flow in enumerate(self.current_flows):
+                nets = _flow_pad_nets(flow)
+                if len(nets) > 1:
+                    net_label = "Mixed"
+                elif nets:
+                    net_label = nets[0]
+                else:
+                    net_label = flow.get("net_name") or "-"
+                from_count = len(flow.get("from_pads", []))
+                to_count = len(flow.get("to_pads", []))
+                total_a = float(flow.get("total_current_a", 0.0))
+                self.current_flow_list.InsertItem(row_idx, flow.get("name", ""))
+                self.current_flow_list.SetItem(row_idx, 1, net_label)
+                self.current_flow_list.SetItem(row_idx, 2, f"{from_count} -> {to_count}")
+                self.current_flow_list.SetItem(row_idx, 3, f"{total_a:.6g} A")
+            if 0 <= self.current_flow_index < len(self.current_flows):
+                self.current_flow_list.Select(self.current_flow_index)
         except Exception:
-            _, balance_rows = summarize_current_groups(self.current_groups)
+            pass
 
-        lines = []
-        for net, total, status in balance_rows:
-            lines.append(f"{net}: {total} - {status}")
-        if not lines:
-            lines.append("No current groups configured.")
+        lines = _format_flow_balance_lines(self.current_flows)
+        _, warnings = validate_current_flows(self.current_flows)
+        for warning in warnings:
+            lines.append(f"Warning: {warning}")
         self.current_balance_text.SetValue("\n".join(lines))
-        self._render_current_group_editor()
+        self._render_current_flow_editor()
         if hasattr(self, "lbl_context"):
             self._refresh_context_summary()
         if hasattr(self, "lbl_preflight"):
             self._refresh_preflight()
 
-    def _render_current_group_editor(self):
-        """Refresh editor fields for the selected group."""
-        group = self._selected_current_group()
-        if group is None:
-            self.current_name_input.SetValue("")
-            self.current_total_input.SetValue(0.0)
-            self.current_mode_choice.SetSelection(0)
-            self.current_pad_list_input.SetValue("")
+    def _render_current_flow_editor(self):
+        """Refresh right-hand flow editor fields and From/To pad tables."""
+        flow = self._selected_current_flow()
+        if flow is None:
+            self.flow_name_input.SetValue("")
+            self.flow_total_input.SetValue(0.0)
+            self.flow_from_sharing.SetSelection(0)
+            self.flow_to_sharing.SetSelection(2)
+            for side in ("from", "to"):
+                widgets = self._flow_side_widgets[side]
+                widgets["pad_list_input"].SetValue("")
+                try:
+                    widgets["list_ctrl"].DeleteAllItems()
+                except Exception:
+                    pass
+            self._apply_flow_mode_visibility()
+            return
+
+        self.flow_name_input.SetValue(str(flow.get("name", "")))
+        self.flow_total_input.SetValue(float(flow.get("total_current_a", 0.0)))
+        from_sharing = normalize_sharing_mode(flow.get("from_sharing", "equipotential"))
+        to_sharing = normalize_sharing_mode(flow.get("to_sharing", "fixed"))
+        self.flow_from_sharing.SetSelection(SHARING_MODE_KEYS.index(from_sharing))
+        self.flow_to_sharing.SetSelection(SHARING_MODE_KEYS.index(to_sharing))
+
+        for side, sharing in (("from", from_sharing), ("to", to_sharing)):
+            widgets = self._flow_side_widgets[side]
+            pads = flow.get(f"{side}_pads", [])
+            if sharing == "fixed":
+                widgets["pad_list_input"].SetValue(
+                    ", ".join(f"{float(p.get('current_a', 0.0)):.6g}" for p in pads)
+                )
+            else:
+                widgets["pad_list_input"].SetValue("")
             try:
-                self.current_pad_list.DeleteAllItems()
+                list_ctrl = widgets["list_ctrl"]
+                list_ctrl.DeleteAllItems()
+                for row_idx, pad in enumerate(pads):
+                    current_label = (
+                        "Auto (Cu)"
+                        if sharing == "equipotential"
+                        else f"{float(pad.get('current_a', 0.0)):.6g}"
+                    )
+                    list_ctrl.InsertItem(row_idx, pad.get("name", ""))
+                    list_ctrl.SetItem(row_idx, 1, pad.get("layer", ""))
+                    list_ctrl.SetItem(row_idx, 2, current_label)
             except Exception:
                 pass
-            self._apply_current_mode_visibility()
-            return
-        self.current_name_input.SetValue(str(group.get('name', '')))
-        self.current_mode_choice.SetSelection(1 if group.get('mode') == 'total' else 0)
-        self.current_total_input.SetValue(float(group.get('total_current_a', 0.0)))
-        self.current_pad_list_input.SetValue(
-            ", ".join(f"{float(pad.get('current_a', 0.0)):.6g}" for pad in group.get('pads', []))
-        )
-
-        try:
-            self.current_pad_list.DeleteAllItems()
-            group_nets = {pad.get('net_name') or "(no net)" for pad in group.get('pads', [])}
-            for row_idx, pad in enumerate(group.get('pads', [])):
-                net = pad.get('net_name') or "(no net)"
-                if net == "(no net)":
-                    status = "No net"
-                elif len(group_nets) > 1:
-                    status = "Mixed nets"
-                else:
-                    status = "OK"
-                values = [
-                    pad.get('name', ''),
-                    net,
-                    pad.get('layer', ''),
-                    f"{float(pad.get('current_a', 0.0)):.6g}",
-                    status,
-                ]
-                self.current_pad_list.InsertItem(row_idx, values[0])
-                for col_idx, value in enumerate(values[1:], start=1):
-                    self.current_pad_list.SetItem(row_idx, col_idx, value)
-        except Exception:
-            pass
-        self._apply_current_mode_visibility()
+        self._apply_flow_mode_visibility()
 
     # ------------------------------------------------------------------
     # Settings I/O
@@ -2442,7 +3163,7 @@ class SettingsDialog(wx.Dialog):
         - compute_engine : str
         """
         try:
-            self._sync_current_group_from_fields()
+            self._sync_current_flow_from_fields()
             if not self._power_pads_edited:
                 legacy_pads = []
                 for pad in (self.power_pads or self.initial_power_pads):
@@ -2453,7 +3174,10 @@ class SettingsDialog(wx.Dialog):
                     legacy_pads.append(item)
                 self.power_pads = prepare_power_pads(legacy_pads, self.power_input.GetValue())
             power_pads = prepare_power_pads(self.power_pads, self.power_input.GetValue())
-            current_groups = prepare_current_groups(self.current_groups)
+            current_flows = prepare_current_flows(self.current_flows)
+            current_groups = (
+                [] if self._current_flows_edited else prepare_current_groups(self.current_groups)
+            )
             power_str = power_pads_to_power_str(power_pads, self.power_input.GetValue())
             detail_idx = self.grid_detail_choice.GetSelection()
             if 0 <= detail_idx < len(GRID_DETAIL_VALUES):
@@ -2538,6 +3262,7 @@ class SettingsDialog(wx.Dialog):
                 'mesh_mode': 'uniform',
                 'time_stepping': time_stepping,
                 'current_enabled': self.chk_current_enabled.GetValue(),
+                'current_flows': current_flows,
                 'current_groups': current_groups,
             }
         except ValueError:
@@ -2709,9 +3434,22 @@ class SettingsDialog(wx.Dialog):
             self.chk_current_enabled.SetValue(
                 bool(defaults.get('current_enabled', self.chk_current_enabled.GetValue()))
             )
-            self.current_groups = prepare_current_groups(defaults.get('current_groups', []))
+            if 'current_flows' in defaults:
+                self.current_flows = prepare_current_flows(defaults.get('current_flows', []))
+                self.current_groups = prepare_current_groups(defaults.get('current_groups', []))
+                self._current_flows_edited = False
+            elif defaults.get('current_groups'):
+                legacy_groups = prepare_current_groups(defaults.get('current_groups', []))
+                self.current_groups = legacy_groups
+                self.current_flows = convert_current_groups_to_flows(legacy_groups)
+                self._current_flows_edited = False
+            else:
+                self.current_flows = []
+                self.current_groups = []
+                self._current_flows_edited = False
+            self.current_flow_index = 0 if self.current_flows else -1
             self.current_group_index = 0 if self.current_groups else -1
-            self._render_current_groups()
+            self._render_current_flows()
             if self.chk_heatsink.GetValue():
                 self.thermal_pad_pane.Expand()
             h_conv_val = float(

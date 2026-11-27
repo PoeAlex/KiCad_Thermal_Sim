@@ -473,3 +473,72 @@ class TestEndToEndSubcommandsWithHeadlessApi:
         assert cfg["h_conv_bottom"] == 0.0
         assert cfg["via_plating_um"] == 35.0
         assert cfg["via_fill"] == "copper"
+
+    def test_v050_current_flow_cli_flags(self, monkeypatch, capsys):
+        captured_calls = []
+
+        class _FakeApi:
+            def validate_job(self, board_path, job_config):
+                captured_calls.append((board_path, job_config))
+                return {
+                    "schema_version": "1.0",
+                    "command": "validate",
+                    "valid": True,
+                    "errors": [],
+                    "warnings": [],
+                }
+
+        monkeypatch.setattr(thermalsim_cli, "headless_api", _FakeApi())
+        rc = thermalsim_cli.main([
+            "validate", "board.kicad_pcb",
+            "--current-flow", "J1.1->U1.1:3,U2.1:3,U3.1:3",
+            "--current-flow", "J2.1->U4.1,U4.2:12A",
+            "--current-flow", "J3.1,J3.2->U5.1,U5.2=8A",
+            "--no-electro-thermal",
+        ])
+        assert rc == 0
+        _ = json.loads(capsys.readouterr().out)
+        _, cfg = captured_calls[0]
+        assert cfg["current_enabled"] is True
+        assert cfg["electro_thermal_coupling"] is False
+        assert cfg["current_flows"] == [
+            {
+                "from": ["J1.1"],
+                "from_sharing": "equipotential",
+                "to": {"U1.1": 3.0, "U2.1": 3.0, "U3.1": 3.0},
+                "to_sharing": "fixed",
+            },
+            {
+                "from": ["J2.1"],
+                "from_sharing": "equipotential",
+                "to": ["U4.1", "U4.2"],
+                "to_sharing": "equipotential",
+                "total_current_a": 12.0,
+            },
+            {
+                "from": ["J3.1", "J3.2"],
+                "from_sharing": "equipotential",
+                "to": ["U5.1", "U5.2"],
+                "to_sharing": "equipotential",
+                "total_current_a": 8.0,
+            },
+        ]
+
+    @pytest.mark.parametrize(
+        "bad_flow",
+        [
+            "J1.1",
+            "->U1.1:5",
+            "J1.1->",
+            "J1.1->U1.1:3,U2.1",
+            "J1.1->U1.1,U1.2",
+            "J1.1->U1.1:-5",
+            "J1->U1.1:5",
+        ],
+    )
+    def test_v050_bad_current_flow_cli_syntax_returns_exit_2(self, bad_flow, capsys):
+        rc = thermalsim_cli.main(["validate", "b.kicad_pcb", "--current-flow", bad_flow])
+        assert rc == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "validation_error"
+        assert payload["errors"][0]["code"] == "CLI_ERROR"

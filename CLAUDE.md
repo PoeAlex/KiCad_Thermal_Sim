@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ThermalSim (**v0.4.9**) is a KiCad 9.0 & 10.0 PCB Editor plugin and headless automation tool for fast 2.5D steady-state and transient thermal simulation. It simulates heat spreading across multilayer PCBs using finite volume methods, a Native C++/OpenMP **v4** Compact Low-RAM Multigrid & Fused PCG core (with pure NumPy/SciPy fallback), and BDF2 time integration.
+ThermalSim (**v0.5.0**) is a KiCad 9.0 & 10.0 PCB Editor plugin and headless automation tool for fast 2.5D steady-state and transient thermal simulation. It simulates heat spreading across multilayer PCBs using finite volume methods, a Native C++/OpenMP **v4** Compact Low-RAM Multigrid & Fused PCG core (with pure NumPy/SciPy fallback), and BDF2 time integration.
 
 ## Dependencies
 
@@ -195,6 +195,7 @@ Generated in a timestamped subfolder (e.g., `Thermalsim_20261124_183800/`) or `-
 - `thermal_preview.png` — Mapped geometry preview
 - `thermal_stackup.png` or `thermal_final.png` — Final temperature heatmap
 - `joule_loss_map.png` — Current-induced copper loss map (when current heating is active)
+- `current_density.png` — Per-layer DC current density map in A/mm² (when current heating is active)
 - `snap_*.png` — Time-series snapshots (when enabled in transient mode)
 - `summary.json` — Semantic JSON summary (written by `headless_api` / CLI)
 - `thermal_sim_last_settings.json` — Persisted GUI settings (in plugin root)

@@ -128,7 +128,7 @@ class TestHeadlessIsolationAndJson:
 
     def test_constants(self):
         assert headless_api.SCHEMA_VERSION == "1.0"
-        assert headless_api.PLUGIN_VERSION == "0.4.9"
+        assert headless_api.PLUGIN_VERSION == "0.5.0"
 
     def test_no_wx_or_gui_imports_in_ast(self):
         for mod in (headless_api, simulation_core):
@@ -1259,3 +1259,261 @@ class TestV049GapAndValidationFixes:
         ):
             res = headless_api.validate_job(board, {"power_pads": {"U1.EP": 1.0}, **valid_overrides})
             assert res["valid"] is True, f"Expected valid for {valid_overrides}: {res['errors']}"
+
+
+class TestV050CurrentFlowsAndElectroThermal:
+    """Tests for v0.5.0 current_flows resolution, EquipotentialBus, electro-thermal coupling, and schemas."""
+
+    @staticmethod
+    def _make_1to2_board(sample_2layer_board_file=None):
+        """Build a 2-layer board with 1 source pad (J1.1) feeding 2 asymmetric sink pads (U1.1, U2.1)."""
+        j1_1 = MockPad(
+            position=VECTOR2I(10_000_000, 10_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(9_000_000, 9_000_000, 2_000_000, 2_000_000),
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        u1_1 = MockPad(
+            position=VECTOR2I(18_000_000, 10_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(17_000_000, 9_000_000, 2_000_000, 2_000_000),
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        u2_1 = MockPad(
+            position=VECTOR2I(36_000_000, 10_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(35_000_000, 9_000_000, 2_000_000, 2_000_000),
+            net_code=1,
+            net_name="VIN",
+            number="1",
+        )
+        u3_1 = MockPad(
+            position=VECTOR2I(20_000_000, 25_000_000),
+            layer=F_Cu,
+            bbox=EDA_RECT(19_000_000, 24_000_000, 2_000_000, 2_000_000),
+            net_code=2,
+            net_name="GND",
+            number="1",
+        )
+        tracks = [
+            MockTrack(
+                layer=F_Cu,
+                bbox=EDA_RECT(10_000_000, 9_500_000, 26_000_000, 1_000_000),
+                start=VECTOR2I(10_000_000, 10_000_000),
+                end=VECTOR2I(36_000_000, 10_000_000),
+                width=1_000_000,
+                net_code=1,
+                net_name="VIN",
+            ),
+        ]
+        return MockBoard(
+            filename=sample_2layer_board_file or "",
+            footprints=[
+                MockFootprint(reference="J1", pads=[j1_1]),
+                MockFootprint(reference="U1", pads=[u1_1]),
+                MockFootprint(reference="U2", pads=[u2_1]),
+                MockFootprint(reference="U3", pads=[u3_1]),
+            ],
+            tracks=tracks,
+            zones=[],
+            drawings=[],
+            layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+        )
+
+    def test_compact_1toN_fixed_and_equipotential_bus_validation_and_run(
+        self, sample_2layer_board_file, tmp_path
+    ):
+        import jsonschema
+
+        board = self._make_1to2_board(sample_2layer_board_file)
+
+        # 1. Compact fixed sink dict auto-balances source J1.1 to +9A
+        cfg_fixed = {
+            "res": 2.0,
+            "steady_state": True,
+            "compute_engine": "legacy",
+            "current_enabled": True,
+            "current_flows": [
+                {"from": ["J1.1"], "to": {"U1.1": 4.0, "U2.1": 5.0}},
+            ],
+        }
+        val_fixed = headless_api.validate_job(board, cfg_fixed)
+        assert val_fixed["valid"] is True
+        by_name = {t["name"]: t["current_a"] for t in val_fixed["resolved_current_terminals"]}
+        assert by_name["J1.1"] == pytest.approx(9.0)
+        assert by_name["U1.1"] == pytest.approx(-4.0)
+        assert by_name["U2.1"] == pytest.approx(-5.0)
+
+        # 2. Compact equipotential bus flow: J1.1 -> [U1.1, U2.1] at 12A
+        cfg_bus = {
+            "res": 1.0,
+            "steady_state": True,
+            "compute_engine": "legacy",
+            "current_enabled": True,
+            "current_flows": [
+                {
+                    "name": "MainBus",
+                    "from": ["J1.1"],
+                    "to": ["U1.1", "U2.1"],
+                    "current_a": 12.0,
+                    "to_sharing": "equipotential",
+                },
+            ],
+        }
+        schema_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "schema",
+        )
+        with open(os.path.join(schema_dir, "job.schema.json"), "r", encoding="utf-8") as fh:
+            job_schema = json.load(fh)
+        with open(os.path.join(schema_dir, "summary.schema.json"), "r", encoding="utf-8") as fh:
+            summary_schema = json.load(fh)
+        jsonschema.validate(cfg_bus, job_schema)
+
+        val_bus = headless_api.validate_job(board, cfg_bus)
+        assert val_bus["valid"] is True
+        assert len(val_bus["resolved_equipotential_buses"]) == 1
+        assert val_bus["resolved_equipotential_buses"][0]["total_current_a"] == pytest.approx(-12.0)
+
+        out_dir = tmp_path / "bus_run"
+        res = headless_api.run_headless_simulation(
+            board,
+            cfg_bus,
+            out_dir=out_dir,
+            generate_plots=True,
+            generate_html=True,
+        )
+        assert res["status"] == "ok"
+        assert res["electrical"] is not None
+        assert res["electrical"]["total_loss_w"] > 0.0
+        assert res["electrical"]["electro_thermal_passes"] >= 1
+        assert res["artifacts"]["current_density_png"] is not None
+        assert os.path.isfile(res["artifacts"]["current_density_png"])
+        assert os.path.basename(res["artifacts"]["current_density_png"]) == "current_density.png"
+
+        # Shorter path U1.1 must carry more current magnitude than longer path U2.1
+        net0 = res["electrical"]["nets"][0]
+        assert "current_density_a_mm2" not in net0
+        diag_by_name = {d["name"]: d for d in net0["terminal_diagnostics"]}
+        assert abs(diag_by_name["U1.1"]["current_a"]) > abs(diag_by_name["U2.1"]["current_a"])
+        assert diag_by_name["U1.1"]["bus_name"] == "MainBus (To)"
+
+        with open(res["artifacts"]["report_html"], "r", encoding="utf-8") as fh:
+            html_text = fh.read()
+        assert "current_density.png" in html_text
+        assert "Terminal Current Sharing &amp; Voltage" in html_text
+        assert "Top Vias by Current" in html_text
+        jsonschema.validate(res, summary_schema)
+
+        # 3. Net mismatch error
+        bad_net = headless_api.validate_job(board, {
+            "current_enabled": True,
+            "current_flows": [{"from": ["J1.1"], "to": {"U3.1": 5.0}}],
+        })
+        assert bad_net["valid"] is False
+        assert any(e["code"] == "FLOW_NET_MISMATCH" for e in bad_net["errors"])
+
+        # 4. Fixed/fixed imbalance error
+        bad_bal = headless_api.validate_job(board, {
+            "current_enabled": True,
+            "current_flows": [{
+                "from": {"J1.1": 8.0},
+                "to": {"U1.1": 3.0, "U2.1": 3.0},
+                "from_sharing": "fixed",
+                "to_sharing": "fixed",
+            }],
+        })
+        assert bad_bal["valid"] is False
+        assert any(e["code"] == "CURRENT_UNBALANCED" for e in bad_bal["errors"])
+
+    def test_electro_thermal_coupling_2_pass_and_runaway_warning(self, monkeypatch):
+        from ThermalSim.electrical_solver import ElectricalNetSummary, ElectricalResult
+
+        board = _make_board(None, with_eco1=False)
+        solve_calls = []
+
+        def spy_solve_electrical(b, terminals, config, equipotential_buses=None, temperature_field=None):
+            solve_calls.append(temperature_field)
+            n = len(config.copper_ids) * config.rows * config.cols
+            q = np.zeros(n, dtype=np.float64)
+            if temperature_field is None:
+                loss = 2.0
+            else:
+                # Simulate > 50% rise on pass 2 and quick convergence on pass 3
+                t_max = float(np.max(temperature_field))
+                loss = 3.5 if len(solve_calls) == 2 else 3.51
+                assert t_max > 30.0
+            q[0] = loss
+            return ElectricalResult(
+                q_joule=q,
+                net_summaries=[ElectricalNetSummary(
+                    net_key="net:1",
+                    net_name="VIN",
+                    terminal_count=2,
+                    total_current_a=5.0,
+                    total_abs_current_a=10.0,
+                    total_loss_w=loss,
+                    max_node_power_w=loss,
+                    connected_component_count=1,
+                    source_current_a=5.0,
+                    sink_current_a=5.0,
+                    current_balance_a=0.0,
+                    effective_resistance_ohm=loss / 25.0,
+                    equivalent_voltage_drop_v=loss / 5.0,
+                    pad_resistance_ohm=loss / 25.0,
+                    copper_cell_count=10,
+                    edge_count=10,
+                    via_edge_count=0,
+                )],
+                warnings=[],
+                errors=[],
+            )
+
+        monkeypatch.setattr(headless_api, "solve_electrical_heating", spy_solve_electrical)
+
+        res = headless_api.run_headless_simulation(
+            board,
+            {
+                "res": 2.0,
+                "amb": 25.0,
+                "steady_state": True,
+                "compute_engine": "legacy",
+                "current_enabled": True,
+                "electro_thermal_coupling": True,
+                "current_flows": [{"from": ["U1.1"], "to": {"C1.1": 5.0}}],
+            },
+            generate_plots=False,
+            generate_html=False,
+        )
+        assert res["status"] == "ok"
+        assert len(solve_calls) == 3  # Pass 1 (None), Pass 2 (T1), Pass 3 (T2 -> converged <=2%)
+        el = res["electrical"]
+        assert el["electro_thermal_passes"] == 3
+        assert el["initial_loss_w"] == pytest.approx(2.0)
+        assert el["coupled_loss_w"] == pytest.approx(3.51)
+        assert any("50%" in w or "runaway" in w.lower() for w in el["warnings"])
+        assert any(w.get("code") == "ELECTRO_THERMAL_RUNAWAY_RISK" for w in res["warnings"])
+
+        # Disabled electro_thermal_coupling runs only 1 pass
+        solve_calls.clear()
+        res_off = headless_api.run_headless_simulation(
+            board,
+            {
+                "res": 2.0,
+                "amb": 25.0,
+                "steady_state": True,
+                "compute_engine": "legacy",
+                "current_enabled": True,
+                "electro_thermal_coupling": False,
+                "current_flows": [{"from": ["U1.1"], "to": {"C1.1": 5.0}}],
+            },
+            generate_plots=False,
+            generate_html=False,
+        )
+        assert res_off["status"] == "ok"
+        assert len(solve_calls) == 1
+        assert res_off["electrical"]["electro_thermal_passes"] == 1

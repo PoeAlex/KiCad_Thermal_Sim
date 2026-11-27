@@ -9,6 +9,7 @@ No GUI or ``wx`` modules are imported here.
 
 from dataclasses import asdict
 import fnmatch
+import inspect
 import json
 import math
 import os
@@ -37,6 +38,10 @@ from .electrical_solver import (
     net_key_from_values,
     solve_electrical_heating,
 )
+try:
+    from .electrical_solver import EquipotentialBus
+except ImportError:  # pragma: no cover - optional during staged updates
+    EquipotentialBus = None
 from .geometry_mapper import (
     build_geometry_state,
     get_pad_copper_layer_indices,
@@ -110,7 +115,7 @@ from .simulation_core import (
 )
 
 SCHEMA_VERSION = "1.0"
-PLUGIN_VERSION = "0.4.9"
+PLUGIN_VERSION = "0.5.0"
 
 SUPPORTED_SWEEP_PARAMS = frozenset({
     "heatsink_rth_kw",
@@ -800,6 +805,152 @@ def _normalize_power_pads_input(raw_pads: Any, fallback_power: str = "1.0") -> L
     return entries
 
 
+def _normalize_sharing_mode(raw_mode: Any, default: str = "equipotential") -> str:
+    """Normalize a current-flow sharing mode to ``equipotential``, ``equal``, or ``fixed``."""
+    mode = str(raw_mode or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if mode in {"equipotential", "equipotential_(auto)", "auto", "natural"}:
+        return "equipotential"
+    if mode in {"equal", "equal_split", "split"}:
+        return "equal"
+    if mode in {"fixed", "fixed_per_pad", "per_pad"}:
+        return "fixed"
+    return default
+
+
+def _normalize_flow_side_entries(raw_side: Any) -> List[Dict[str, Any]]:
+    """Normalize a flow side selector (mapping, string, or list) into pad spec dicts."""
+    entries: List[Dict[str, Any]] = []
+    if isinstance(raw_side, dict):
+        for key, val in raw_side.items():
+            ref, pad = _parse_ref_pad_name(str(key))
+            name = f"{ref}.{pad}" if (ref and pad) else str(key).strip()
+            entries.append({
+                "ref": ref,
+                "pad": pad,
+                "name": name,
+                "current_a": abs(float(val or 0.0)),
+            })
+        return entries
+
+    items = [raw_side] if isinstance(raw_side, str) else list(raw_side or [])
+    for item in items:
+        if isinstance(item, str):
+            ref, pad = _parse_ref_pad_name(item)
+            name = f"{ref}.{pad}" if (ref and pad) else item.strip()
+            entries.append({
+                "ref": ref,
+                "pad": pad,
+                "name": name,
+                "current_a": 0.0,
+            })
+        elif isinstance(item, dict):
+            ref = str(item.get("ref", "") or "").strip()
+            pad = str(item.get("pad", "") or "").strip()
+            raw_name = str(item.get("name", "") or "").strip()
+            if not (ref and pad) and raw_name:
+                parsed_ref, parsed_pad = _parse_ref_pad_name(raw_name)
+                ref = ref or parsed_ref
+                pad = pad or parsed_pad
+            canonical = raw_name or (f"{ref}.{pad}" if (ref and pad) else "")
+            entry: Dict[str, Any] = {
+                "ref": ref,
+                "pad": pad,
+                "name": canonical,
+                "net_name": str(item.get("net_name", item.get("net", "")) or ""),
+                "net_code": int(item.get("net_code", 0) or 0),
+                "layer": str(item.get("layer", "") or ""),
+                "current_a": abs(float(item.get("current_a", item.get("current", 0.0)) or 0.0)),
+            }
+            if item.get("pad_key"):
+                entry["pad_key"] = str(item["pad_key"])
+            entries.append(entry)
+    return entries
+
+
+def _normalize_current_flows_input(raw_flows: Any) -> List[Dict[str, Any]]:
+    """Normalize ``current_flows`` from canonical GUI dicts or compact JSON job specs."""
+    normalized: List[Dict[str, Any]] = []
+    for idx, raw_flow in enumerate(list(raw_flows or [])):
+        if not isinstance(raw_flow, dict):
+            continue
+        from_raw = raw_flow.get("from", raw_flow.get("from_pads", []))
+        to_raw = raw_flow.get("to", raw_flow.get("to_pads", []))
+        from_pads = _normalize_flow_side_entries(from_raw)
+        to_pads = _normalize_flow_side_entries(to_raw)
+
+        has_flow_total = any(
+            raw_flow.get(k) is not None for k in ("total_current_a", "current_a", "total_current")
+        )
+
+        def _default_sharing(side_raw: Any, side_pads: List[Dict[str, Any]]) -> str:
+            if isinstance(side_raw, dict):
+                return "fixed"
+            if (
+                not has_flow_total
+                and side_pads
+                and any(float(p.get("current_a", 0.0)) > 0.0 for p in side_pads)
+            ):
+                return "fixed"
+            return "equipotential"
+
+        from_sharing = _normalize_sharing_mode(
+            raw_flow.get("from_sharing"),
+            default=_default_sharing(from_raw, from_pads),
+        )
+        to_sharing = _normalize_sharing_mode(
+            raw_flow.get("to_sharing"),
+            default=_default_sharing(to_raw, to_pads),
+        )
+
+        raw_total = raw_flow.get(
+            "total_current_a",
+            raw_flow.get("current_a", raw_flow.get("total_current", 0.0)),
+        )
+        total_current_a = abs(float(raw_total or 0.0))
+
+        if to_sharing == "fixed" and from_sharing != "fixed":
+            total_current_a = sum(float(p["current_a"]) for p in to_pads)
+        elif from_sharing == "fixed" and to_sharing != "fixed":
+            total_current_a = sum(float(p["current_a"]) for p in from_pads)
+        elif from_sharing == "fixed" and to_sharing == "fixed":
+            total_current_a = sum(float(p["current_a"]) for p in from_pads)
+
+        def _sync_side_currents(side_pads: List[Dict[str, Any]], sharing: str) -> None:
+            if not side_pads or sharing == "fixed":
+                return
+            if sharing == "equal":
+                per_pad = total_current_a / float(len(side_pads))
+                for p in side_pads:
+                    p["current_a"] = per_pad
+            elif sharing == "equipotential":
+                for p in side_pads:
+                    p["current_a"] = total_current_a if len(side_pads) == 1 else 0.0
+
+        _sync_side_currents(from_pads, from_sharing)
+        _sync_side_currents(to_pads, to_sharing)
+
+        net_name = str(raw_flow.get("net_name", raw_flow.get("net", "")) or "")
+        net_code = int(raw_flow.get("net_code", 0) or 0)
+        if not net_name:
+            for p in from_pads + to_pads:
+                if p.get("net_name"):
+                    net_name = str(p["net_name"])
+                    net_code = int(p.get("net_code", net_code) or 0)
+                    break
+
+        normalized.append({
+            "name": str(raw_flow.get("name") or f"Flow {idx + 1}"),
+            "net_name": net_name,
+            "net_code": net_code,
+            "total_current_a": float(total_current_a),
+            "from_sharing": from_sharing,
+            "to_sharing": to_sharing,
+            "from_pads": from_pads,
+            "to_pads": to_pads,
+        })
+    return normalized
+
+
 def normalize_job_config(
     job_config: Optional[Dict[str, Any]],
     suggested_res_mm: float = 0.5,
@@ -977,6 +1128,10 @@ def normalize_job_config(
         "heatsink_mass_g": heatsink_mass_g,
         "heatsink_cp_j_kgk": heatsink_cp_j_kgk,
         "current_enabled": bool(raw.get("current_enabled", False)),
+        "electro_thermal_coupling": bool(
+            True if raw.get("electro_thermal_coupling") is None else raw["electro_thermal_coupling"]
+        ),
+        "current_flows": _normalize_current_flows_input(raw.get("current_flows", [])),
         "current_groups": list(raw.get("current_groups") or []),
         "limits": limits_norm,
         "copper_thickness_scale": float(1.0 if raw.get("copper_thickness_scale") is None else raw["copper_thickness_scale"]),
@@ -1129,6 +1284,142 @@ def _resolve_current_groups_entries(
             ))
 
     return terminals, missing
+
+
+def _emit_flow_side_entries(
+    side_label: str,
+    resolved_items: List[Tuple[Dict[str, Any], Any, float]],
+    sharing: str,
+    total_a: float,
+    sign: float,
+    flow_name: str,
+    flow_net_name: str,
+    flow_net_code: int,
+    terminals: List[CurrentTerminal],
+    buses: List[Any],
+) -> None:
+    """Emit ``EquipotentialBus`` or ``CurrentTerminal`` entries for one side of a flow."""
+    if not resolved_items:
+        return
+    if sharing == "equipotential":
+        if abs(total_a) <= 0.0:
+            return
+        if len(resolved_items) >= 2 and EquipotentialBus is not None:
+            buses.append(EquipotentialBus(
+                name=f"{flow_name} ({side_label})",
+                net_name=flow_net_name,
+                net_code=int(flow_net_code),
+                pads=[(pad_obj, desc["name"]) for desc, pad_obj, _ in resolved_items],
+                total_current_a=float(sign * total_a),
+            ))
+        else:
+            per_pad = (sign * total_a) / float(len(resolved_items))
+            for desc, pad_obj, _ in resolved_items:
+                terminals.append(CurrentTerminal(
+                    pad=pad_obj,
+                    name=desc["name"],
+                    net_name=desc["net_name"],
+                    net_code=int(desc["net_code"]),
+                    current_a=float(per_pad),
+                ))
+    elif sharing == "equal":
+        if abs(total_a) <= 0.0:
+            return
+        per_pad = (sign * total_a) / float(len(resolved_items))
+        for desc, pad_obj, _ in resolved_items:
+            terminals.append(CurrentTerminal(
+                pad=pad_obj,
+                name=desc["name"],
+                net_name=desc["net_name"],
+                net_code=int(desc["net_code"]),
+                current_a=float(per_pad),
+            ))
+    else:  # fixed
+        for desc, pad_obj, item_current in resolved_items:
+            curr = float(sign * abs(float(item_current)))
+            if abs(curr) <= 0.0:
+                continue
+            terminals.append(CurrentTerminal(
+                pad=pad_obj,
+                name=desc["name"],
+                net_name=desc["net_name"],
+                net_code=int(desc["net_code"]),
+                current_a=curr,
+            ))
+
+
+def _resolve_current_flows_entries(
+    raw_flows: List[Any],
+    pad_index: Dict[str, Any],
+) -> Tuple[List[CurrentTerminal], List[Any], List[Tuple[str, str]], List[Dict[str, Any]]]:
+    """Resolve ``current_flows`` into ``(terminals, buses, missing, flow_errors)``."""
+    terminals: List[CurrentTerminal] = []
+    buses: List[Any] = []
+    missing: List[Tuple[str, str]] = []
+    flow_errors: List[Dict[str, Any]] = []
+
+    for flow in list(raw_flows or []):
+        if not isinstance(flow, dict):
+            continue
+        flow_name = str(flow.get("name") or "Flow")
+        from_pads = list(flow.get("from_pads") or [])
+        to_pads = list(flow.get("to_pads") or [])
+        total_a = abs(float(flow.get("total_current_a", 0.0) or 0.0))
+        from_sharing = _normalize_sharing_mode(flow.get("from_sharing"), default="equipotential")
+        to_sharing = _normalize_sharing_mode(flow.get("to_sharing"), default="equipotential")
+
+        if (from_pads or to_pads or total_a > 0.0) and (not from_pads or not to_pads):
+            flow_errors.append({
+                "code": "FLOW_INCOMPLETE",
+                "target": flow_name,
+                "message": f"Current flow '{flow_name}' must specify both 'from' and 'to' pads.",
+            })
+
+        def _resolve_side(side_pads: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], Any, float]]:
+            resolved: List[Tuple[Dict[str, Any], Any, float]] = []
+            for item in side_pads:
+                match, hint = _lookup_pad(pad_index, item)
+                if not match:
+                    target = str(item.get("name") or f"{item.get('ref', '')}.{item.get('pad', '')}").strip(".")
+                    missing.append((target or "<unknown>", hint))
+                    continue
+                desc, pad_obj = match
+                resolved.append((desc, pad_obj, float(item.get("current_a", 0.0) or 0.0)))
+            return resolved
+
+        resolved_from = _resolve_side(from_pads)
+        resolved_to = _resolve_side(to_pads)
+
+        all_resolved = resolved_from + resolved_to
+        if not all_resolved:
+            continue
+
+        net_keys = {
+            net_key_from_values(int(desc["net_code"]), desc["net_name"])
+            for desc, _, _ in all_resolved
+        }
+        if len(net_keys) > 1:
+            flow_errors.append({
+                "code": "FLOW_NET_MISMATCH",
+                "target": flow_name,
+                "message": f"Current flow '{flow_name}' references pads on multiple nets; all pads in a flow must share one net.",
+            })
+            continue
+
+        first_desc = all_resolved[0][0]
+        flow_net_name = str(first_desc["net_name"] or flow.get("net_name", "") or "")
+        flow_net_code = int(first_desc["net_code"])
+
+        _emit_flow_side_entries(
+            "From", resolved_from, from_sharing, total_a, +1.0,
+            flow_name, flow_net_name, flow_net_code, terminals, buses,
+        )
+        _emit_flow_side_entries(
+            "To", resolved_to, to_sharing, total_a, -1.0,
+            flow_name, flow_net_name, flow_net_code, terminals, buses,
+        )
+
+    return terminals, buses, missing, flow_errors
 
 
 def _validate_with_context(
@@ -1331,9 +1622,16 @@ def _validate_with_context(
         })
 
     terminals: List[CurrentTerminal] = []
+    buses: List[Any] = []
     has_current = False
     if norm["current_enabled"]:
-        terminals, missing_curr = _resolve_current_groups_entries(norm["current_groups"], pad_index)
+        if norm["current_flows"]:
+            terminals, buses, missing_curr, flow_errors = _resolve_current_flows_entries(
+                norm["current_flows"], pad_index
+            )
+            errors.extend(flow_errors)
+        else:
+            terminals, missing_curr = _resolve_current_groups_entries(norm["current_groups"], pad_index)
         for target, hint in missing_curr:
             errors.append({
                 "code": "PAD_NOT_FOUND",
@@ -1341,13 +1639,20 @@ def _validate_with_context(
                 "message": f"Current terminal pad '{target}' was not found on the board.",
                 "hint": hint,
             })
-        has_current = any(abs(float(item.current_a)) > 0.0 for item in terminals)
+        has_current = (
+            any(abs(float(item.current_a)) > 0.0 for item in terminals)
+            or any(abs(float(bus.total_current_a)) > 0.0 for bus in buses)
+        )
         totals: Dict[str, float] = {}
         abs_totals: Dict[str, float] = {}
         for item in terminals:
             net = item.net_name or f"net:{item.net_code}"
             totals[net] = totals.get(net, 0.0) + float(item.current_a)
             abs_totals[net] = abs_totals.get(net, 0.0) + abs(float(item.current_a))
+        for bus in buses:
+            net = bus.net_name or f"net:{bus.net_code}"
+            totals[net] = totals.get(net, 0.0) + float(bus.total_current_a)
+            abs_totals[net] = abs_totals.get(net, 0.0) + abs(float(bus.total_current_a))
         for net, total in totals.items():
             tol = max(1e-9, 1e-6 * abs_totals.get(net, 0.0))
             if abs(total) > tol:
@@ -1378,12 +1683,23 @@ def _validate_with_context(
                 "message": "Thermal pad (use_heatsink) is enabled, but no User.Eco1 shapes exist on the board.",
             })
 
+    area_terminals = list(terminals)
+    for bus in buses:
+        if getattr(bus, "pads", None) and abs(float(bus.total_current_a)) > 0.0:
+            area_terminals.append(CurrentTerminal(
+                pad=bus.pads[0][0],
+                name=bus.name,
+                net_name=bus.net_name,
+                net_code=int(bus.net_code),
+                current_a=float(bus.total_current_a),
+            ))
+
     area = _estimate_simulation_area(
         board,
         bbox,
         norm,
         power_pads=resolved_power_objs,
-        terminals=terminals,
+        terminals=area_terminals,
     )
     for w_msg in area.warnings:
         warnings.append({"code": "AREA_ESTIMATE", "message": w_msg})
@@ -1433,6 +1749,16 @@ def _validate_with_context(
         for item in terminals
     ]
 
+    resolved_buses_out = [
+        {
+            "name": bus.name,
+            "net": bus.net_name,
+            "total_current_a": float(bus.total_current_a),
+            "pads": [pad_name for _, pad_name in bus.pads],
+        }
+        for bus in buses
+    ]
+
     valid = len(errors) == 0
     payload = _json_clean({
         "schema_version": SCHEMA_VERSION,
@@ -1444,6 +1770,7 @@ def _validate_with_context(
         "grid": grid_dict,
         "resolved_power_pads": resolved_power_pads,
         "resolved_current_terminals": resolved_terminals_out,
+        "resolved_equipotential_buses": resolved_buses_out,
         "normalized_config": norm,
     })
 
@@ -1462,6 +1789,7 @@ def _validate_with_context(
         "resolved_power_pads": resolved_power_pads,
         "pad_sources": pad_sources,
         "terminals": terminals,
+        "buses": buses,
         "unfilled_zones": unfilled_zones,
     }
 
@@ -1957,6 +2285,7 @@ def build_semantic_summary(
         "heatmap_png": None,
         "preview_png": None,
         "joule_map_png": None,
+        "current_density_png": None,
     }
     if artifacts:
         default_artifacts.update(artifacts)
@@ -2091,6 +2420,7 @@ def run_headless_simulation(
     power_pads = vctx["resolved_power_objs"]
     pad_sources = vctx["pad_sources"]
     terminals = vctx["terminals"]
+    buses = vctx["buses"]
 
     if settings["refill_zones"] and unfilled_zones > 0:
         try:
@@ -2145,7 +2475,13 @@ def run_headless_simulation(
     cu_thick_m = [max(1e-9, th * 1e-3) for th in stackup_derived["copper_thickness_mm_used"]]
     gap_m = [max(1e-9, g * 1e-3) for g in stackup_derived["gap_mm_used"]]
 
-    focus_pads = list(power_pads) + [item.pad for item in terminals]
+    bus_pads = [pad_obj for bus in buses for pad_obj, _ in getattr(bus, "pads", [])]
+    focus_pads: List[Any] = []
+    _seen_focus = set()
+    for p in list(power_pads) + [item.pad for item in terminals] + bus_pads:
+        if id(p) not in _seen_focus:
+            focus_pads.append(p)
+            _seen_focus.add(id(p))
     geom_key = _build_geometry_context_key(grid, settings)
     geometry_state = None
     if (
@@ -2249,10 +2585,43 @@ def run_headless_simulation(
     if not use_compact_path or has_pwl_sources or SparsePowerVector is None:
         Q, Q_func = _build_power_vector(pad_sources, pad_contributions, N)
 
+    def _serialize_net_summary(item: Any) -> Dict[str, Any]:
+        data = asdict(item)
+        data.pop("current_density_a_mm2", None)
+        data["net"] = data.get("net_name", "")
+        return data
+
+    def _supports_kwarg(fn: Any, kw_name: str) -> bool:
+        try:
+            params = inspect.signature(fn).parameters
+            return kw_name in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+        except (TypeError, ValueError):
+            return False
+
     electrical_summary = None
+    electrical_result = None
+    electrical_config = None
     q_joule = None
+    q_base = Q
+    base_q_func = Q_func
+    electro_thermal_passes = 0
+    initial_loss_w = 0.0
+    coupled_loss_w = 0.0
+
+    def _apply_joule_heating(q_j: np.ndarray) -> None:
+        nonlocal Q, Q_func, q_base, base_q_func
+        if q_base is None:
+            q_base, base_q_func = _build_power_vector(pad_sources, pad_contributions, N)
+        Q = q_base + q_j
+        if base_q_func is not None:
+            def q_func_with_joule(t, _base=base_q_func, _q_joule=q_j):
+                return _base(t) + _q_joule
+            Q_func = q_func_with_joule
+
     if settings.get("current_enabled"):
-        if terminals:
+        if terminals or buses:
             electrical_config = call_with_supported_kwargs(
                 ElectricalConfig,
                 copper_ids=list(copper_ids),
@@ -2268,9 +2637,16 @@ def run_headless_simulation(
                     "via_fill": via_fill,
                     "ambient_c": amb,
                     "gap_m": gap_m,
+                    "equipotential_pads": True,
                 },
             )
-            electrical_result = solve_electrical_heating(board, terminals, electrical_config)
+            electrical_result = call_with_supported_kwargs(
+                solve_electrical_heating,
+                board,
+                terminals,
+                electrical_config,
+                optional_kwargs={"equipotential_buses": buses or None},
+            )
             if not electrical_result.valid:
                 return _json_clean({
                     "schema_version": SCHEMA_VERSION,
@@ -2284,21 +2660,18 @@ def run_headless_simulation(
                     "warnings": warnings,
                 })
             q_joule = electrical_result.q_joule
+            electro_thermal_passes = 1
+            initial_loss_w = float(electrical_result.total_loss_w)
+            coupled_loss_w = initial_loss_w
             if np.any(q_joule):
-                if Q is None:
-                    Q, Q_func = _build_power_vector(pad_sources, pad_contributions, N)
-                Q = Q + q_joule
-                if Q_func is not None:
-                    base_q_func = Q_func
-
-                    def q_func_with_joule(t, _base=base_q_func, _q_joule=q_joule):
-                        return _base(t) + _q_joule
-
-                    Q_func = q_func_with_joule
+                _apply_joule_heating(q_joule)
             electrical_summary = {
                 "total_loss_w": float(electrical_result.total_loss_w),
+                "electro_thermal_passes": electro_thermal_passes,
+                "initial_loss_w": initial_loss_w,
+                "coupled_loss_w": coupled_loss_w,
                 "warnings": list(electrical_result.warnings),
-                "nets": [{**asdict(item), "net": item.net_name} for item in electrical_result.net_summaries],
+                "nets": [_serialize_net_summary(item) for item in electrical_result.net_summaries],
             }
         else:
             electrical_summary = {
@@ -2412,29 +2785,29 @@ def run_headless_simulation(
             steady_state=steady_state,
         )
 
-        try:
-            if use_fast_engine:
-                solver_power = Q_sparse if Q_sparse is not None else Q
-                mf_kwargs = {}
-                if solver_heatsink_model is not None:
-                    mf_kwargs["heatsink_model"] = solver_heatsink_model
-                result = run_simulation_matrix_free(
-                    config,
-                    K_matrix,
-                    C,
-                    solver_power,
-                    b,
-                    hA,
-                    None,
-                    snapshot_callback,
-                    Q_func=Q_func,
-                    **mf_kwargs,
-                )
-            else:
+        def _solve_thermal_once():
+            try:
+                if use_fast_engine:
+                    solver_power = Q_sparse if Q_sparse is not None else Q
+                    mf_kwargs = {}
+                    if solver_heatsink_model is not None:
+                        mf_kwargs["heatsink_model"] = solver_heatsink_model
+                    return run_simulation_matrix_free(
+                        config,
+                        K_matrix,
+                        C,
+                        solver_power,
+                        b,
+                        hA,
+                        None,
+                        snapshot_callback,
+                        Q_func=Q_func,
+                        **mf_kwargs,
+                    )
                 legacy_kwargs = {}
                 if heatsink_model is not None:
                     legacy_kwargs["heatsink_model"] = heatsink_model
-                result = run_simulation(
+                return run_simulation(
                     config,
                     K_matrix,
                     C,
@@ -2449,93 +2822,164 @@ def run_headless_simulation(
                     Q_func=Q_func,
                     **legacy_kwargs,
                 )
-        except Exception:
-            if not (use_fast_engine and N <= 1_000_000):
-                raise
-            fast_tb = traceback.format_exc()
-            H_map_float = H_map.astype(np.float64, copy=False)
-            fallback_C = (
-                C
-                if C is not None
-                else _build_dense_capacity(
+            except Exception:
+                if not (use_fast_engine and N <= 1_000_000):
+                    raise
+                fast_tb = traceback.format_exc()
+                H_map_float = H_map.astype(np.float64, copy=False)
+                fallback_C = (
+                    C
+                    if C is not None
+                    else _build_dense_capacity(
+                        layer_count,
+                        rows,
+                        cols,
+                        copper_mask,
+                        t_cu,
+                        t_fr4_eff,
+                        pixel_area,
+                        rho_cu,
+                        cp_cu,
+                        rho_fr4,
+                        cp_fr4,
+                        pad_cap_areal,
+                        H_map,
+                    )
+                )
+                if Q is not None:
+                    fallback_Q, fallback_Q_func = Q, Q_func
+                elif Q_sparse is not None:
+                    fallback_Q, fallback_Q_func = Q_sparse.to_dense(), None
+                else:
+                    fallback_Q, fallback_Q_func = _build_power_vector(pad_sources, pad_contributions, N)
+                fb_K, fb_b, fb_hA, _ = build_stiffness_matrix(
                     layer_count,
                     rows,
                     cols,
                     copper_mask,
                     t_cu,
                     t_fr4_eff,
-                    pixel_area,
-                    rho_cu,
-                    cp_cu,
-                    rho_fr4,
-                    cp_fr4,
-                    pad_cap_areal,
-                    H_map,
+                    k_cu,
+                    k_fr4,
+                    dx,
+                    dy,
+                    V_map,
+                    gap_m,
+                    H_map_float,
+                    settings,
+                    amb,
                 )
-            )
-            if Q is not None:
-                fallback_Q, fallback_Q_func = Q, Q_func
-            elif Q_sparse is not None:
-                fallback_Q, fallback_Q_func = Q_sparse.to_dense(), None
-            else:
-                fallback_Q, fallback_Q_func = _build_power_vector(pad_sources, pad_contributions, N)
-            fb_K, fb_b, fb_hA, _ = build_stiffness_matrix(
-                layer_count,
-                rows,
-                cols,
-                copper_mask,
-                t_cu,
-                t_fr4_eff,
-                k_cu,
-                k_fr4,
-                dx,
-                dy,
-                V_map,
-                gap_m,
-                H_map_float,
-                settings,
-                amb,
-            )
-            fb_config = SolverConfig(
-                sim_time=sim_time,
-                amb=amb,
-                dt_base=dt,
-                steps_target=steps_target,
-                use_multi_phase=True,
-                time_stepping=settings.get("time_stepping", "auto"),
-                snapshots_enabled=False,
-                snap_times=[],
-                steady_state=steady_state,
-            )
-            fb_hs = (
-                heatsink_model
-                if (heatsink_model is not None and not getattr(heatsink_model, "bottom_layer_only", False))
-                else build_heatsink_model(layer_count, rows, cols, dx, dy, H_map_float, settings, amb)
-            )
-            fb_kwargs = {"heatsink_model": fb_hs} if fb_hs is not None else {}
-            result = run_simulation(
-                fb_config,
-                fb_K,
-                fallback_C,
-                fallback_Q,
-                fb_b,
-                fb_hA,
-                layer_count,
-                rows,
-                cols,
-                None,
-                None,
-                Q_func=fallback_Q_func,
-                **fb_kwargs,
-            )
-            result.k_norm_info.update({
-                "compute_engine": "legacy_fallback",
-                "fast_engine_error": fast_tb,
-            })
-            grid_info.update({
-                "mesh_mode": "uniform",
-                "equivalent_uniform_nodes": int(N),
-            })
+                fb_config = SolverConfig(
+                    sim_time=sim_time,
+                    amb=amb,
+                    dt_base=dt,
+                    steps_target=steps_target,
+                    use_multi_phase=True,
+                    time_stepping=settings.get("time_stepping", "auto"),
+                    snapshots_enabled=False,
+                    snap_times=[],
+                    steady_state=steady_state,
+                )
+                fb_hs = (
+                    heatsink_model
+                    if (heatsink_model is not None and not getattr(heatsink_model, "bottom_layer_only", False))
+                    else build_heatsink_model(layer_count, rows, cols, dx, dy, H_map_float, settings, amb)
+                )
+                fb_kwargs = {"heatsink_model": fb_hs} if fb_hs is not None else {}
+                fb_res = run_simulation(
+                    fb_config,
+                    fb_K,
+                    fallback_C,
+                    fallback_Q,
+                    fb_b,
+                    fb_hA,
+                    layer_count,
+                    rows,
+                    cols,
+                    None,
+                    None,
+                    Q_func=fallback_Q_func,
+                    **fb_kwargs,
+                )
+                fb_res.k_norm_info.update({
+                    "compute_engine": "legacy_fallback",
+                    "fast_engine_error": fast_tb,
+                })
+                grid_info.update({
+                    "mesh_mode": "uniform",
+                    "equivalent_uniform_nodes": int(N),
+                })
+                return fb_res
+
+        result = _solve_thermal_once()
+
+        # 2-pass (up to 3-pass) electro-thermal coupling: update rho_cu(T)
+        if (
+            settings.get("current_enabled")
+            and settings.get("electro_thermal_coupling", True)
+            and electrical_result is not None
+            and electrical_result.valid
+            and initial_loss_w > 0.0
+            and q_joule is not None
+            and np.any(q_joule)
+            and not getattr(result, "aborted", False)
+            and (float(np.max(result.T)) - amb) > 5.0
+            and _supports_kwarg(solve_electrical_heating, "temperature_field")
+        ):
+            did_not_converge = False
+            for pass_idx in (2, 3):
+                next_electrical = call_with_supported_kwargs(
+                    solve_electrical_heating,
+                    board,
+                    terminals,
+                    electrical_config,
+                    optional_kwargs={
+                        "equipotential_buses": buses or None,
+                        "temperature_field": result.T,
+                    },
+                )
+                if not next_electrical.valid:
+                    break
+                loss_prev = coupled_loss_w
+                loss_new = float(next_electrical.total_loss_w)
+                electrical_result = next_electrical
+                coupled_loss_w = loss_new
+                electro_thermal_passes = pass_idx
+                q_joule = electrical_result.q_joule
+                _apply_joule_heating(q_joule)
+                result = _solve_thermal_once()
+                if getattr(result, "aborted", False):
+                    break
+                rel_change = abs(loss_new - loss_prev) / max(loss_prev, 1e-9)
+                if rel_change <= 0.02:
+                    break
+                if pass_idx == 3:
+                    did_not_converge = True
+
+            et_warnings = list(electrical_result.warnings)
+            if initial_loss_w > 0.0 and coupled_loss_w > 1.5 * initial_loss_w:
+                msg = (
+                    f"Electro-thermal coupling increased copper Joule loss by more than 50% "
+                    f"({initial_loss_w:.4f} W -> {coupled_loss_w:.4f} W): thermal runaway risk."
+                )
+                et_warnings.append(msg)
+                warnings.append({"code": "ELECTRO_THERMAL_RUNAWAY_RISK", "message": msg})
+            if did_not_converge:
+                msg = (
+                    "Electro-thermal coupling did not converge within 3 passes "
+                    "(thermal runaway risk)."
+                )
+                et_warnings.append(msg)
+                warnings.append({"code": "ELECTRO_THERMAL_NONCONVERGENCE", "message": msg})
+
+            electrical_summary = {
+                "total_loss_w": float(electrical_result.total_loss_w),
+                "electro_thermal_passes": int(electro_thermal_passes),
+                "initial_loss_w": float(initial_loss_w),
+                "coupled_loss_w": float(coupled_loss_w),
+                "warnings": et_warnings,
+                "nets": [_serialize_net_summary(item) for item in electrical_result.net_summaries],
+            }
     finally:
         if K_matrix is not None and hasattr(K_matrix, "clear_caches"):
             K_matrix.clear_caches()
@@ -2575,6 +3019,7 @@ def run_headless_simulation(
         "heatmap_png": None,
         "preview_png": None,
         "joule_map_png": None,
+        "current_density_png": None,
     }
 
     if out_dir is not None:
@@ -2583,9 +3028,11 @@ def run_headless_simulation(
         heatmap_path = None
         preview_path = None
         joule_map_path = None
+        current_density_path = None
 
         if generate_plots:
             from .visualization import (
+                save_current_density_map,
                 save_joule_loss_map,
                 save_preview_image,
                 show_results_all_layers,
@@ -2616,6 +3063,13 @@ def run_headless_simulation(
                     electrical_summary=electrical_summary,
                     out_dir=out_dir_str,
                 )
+            current_density_map = getattr(electrical_result, "current_density_map", None) if electrical_result is not None else None
+            if current_density_map is not None and np.any(current_density_map):
+                current_density_path = save_current_density_map(
+                    current_density_map,
+                    layer_names=layer_names,
+                    out_dir=out_dir_str,
+                )
 
             def _derive_wrapper(b, cids, sinfo, st):
                 return _derive_stackup_thicknesses(b, cids, sinfo, st)
@@ -2639,6 +3093,7 @@ def run_headless_simulation(
             artifacts["heatmap_png"] = heatmap_path
             artifacts["preview_png"] = preview_path
             artifacts["joule_map_png"] = joule_map_path
+            artifacts["current_density_png"] = current_density_path
 
         if generate_html:
             from .thermal_report import write_html_report
@@ -2686,6 +3141,7 @@ def run_headless_simulation(
                 interactive_heatmap=interactive_heatmap,
                 electrical_summary=electrical_summary,
                 joule_map_path=joule_map_path,
+                current_density_path=current_density_path,
             )
             artifacts["report_html"] = report_path
 

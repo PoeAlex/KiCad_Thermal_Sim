@@ -260,10 +260,90 @@
       "default": false,
       "description": "Enable DC current-flow simulation for copper Joule (I^2*R) heating."
     },
+    "electro_thermal_coupling": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable iterative electro-thermal coupling (updating copper resistivity rho_cu(T) from the solved 3D temperature field when max rise exceeds 5 C)."
+    },
+    "current_flows": {
+      "type": "array",
+      "default": [],
+      "description": "Pad-to-pad DC current flows (1->1, 1->N, N->M). Accepts canonical GUI flow objects or compact pad selectors (e.g. {'from': ['J1.1'], 'to': {'U1.1': 3.0, 'U2.1': 3.0}} or {'from': ['J1.1'], 'to': ['U1.1', 'U1.2'], 'current_a': 12.0, 'to_sharing': 'equipotential'}).",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Optional flow display name."
+          },
+          "net_name": {
+            "type": "string",
+            "description": "Optional KiCad net name."
+          },
+          "net_code": {
+            "type": "integer",
+            "description": "Optional KiCad net code."
+          },
+          "total_current_a": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Total flow current magnitude in Amperes from source pads to sink pads."
+          },
+          "current_a": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Compact alias for total_current_a."
+          },
+          "from_sharing": {
+            "type": "string",
+            "enum": ["equipotential", "equal", "fixed"],
+            "default": "equipotential",
+            "description": "How current is distributed across source ('from') pads."
+          },
+          "to_sharing": {
+            "type": "string",
+            "enum": ["equipotential", "equal", "fixed"],
+            "default": "equipotential",
+            "description": "How current is distributed across sink ('to') pads."
+          },
+          "from": {
+            "description": "Compact source pad selector (list of 'REF.PAD' strings/descriptors or mapping of 'REF.PAD' to current in Amperes).",
+            "oneOf": [
+              {"type": "string"},
+              {"type": "array"},
+              {"type": "object", "additionalProperties": {"type": "number"}}
+            ]
+          },
+          "to": {
+            "description": "Compact sink pad selector (list of 'REF.PAD' strings/descriptors or mapping of 'REF.PAD' to current in Amperes).",
+            "oneOf": [
+              {"type": "string"},
+              {"type": "array"},
+              {"type": "object", "additionalProperties": {"type": "number"}}
+            ]
+          },
+          "from_pads": {
+            "type": "array",
+            "description": "Canonical list of source pad descriptors.",
+            "items": {
+              "type": ["string", "object"]
+            }
+          },
+          "to_pads": {
+            "type": "array",
+            "description": "Canonical list of sink pad descriptors.",
+            "items": {
+              "type": ["string", "object"]
+            }
+          }
+        }
+      }
+    },
     "current_groups": {
       "type": "array",
       "default": [],
-      "description": "DC current terminal groups. Each active net must balance to 0 A.",
+      "description": "Legacy DC current terminal groups (supported when current_flows is empty). Each active net must balance to 0 A.",
       "items": {
         "type": "object",
         "additionalProperties": true,

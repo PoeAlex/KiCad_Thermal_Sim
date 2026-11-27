@@ -758,3 +758,47 @@ class TestSavePreviewImageV049:
         assert out is not None and os.path.exists(out)
         assert recorded_layer_ids == [B_Cu]
         assert autumn_axes == ["Preview: B.Cu"]
+
+
+class TestSaveCurrentDensityMap:
+    """Tests for v0.5.0 save_current_density_map."""
+
+    def test_returns_none_for_empty_or_zero_map(self, temp_dir):
+        from ThermalSim.visualization import save_current_density_map
+
+        assert save_current_density_map(None, ["F.Cu"], out_dir=temp_dir) is None
+        assert save_current_density_map(np.zeros((2, 10, 10), dtype=np.float32), ["F.Cu", "B.Cu"], out_dir=temp_dir) is None
+
+    def test_saves_png_and_preserves_peak_on_large_grid(self, temp_dir, monkeypatch):
+        import matplotlib.axes
+        from ThermalSim.visualization import save_current_density_map
+
+        j_map = np.zeros((2, 1200, 1200), dtype=np.float32)
+        j_map[0, 321, 654] = 42.5
+        j_map[1, 100, 200] = 12.25
+
+        recorded_imshow = []
+        recorded_titles = []
+        orig_imshow = matplotlib.axes.Axes.imshow
+        orig_set_title = matplotlib.axes.Axes.set_title
+
+        def spy_imshow(self, X, *args, **kwargs):
+            recorded_imshow.append((np.asarray(X).shape, kwargs.get("extent")))
+            return orig_imshow(self, X, *args, **kwargs)
+
+        def spy_set_title(self, label, *args, **kwargs):
+            recorded_titles.append(label)
+            return orig_set_title(self, label, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "imshow", spy_imshow)
+        monkeypatch.setattr(matplotlib.axes.Axes, "set_title", spy_set_title)
+
+        out = save_current_density_map(j_map, ["F.Cu", "B.Cu"], out_dir=temp_dir)
+        assert out is not None and os.path.exists(out)
+        assert os.path.basename(out) == "current_density.png"
+        with open(out, "rb") as fh:
+            assert fh.read(4) == b"\x89PNG"
+        assert len(recorded_imshow) == 2
+        assert all(shape == (600, 600) and extent == [-0.5, 1199.5, 1199.5, -0.5] for shape, extent in recorded_imshow)
+        assert any("42.50 A/mm^2" in title for title in recorded_titles)
+        assert any("12.25 A/mm^2" in title for title in recorded_titles)

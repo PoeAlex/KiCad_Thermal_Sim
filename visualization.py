@@ -421,6 +421,84 @@ def save_joule_loss_map(
     return output_file
 
 
+def save_current_density_map(current_density_map, layer_names, out_dir=None):
+    """
+    Save a per-layer DC current-density map (A/mm^2) with peak-preserving pooling.
+
+    Parameters
+    ----------
+    current_density_map : np.ndarray
+        3D current density array of shape ``(layers, rows, cols)`` in A/mm^2.
+    layer_names : list of str
+        Names for each copper layer.
+    out_dir : str, optional
+        Output directory. Defaults to module directory.
+
+    Returns
+    -------
+    str or None
+        Path to saved ``current_density.png`` image, or None when no valid
+        non-zero current density data is available.
+    """
+    if current_density_map is None:
+        return None
+    j_arr = np.asarray(current_density_map, dtype=np.float64)
+    if j_arr.ndim == 2:
+        j_arr = j_arr[np.newaxis, :, :]
+    if j_arr.ndim != 3 or j_arr.size <= 0:
+        return None
+    finite_mask = np.isfinite(j_arr)
+    if not np.any(finite_mask):
+        return None
+    vmax = float(np.nanmax(j_arr))
+    if vmax <= 0.0:
+        return None
+
+    layer_count = int(j_arr.shape[0])
+    out_dir = out_dir or os.path.dirname(__file__)
+    os.makedirs(out_dir, exist_ok=True)
+    output_file = os.path.join(out_dir, "current_density.png")
+
+    if layer_count == 1:
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+        axes = [ax]
+    elif layer_count == 2:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        axes = axes.flatten()
+    else:
+        cols_grid = 2
+        rows_grid = math.ceil(layer_count / 2)
+        fig, axes = plt.subplots(rows_grid, cols_grid, figsize=(12, 4 * rows_grid))
+        axes = axes.flatten()
+
+    for i in range(layer_count):
+        ax = axes[i]
+        name = layer_names[i] if i < len(layer_names) else f"Layer {i}"
+        layer = j_arr[i]
+        plot_layer, extent = _downsample_for_plot(layer)
+        im = ax.imshow(
+            plot_layer,
+            cmap="plasma",
+            origin="upper",
+            vmin=0.0,
+            vmax=max(vmax, 1e-18),
+            interpolation="nearest",
+            extent=extent,
+        )
+        max_j = float(np.nanmax(layer)) if np.any(np.isfinite(layer)) else 0.0
+        ax.set_title(f"{name} Current Density - Max: {max_j:.2f} A/mm^2")
+        plt.colorbar(im, ax=ax, label="Current density (A/mm^2)")
+        ax.axis("off")
+
+    for j in range(layer_count, len(axes)):
+        axes[j].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=150)
+    plt.close()
+    return output_file
+
+
 def show_results_top_bot(T, H, amb, open_file=True, t_elapsed=None, out_dir=None):
     """
     Save and optionally display top/bottom layer temperature results.

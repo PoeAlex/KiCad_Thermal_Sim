@@ -522,29 +522,40 @@ class TestCurrentGroupSettings:
 
         assert group_rows[0][1] == 'Mixed nets: GND, PWR'
 
-    def test_dialog_new_group_defaults_to_per_pad_and_applies_current_list(self):
+    def test_dialog_new_flow_1_to_3_auto_balances_total_and_displays_equipotential(self):
         from ThermalSim.gui_dialogs import SettingsDialog
 
-        selected_pads = [
-            {'pad_key': 'a', 'name': 'Pad1', 'net_name': 'PWR', 'layer': 'F.Cu'},
-            {'pad_key': 'b', 'name': 'Pad2', 'net_name': 'PWR', 'layer': 'F.Cu'},
-            {'pad_key': 'c', 'name': 'Pad3', 'net_name': 'PWR', 'layer': 'F.Cu'},
+        from_pad = [{'pad_key': 'j1', 'name': 'J1:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'F.Cu'}]
+        to_pads = [
+            {'pad_key': 'u1', 'name': 'U1:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'F.Cu'},
+            {'pad_key': 'u2', 'name': 'U2:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'F.Cu'},
+            {'pad_key': 'u3', 'name': 'U3:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'F.Cu'},
         ]
+        selected = list(from_pad)
         dlg = SettingsDialog(
             None, 0, 0.5, ["F.Cu", "B.Cu"],
-            selection_provider=lambda: selected_pads
+            selection_provider=lambda: selected
         )
 
-        dlg._on_current_new_group(None)
-        dlg.current_pad_list_input.SetValue("+6, -4, -2")
-        dlg._on_current_apply_pad_current_list(None)
+        dlg._on_flow_new(None)
+        dlg._on_flow_add_selection("from")
+        selected = list(to_pads)
+        dlg._on_flow_add_selection("to")
+        dlg.flow_to_pad_list_input.SetValue("3, 3, 3")
+        dlg._on_flow_apply_pad_current_list("to")
         values = dlg.get_values()
 
-        group = values['current_groups'][0]
+        flow = values['current_flows'][0]
         assert values['current_enabled'] is True
-        assert group['mode'] == 'per_pad'
-        assert [pad['current_a'] for pad in group['pads']] == [6.0, -4.0, -2.0]
-        assert dlg.current_balance_text.GetValue() == "PWR: 0 A - OK"
+        assert flow['net_name'] == '+12V'
+        assert flow['from_sharing'] == 'equipotential'
+        assert flow['to_sharing'] == 'fixed'
+        assert flow['total_current_a'] == 9.0
+        assert [p['current_a'] for p in flow['to_pads']] == [3.0, 3.0, 3.0]
+        assert dlg.flow_total_input.GetValue() == 9.0
+        assert dlg.flow_total_input.IsEnabled() is False
+        assert dlg.flow_from_list._items[0][2] == "Auto (Cu)"
+        assert dlg.current_balance_text.GetValue() == "+12V: 9 A (1 -> 3 pads, OK)"
 
     def test_power_pads_tab_uses_live_selection_independently(self):
         from ThermalSim.gui_dialogs import SettingsDialog
@@ -564,6 +575,7 @@ class TestCurrentGroupSettings:
         assert values['power_str'] == "2.5"
         assert values['power_pads'][0]['name'] == "U1-1 [VIN]"
         assert values['power_pads'][0]['power'] == "2.5"
+        assert values['current_flows'] == []
         assert values['current_groups'] == []
 
     def test_legacy_initial_selection_becomes_power_pads(self):
@@ -608,8 +620,11 @@ class TestCurrentGroupSettings:
         page_labels = [caption for _, caption in dlg.notebook._pages]
         assert page_labels == ["Overview", "Heat Sources", "Current Heating", "Advanced"]
         labels = " ".join(
-            list(dlg.current_group_list._columns)
-            + list(dlg.current_pad_list._columns)
+            list(dlg.current_flow_list._columns)
+            + list(dlg.flow_from_list._columns)
+            + list(dlg.flow_to_list._columns)
+            + list(dlg.flow_from_sharing._choices)
+            + list(dlg.flow_to_sharing._choices)
             + [dlg.chk_current_enabled.label]
         )
         forbidden = [
@@ -618,6 +633,202 @@ class TestCurrentGroupSettings:
         ]
         for word in forbidden:
             assert word not in labels
+
+
+class TestCurrentFlowSettings:
+    """Tests for v0.5.0 Pad-to-Pad Current Flow helpers, migration, and PadPickerDialog."""
+
+    def test_normalize_sharing_mode_aliases(self):
+        from ThermalSim.gui_dialogs import normalize_sharing_mode
+
+        assert normalize_sharing_mode("equipotential") == "equipotential"
+        assert normalize_sharing_mode("Equipotential (Auto)") == "equipotential"
+        assert normalize_sharing_mode("equal") == "equal"
+        assert normalize_sharing_mode("Equal Split") == "equal"
+        assert normalize_sharing_mode("fixed") == "fixed"
+        assert normalize_sharing_mode("Fixed per Pad") == "fixed"
+        assert normalize_sharing_mode("unknown") == "equipotential"
+
+    def test_prepare_current_flows_modes_and_superposition(self):
+        from ThermalSim.gui_dialogs import prepare_current_flows, summarize_current_flows
+
+        flows = [
+            {
+                'name': 'Main 12V',
+                'from_sharing': 'equipotential',
+                'to_sharing': 'fixed',
+                'from_pads': [{'pad_key': 'j1', 'name': 'J1:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'F.Cu'}],
+                'to_pads': [
+                    {'pad_key': 'u1', 'name': 'U1:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'F.Cu', 'current_a': 3.0},
+                    {'pad_key': 'u2', 'name': 'U2:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'F.Cu', 'current_a': 3.0},
+                    {'pad_key': 'u3', 'name': 'U3:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'F.Cu', 'current_a': -3.0},
+                ],
+            },
+            {
+                'name': 'Aux 12V',
+                'total_current_a': 6.0,
+                'from_sharing': 'equipotential',
+                'to_sharing': 'equal',
+                'from_pads': [
+                    {'pad_key': 'j1', 'name': 'J1:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'F.Cu'},
+                    {'pad_key': 'j2', 'name': 'J2:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'F.Cu'},
+                ],
+                'to_pads': [
+                    {'pad_key': 'u4', 'name': 'U4:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'F.Cu'},
+                    {'pad_key': 'u5', 'name': 'U5:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'F.Cu'},
+                ],
+            },
+        ]
+
+        prepared = prepare_current_flows(flows)
+        assert prepared[0]['total_current_a'] == 9.0
+        assert prepared[0]['net_name'] == '+12V'
+        assert prepared[0]['net_code'] == 1
+        assert [p['current_a'] for p in prepared[0]['to_pads']] == [3.0, 3.0, 3.0]
+        assert prepared[0]['from_pads'][0]['current_a'] == 9.0
+
+        assert prepared[1]['total_current_a'] == 6.0
+        assert [p['current_a'] for p in prepared[1]['from_pads']] == [0.0, 0.0]
+        assert [p['current_a'] for p in prepared[1]['to_pads']] == [3.0, 3.0]
+        assert summarize_current_flows(prepared) == "2 flows / 15 A"
+        assert summarize_current_flows([]) == "0 flows"
+
+    def test_validate_current_flows_errors_and_warnings(self):
+        from ThermalSim.gui_dialogs import validate_current_flows
+
+        ok_errors, ok_warnings = validate_current_flows([{
+            'name': 'Good',
+            'from_sharing': 'equipotential',
+            'to_sharing': 'fixed',
+            'from_pads': [{'pad_key': 'a', 'name': 'J1:1', 'net_name': '+12V'}],
+            'to_pads': [{'pad_key': 'b', 'name': 'U1:1', 'net_name': '+12V', 'current_a': 5.0}],
+        }])
+        assert ok_errors == []
+        assert ok_warnings == []
+
+        errors, warnings = validate_current_flows([
+            {
+                'name': 'FixedMismatch',
+                'from_sharing': 'fixed',
+                'to_sharing': 'fixed',
+                'from_pads': [{'pad_key': 'a', 'name': 'J1:1', 'net_name': '+12V', 'current_a': 5.0}],
+                'to_pads': [{'pad_key': 'b', 'name': 'U1:1', 'net_name': '+12V', 'current_a': 3.0}],
+            },
+            {
+                'name': 'MissingTo',
+                'from_sharing': 'equipotential',
+                'to_sharing': 'equipotential',
+                'from_pads': [{'pad_key': 'c', 'name': 'J2:1', 'net_name': 'GND'}],
+                'to_pads': [],
+            },
+            {
+                'name': 'MismatchedNets',
+                'from_sharing': 'equipotential',
+                'to_sharing': 'equipotential',
+                'total_current_a': 0.0,
+                'from_pads': [{'pad_key': 'd', 'name': 'J3:1', 'net_name': '+5V'}],
+                'to_pads': [{'pad_key': 'd', 'name': 'J3:1', 'net_name': 'GND'}],
+            },
+        ])
+        assert any("From (5 A) != To (3 A)" in err for err in errors)
+        assert any("missing To pads" in err for err in errors)
+        assert any("mismatched nets" in err for err in errors)
+        assert any("both From and To" in warn for warn in warnings)
+        assert any("total current is 0 A" in warn for warn in warnings)
+
+    def test_convert_current_groups_to_flows_and_apply_defaults_migration(self):
+        from ThermalSim.gui_dialogs import (
+            SettingsDialog,
+            convert_current_groups_to_flows,
+            current_groups_to_pad_currents,
+        )
+
+        legacy_groups = [
+            {
+                'name': 'VIN Supply',
+                'mode': 'per_pad',
+                'pads': [
+                    {'pad_key': 'j1', 'name': 'J1:1', 'net_name': 'VIN', 'net_code': 2, 'layer': 'F.Cu', 'current_a': 9.0},
+                    {'pad_key': 'u1', 'name': 'U1:1', 'net_name': 'VIN', 'net_code': 2, 'layer': 'F.Cu', 'current_a': -3.0},
+                    {'pad_key': 'u2', 'name': 'U2:1', 'net_name': 'VIN', 'net_code': 2, 'layer': 'F.Cu', 'current_a': -6.0},
+                ],
+            },
+        ]
+        pad_map = current_groups_to_pad_currents(legacy_groups)
+        assert pad_map == {'j1': 9.0, 'u1': -3.0, 'u2': -6.0}
+
+        migrated = convert_current_groups_to_flows(legacy_groups)
+        assert len(migrated) == 1
+        assert migrated[0]['net_name'] == 'VIN'
+        assert migrated[0]['total_current_a'] == 9.0
+        assert migrated[0]['from_sharing'] == 'fixed'
+        assert migrated[0]['to_sharing'] == 'fixed'
+        assert [p['current_a'] for p in migrated[0]['from_pads']] == [9.0]
+        assert [p['current_a'] for p in migrated[0]['to_pads']] == [3.0, 6.0]
+
+        dlg = SettingsDialog(
+            None, 0, 0.5, ["F.Cu", "B.Cu"],
+            defaults={'current_enabled': True, 'current_groups': legacy_groups},
+        )
+        values = dlg.get_values()
+        assert len(values['current_flows']) == 1
+        assert values['current_flows'][0]['total_current_a'] == 9.0
+        assert len(values['current_groups']) == 1
+        assert len(dlg.current_flow_list._items) == 1
+
+    def test_pad_picker_dialog_filters_and_adds_to_flow(self, monkeypatch):
+        from ThermalSim.gui_dialogs import PadPickerDialog, SettingsDialog
+
+        board_pads = [
+            {'pad_key': 'j1', 'name': 'J1:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'F.Cu'},
+            {'pad_key': 'u1', 'name': 'U1:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'F.Cu'},
+            {'pad_key': 'u2', 'name': 'U2:1', 'net_name': '+12V', 'net_code': 1, 'layer': 'B.Cu'},
+            {'pad_key': 'g1', 'name': 'J1:2', 'net_name': 'GND', 'net_code': 2, 'layer': 'F.Cu'},
+        ]
+        picker = PadPickerDialog(None, board_pads, initial_net='+12V')
+        assert picker.get_selected_net() == '+12V'
+        assert [p['name'] for p in picker.filtered_pads] == ['J1:1', 'U1:1', 'U2:1']
+
+        picker.set_search_text('u2')
+        assert [p['name'] for p in picker.filtered_pads] == ['U2:1']
+
+        picker.set_net_filter('')
+        picker.set_search_text('j1')
+        assert [p['name'] for p in picker.filtered_pads] == ['J1:1', 'J1:2']
+
+        picker.set_net_filter('+12V')
+        picker.set_search_text('')
+        picker.pad_list.Select(1)
+        picker.pad_list.Select(2)
+        assert [p['name'] for p in picker.get_selected_pads()] == ['U1:1', 'U2:1']
+
+        # Integrate with SettingsDialog._on_flow_pick_pads
+        class FakePicker(PadPickerDialog):
+            def __init__(self, parent, pads, initial_net=""):
+                super().__init__(parent, pads, initial_net=initial_net)
+                self.pad_list.Select(1)
+                self.pad_list.Select(2)
+
+        import ThermalSim.gui_dialogs as gui_mod
+        monkeypatch.setattr(gui_mod, "PadPickerDialog", FakePicker)
+
+        dlg = SettingsDialog(
+            None, 0, 0.5, ["F.Cu", "B.Cu"],
+            board_pads=board_pads,
+            defaults={
+                'current_enabled': True,
+                'current_flows': [{
+                    'name': 'Load',
+                    'from_sharing': 'equipotential',
+                    'to_sharing': 'fixed',
+                    'from_pads': [board_pads[0]],
+                    'to_pads': [],
+                }],
+            },
+        )
+        dlg._on_flow_pick_pads("to")
+        flow = dlg.get_values()['current_flows'][0]
+        assert [p['name'] for p in flow['to_pads']] == ['U1:1', 'U2:1']
 
 
 class TestTooltipTexts:
@@ -642,6 +853,8 @@ class TestTooltipTexts:
             'pcb_thick', 'grid_expert_limits',
             'grid_max_cells', 'grid_target_cells', 'capabilities',
             'help', 'preview', 'load_settings', 'save_settings',
+            'current_flows', 'flow_from_sharing', 'flow_to_sharing',
+            'flow_total', 'flow_pick_pads', 'flow_from_pads', 'flow_to_pads',
         ]
 
         for field in expected_fields:
@@ -745,29 +958,42 @@ class TestSettingsDialogInstantiation:
         assert dlg.lbl_heat_summary.GetLabel() == "1 heat source / 1 W"
 
     def test_current_mode_shows_only_relevant_entry_rows(self):
-        """Current-entry rows should follow the selected distribution mode."""
+        """Flow sharing choices should toggle fixed-current rows and Total (A) editability."""
         from ThermalSim.gui_dialogs import SettingsDialog
 
         dlg = SettingsDialog(
             None, 0, 0.5, ["F.Cu", "B.Cu"],
             defaults={
                 'current_enabled': True,
-                'current_groups': [{
-                    'name': 'Supply', 'mode': 'total', 'total_current_a': 4.0,
-                    'pads': [{'pad_key': '1', 'name': 'J1-1', 'net_name': 'VIN'}],
+                'current_flows': [{
+                    'name': 'Supply',
+                    'from_sharing': 'equipotential',
+                    'to_sharing': 'fixed',
+                    'from_pads': [{'pad_key': '1', 'name': 'J1-1', 'net_name': 'VIN'}],
+                    'to_pads': [{'pad_key': '2', 'name': 'U1-1', 'net_name': 'VIN', 'current_a': 4.0}],
                 }],
             },
         )
 
-        assert dlg.current_total_row._shown is True
-        assert dlg.current_pad_current_row._shown is False
-        assert dlg.current_pad_list_row._shown is False
+        assert dlg.flow_total_input.IsEnabled() is False
+        assert dlg.flow_from_fixed_row._shown is False
+        assert dlg.flow_to_fixed_row._shown is True
 
-        dlg.current_mode_choice.SetSelection(0)
-        dlg._on_current_mode_changed(None)
-        assert dlg.current_total_row._shown is False
-        assert dlg.current_pad_current_row._shown is True
-        assert dlg.current_pad_list_row._shown is True
+        # Switch To side to Equipotential -> Total (A) becomes editable and fixed row hides
+        dlg.flow_to_sharing.SetSelection(0)
+        dlg._on_flow_sharing_changed("to")
+        assert dlg.flow_total_input.IsEnabled() is True
+        assert dlg.flow_from_fixed_row._shown is False
+        assert dlg.flow_to_fixed_row._shown is False
+        assert dlg.flow_to_list._items[0][2] == "Auto (Cu)"
+
+        # Switch To side to Equal Split -> displays split value and keeps Total (A) editable
+        dlg.flow_total_input.SetValue(10.0)
+        dlg._on_flow_total_changed(None)
+        dlg.flow_to_sharing.SetSelection(1)
+        dlg._on_flow_sharing_changed("to")
+        assert dlg.flow_total_input.IsEnabled() is True
+        assert dlg.flow_to_list._items[0][2] == "10"
 
     def test_active_advanced_sections_expand_from_defaults(self):
         """Non-default advanced settings should reveal their native panes."""
@@ -1036,7 +1262,9 @@ class TestSimulationDetailSettings:
         assert dlg.time_stepping_choice._tooltip
         assert dlg.btn_run._tooltip
         assert dlg.btn_more._tooltip
-        assert dlg.current_mode_choice._tooltip
+        assert dlg.flow_from_sharing._tooltip
+        assert dlg.flow_to_sharing._tooltip
+        assert dlg.flow_total_input._tooltip
         assert dlg.current_balance_text._tooltip
 
     def test_legacy_solver_backend_setting_is_ignored_and_engine_label_updates(self, monkeypatch):

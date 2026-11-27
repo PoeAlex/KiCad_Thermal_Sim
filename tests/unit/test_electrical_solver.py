@@ -13,6 +13,8 @@ import ThermalSim.electrical_solver as electrical_solver
 from ThermalSim.electrical_solver import (
     CurrentTerminal,
     ElectricalConfig,
+    ElectricalViaDiagnostics,
+    EquipotentialBus,
     _build_relevant_net_masks,
     _solve_electrical_system,
     solve_electrical_heating,
@@ -1024,3 +1026,421 @@ def test_electrical_solver_skips_rule_and_keepout_zones():
     )
     assert not res.valid
     assert any("not electrically connected" in err for err in res.errors)
+
+
+def _rect_pad(x_mm, y_mm, w_mm, h_mm, number, net_code=1, net_name="PWR", layer=F_Cu):
+    """Create a rectangular SMD MockPad with explicit GetSize/GetShape for multi-cell tests."""
+    import pcbnew
+
+    class _RectPad(MockPad):
+        def __init__(self):
+            cx_nm = int(round(x_mm * 1e6))
+            cy_nm = int(round(y_mm * 1e6))
+            w_nm = int(round(w_mm * 1e6))
+            h_nm = int(round(h_mm * 1e6))
+            super().__init__(
+                position=VECTOR2I(cx_nm, cy_nm),
+                layer=layer,
+                attribute=PAD_ATTRIB_SMD,
+                bbox=EDA_RECT(cx_nm - w_nm // 2, cy_nm - h_nm // 2, w_nm, h_nm),
+                net_code=net_code,
+                net_name=net_name,
+                number=number,
+            )
+            self._size = VECTOR2I(w_nm, h_nm)
+
+        def GetSize(self):
+            return self._size
+
+        def GetShape(self):
+            return getattr(pcbnew, "PAD_SHAPE_RECT", 1)
+
+    return _RectPad()
+
+
+def test_equipotential_pad_contraction_zero_gradient_and_pcg_parity(monkeypatch):
+    """Equipotential pad contraction eliminates intra-pad spreading loss and matches direct/PCG."""
+    # Two 2x2 mm pads (each 4x4 = 16 cells on 0.5 mm grid) bridged by a 6 mm x 1 mm strip
+    pad_a = _rect_pad(2.0, 3.0, 2.0, 2.0, "1")
+    pad_b = _rect_pad(10.0, 3.0, 2.0, 2.0, "2")
+    track = MockTrack(
+        layer=F_Cu,
+        bbox=EDA_RECT(2_000_000, 2_500_000, 8_000_000, 1_000_000),
+        start=VECTOR2I(2_000_000, 3_000_000),
+        end=VECTOR2I(10_000_000, 3_000_000),
+        width=1_000_000,
+        net_code=1,
+        net_name="PWR",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_a, pad_b])],
+        tracks=[track],
+        layer_names={F_Cu: "F.Cu"},
+    )
+    terms = [
+        CurrentTerminal(pad_a, "J1.1", "PWR", 1, 4.0),
+        CurrentTerminal(pad_b, "J2.1", "PWR", 1, -4.0),
+    ]
+    cfg_eq = ElectricalConfig(
+        copper_ids=[F_Cu],
+        rows=12,
+        cols=24,
+        x_min=0.0,
+        y_min=0.0,
+        res=0.5,
+        t_cu=np.array([35e-6], dtype=np.float64),
+        equipotential_pads=True,
+    )
+    cfg_spread = ElectricalConfig(
+        copper_ids=[F_Cu],
+        rows=12,
+        cols=24,
+        x_min=0.0,
+        y_min=0.0,
+        res=0.5,
+        t_cu=np.array([35e-6], dtype=np.float64),
+        equipotential_pads=False,
+    )
+
+    monkeypatch.setattr(electrical_solver, "_ELECTRICAL_ITERATIVE_NODE_THRESHOLD", 100_000)
+    res_eq = solve_electrical_heating(board, terms, cfg_eq)
+    res_spread = solve_electrical_heating(board, terms, cfg_spread)
+
+    monkeypatch.setattr(electrical_solver, "_ELECTRICAL_ITERATIVE_NODE_THRESHOLD", 2)
+    res_eq_pcg = solve_electrical_heating(board, terms, cfg_eq)
+
+    assert res_eq.valid and res_spread.valid and res_eq_pcg.valid
+    # Equipotential pads have zero internal spreading loss -> lower resistance than uncontracted pads
+    assert res_eq.total_loss_w < res_spread.total_loss_w
+    # Strip between inner pad edges: 6.0 mm long x 1.0 mm wide
+    expected_strip_r = 1.724e-8 * (6.0e-3) / (1.0e-3 * 35e-6)
+    np.testing.assert_allclose(
+        res_eq.net_summaries[0].effective_resistance_ohm,
+        expected_strip_r,
+        rtol=0.10,
+    )
+    # Direct spsolve and iterative CG match cleanly on contracted Laplacian
+    np.testing.assert_allclose(res_eq_pcg.total_loss_w, res_eq.total_loss_w, rtol=1e-7)
+    np.testing.assert_allclose(res_eq_pcg.q_joule, res_eq.q_joule, rtol=1e-7, atol=1e-12)
+    # Interior of pad_a has zero Joule dissipation when contracted
+    q_2d = res_eq.q_joule.reshape(12, 24)
+    assert q_2d[5, 3] == 0.0
+
+
+def test_equipotential_bus_1_to_3_asymmetric_natural_sharing():
+    """EquipotentialBus shares current proportionally to copper conductance and sums to total_current_a."""
+    # Source J1.1 at (1.25, 6.25), three sink pads on an EquipotentialBus fed by asymmetric traces:
+    # Branch 1 (y=2.25): short (4 mm) & wide (2.0 mm) -> highest current
+    # Branch 2 (y=6.25): medium (8 mm) & medium (1.0 mm) -> middle current
+    # Branch 3 (y=10.25): long (16 mm) & narrow (0.5 mm) -> lowest current
+    pad_src = _rect_pad(1.25, 6.25, 0.5, 9.0, "1")
+    pad_u1 = _rect_pad(6.25, 2.25, 0.5, 0.5, "1")
+    pad_u2 = _rect_pad(10.25, 6.25, 0.5, 0.5, "1")
+    pad_u3 = _rect_pad(18.25, 10.25, 0.5, 0.5, "1")
+
+    t1 = MockTrack(
+        layer=F_Cu,
+        bbox=EDA_RECT(1_250_000, 1_250_000, 5_000_000, 2_000_000),
+        start=VECTOR2I(1_250_000, 2_250_000),
+        end=VECTOR2I(6_250_000, 2_250_000),
+        width=2_000_000,
+        net_code=1,
+        net_name="PWR",
+    )
+    t2 = MockTrack(
+        layer=F_Cu,
+        bbox=EDA_RECT(1_250_000, 5_750_000, 9_000_000, 1_000_000),
+        start=VECTOR2I(1_250_000, 6_250_000),
+        end=VECTOR2I(10_250_000, 6_250_000),
+        width=1_000_000,
+        net_code=1,
+        net_name="PWR",
+    )
+    t3 = MockTrack(
+        layer=F_Cu,
+        bbox=EDA_RECT(1_250_000, 10_000_000, 17_000_000, 500_000),
+        start=VECTOR2I(1_250_000, 10_250_000),
+        end=VECTOR2I(18_250_000, 10_250_000),
+        width=500_000,
+        net_code=1,
+        net_name="PWR",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_src, pad_u1, pad_u2, pad_u3])],
+        tracks=[t1, t2, t3],
+        layer_names={F_Cu: "F.Cu"},
+    )
+    cfg = ElectricalConfig(
+        copper_ids=[F_Cu],
+        rows=26,
+        cols=40,
+        x_min=0.0,
+        y_min=0.0,
+        res=0.5,
+        t_cu=np.array([35e-6], dtype=np.float64),
+    )
+    bus = EquipotentialBus(
+        name="Loads",
+        net_name="PWR",
+        net_code=1,
+        pads=[(pad_u1, "U1.1"), (pad_u2, "U2.1"), (pad_u3, "U3.1")],
+        total_current_a=-12.0,
+    )
+    result = solve_electrical_heating(
+        board,
+        [CurrentTerminal(pad_src, "J1.1", "PWR", 1, 12.0)],
+        cfg,
+        equipotential_buses=[bus],
+    )
+
+    assert result.valid, result.errors
+    summary = result.net_summaries[0]
+    bus_diags = {d.name: d for d in summary.terminal_diagnostics if d.bus_name == "Loads"}
+    assert set(bus_diags.keys()) == {"U1.1", "U2.1", "U3.1"}
+    i1 = bus_diags["U1.1"].current_a
+    i2 = bus_diags["U2.1"].current_a
+    i3 = bus_diags["U3.1"].current_a
+    # KCL conservation to machine precision
+    assert (i1 + i2 + i3) == pytest.approx(-12.0, abs=1e-9)
+    # Shorter/wider path carries more negative extraction current
+    assert i1 < i2 < i3 < 0.0
+    assert abs(i1) > 2.0 * abs(i2)
+    assert abs(i2) > 2.0 * abs(i3)
+    # All bus pads share the exact same potential
+    v_vals = [bus_diags[k].mean_potential_v for k in ("U1.1", "U2.1", "U3.1")]
+    np.testing.assert_allclose(v_vals, v_vals[0], atol=1e-12)
+
+
+def test_superposition_duplicate_pad_terminals():
+    """Multiple CurrentTerminal entries on the same pad superpose cleanly without double-contracting."""
+    pad_j1 = _rect_pad(1.25, 2.25, 0.5, 0.5, "1")
+    pad_u1 = _rect_pad(9.25, 2.25, 0.5, 0.5, "2")
+    pad_u2 = _rect_pad(1.25, 6.25, 0.5, 0.5, "3")
+    t_right = MockTrack(
+        layer=F_Cu,
+        bbox=EDA_RECT(1_000_000, 2_000_000, 8_500_000, 500_000),
+        start=VECTOR2I(1_250_000, 2_250_000),
+        end=VECTOR2I(9_250_000, 2_250_000),
+        width=500_000,
+        net_code=1,
+        net_name="PWR",
+    )
+    t_down = MockTrack(
+        layer=F_Cu,
+        bbox=EDA_RECT(1_000_000, 2_000_000, 500_000, 4_500_000),
+        start=VECTOR2I(1_250_000, 2_250_000),
+        end=VECTOR2I(1_250_000, 6_250_000),
+        width=500_000,
+        net_code=1,
+        net_name="PWR",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_j1, pad_u1, pad_u2])],
+        tracks=[t_right, t_down],
+    )
+    cfg = _config(rows=16, cols=22, res=0.5)
+
+    res_dup = solve_electrical_heating(
+        board,
+        [
+            CurrentTerminal(pad_j1, "J1.1", "PWR", 1, 3.0),
+            CurrentTerminal(pad_u1, "U1.1", "PWR", 1, -3.0),
+            CurrentTerminal(pad_j1, "J1.1", "PWR", 1, 5.0),
+            CurrentTerminal(pad_u2, "U2.1", "PWR", 1, -5.0),
+        ],
+        cfg,
+    )
+    res_merged = solve_electrical_heating(
+        board,
+        [
+            CurrentTerminal(pad_j1, "J1.1", "PWR", 1, 8.0),
+            CurrentTerminal(pad_u1, "U1.1", "PWR", 1, -3.0),
+            CurrentTerminal(pad_u2, "U2.1", "PWR", 1, -5.0),
+        ],
+        cfg,
+    )
+
+    assert res_dup.valid and res_merged.valid
+    np.testing.assert_allclose(res_dup.q_joule, res_merged.q_joule, rtol=1e-12, atol=1e-15)
+    summary = res_dup.net_summaries[0]
+    assert summary.source_current_a == pytest.approx(8.0)
+    assert summary.sink_current_a == pytest.approx(8.0)
+    j1_diag = [d for d in summary.terminal_diagnostics if d.name == "J1.1"]
+    assert len(j1_diag) == 1
+    assert j1_diag[0].current_a == pytest.approx(8.0)
+
+
+def test_subgrid_narrow_trace_width_correction():
+    """A 0.2 mm narrow trace on a 0.6 mm grid matches analytical resistance within 10%."""
+    res_mm = 0.6
+    width_mm = 0.2
+    length_mm = 12.0  # 20 cells along X
+    y_mm = 0.9  # center of row 1
+    pad_a = _pad(0.3, y_mm, "1")
+    pad_b = _pad(0.3 + length_mm, y_mm, "2")
+    narrow_track = MockTrack(
+        layer=F_Cu,
+        bbox=EDA_RECT(
+            int(round(0.3 * 1e6)),
+            int(round((y_mm - 0.5 * width_mm) * 1e6)),
+            int(round(length_mm * 1e6)),
+            int(round(width_mm * 1e6)),
+        ),
+        start=VECTOR2I(int(round(0.3 * 1e6)), int(round(y_mm * 1e6))),
+        end=VECTOR2I(int(round((0.3 + length_mm) * 1e6)), int(round(y_mm * 1e6))),
+        width=int(round(width_mm * 1e6)),
+        net_code=1,
+        net_name="PWR",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_a, pad_b])],
+        tracks=[narrow_track],
+    )
+    cfg = ElectricalConfig(
+        copper_ids=[F_Cu],
+        rows=4,
+        cols=24,
+        x_min=0.0,
+        y_min=0.0,
+        res=res_mm,
+        t_cu=np.array([35e-6], dtype=np.float64),
+    )
+    result = solve_electrical_heating(
+        board,
+        [
+            CurrentTerminal(pad_a, "J1.1", "PWR", 1, 1.0),
+            CurrentTerminal(pad_b, "J2.1", "PWR", 1, -1.0),
+        ],
+        cfg,
+    )
+    assert result.valid, result.errors
+    expected_r = 1.724e-8 * (length_mm * 1e-3) / ((width_mm * 1e-3) * 35e-6)
+    np.testing.assert_allclose(
+        result.net_summaries[0].effective_resistance_ohm,
+        expected_r,
+        rtol=0.10,
+    )
+
+
+def test_local_temperature_field_copper_resistivity_100c():
+    """Passing temperature_field at 100 C increases Joule loss by ~+31.44% vs 20 C (including vias)."""
+    pad_top = _pad(1.5, 1.5, "1", layer=F_Cu)
+    pad_bot = _pad(8.5, 1.5, "2", layer=B_Cu)
+    track_top = MockTrack(
+        layer=F_Cu,
+        bbox=EDA_RECT(1_500_000, 1_000_000, 3_500_000, 1_000_000),
+        start=VECTOR2I(1_500_000, 1_500_000),
+        end=VECTOR2I(5_000_000, 1_500_000),
+        width=1_000_000,
+        net_code=1,
+        net_name="PWR",
+    )
+    via = _ElectricalVia(5.0, 1.5, 0.6, 0.3, [F_Cu, B_Cu])
+    track_bot = MockTrack(
+        layer=B_Cu,
+        bbox=EDA_RECT(5_000_000, 1_000_000, 3_500_000, 1_000_000),
+        start=VECTOR2I(5_000_000, 1_500_000),
+        end=VECTOR2I(8_500_000, 1_500_000),
+        width=1_000_000,
+        net_code=1,
+        net_name="PWR",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_top, pad_bot])],
+        tracks=[track_top, via, track_bot],
+        layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+    )
+    cfg = ElectricalConfig(
+        copper_ids=[F_Cu, B_Cu],
+        rows=4,
+        cols=10,
+        x_min=0.0,
+        y_min=0.0,
+        res=1.0,
+        t_cu=np.array([35e-6, 35e-6], dtype=np.float64),
+        gap_m=[1.6e-3],
+        ambient_c=20.0,
+    )
+    terms = [
+        CurrentTerminal(pad_top, "J1.1", "PWR", 1, 3.0),
+        CurrentTerminal(pad_bot, "J2.1", "PWR", 1, -3.0),
+    ]
+    t_20 = np.full((2, 4, 10), 20.0, dtype=np.float64)
+    t_100 = np.full((2, 4, 10), 100.0, dtype=np.float64)
+
+    res_20 = solve_electrical_heating(board, terms, cfg, temperature_field=t_20)
+    res_100 = solve_electrical_heating(board, terms, cfg, temperature_field=t_100)
+    assert res_20.valid and res_100.valid
+
+    expected_ratio = 1.0 + 0.00393 * (100.0 - 20.0)
+    assert res_100.total_loss_w / res_20.total_loss_w == pytest.approx(expected_ratio, rel=1e-11)
+
+
+def test_top_vias_current_and_current_density_map():
+    """Single via carrying 5.0 A reports ~5.0 A in top_vias and current_density_map matches I/(w*t)."""
+    from ThermalSim.geometry_mapper import compute_via_copper_area_m2
+
+    pad_top = _pad(1.5, 1.5, "1", layer=F_Cu)
+    pad_bot = _pad(10.5, 1.5, "2", layer=B_Cu)
+    track_top = MockTrack(
+        layer=F_Cu,
+        bbox=EDA_RECT(1_500_000, 1_000_000, 4_500_000, 1_000_000),
+        start=VECTOR2I(1_500_000, 1_500_000),
+        end=VECTOR2I(6_000_000, 1_500_000),
+        width=1_000_000,
+        net_code=1,
+        net_name="PWR",
+    )
+    via = _ElectricalVia(6.0, 1.5, 0.6, 0.3, [F_Cu, B_Cu])
+    track_bot = MockTrack(
+        layer=B_Cu,
+        bbox=EDA_RECT(6_000_000, 1_000_000, 4_500_000, 1_000_000),
+        start=VECTOR2I(6_000_000, 1_500_000),
+        end=VECTOR2I(10_500_000, 1_500_000),
+        width=1_000_000,
+        net_code=1,
+        net_name="PWR",
+    )
+    board = MockBoard(
+        footprints=[MockFootprint(pads=[pad_top, pad_bot])],
+        tracks=[track_top, via, track_bot],
+        layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+    )
+    cfg = ElectricalConfig(
+        copper_ids=[F_Cu, B_Cu],
+        rows=4,
+        cols=12,
+        x_min=0.0,
+        y_min=0.0,
+        res=1.0,
+        t_cu=np.array([35e-6, 35e-6], dtype=np.float64),
+        gap_m=[1.6e-3],
+        layer_names={F_Cu: "F.Cu", B_Cu: "B.Cu"},
+    )
+    current_a = 5.0
+    result = solve_electrical_heating(
+        board,
+        [
+            CurrentTerminal(pad_top, "J1.1", "PWR", 1, current_a),
+            CurrentTerminal(pad_bot, "J2.1", "PWR", 1, -current_a),
+        ],
+        cfg,
+    )
+    assert result.valid, result.errors
+    summary = result.net_summaries[0]
+
+    assert len(summary.top_vias) == 1
+    v_diag = summary.top_vias[0]
+    assert isinstance(v_diag, ElectricalViaDiagnostics)
+    assert v_diag.current_a == pytest.approx(current_a, rel=1e-4)
+    assert summary.max_via_current_a == pytest.approx(current_a, rel=1e-4)
+    a_cu = compute_via_copper_area_m2(0.3e-3, plating_um=25.0, via_fill="plated")
+    expected_r_via = 1.724e-8 * 1.6e-3 / a_cu
+    assert v_diag.power_w == pytest.approx(current_a * current_a * expected_r_via, rel=1e-3)
+
+    assert result.current_density_map is not None
+    assert result.current_density_map.shape == (2, 4, 12)
+    assert result.current_density_map.dtype == np.float32
+    expected_j = current_a / (1.0 * 0.035)  # 5.0 A / (1.0 mm * 0.035 mm) = 142.857 A/mm^2
+    assert summary.max_current_density_a_mm2 == pytest.approx(expected_j, rel=1e-3)
+    assert float(np.max(result.current_density_map)) == pytest.approx(expected_j, rel=1e-3)
